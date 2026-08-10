@@ -23,6 +23,7 @@ chrono = { version = "0.4", features = ["serde"] }
 lazy_static = "1"
 log = "0.4"
 base64 = "0.22"
+tauri-plugin-autostart = "2"
 
 [features]
 default = ["custom-protocol"]
@@ -37,4 +38,10 @@ opt-level = 1        # 1 is plenty for a card bridge; far faster to compile than
 codegen-units = 256  # maximise codegen parallelism (default 16)
 lto = false          # LTO is a large build-time cost with no benefit here
 strip = true         # smaller binary/installer + faster artifact upload
+
+[target."cfg(windows)".dependencies]
+tauri-winrt-notification = "0.8.1"
+
+[dev-dependencies]
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 

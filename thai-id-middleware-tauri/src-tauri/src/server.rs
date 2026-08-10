@@ -10,12 +10,20 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::card_reader::{is_debug_mode, set_debug_mode, CardData, CardReader, FullDebugInfo};
+use crate::ihotel;
+use crate::stale::{Action, StaleLatch, StaleSignalPayload};
+use crate::toast;
+
+/// Title shown on every legacy-stale toast. Body text is per-episode (see
+/// `crate::stale::compose_toast_text` via `Action::ShowToast`).
+const TOAST_TITLE: &str = "iHOTEL";
 
 /// Server port for the HTTP API
 const SERVER_PORT: u16 = 9898;
@@ -33,6 +41,10 @@ const DEFAULT_ALLOWED_ORIGINS: &str =
 #[derive(Clone)]
 pub struct AppState {
     pub card_reader: Arc<Mutex<CardReader>>,
+    /// The grid-staleness latch (`docs/adr/0006-legacy-stale-notification.md`).
+    /// Shared with `main.rs`'s tray menu so `POST /ihotel/refresh` and the
+    /// tray's "รีเฟรช iHOTEL" item clear the same state.
+    pub stale_latch: Arc<Mutex<StaleLatch>>,
 }
 
 /// Health/Status response structure
@@ -79,6 +91,26 @@ pub struct DebugModeResponse {
     pub debug_mode: bool,
 }
 
+/// `GET /ihotel/status` response — a snapshot combining the (currently
+/// stubbed, see `crate::ihotel`) process/window probe with the grid
+/// staleness latch's own state.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IhotelStatusResponse {
+    pub process_found: bool,
+    pub grid_window_found: bool,
+    pub latch_state: &'static str,
+    pub stale_count: u32,
+    pub last_notify_at: Option<String>,
+}
+
+/// `POST /ihotel/refresh` error body — today this is the ONLY body it ever
+/// returns (Stage 4 owns making the action real; see `crate::ihotel`).
+#[derive(Debug, Serialize)]
+pub struct RefreshErrorResponse {
+    pub error: String,
+}
+
 /// Query parameters for the read endpoint
 #[derive(Debug, Deserialize)]
 pub struct ReadParams {
@@ -123,17 +155,10 @@ pub struct ParseMrzResponse {
     pub image: Option<String>,
 }
 
-/// Start the HTTP server - runs until the application exits
-///
-/// # Arguments
-/// * `card_reader` - Shared CardReader instance wrapped in Arc<Mutex<>>
-///
-/// # Returns
-/// * `Ok(())` when server stops
-/// * `Err(String)` if server failed to start
-pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<(), String> {
-    let state = AppState { card_reader };
-
+/// Build the Axum router. Split out from [`start_http_server`] so tests can
+/// drive it directly (via `tower::ServiceExt::oneshot`) without binding a
+/// real TCP socket — see the `test_notify_requires_json_content_type` test.
+fn build_router(state: AppState) -> Router {
     // Lock CORS down to a curated allowlist. The middleware is bound to
     // 127.0.0.1 but the browser still happily proxies cross-origin
     // `fetch('http://localhost:9898/read')` requests from any tab the
@@ -144,15 +169,15 @@ pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<()
     // handler is a GET today) plus OPTIONS for the preflight; headers are
     // restricted to `Content-Type` since none of the endpoints inspect
     // anything else. No credentials/cookies are involved, so
-    // `allow_credentials` stays off. POST is allowed for `/parse-mrz`, which
-    // takes a JSON body (all other endpoints are GET).
+    // `allow_credentials` stays off. POST is allowed for `/parse-mrz` and
+    // the `/notify`/`/ihotel/*` endpoints below, which take/accept a JSON
+    // body (or nothing).
     let cors = CorsLayer::new()
         .allow_origin(parse_allowed_origins())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE]);
 
-    // Build the router with all endpoints
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
         .route("/read", get(read_handler))
@@ -160,9 +185,34 @@ pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<()
         .route("/debug", get(debug_info_handler))
         .route("/debug/enable", get(enable_debug_handler))
         .route("/debug/disable", get(disable_debug_handler))
+        .route("/notify", post(notify_handler))
+        .route("/ihotel/status", get(ihotel_status_handler))
+        .route("/ihotel/refresh", post(ihotel_refresh_handler))
         .fallback(not_found_handler)
         .layer(cors)
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Start the HTTP server - runs until the application exits
+///
+/// # Arguments
+/// * `card_reader` - Shared CardReader instance wrapped in Arc<Mutex<>>
+/// * `stale_latch` - Shared grid-staleness latch (ADR 0006), also captured
+///   by `main.rs`'s tray menu so both surfaces agree on state.
+///
+/// # Returns
+/// * `Ok(())` when server stops
+/// * `Err(String)` if server failed to start
+pub async fn start_http_server(
+    card_reader: Arc<Mutex<CardReader>>,
+    stale_latch: Arc<Mutex<StaleLatch>>,
+) -> Result<(), String> {
+    let state = AppState {
+        card_reader,
+        stale_latch,
+    };
+
+    let app = build_router(state);
 
     let addr = format!("127.0.0.1:{}", SERVER_PORT);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -371,6 +421,102 @@ async fn disable_debug_handler() -> Json<DebugModeResponse> {
     })
 }
 
+/// POST /notify - Feed a `legacy_stale` signal into the grid-staleness latch
+///
+/// Per `docs/adr/0006-legacy-stale-notification.md` §3: the reception
+/// browser tab (already SSE-connected to the backend) relays the signal
+/// here after receiving it. Body is the `LegacyStaleSignal` JSON shape
+/// (`{id, site, count, summary, items, emitted_at}` — see
+/// `hotel-backend/src/outbox/legacy_stale.rs` and `crate::stale`).
+///
+/// **Requires `Content-Type: application/json`.** This isn't just
+/// pedantry: a "simple" cross-origin POST (e.g. `Content-Type: text/plain`,
+/// or no body at all) never triggers the browser's CORS preflight, which
+/// means the `CARD_READER_ALLOWED_ORIGINS` allowlist above would never even
+/// be consulted for it — any page could fire one blind. Axum's `Json<T>`
+/// extractor already rejects a request whose `Content-Type` isn't
+/// `application/json` (or an `+json` suffix) with `415 Unsupported Media
+/// Type` before this handler body ever runs (see
+/// `test_notify_requires_json_content_type` below), which is what actually
+/// forces the preflight and makes the allowlist gate this endpoint for
+/// real.
+async fn notify_handler(State(state): State<AppState>, Json(payload): Json<StaleSignalPayload>) -> StatusCode {
+    let action = {
+        let mut latch = state.stale_latch.lock().await;
+        latch.on_notify(&payload, Utc::now())
+    };
+    dispatch_action(action);
+    StatusCode::NO_CONTENT
+}
+
+/// GET /ihotel/status - Snapshot of iHOTEL's observed state + the latch
+///
+/// `processFound`/`gridWindowFound` come from `crate::ihotel::snapshot()`,
+/// which is a stub off Windows (and, for now, on Windows too — Stage 4
+/// fills in real UIA probing) and honestly reports `false`/`false` rather
+/// than guessing.
+async fn ihotel_status_handler(State(state): State<AppState>) -> Json<IhotelStatusResponse> {
+    let probe = ihotel::snapshot();
+    let snap = {
+        let latch = state.stale_latch.lock().await;
+        latch.snapshot()
+    };
+
+    Json(IhotelStatusResponse {
+        process_found: probe.process_found,
+        grid_window_found: probe.grid_window_found,
+        latch_state: snap.state,
+        stale_count: snap.stale_count,
+        last_notify_at: snap.last_notify_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+/// POST /ihotel/refresh - Trigger iHOTEL's reception-invoked refresh
+///
+/// Stage 4 owns making this real (`crate::ihotel::trigger_refresh`); it is
+/// the same code path the tray's "รีเฟรช iHOTEL" item calls, so both
+/// surfaces can never disagree about what "refresh" does. Today
+/// `trigger_refresh` unconditionally reports unavailable, so this endpoint
+/// always answers `501 Not Implemented` with `{"error":
+/// "refresh-not-available"}` — but the route and the response shape are in
+/// place for Stage 4 to fill in without a client-visible contract change.
+async fn ihotel_refresh_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match ihotel::trigger_refresh() {
+        Ok(()) => {
+            // Unreachable today (see doc comment) — kept correct so Stage 4
+            // gets a working "refresh clears the latch" for free.
+            let mut latch = state.stale_latch.lock().await;
+            latch.on_refresh_performed(Utc::now());
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(RefreshErrorResponse {
+                error: err.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Turn a latch [`Action`] into a real toast call. Factored out of
+/// `notify_handler` so its body reads as "update state, then react".
+fn dispatch_action(action: Action) {
+    match action {
+        Action::ShowToast(text) => toast::show(TOAST_TITLE, &text),
+        Action::UpdateCount(count) => {
+            // No update-in-place toast API is wired yet (see `crate::toast`
+            // module docs) — a count bump while a toast is already showing
+            // is logged, not re-toasted, to honor the "one toast per
+            // episode" rule (ADR 0006 §5).
+            println!(
+                "[legacy-stale] stale count now {count} (toast already shown for this episode)"
+            );
+        }
+        Action::Nothing => {}
+    }
+}
+
 /// 404 handler - Returns available endpoints
 async fn not_found_handler() -> impl IntoResponse {
     (
@@ -386,6 +532,10 @@ async fn not_found_handler() -> impl IntoResponse {
                 "GET /debug - Get full debug info (ATR, protocol, AID tests)".to_string(),
                 "GET /debug/enable - Enable debug mode".to_string(),
                 "GET /debug/disable - Disable debug mode".to_string(),
+                "POST /notify - Feed a legacy_stale signal into the grid-staleness latch"
+                    .to_string(),
+                "GET /ihotel/status - iHOTEL process/window snapshot + latch state".to_string(),
+                "POST /ihotel/refresh - Trigger iHOTEL's refresh (501 until Stage 4)".to_string(),
             ],
         }),
     )
@@ -453,6 +603,138 @@ fn is_leap_year(year: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_app_state() -> AppState {
+        AppState {
+            card_reader: Arc::new(Mutex::new(CardReader::new())),
+            stale_latch: Arc::new(Mutex::new(StaleLatch::new())),
+        }
+    }
+
+    fn stale_signal_body() -> String {
+        serde_json::json!({
+            "id": "9f5c1e2a-0000-0000-0000-000000000000",
+            "site": "hfhotel",
+            "count": 1,
+            "summary": "เช็คอิน ห้อง 302",
+            "items": ["เช็คอิน ห้อง 302"],
+            "emitted_at": "2026-08-10T09:00:00Z"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_notify_requires_json_content_type() {
+        // The load-bearing assertion in this file: a "simple" content type
+        // must be rejected with 415 before the handler ever touches the
+        // latch — see notify_handler's doc comment for why this is what
+        // makes the CORS allowlist actually gate this endpoint.
+        let app = build_router(test_app_state());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/notify")
+            .header("content-type", "text/plain")
+            .body(Body::from(stale_signal_body()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_notify_without_content_type_is_rejected() {
+        let app = build_router(test_app_state());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/notify")
+            .body(Body::from(stale_signal_body()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_notify_with_json_content_type_returns_204() {
+        let app = build_router(test_app_state());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/notify")
+            .header("content-type", "application/json")
+            .body(Body::from(stale_signal_body()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_notify_feeds_the_latch() {
+        let state = test_app_state();
+        let latch = state.stale_latch.clone();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/notify")
+            .header("content-type", "application/json")
+            .body(Body::from(stale_signal_body()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let snap = latch.lock().await.snapshot();
+        assert_eq!(snap.state, "stale");
+        assert_eq!(snap.stale_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ihotel_status_reports_clear_latch_and_unavailable_probe() {
+        let app = build_router(test_app_state());
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ihotel/status")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["processFound"], false);
+        assert_eq!(body["gridWindowFound"], false);
+        assert_eq!(body["latchState"], "clear");
+        assert_eq!(body["staleCount"], 0);
+        assert!(body["lastNotifyAt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_ihotel_refresh_returns_501_stub_shape() {
+        let app = build_router(test_app_state());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ihotel/refresh")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "refresh-not-available");
+    }
 
     #[test]
     fn test_health_response_serialization() {
