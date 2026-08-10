@@ -284,6 +284,10 @@ fn current_site_id() -> &'static str {
 /// The site id whose writeback worker honors [`HFVILLE_WRITEBACK_INTENTS`].
 const VILLE_SITE_ID: &str = "hfville";
 
+/// Running count of jobs this worker parked as `skipped`. Reported on every
+/// park so an unexpected burst is visible in deploy logs without aggregation.
+static VILLE_SKIPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Process-global HF Ville intent allowlist, resolved once on first use from
 /// `HFVILLE_WRITEBACK_INTENTS`. `None` = unset ⇒ allow every intent (current
 /// behavior). See `config::hfville_writeback_intents` for the rationale.
@@ -1224,10 +1228,20 @@ async fn process_job(
     // connection — so a non-allowlisted intent costs nothing and, crucially,
     // never opens a transaction against Ville's iHOTEL.
     if !ville_intent_allowed(intent_name) {
+        // WARN, not INFO/DEBUG: at launch the ONLY intent that should ever be
+        // enqueued for Ville is `mark_room_clean` (the admission gate in
+        // `middleware::ville_guard` admits exactly that one flow), so a park
+        // here means something enqueued a Ville intent nobody expected —
+        // visible in deploy logs at the default RUST_LOG. `skipped_total` is
+        // the running count for this worker process, so a burst is obvious
+        // without grepping every line.
         tracing::warn!(
             job_id,
             intent = intent_name,
-            "Skipping job: intent is not in HFVILLE_WRITEBACK_INTENTS"
+            site = current_site_id(),
+            allowlist = ?VILLE_INTENT_ALLOWLIST.get().and_then(|a| a.as_ref()),
+            skipped_total = VILLE_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1,
+            "Parking job as skipped: intent is not in HFVILLE_WRITEBACK_INTENTS"
         );
         mark_skipped(
             pg,

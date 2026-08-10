@@ -386,37 +386,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `HkIdentity`. FAIL CLOSED — env unset ⇒ every request 401, so the
     // surface ships dark until the Access wiring lands. Mounted OUTSIDE
     // `require_auth` (maids have no PMS session) but WITH its own
-    // `ville_write_guard` layer so a `branch=hfville` mutation stays
-    // blocked until `HFVILLE_WRITES_ENABLED`, exactly like the main router.
-    // Body limit raised for the optional broken-item photo (base64 JSON,
-    // same transport as guest documents).
+    // `ville_write_guard` layer, exactly like the main router — with ONE
+    // exemption: `POST /api/hk/rooms/{id}/cleaning` is admitted for
+    // `branch=hfville` even while `HFVILLE_WRITES_ENABLED` is off, so the
+    // admitted set matches `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` and
+    // canonical PG cannot diverge from Ville's iHOTEL (see
+    // `middleware::ville_guard`).
+    //
+    // The whole stack is built by `routes::hk::router` so the integration
+    // tests mount the shipped wiring rather than a replica.
     let hk_routes = match &final_app_state {
-        Some(state) => {
-            let hk_ville_guard =
-                axum_middleware::from_fn_with_state(state.clone(), ville_write_guard);
-            Router::new()
-                .route("/api/hk/me", get(routes::hk::me))
-                .route("/api/hk/rooms", get(routes::hk::list_rooms))
-                .route("/api/hk/rooms/{room_id}", get(routes::hk::room_detail))
-                .route(
-                    "/api/hk/rooms/{room_id}/cleaning",
-                    post(routes::hk::report_cleaning),
-                )
-                .route(
-                    "/api/hk/rooms/{room_id}/broken-items",
-                    post(routes::hk::report_broken_item),
-                )
-                .route(
-                    "/api/hk/broken-items/{report_id}/photo",
-                    get(routes::hk::broken_item_photo),
-                )
-                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
-                .layer(axum_middleware::from_fn(
-                    app_middleware::hk_access::require_hk_access,
-                ))
-                .layer(hk_ville_guard)
-                .with_state(state.clone())
-        }
+        Some(state) => routes::hk::router(state.clone()),
         None => Router::new(),
     };
 
@@ -1159,36 +1139,7 @@ fn build_new_routes(app_state: AppState) -> Router {
         .layer(ville_write_guard_layer)
 }
 
-/// Guard: when `HFVILLE_WRITES_ENABLED` is off, reject any mutating
-/// (POST/PUT/PATCH/DELETE) request carrying `?branch=hfville` with 403 — before
-/// it can reach a handler that would write the HF Hotel pool. Robustly parses
-/// the `branch` query param (URL-decoded) rather than substring-matching.
-async fn ville_write_guard(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let mutating = matches!(
-        *req.method(),
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
-    if mutating && !state.hfville_writes_enabled {
-        let targets_ville = req
-            .uri()
-            .query()
-            .map(|q| {
-                form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "branch" && v == "hfville")
-            })
-            .unwrap_or(false);
-        if targets_ville {
-            return hotel_backend::error::ApiError::Forbidden(
-                "HF Ville writes are disabled (HFVILLE_WRITES_ENABLED=false); manage HF Ville via iHOTEL"
-                    .to_string(),
-            )
-            .into_response();
-        }
-    }
-    next.run(req).await
-}
+// `ville_write_guard` now lives in the lib
+// (`hotel_backend::middleware::ville_guard`) so its decision matrix is
+// unit-testable and integration tests can mount the real layered router.
+use hotel_backend::middleware::ville_guard::ville_write_guard;

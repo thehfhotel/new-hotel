@@ -84,6 +84,19 @@ is_allowlisted() {
         # only calls central HF-ID + the in-memory store, never new_pool, so it
         # passes on its own merits without an allowlist entry.)
         auth::card_login) return 0 ;;
+        # (A) Admin user administration — writes the SAME global `ht_users`
+        # store as auth::login above (CARDINALITY_MAP: `ht_users` is PG
+        # canonical with no legacy twin and no per-site split), so `new_pool`
+        # is the correct target and there is no `?branch=` on these routes.
+        #
+        # NEWLY VISIBLE 2026-08-11, not newly written: both handlers live in
+        # `routes::admin_users::router()`, and until this script learned to
+        # scan module-local routers they were silently outside its universe.
+        # Listed explicitly so the classification is recorded rather than
+        # implicit. If PMS accounts ever become per-site, these are the first
+        # two handlers to revisit.
+        admin_users::create_user) return 0 ;;
+        admin_users::patch_user) return 0 ;;
         # (A) Legacy `/api/bookings/by-number/{book_no}/notes` path — HF-Hotel-
         # only legacy booking-notes surface; the by-number lookups read new_pool
         # and there is no Ville variant of this path. TODO(ville-bundle).
@@ -129,7 +142,7 @@ is_allowlisted() {
 # Extract `module::handler` for every mutating route mount in main.rs. Matches
 # `post(routes::m::h` / `.put(routes::m::h` / `axum::routing::patch(routes::m::h`
 # / `delete(routes::m::h`. `get(` is intentionally excluded (read-only).
-extract_mutating_handlers() {
+extract_mutating_handlers_from_main() {
     local main="$1"
     if [ ! -f "${main}" ]; then
         echo "::error::main.rs not found: ${main}" >&2
@@ -138,6 +151,51 @@ extract_mutating_handlers() {
     grep -oE '(post|put|patch|delete)\([[:space:]]*routes::[a-zA-Z0-9_]+::[a-zA-Z0-9_]+' "${main}" \
         | sed -E 's/^(post|put|patch|delete)\([[:space:]]*routes:://' \
         | sort -u
+}
+
+# Extract `module::handler` for mutating routes registered INSIDE a route
+# module's own `router()` fn, e.g. `routes/hk.rs`:
+#
+#     pub fn router(state: AppState) -> Router {
+#         Router::new().route("/api/hk/rooms/{id}/cleaning", post(report_cleaning))
+#
+# Those handlers are referenced by BARE name (they are in scope), so the
+# main.rs matcher above cannot see them — main.rs only mounts
+# `routes::<module>::router(...)`. Without this pass, moving a route out of
+# main.rs into a module router would SILENTLY drop it from this gate's
+# universe (which is exactly what happened when the `/api/hk/*` stack moved
+# into `routes::hk::router`, and is a long-standing blind spot for
+# `routes::admin_users::router`). Handlers are attributed to the module whose
+# file they were found in.
+extract_mutating_handlers_from_route_modules() {
+    local routes_dir="$1"
+    [ -d "${routes_dir}" ] || return 0
+    local file module
+    for file in "${routes_dir}"/*.rs; do
+        [ -f "${file}" ] || continue
+        module="$(basename "${file}" .rs)"
+        [ "${module}" = "mod" ] && continue
+        # Bare-name registrations only: a `routes::m::h` form here would be
+        # the main.rs shape and is already covered above.
+        # `|| true`: most route files register nothing this way, and a
+        # no-match grep exits 1 — which would abort the whole script under
+        # `set -euo pipefail`.
+        grep -oE '(post|put|patch|delete)\([[:space:]]*[a-z][a-zA-Z0-9_]*[[:space:]]*\)' "${file}" 2>/dev/null \
+            | sed -E 's/^(post|put|patch|delete)\([[:space:]]*//; s/[[:space:]]*\)$//' \
+            | while IFS= read -r handler; do
+                [ -z "${handler}" ] && continue
+                echo "${module}::${handler}"
+            done || true
+    done | sort -u
+}
+
+# The full universe: main.rs mounts + module-local `router()` registrations.
+extract_mutating_handlers() {
+    local main="$1"
+    {
+        extract_mutating_handlers_from_main "${main}"
+        extract_mutating_handlers_from_route_modules "${ROUTES_DIR}"
+    } | sort -u
 }
 
 # Print the body of a top-level `fn <handler>` from a route file: from the fn
