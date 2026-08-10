@@ -52,6 +52,10 @@ pub struct AppState {
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub status: String,
+    /// Crate version — lets the Stage-6 SSH install verify which build is
+    /// actually serving (an in-place upgrade that silently failed would
+    /// otherwise be indistinguishable from success).
+    pub version: String,
     pub timestamp: String,
     pub reader_connected: bool,
     pub card_inserted: bool,
@@ -296,6 +300,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
 
     Json(HealthResponse {
         status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: iso_timestamp(),
         reader_connected: status.reader_connected,
         card_inserted: status.card_inserted,
