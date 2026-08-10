@@ -426,11 +426,13 @@ services:
       # #282 class-B heal: re-stamps rcal_legacy_id on tiles whose (room,
       # night) still exists in legacy under a rebound id. Canonical-only
       # UPDATE, per-tick cap 100, cannot violate the partial unique index.
-      # First live test belongs at HF HOTEL (3 fully-predicted writes:
-      # rcal_id 48/49/50 <- legacy 50980/50981/50982), not Ville (0
-      # candidates = proves nothing). No reception coordination needed —
-      # no legacy traffic.
-      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
+      # FLIPPED 2026-08-10 as the first live test — HF Hotel had exactly 3
+      # fully-predicted candidates (rcal_id 48/49/50 <- legacy
+      # 50980/50981/50982, the #282 room-405 tiles), verified row-by-row
+      # after the first tick. No reception coordination needed — no legacy
+      # traffic. Steady state: restamped=0 except after iHOTEL id-reuse
+      # rebinds, where it heals the pointer within one tick.
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-true}
       # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
       # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
       # itemized amount + receipt-deduped ACTIVE tender. The folio is the
