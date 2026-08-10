@@ -223,3 +223,10 @@ fontdb = "0.23"
 # the landscape Thai-ID card on a tall white canvas (703×996, card at the top),
 # so the sync worker trims the near-white border to just the card before storing.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` — lets integration tests drive the REAL layered axum
+# router (`routes::hk::router`) with actual HTTP requests, instead of asserting
+# against a hand-rebuilt replica of the layer stack. Already in the lock tree
+# via tower-http, so this adds only the `util` feature.
+tower = { version = "0.5", features = ["util"] }

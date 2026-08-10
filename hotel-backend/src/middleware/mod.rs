@@ -17,6 +17,10 @@
 //! * `hk_access` — Cloudflare Access gate for the maid-facing `/api/hk/*`
 //!   surface (a THIRD consumer of the team JWKS, different Access app AUD;
 //!   employee-login plan Phase 4). IS a tower layer, unlike `cf_access`.
+//! * `ville_guard` — HF Ville write admission gate (ADR 0002 / Ship-A):
+//!   403s `?branch=hfville` mutations while `HFVILLE_WRITES_ENABLED` is off,
+//!   with one narrow housekeeping exemption. Lives here (not `main.rs`) so
+//!   the decision is unit-testable.
 
 pub mod auth;
 pub mod cf_access;
@@ -24,7 +28,9 @@ pub mod hfid_assertion;
 pub mod hk_access;
 pub mod permissions;
 pub mod rate_limit;
+pub mod ville_guard;
 
 pub use auth::require_auth;
 pub use permissions::{permissions_for_user, require_permission};
 pub use rate_limit::{login_rate_limit, LoginRateLimitState};
+pub use ville_guard::{is_ville_exempt_path, ville_write_blocked, ville_write_guard};

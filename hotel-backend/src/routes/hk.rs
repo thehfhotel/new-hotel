@@ -40,12 +40,24 @@
 //!   so a maid double-tapping เสร็จแล้ว cannot double-write `HT_Housewife`.
 //!
 //! Branch-aware via `?branch=` resolved through the unified
-//! [`AppState::write_pool`] chokepoint (Ship-B gate); `branch=hfville`
-//! mutations stay blocked by the `ville_write_guard` layer until
-//! `HFVILLE_WRITES_ENABLED` flips — v1 of the frontend pins HF Hotel. When
-//! that flag is flipped for Ville, `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`
-//! on the Ville writeback worker keeps this the ONLY intent that reaches
-//! Ville's iHOTEL (`config::hfville_writeback_intents`).
+//! [`AppState::write_pool`] chokepoint (Ship-B gate).
+//!
+//! ## HF Ville admission (housekeeping-ops launch)
+//!
+//! The launch environment leaves `HFVILLE_WRITES_ENABLED` UNSET — general
+//! Ville mutations must stay inadmissible — and sets
+//! `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` on the Ville writeback worker.
+//! For the maid surface to work at Ville under that env, `ville_write_guard`
+//! grants ONE narrow exemption: `POST /api/hk/rooms/{id}/cleaning` is admitted
+//! for `branch=hfville` regardless of the flag
+//! ([`crate::middleware::ville_guard::is_ville_exempt_path`]).
+//!
+//! That keeps the ADMITTED set identical to the ALLOWLISTED writeback set. The
+//! alternative — flipping `HFVILLE_WRITES_ENABLED` on — would admit every other
+//! Ville mutation, each writing canonical PG while its writeback intent parked
+//! as `'skipped'`, silently diverging PG from Ville's iHOTEL. `broken-items`
+//! and every non-hk mutation stay blocked. Pinned by
+//! `tests/test_hk_ville_guard.rs`.
 //!
 //! All SQL is RUNTIME `sqlx::query` (no compile-time macro), so this module
 //! needs no `.sqlx/` cache regeneration — same policy as
@@ -56,7 +68,8 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::Response,
-    Extension, Json,
+    routing::{get, post},
+    Extension, Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -124,6 +137,54 @@ fn maid_label(identity: &HkIdentity) -> String {
 /// maids ever became PMS accounts (they are CF Access identities today).
 fn hk_source() -> EventSource {
     EventSource::our_app(uuid::Uuid::nil(), uuid::Uuid::new_v4())
+}
+
+// ============================================================================
+// Router
+// ============================================================================
+
+/// Build the fully-layered `/api/hk/*` router.
+///
+/// Lives here (rather than inline in `main`) so `main.rs` and the integration
+/// tests mount the SAME stack — a test that rebuilt the layer order by hand
+/// would be testing its own replica, not the shipped wiring. Same idiom as
+/// `routes::admin_users::router()`.
+///
+/// Layer order is load-bearing, outermost last:
+/// 1. `ville_write_guard` (OUTERMOST) — a disabled-Ville mutation is refused
+///    up front, before any auth work, EXCEPT the exempt cleaning route.
+/// 2. `require_hk_access` — Cloudflare Access gate; fails closed (401) when
+///    `CF_ACCESS_HK_AUD` is unset, so the surface ships dark.
+/// 3. body limit, then the handlers.
+///
+/// That order is what `tests/test_hk_ville_guard.rs` asserts against: an
+/// unauthenticated `branch=hfville` request returns 403 when the guard refuses
+/// it and 401 when the guard admits it and auth then refuses — which
+/// distinguishes the two layers without needing a valid Access assertion.
+pub fn router(state: AppState) -> Router {
+    let ville_guard = axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::ville_guard::ville_write_guard,
+    );
+    Router::new()
+        .route("/api/hk/me", get(me))
+        .route("/api/hk/rooms", get(list_rooms))
+        .route("/api/hk/rooms/{room_id}", get(room_detail))
+        .route("/api/hk/rooms/{room_id}/cleaning", post(report_cleaning))
+        .route(
+            "/api/hk/rooms/{room_id}/broken-items",
+            post(report_broken_item),
+        )
+        .route(
+            "/api/hk/broken-items/{report_id}/photo",
+            get(broken_item_photo),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(
+            crate::middleware::hk_access::require_hk_access,
+        ))
+        .layer(ville_guard)
+        .with_state(state)
 }
 
 // ============================================================================
