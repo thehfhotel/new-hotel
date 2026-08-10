@@ -240,6 +240,62 @@ mod tests {
         assert!(statements[1].contains("'306'"));
     }
 
+    /// Maid attribution (housekeeping-ops, 2026-08-11): `by` must land in
+    /// **`[h_name]`** — the FIRST projected column — and must not be confused
+    /// with `[h_cin_name]` (the prior occupant, last column). The pre-existing
+    /// spike-capture test only asserts `contains("'Admin'")`, which would still
+    /// pass if the two were swapped; the `/hk` surface now feeds the maid's
+    /// name through `by`, so pin the column ORDER explicitly.
+    #[test]
+    fn by_is_projected_into_h_name_not_h_cin_name() {
+        let prior = PriorOccupant {
+            cin_no: "CH26-005159".into(),
+            customer_full_name: "Jane Doe".into(),
+        };
+        let statements = build_statements(6, "306", "นก", Some(&prior), pinned_now());
+        let insert = &statements[1];
+
+        // Column list order is the contract the SELECT projection must match.
+        assert!(
+            insert.contains("([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name])"),
+            "column list changed — the projection assertions below assume it: {insert}"
+        );
+        // `by` is the FIRST projected value (h_name); the guest name is LAST.
+        assert!(
+            insert.contains("SELECT 'นก', '306',"),
+            "the maid's name must be projected first, into [h_name]: {insert}"
+        );
+        assert!(
+            insert.contains(",'Jane Doe'"),
+            "the prior occupant must remain in [h_cin_name]: {insert}"
+        );
+        assert!(
+            !insert.contains("SELECT 'Jane Doe'"),
+            "the guest name must never land in [h_name]: {insert}"
+        );
+    }
+
+    /// Byte-parity (invariant #3): a Thai maid name must be emitted as a PLAIN
+    /// `'…'` literal — an `N'…'` prefix corrupts TIS-620 on the legacy side —
+    /// and an apostrophe must be doubled, not escaped.
+    #[test]
+    fn thai_maid_name_is_a_plain_literal_with_doubled_apostrophes() {
+        let statements = build_statements(6, "306", "นก", None, pinned_now());
+        let insert = &statements[1];
+        assert!(insert.contains("'นก'"), "Thai name must round-trip: {insert}");
+        assert!(
+            !insert.contains("N'"),
+            "must never emit an N-prefixed literal (TIS-620 corruption): {insert}"
+        );
+
+        let quoted = build_statements(6, "306", "O'Brien", None, pinned_now());
+        assert!(
+            quoted[1].contains("'O''Brien'"),
+            "apostrophes must be doubled: {}",
+            quoted[1]
+        );
+    }
+
     /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — repeated
     /// calls with the same inputs produce byte-identical output, including
     /// the `h_date` stamp.

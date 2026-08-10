@@ -7,7 +7,7 @@
 //! - `GET  /api/hk/rooms`                       — room list + today's progress.
 //! - `GET  /api/hk/rooms/{id}`                  — one room + events + reports.
 //! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`).
-//! - `POST /api/hk/rooms/{id}/broken-items`     — report a broken/damaged item.
+//! - `POST /api/hk/rooms/{id}/broken-items`     — RETIRED, answers `410 Gone`.
 //! - `GET  /api/hk/broken-items/{id}/photo`     — stream a report's photo.
 //!
 //! ## Identity & auth
@@ -21,16 +21,31 @@
 //!
 //! ## Coexistence stance (ADR 0002 / invariant #6)
 //!
-//! Everything here is PG-canonical-only NEW data (`ht_hk_cleaning_events`,
-//! `ht_hk_broken_reports`, migration 077): NO legacy writeback, NO sync
-//! mapper, and deliberately NO write to `ht_rooms_new.room_clean` (that flag
-//! belongs to the front-desk board + its legacy mirror via
-//! `service::housekeeping`). A maid's progress report cannot touch iHOTEL.
+//! **Changed 2026-08-11 (housekeeping-ops).** This surface used to be
+//! PG-canonical-only with NO legacy coupling at all. It no longer is:
+//!
+//! - `ht_hk_cleaning_events` / `ht_hk_broken_reports` (migration 077) remain
+//!   PG-canonical-only NEW data — no sync mapper, no legacy twin.
+//! - **`cleaning` with `done` DOES now reach iHOTEL**: it delegates to
+//!   [`crate::service::housekeeping::HousekeepingService::mark_clean_if_dirty`],
+//!   which flips `ht_rooms_new.room_clean`, enqueues the proven
+//!   `MarkRoomClean` writeback and publishes `RoomMarkedClean` — all in one
+//!   transaction (PG first, mirror async; invariant #2). That is the whole
+//!   point of the change: reception must see the finished room on iHOTEL's
+//!   board without the maid touching the legacy app.
+//! - `started` stays PG-only on purpose — iHOTEL's in-progress field
+//!   `Room_Clean_Time` feeds its room-power countdown, so mirroring it is
+//!   parity risk for no operational gain (housekeeping-ops plan, decision #3).
+//! - The repeat-tap guard lives in `mark_clean_if_dirty`'s conditional UPDATE,
+//!   so a maid double-tapping เสร็จแล้ว cannot double-write `HT_Housewife`.
 //!
 //! Branch-aware via `?branch=` resolved through the unified
 //! [`AppState::write_pool`] chokepoint (Ship-B gate); `branch=hfville`
 //! mutations stay blocked by the `ville_write_guard` layer until
-//! `HFVILLE_WRITES_ENABLED` flips — v1 of the frontend pins HF Hotel.
+//! `HFVILLE_WRITES_ENABLED` flips — v1 of the frontend pins HF Hotel. When
+//! that flag is flipped for Ville, `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`
+//! on the Ville writeback worker keeps this the ONLY intent that reaches
+//! Ville's iHOTEL (`config::hfville_writeback_intents`).
 //!
 //! All SQL is RUNTIME `sqlx::query` (no compile-time macro), so this module
 //! needs no `.sqlx/` cache regeneration — same policy as
@@ -43,7 +58,6 @@ use axum::{
     response::Response,
     Extension, Json,
 };
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -52,18 +66,13 @@ use super::mode::{AppState, Branch};
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::hk_access::HkIdentity;
+use crate::outbox::event::EventSource;
+use crate::service::housekeeping::{HousekeepingService, MarkCleanCommand};
 
 /// Cleaning-progress statuses a maid can report. `started` =
 /// เริ่มทำความสะอาด, `done` = เสร็จแล้ว. Matches the CHECK constraint on
 /// `ht_hk_cleaning_events.hkev_status` (migration 077).
 pub const VALID_CLEANING_STATUSES: [&str; 2] = ["started", "done"];
-
-/// Upper bound on a decoded broken-item photo (bytes). Phones downscale
-/// client-side before upload; this is the server-side backstop.
-const MAX_PHOTO_BYTES: usize = 5 * 1024 * 1024;
-
-/// Upper bound on a broken-item description (chars).
-const MAX_DESCRIPTION_CHARS: usize = 4000;
 
 /// Branch selector shared by every hk route (`?branch=`; absent ⇒ HF Hotel).
 #[derive(Debug, Default, Deserialize)]
@@ -76,6 +85,45 @@ pub struct HkBranchQuery {
 /// same idiom as `routes::new_maintenance::resolve_pool`.
 fn resolve_pool(state: &AppState, branch: Option<Branch>) -> ApiResult<&PgPool> {
     state.write_pool(branch)
+}
+
+/// Build a [`HousekeepingService`] bound to the branch's pool — identical
+/// construction to `routes::housekeeping::service_for`, so the maid surface
+/// and the front desk share one code path into the `MarkRoomClean` writeback
+/// (and one `Hfville → ville_pool` decision, via `write_pool`).
+fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<HousekeepingService> {
+    let pool = state.write_pool(branch)?.clone();
+    Ok(HousekeepingService::new(
+        state.rooms.clone(),
+        state.outbox.clone(),
+        state.events.clone(),
+        pool,
+    ))
+}
+
+/// The label recorded as the housekeeper in `HT_Housewife.h_name`.
+///
+/// Prefers the verified HF ID display name so iHOTEL's housekeeping log names
+/// the actual maid; falls back to the badge, which is ALWAYS present (the
+/// middleware 401s without one). Today the CF Access IdP forwards only
+/// `["apps", "badge"]`, so this resolves to the badge in production — adding
+/// `name` to the forwarded claims upgrades the audit row with no code change
+/// here. Never client-supplied: both fields come from the verified assertion.
+fn maid_label(identity: &HkIdentity) -> String {
+    identity
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&identity.badge)
+        .to_string()
+}
+
+/// `EventSource` for a maid-originated cleaning event. Mirrors
+/// `routes::housekeeping::http_source`; a real `user_id` would land here if
+/// maids ever became PMS accounts (they are CF Access identities today).
+fn hk_source() -> EventSource {
+    EventSource::our_app(uuid::Uuid::nil(), uuid::Uuid::new_v4())
 }
 
 // ============================================================================
@@ -174,26 +222,19 @@ pub struct ReportCleaningResponse {
     pub success: bool,
     pub room_id: i32,
     pub status: String,
+    /// `true` when this call performed the dirty→clean transition and so
+    /// enqueued the `MarkRoomClean` writeback. `false` for `started`, and for
+    /// a repeat `done` on an already-clean room (idempotent no-op).
+    pub writeback_enqueued: bool,
 }
 
-/// Body for `POST /api/hk/rooms/{id}/broken-items`. The photo rides the same
-/// base64→bytea pattern as `routes::guest_documents`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReportBrokenItemBody {
-    pub description: String,
-    #[serde(default)]
-    pub photo_base64: Option<String>,
-    #[serde(default)]
-    pub photo_mime: Option<String>,
-}
-
+/// Body of a `410 Gone` answer from a retired endpoint. Same
+/// `{success:false, error}` shape the frontend's `hkFetch` already expects.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReportBrokenItemResponse {
+pub struct GoneResponse {
     pub success: bool,
-    pub report_id: i64,
-    pub room_id: i32,
+    pub error: String,
 }
 
 // ============================================================================
@@ -212,55 +253,6 @@ fn parse_cleaning_status(raw: &str) -> Result<&'static str, ApiError> {
                 "invalid status '{raw}' (expected one of {VALID_CLEANING_STATUSES:?})"
             ))
         })
-}
-
-/// Normalize + validate a broken-item description.
-fn parse_description(raw: &str) -> Result<String, ApiError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(
-            "description must not be empty".to_string(),
-        ));
-    }
-    if trimmed.chars().count() > MAX_DESCRIPTION_CHARS {
-        return Err(ApiError::BadRequest(format!(
-            "description exceeds {MAX_DESCRIPTION_CHARS} characters"
-        )));
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Decode an optional base64 photo, enforcing the size backstop. Returns
-/// `(bytes, mime)` when present. Whitespace/newlines tolerated, same as
-/// `routes::guest_documents`.
-fn parse_photo(
-    photo_base64: Option<&str>,
-    photo_mime: Option<&str>,
-) -> Result<Option<(Vec<u8>, String)>, ApiError> {
-    let Some(raw) = photo_base64 else {
-        return Ok(None);
-    };
-    let cleaned: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return Ok(None);
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(cleaned.as_bytes())
-        .map_err(|e| ApiError::BadRequest(format!("photoBase64 is not valid base64: {e}")))?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    if bytes.len() > MAX_PHOTO_BYTES {
-        return Err(ApiError::BadRequest(format!(
-            "photo exceeds {MAX_PHOTO_BYTES} bytes after decoding"
-        )));
-    }
-    let mime = photo_mime
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("image/jpeg")
-        .to_string();
-    Ok(Some((bytes, mime)))
 }
 
 // ============================================================================
@@ -422,33 +414,6 @@ async fn fetch_today_events(
         .collect())
 }
 
-/// Insert a broken-item report. Returns the new report id.
-#[allow(clippy::too_many_arguments)]
-async fn insert_broken_report(
-    pool: &PgPool,
-    room_id: i32,
-    description: &str,
-    badge: &str,
-    name: Option<&str>,
-    photo: Option<&[u8]>,
-    photo_mime: Option<&str>,
-) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "INSERT INTO ht_hk_broken_reports \
-             (hkbr_room_id, hkbr_description, hkbr_badge, hkbr_name, hkbr_photo, hkbr_photo_mime) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING hkbr_id",
-    )
-    .bind(room_id)
-    .bind(description)
-    .bind(badge)
-    .bind(name)
-    .bind(photo)
-    .bind(photo_mime)
-    .fetch_one(pool)
-    .await?;
-    row.try_get("hkbr_id")
-}
-
 /// Recent broken-item reports for one room (metadata only), recent first.
 async fn fetch_room_reports(pool: &PgPool, room_id: i32) -> Result<Vec<BrokenReport>, sqlx::Error> {
     let rows = sqlx::query(
@@ -543,6 +508,17 @@ pub async fn room_detail(
 }
 
 /// POST /api/hk/rooms/{id}/cleaning — report cleaning progress.
+///
+/// `started` is PG-only (see the module header). `done` ADDITIONALLY drives
+/// the canonical clean flip + the `MarkRoomClean` legacy writeback through
+/// [`HousekeepingService::mark_clean_if_dirty`], so the front desk sees the
+/// maid's finished room in iHOTEL.
+///
+/// The maid's append-only event is recorded FIRST and unconditionally: it is
+/// the maid's own record of work done, and it must survive even if the
+/// writeback leg is unavailable (e.g. the Ville pool is down). The
+/// `writeback_enqueued` flag reports whether this call was the one that
+/// performed the dirty→clean transition — `false` on a repeat tap.
 pub async fn report_cleaning(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
@@ -561,43 +537,51 @@ pub async fn report_cleaning(
         identity.display_name.as_deref(),
     )
     .await?;
+
+    // `done` ⇒ canonical flip + outbox enqueue + domain event in ONE tx.
+    // Idempotent: a repeat `done` on an already-clean room returns `None` and
+    // enqueues nothing (invariant #4).
+    let writeback_enqueued = if status == "done" {
+        let svc = service_for(&state, query.branch)?;
+        svc.mark_clean_if_dirty(MarkCleanCommand {
+            room_id,
+            by: maid_label(&identity),
+            source: hk_source(),
+        })
+        .await?
+        .is_some()
+    } else {
+        false
+    };
+
     Ok(Json(ReportCleaningResponse {
         success: true,
         room_id,
         status: status.to_string(),
+        writeback_enqueued,
     }))
 }
 
-/// POST /api/hk/rooms/{id}/broken-items — submit a broken-item report.
-pub async fn report_broken_item(
-    State(state): State<AppState>,
-    Path(room_id): Path<i32>,
-    Query(query): Query<HkBranchQuery>,
-    Extension(identity): Extension<HkIdentity>,
-    Json(body): Json<ReportBrokenItemBody>,
-) -> ApiResult<(StatusCode, Json<ReportBrokenItemResponse>)> {
-    let description = parse_description(&body.description)?;
-    let photo = parse_photo(body.photo_base64.as_deref(), body.photo_mime.as_deref())?;
-    let pool = resolve_pool(&state, query.branch)?;
-    require_room(pool, room_id).await?;
-    let report_id = insert_broken_report(
-        pool,
-        room_id,
-        &description,
-        &identity.badge,
-        identity.display_name.as_deref(),
-        photo.as_ref().map(|(bytes, _)| bytes.as_slice()),
-        photo.as_ref().map(|(_, mime)| mime.as_str()),
-    )
-    .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(ReportBrokenItemResponse {
-            success: true,
-            report_id,
-            room_id,
+/// POST /api/hk/rooms/{id}/broken-items — **RETIRED (410 Gone)**.
+///
+/// Breakage intake moved to the Housekeeping ops app
+/// (`housekeeping.thehfhotel.org/staff/report`), which opens a real Work Order
+/// with photos, status lifecycle and reception ownership — see the
+/// housekeeping-ops plan, Module 2. `410` (not `404`) is deliberate: the
+/// resource existed and is permanently gone, which tells a stale cached
+/// client to stop retrying rather than treat it as a transient routing error.
+///
+/// `ht_hk_broken_reports` and its rows are KEPT as history, and
+/// [`broken_item_photo`] still serves their photos.
+pub async fn report_broken_item() -> (StatusCode, Json<GoneResponse>) {
+    (
+        StatusCode::GONE,
+        Json(GoneResponse {
+            success: false,
+            error: "endpoint ย้ายไปที่แอปแม่บ้านแล้ว: แจ้งซ่อมที่ housekeeping.thehfhotel.org/staff/report"
+                .to_string(),
         }),
-    ))
+    )
 }
 
 /// GET /api/hk/broken-items/{id}/photo — stream a report's photo bytes.
@@ -655,41 +639,47 @@ mod tests {
         }
     }
 
+    /// The maid label stamped into `HT_Housewife.h_name` prefers the verified
+    /// display name and falls back to the badge — never blank, because
+    /// `mark_clean_if_dirty` rejects an empty `by`.
     #[test]
-    fn description_is_trimmed_and_bounded() {
-        assert_eq!(parse_description("  ก๊อกน้ำพัง  ").unwrap(), "ก๊อกน้ำพัง");
-        assert!(parse_description("   ").is_err());
-        let too_long = "ก".repeat(MAX_DESCRIPTION_CHARS + 1);
-        assert!(parse_description(&too_long).is_err());
-        let just_fits = "ก".repeat(MAX_DESCRIPTION_CHARS);
-        assert!(parse_description(&just_fits).is_ok());
+    fn maid_label_prefers_display_name_then_badge() {
+        let with_name = HkIdentity {
+            badge: "Q1001".into(),
+            display_name: Some("นก".into()),
+            email: None,
+        };
+        assert_eq!(maid_label(&with_name), "นก");
+
+        // Production reality today: the CF IdP forwards only `apps` + `badge`.
+        let no_name = HkIdentity {
+            badge: "Q1001".into(),
+            display_name: None,
+            email: None,
+        };
+        assert_eq!(maid_label(&no_name), "Q1001");
+
+        // A whitespace-only name must not produce a blank `by`.
+        let blank_name = HkIdentity {
+            badge: "Q1001".into(),
+            display_name: Some("   ".into()),
+            email: None,
+        };
+        assert_eq!(maid_label(&blank_name), "Q1001");
     }
 
-    #[test]
-    fn photo_decoding_handles_absent_blank_valid_and_garbage() {
-        // Absent / blank ⇒ no photo, no error.
-        assert!(parse_photo(None, None).unwrap().is_none());
-        assert!(parse_photo(Some("   \n"), None).unwrap().is_none());
-        // Valid base64 round-trips, default mime applied.
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"jpegbytes");
-        let (bytes, mime) = parse_photo(Some(&encoded), None).unwrap().unwrap();
-        assert_eq!(bytes, b"jpegbytes");
-        assert_eq!(mime, "image/jpeg");
-        // Explicit mime wins.
-        let (_, mime) = parse_photo(Some(&encoded), Some("image/png"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(mime, "image/png");
-        // Garbage is a BadRequest.
-        assert!(parse_photo(Some("!!!not-base64!!!"), None).is_err());
-    }
-
-    #[test]
-    fn oversized_photo_is_rejected() {
-        // A base64 payload that decodes to MAX_PHOTO_BYTES + 3 bytes.
-        let raw = vec![0u8; MAX_PHOTO_BYTES + 3];
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
-        assert!(parse_photo(Some(&encoded), None).is_err());
+    /// The retired broken-item intake answers 410 (permanently gone), not 404
+    /// (transient/unknown) — so stale cached clients stop retrying.
+    #[tokio::test]
+    async fn retired_broken_item_endpoint_answers_410() {
+        let (status, Json(body)) = report_broken_item().await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(!body.success);
+        assert!(
+            body.error.contains("housekeeping.thehfhotel.org/staff/report"),
+            "the 410 must point maids at the new intake; got: {}",
+            body.error
+        );
     }
 
     // ---- DB-backed (skip gracefully when no local PG — same `try_pool`
@@ -742,19 +732,22 @@ mod tests {
         assert_eq!(progress.badge, "Q1001");
         assert_eq!(room.open_reports, 0);
 
-        // Broken-item report (with photo) → open_reports increments, detail
-        // queries return it, photo bytes round-trip.
-        let report_id = insert_broken_report(
-            &pool,
-            room_id,
-            "ก๊อกน้ำรั่ว",
-            "Q1001",
-            Some("Nok"),
-            Some(b"fakejpeg"),
-            Some("image/jpeg"),
+        // Historical broken-item report → open_reports increments and the
+        // detail queries still return it. The INSERT is raw SQL because the
+        // intake helper is gone (the endpoint is 410 and the Housekeeping ops
+        // app owns new reports); the READ path must keep working for the rows
+        // already in the table.
+        let report_row = sqlx::query(
+            "INSERT INTO ht_hk_broken_reports \
+                 (hkbr_room_id, hkbr_description, hkbr_badge, hkbr_name, hkbr_photo, hkbr_photo_mime) \
+             VALUES ($1, 'ก๊อกน้ำรั่ว', 'Q1001', 'Nok', $2, 'image/jpeg') RETURNING hkbr_id",
         )
+        .bind(room_id)
+        .bind(b"fakejpeg".as_slice())
+        .fetch_one(&pool)
         .await
-        .expect("broken report must insert");
+        .expect("historical broken report must insert");
+        let report_id: i64 = report_row.try_get("hkbr_id").unwrap();
         assert!(report_id > 0);
 
         let room = fetch_room(&pool, room_id)
