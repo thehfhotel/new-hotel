@@ -1110,6 +1110,19 @@ services:
       - WRITEBACK_ENABLED=${HFVILLE_WRITEBACK_ENABLED:-true}
       - WRITEBACK_POLL_INTERVAL_SECS=${HFVILLE_WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${HFVILLE_WRITEBACK_MAX_ATTEMPTS:-3}
+      # Per-intent allowlist for Ville's iHOTEL (housekeeping-ops 2026-08-11).
+      # UNSET BY DEFAULT = current behavior (every intent dispatches), so this
+      # line is inert until an operator sets HFVILLE_WRITEBACK_INTENTS in .env.
+      #
+      # Why it exists: HFVILLE_WRITES_ENABLED is a single all-or-nothing gate
+      # AND it only lives at the HTTP layer (main.rs::ville_write_guard) — this
+      # worker never reads it. So flipping that flag to let maids' cleaning
+      # reach Ville's iHOTEL would ALSO admit bookings/check-ins/payments/POS.
+      # Set HFVILLE_WRITEBACK_INTENTS=mark_room_clean to keep housekeeping the
+      # ONLY intent reaching Ville's legacy DB until the coequal-writes program
+      # (docs/coexistence/ville-coequal-writes-plan.md) launches on its own
+      # schedule. Non-allowlisted jobs are parked terminal as status='skipped'.
+      - HFVILLE_WRITEBACK_INTENTS=${HFVILLE_WRITEBACK_INTENTS:-}
       # ADR 0006 — see the HF Hotel writeback service for the full rationale.
       # Distinct `HFVILLE_`-prefixed source variable, so the per-site canary
       # falls out of the two-service topology for free: HF Ville is the pilot
