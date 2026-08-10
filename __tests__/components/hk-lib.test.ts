@@ -21,7 +21,6 @@ function room(overrides: Partial<HkRoom>): HkRoom {
     building: null,
     roomClean: true,
     cleaning: null,
-    openReports: 0,
     ...overrides,
   }
 }
