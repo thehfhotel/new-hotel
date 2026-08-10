@@ -7,6 +7,7 @@
 
 import {
   groupRoomsByFloor,
+  HOUSEKEEPING_URL,
   progressLabel,
   timeLabel,
   type HkRoom,
@@ -68,6 +69,21 @@ describe('groupRoomsByFloor', () => {
 
   it('returns an empty list for no rooms', () => {
     expect(groupRoomsByFloor([])).toEqual([])
+  })
+})
+
+describe('HOUSEKEEPING_URL', () => {
+  it('defaults to the housekeeping ops app', () => {
+    expect(HOUSEKEEPING_URL).toBe('https://housekeeping.thehfhotel.org')
+  })
+
+  it('composes the แจ้งซ่อม / เบิกของ deep links', () => {
+    expect(`${HOUSEKEEPING_URL}/staff/report`).toBe(
+      'https://housekeeping.thehfhotel.org/staff/report'
+    )
+    expect(`${HOUSEKEEPING_URL}/staff/stock`).toBe(
+      'https://housekeeping.thehfhotel.org/staff/stock'
+    )
   })
 })
 

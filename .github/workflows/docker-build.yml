@@ -751,6 +751,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend
           build-args: |
             NEXT_PUBLIC_CARD_READER_URL=${{ secrets.CARD_READER_URL }}
+            NEXT_PUBLIC_HOUSEKEEPING_URL=${{ vars.HOUSEKEEPING_URL || 'https://housekeeping.thehfhotel.org' }}
             NEXT_PUBLIC_AUTH_REQUIRED=${{ vars.AUTH_REQUIRED || 'false' }}
 
   build-backend:

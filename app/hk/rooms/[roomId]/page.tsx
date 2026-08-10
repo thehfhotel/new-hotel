@@ -1,32 +1,23 @@
 'use client'
 
-// Room screen (/hk/rooms/[roomId]) — report cleaning progress or a broken
-// item for one room. Part of the maid-facing housekeeping surface (employee-
-// login plan Phase 4). The reporter identity is stamped SERVER-SIDE from the
-// verified Cloudflare Access assertion; nothing identity-like is sent from
-// this form.
+// Room screen (/hk/rooms/[roomId]) — report cleaning progress for one room,
+// plus deep links to the Housekeeping ops app for แจ้งซ่อม / เบิกของ. Part of
+// the maid-facing housekeeping surface (employee-login plan Phase 4). The
+// reporter identity is stamped SERVER-SIDE from the verified Cloudflare
+// Access assertion; nothing identity-like is sent from this form.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
-import {
-  AlertCircle,
-  Camera,
-  Check,
-  ChevronLeft,
-  Loader2,
-  Sparkles,
-  Wrench,
-  X,
-} from 'lucide-react'
+import { AlertCircle, Check, ChevronLeft, Loader2, Sparkles } from 'lucide-react'
 import {
   hkFetch,
-  preparePhoto,
   progressLabel,
   timeLabel,
   type CleaningStatus,
   type HkRoomDetail,
 } from '../../hk-lib'
+import HkOpsLinks from '../../HkOpsLinks'
 
 export default function HkRoomPage() {
   const params = useParams<{ roomId: string }>()
@@ -37,12 +28,6 @@ export default function HkRoomPage() {
   const [error, setError] = useState<string | null>(null)
   const [posting, setPosting] = useState<CleaningStatus | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-
-  // Broken-item form state
-  const [description, setDescription] = useState('')
-  const [photoFile, setPhotoFile] = useState<File | null>(null)
-  const [submittingReport, setSubmittingReport] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
     if (!Number.isFinite(roomId)) {
@@ -86,34 +71,6 @@ export default function HkRoomPage() {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
       setPosting(null)
-    }
-  }
-
-  const submitBrokenItem = async (event: React.FormEvent) => {
-    event.preventDefault()
-    if (!description.trim()) return
-    setSubmittingReport(true)
-    setNotice(null)
-    try {
-      let photo: { photoBase64: string; photoMime: string } | undefined
-      if (photoFile) {
-        photo = await preparePhoto(photoFile)
-      }
-      const res = await hkFetch(`/rooms/${roomId}/broken-items`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description: description.trim(), ...photo }),
-      })
-      if (!res.ok) throw new Error('ส่งรายงานไม่สำเร็จ กรุณาลองใหม่')
-      setDescription('')
-      setPhotoFile(null)
-      if (fileInputRef.current) fileInputRef.current.value = ''
-      setNotice('ส่งรายงานของชำรุดแล้ว')
-      await load()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
-    } finally {
-      setSubmittingReport(false)
     }
   }
 
@@ -215,95 +172,7 @@ export default function HkRoomPage() {
             )}
           </section>
 
-          {/* Broken-item report */}
-          <section className="mb-6">
-            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-gray-600">
-              <Wrench className="h-4 w-4 text-orange-600" />
-              แจ้งของชำรุด / เสียหาย
-            </h2>
-            <form
-              onSubmit={submitBrokenItem}
-              className="rounded-xl border border-gray-200 bg-white p-3"
-            >
-              <textarea
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                rows={3}
-                placeholder="เช่น ก๊อกน้ำรั่ว, แอร์ไม่เย็น, รีโมทหาย..."
-                className="w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500"
-              />
-              <div className="mt-2 flex items-center justify-between gap-2">
-                <label className="flex cursor-pointer items-center gap-1.5 text-sm text-gray-500">
-                  <Camera className="h-5 w-5" />
-                  {photoFile ? (
-                    <span className="max-w-[10rem] truncate text-gray-700">
-                      {photoFile.name}
-                    </span>
-                  ) : (
-                    'แนบรูป (ถ้ามี)'
-                  )}
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => setPhotoFile(e.target.files?.[0] ?? null)}
-                  />
-                </label>
-                {photoFile && (
-                  <button
-                    type="button"
-                    aria-label="ลบรูป"
-                    onClick={() => {
-                      setPhotoFile(null)
-                      if (fileInputRef.current) fileInputRef.current.value = ''
-                    }}
-                    className="p-1 text-gray-400"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                )}
-                <button
-                  type="submit"
-                  disabled={submittingReport || !description.trim()}
-                  className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white active:bg-red-700 disabled:opacity-50"
-                >
-                  {submittingReport ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    'ส่งรายงาน'
-                  )}
-                </button>
-              </div>
-            </form>
-
-            {detail && detail.reports.length > 0 && (
-              <ul className="mt-3 space-y-2">
-                {detail.reports.map((report) => (
-                  <li
-                    key={report.reportId}
-                    className="rounded-lg border border-gray-200 bg-white p-3 text-sm"
-                  >
-                    <p className="text-gray-800">{report.description}</p>
-                    <p className="mt-1 text-xs text-gray-400">
-                      {timeLabel(report.at)}
-                      {report.name ? ` โดย ${report.name}` : ` (${report.badge})`}
-                      {report.status === 'open' ? ' · รอดำเนินการ' : ''}
-                    </p>
-                    {report.hasPhoto && (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={`/hk/api/broken-items/${report.reportId}/photo`}
-                        alt="รูปของชำรุด"
-                        loading="lazy"
-                        className="mt-2 max-h-40 rounded-lg border border-gray-100 object-cover"
-                      />
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+          <HkOpsLinks />
         </>
       )}
     </main>
