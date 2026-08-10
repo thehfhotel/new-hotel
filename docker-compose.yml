@@ -1000,9 +1000,11 @@ services:
       # probe silence means "mirrored state matches legacy", not "canonical
       # is clean".
       - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
-      # #282 class-B heal — dark. Ville has 0 candidates today; first live
-      # test belongs at HF Hotel (see the backend block's checklist).
-      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${HFVILLE_RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
+      # #282 class-B heal — enabled 2026-08-10 after the HF Hotel first
+      # live test verified row-by-row (restamped=3, exactly the predicted
+      # rcal_id 48/49/50 <- legacy 50980/50981/50982). Ville has 0
+      # candidates today; this makes future id-rebinds heal within a tick.
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${HFVILLE_RECONCILE_CALENDAR_RESTAMP_ENABLED:-true}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
