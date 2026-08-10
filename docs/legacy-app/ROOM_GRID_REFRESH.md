@@ -182,6 +182,25 @@ selection-safe but focus-blind, and the manual button is focus-safe but selectio
 There is no path that is both. There is also no `Keys.F5` handler anywhere in the
 decompiled tree — zero hits for `Keys.F5` across all 308 files.
 
+### 5b. Posted-click caveat: WinForms may swallow `Click` when the window is covered (2026-08-10)
+
+Found while building the Stage-4 middleware action (verified against Microsoft's
+published reference source for .NET Framework `Control.cs`, and confirmed unchanged
+in current `dotnet/winforms`): WinForms' standard click path — `Control.WmMouseUp` —
+raises the `Click` event only when
+`StandardClick && STATE_MOUSEPRESSED && !IsDisposed && WindowFromPoint(PointToScreen(lParam)) == Handle`.
+The last clause asks what is **actually visible at that screen point**. So a
+`PostMessage(WM_LBUTTONDOWN/WM_LBUTTONUP)` pair delivered while iHOTEL is covered by
+another window (our app, say) fires `MouseDown`/`MouseUp` but may NOT fire `Click` —
+which is precisely the situation the whole refresh feature targets. It may still
+work: `ButtonX` is hand-painted DevComponents, not `ButtonBase`-derived, and that
+family commonly raises `Click` from its own unconditional `OnMouseUp` override — but
+whether iHOTEL's build does is **unproven** until measured. `BM_CLICK` is not a
+fallback (`ButtonBase.WndProc` is what handles it; `ButtonX` isn't one). Test with
+`scripts/dev/ihotel-uia-harness.ps1` row F (obscured-window case), then once on a
+real terminal. If it fails there, the lever changes to UIA `Invoke` /
+`LegacyIAccessible.DoDefaultAction` — a design decision, not a patch.
+
 ## 6. The negative finding — no external trigger surface exists
 
 Exhaustive `grep` across all 308 `.cs` files in `_decompiled_clean/iHOTEL2025/`, run

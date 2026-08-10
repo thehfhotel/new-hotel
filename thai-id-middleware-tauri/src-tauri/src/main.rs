@@ -48,6 +48,13 @@ fn main() {
     // state.
     let stale_latch = Arc::new(Mutex::new(StaleLatch::new()));
 
+    // Print the effective iHOTEL process / AutomationId targets once at
+    // startup. A silent AutomationId mismatch after a vendor update is this
+    // feature's most likely field failure, and it presents as a bland
+    // `grid-not-found` — having the resolved ids in the log makes the first
+    // diagnostic step reading rather than guessing.
+    ihotel::log_targets_once();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         // Reception PCs need this middleware running before anyone opens a
@@ -108,11 +115,17 @@ fn main() {
                         tauri::async_runtime::spawn(async move {
                             match ihotel::trigger_refresh() {
                                 Ok(()) => {
+                                    // Only a real send clears the episode —
+                                    // a guarded skip leaves the grid stale.
                                     latch.lock().await.on_refresh_performed(chrono::Utc::now());
-                                    println!("[tray] iHOTEL refresh triggered");
+                                    println!("[tray] iHOTEL refresh click posted");
                                 }
-                                Err(e) => {
-                                    println!("[tray] iHOTEL refresh not available: {}", e);
+                                Err(reason) => {
+                                    // `trigger_refresh` has already raised
+                                    // the explanatory Thai toast itself, so
+                                    // this is a log line, not a second
+                                    // notification.
+                                    println!("[tray] iHOTEL refresh skipped: {}", reason);
                                 }
                             }
                         });

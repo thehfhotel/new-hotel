@@ -39,8 +39,24 @@ codegen-units = 256  # maximise codegen parallelism (default 16)
 lto = false          # LTO is a large build-time cost with no benefit here
 strip = true         # smaller binary/installer + faster artifact upload
 
+# Windows-only. Scoped here (`cfg(windows)` ≡ `cfg(target_os = "windows")`)
+# so the macOS/CI leg never fetches or compiles any of it.
 [target."cfg(windows)".dependencies]
 tauri-winrt-notification = "0.8.1"
+# UI Automation + Win32 messaging for the iHOTEL refresh action
+# (src/ihotel/windows_impl.rs). Pinned to the same 0.61.x `tauri` itself
+# resolves, so feature unification adds features to a crate already in the
+# build rather than dragging in a second copy of the Windows metadata.
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",                   # HWND, LPARAM, WPARAM, RECT, CloseHandle
+  "Win32_System_Com",                   # CoInitializeEx / CoCreateInstance
+  "Win32_System_Diagnostics_ToolHelp",  # process enumeration (HOTEL.exe)
+  "Win32_System_Ole",                   # required by VARIANT
+  "Win32_System_Variant",               # VARIANT for CreatePropertyCondition
+  "Win32_UI_Accessibility",             # IUIAutomation, AutomationId search
+  "Win32_UI_Input_KeyboardAndMouse",    # IsWindowEnabled (modal guard)
+  "Win32_UI_WindowsAndMessaging",       # EnumWindows, PostMessageW, styles
+] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", default-features = false, features = ["util"] }

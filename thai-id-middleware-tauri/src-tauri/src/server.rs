@@ -91,9 +91,10 @@ pub struct DebugModeResponse {
     pub debug_mode: bool,
 }
 
-/// `GET /ihotel/status` response — a snapshot combining the (currently
-/// stubbed, see `crate::ihotel`) process/window probe with the grid
-/// staleness latch's own state.
+/// `GET /ihotel/status` response — a snapshot combining the live
+/// process/window probe (`crate::ihotel::snapshot`, real on Windows,
+/// honestly `false`/`false` everywhere else) with the grid staleness
+/// latch's own state.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IhotelStatusResponse {
@@ -104,11 +105,24 @@ pub struct IhotelStatusResponse {
     pub last_notify_at: Option<String>,
 }
 
-/// `POST /ihotel/refresh` error body — today this is the ONLY body it ever
-/// returns (Stage 4 owns making the action real; see `crate::ihotel`).
+/// `POST /ihotel/refresh` response, for both outcomes.
+///
+/// `sent` is the whole answer: `true` means a click was posted to iHOTEL's
+/// Refresh button, `false` means a guard stopped us and `reason`/`message`
+/// say which and why (see `crate::ihotel::SkipReason`).
 #[derive(Debug, Serialize)]
-pub struct RefreshErrorResponse {
-    pub error: String,
+#[serde(rename_all = "camelCase")]
+pub struct RefreshResponse {
+    pub sent: bool,
+    /// Stable machine-readable skip reason: `process-not-found`,
+    /// `modal-open`, `selection-pending`, `grid-not-found`,
+    /// `probe-timeout`, `post-failed`. Absent when `sent` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The same Thai sentence reception just saw on the toast, so a caller
+    /// can echo it in-page instead of inventing a second wording.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Query parameters for the read endpoint
@@ -451,10 +465,10 @@ async fn notify_handler(State(state): State<AppState>, Json(payload): Json<Stale
 
 /// GET /ihotel/status - Snapshot of iHOTEL's observed state + the latch
 ///
-/// `processFound`/`gridWindowFound` come from `crate::ihotel::snapshot()`,
-/// which is a stub off Windows (and, for now, on Windows too — Stage 4
-/// fills in real UIA probing) and honestly reports `false`/`false` rather
-/// than guessing.
+/// `processFound`/`gridWindowFound` come from `crate::ihotel::snapshot()`:
+/// on Windows that is a real probe (is `HOTEL.exe` running, does its
+/// Refresh button resolve); on every other target it honestly reports
+/// `false`/`false` rather than guessing.
 async fn ihotel_status_handler(State(state): State<AppState>) -> Json<IhotelStatusResponse> {
     let probe = ihotel::snapshot();
     let snap = {
@@ -473,26 +487,42 @@ async fn ihotel_status_handler(State(state): State<AppState>) -> Json<IhotelStat
 
 /// POST /ihotel/refresh - Trigger iHOTEL's reception-invoked refresh
 ///
-/// Stage 4 owns making this real (`crate::ihotel::trigger_refresh`); it is
-/// the same code path the tray's "รีเฟรช iHOTEL" item calls, so both
-/// surfaces can never disagree about what "refresh" does. Today
-/// `trigger_refresh` unconditionally reports unavailable, so this endpoint
-/// always answers `501 Not Implemented` with `{"error":
-/// "refresh-not-available"}` — but the route and the response shape are in
-/// place for Stage 4 to fill in without a client-visible contract change.
+/// The same code path the tray's "รีเฟรช iHOTEL" item calls
+/// (`crate::ihotel::trigger_refresh`), so the two surfaces can never
+/// disagree about what "refresh" does. Per ADR 0006 Decision §1 this is
+/// always reception-invoked — no writeback signal can reach it.
+///
+/// **Both outcomes answer `200`.** A guard skip is not a server error: the
+/// request was understood, a decision was made, and reception has already
+/// been told why on a toast. Encoding "we deliberately did nothing" as a
+/// 4xx/5xx would light up browser consoles for the single most common and
+/// most *correct* outcome (`selection-pending` — refusing to destroy her
+/// in-progress room selection). `sent` is the discriminator.
+///
+/// The staleness latch is cleared **only** on a real send: a skip means the
+/// grid was never refreshed, so the episode is still open and reception
+/// should still be told about the next writeback.
 async fn ihotel_refresh_handler(State(state): State<AppState>) -> impl IntoResponse {
     match ihotel::trigger_refresh() {
         Ok(()) => {
-            // Unreachable today (see doc comment) — kept correct so Stage 4
-            // gets a working "refresh clears the latch" for free.
             let mut latch = state.stale_latch.lock().await;
             latch.on_refresh_performed(Utc::now());
-            StatusCode::NO_CONTENT.into_response()
+            (
+                StatusCode::OK,
+                Json(RefreshResponse {
+                    sent: true,
+                    reason: None,
+                    message: None,
+                }),
+            )
+                .into_response()
         }
-        Err(err) => (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(RefreshErrorResponse {
-                error: err.to_string(),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(RefreshResponse {
+                sent: false,
+                reason: Some(reason.to_string()),
+                message: Some(reason.toast_text().to_string()),
             }),
         )
             .into_response(),
@@ -535,7 +565,8 @@ async fn not_found_handler() -> impl IntoResponse {
                 "POST /notify - Feed a legacy_stale signal into the grid-staleness latch"
                     .to_string(),
                 "GET /ihotel/status - iHOTEL process/window snapshot + latch state".to_string(),
-                "POST /ihotel/refresh - Trigger iHOTEL's refresh (501 until Stage 4)".to_string(),
+                "POST /ihotel/refresh - Post a click to iHOTEL's Refresh button (guarded)"
+                    .to_string(),
             ],
         }),
     )
@@ -717,23 +748,62 @@ mod tests {
         assert!(body["lastNotifyAt"].is_null());
     }
 
-    #[tokio::test]
-    async fn test_ihotel_refresh_returns_501_stub_shape() {
-        let app = build_router(test_app_state());
-
+    async fn post_refresh(app: Router) -> serde_json::Value {
         let request = Request::builder()
             .method("POST")
             .uri("/ihotel/refresh")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        // Both outcomes are 200 — see ihotel_refresh_handler's doc comment.
+        assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], "refresh-not-available");
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ihotel_refresh_reports_the_decision_on_the_wire() {
+        // `process-not-found` is the honest answer on this crate's macOS CI
+        // leg (and on any Windows box that isn't running iHOTEL), so it is
+        // the one decision shape reachable from an end-to-end HTTP test.
+        let body = post_refresh(build_router(test_app_state())).await;
+        assert_eq!(body["sent"], false);
+        assert_eq!(body["reason"], "process-not-found");
+        assert!(
+            body["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "a skip must carry the Thai explanation reception just saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ihotel_refresh_skip_does_not_clear_the_latch() {
+        // The load-bearing assertion for ADR 0006 §5: nothing was
+        // refreshed, so the stale episode must still be open. Clearing here
+        // would silently swallow the next writeback's toast.
+        let state = test_app_state();
+        let latch = state.stale_latch.clone();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/notify")
+            .header("content-type", "application/json")
+            .body(Body::from(stale_signal_body()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let body = post_refresh(app).await;
+        assert_eq!(body["sent"], false);
+
+        let snap = latch.lock().await.snapshot();
+        assert_eq!(snap.state, "stale");
+        assert_eq!(snap.stale_count, 1);
     }
 
     #[test]
