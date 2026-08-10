@@ -1142,6 +1142,12 @@ services:
     command: ["./backfill_rooms"]
     profiles:
       - backfill
+    # #284: the image bakes a HEALTHCHECK curling :3003/health; a one-shot
+    # batch binary never opens that port, so without this override every
+    # `docker compose run` of this service is unhealthy by construction and
+    # Netdata pages on jobs that succeeded. Same pattern as the workers.
+    healthcheck:
+      disable: true
     # Security audit 2026-05-14: DB_PASSWORD + pre-baked DATABASE_URL
     # moved to secret-file hydration. Backfill is one-shot, so an operator
     # running this without secrets mounted would hit the loud `require_secret`
@@ -1178,6 +1184,10 @@ services:
     command: ["./backfill_payment_ledger"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     environment:
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
@@ -1207,6 +1217,10 @@ services:
     command: ["./backfill_payment_ledger"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     environment:
       - DB_SERVER=192.168.11.51
       - DB_NAME=HOTEL
@@ -1246,6 +1260,10 @@ services:
     command: ["./backfill_checkin_rooms"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     # Security audit 2026-05-14: same secret-file migration as backfill-rooms.
     environment:
       - SITE_ID=${SITE_ID:-hfhotel}
