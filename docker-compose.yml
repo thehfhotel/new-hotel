@@ -417,14 +417,12 @@ services:
       # 2026-07-31; phantom deficit at HF Hotel 2026-08-04 — room 405 nights
       # 05-11..13, present both sides, only the back-pointer NULL).
       #
-      # FLIP CHECKLIST (in order — flipping early re-mints the 08-04 false
-      # positive from the old binary still running):
-      #   1. this image deployed AND backend-1 restarted on it
-      #   2. re-run the classification read-only (drifts with room-move
-      #      traffic; 2026-08-10 reading: 0 deficit both sites, 3 class-B
-      #      at HF Hotel, 137/75 class-A)
-      #   3. flip here to :-true, expect probes=9 converged=9
-      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # FLIPPED 2026-08-10 after the checklist passed: set-diff image
+      # deployed (741bdd, backend-1 restarted 06:32Z), classification
+      # re-run live immediately before the flip — 0 legacy-only pairs
+      # (no deficit), 137 class-A (log-only), 3 class-B (heal candidates,
+      # separate flag below). Expect probes=9 converged=9.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-true}
       # #282 class-B heal: re-stamps rcal_legacy_id on tiles whose (room,
       # night) still exists in legacy under a rebound id. Canonical-only
       # UPDATE, per-tick cap 100, cannot violate the partial unique index.
