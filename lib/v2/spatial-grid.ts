@@ -185,6 +185,55 @@ export function deriveBoardPixels<T extends SpatialRoom>(
   return { x, y }
 }
 
+/** Where a จัดผัง drop landed: on another placed tile (swap) or on an empty
+ *  lattice cell (move/place). Mirrors `LayoutDropTarget` in
+ *  `components/v2/SpatialRoomGrid.tsx`, minus the React coupling. */
+export type LayoutDropLanding<T extends SpatialRoom> =
+  | { type: 'swap'; room: T }
+  | { type: 'cell'; col: number; row: number }
+
+/** One entry of the `PUT /api/rooms/layout` body (#236 wire contract). */
+export interface LayoutMove {
+  id: number
+  roomX: number
+  roomY: number
+}
+
+/** Build the `PUT /api/rooms/layout` payload for one จัดผัง drop.
+ *
+ *  - **cell** (move/place): one move, pixels neighbour-derived via
+ *    `deriveBoardPixels` so they round-trip through `computeSpatialLayout`
+ *    into exactly the intended cell.
+ *  - **swap**: two moves exchanging the two rooms' existing pairs VERBATIM —
+ *    no derivation, because both values already band correctly by exact-value
+ *    reuse. One request, so the backend commits both halves in one intent and
+ *    the shared board is never left half-swapped.
+ *
+ *  Returns `null` when the drop is a no-op the caller must ignore: a swap
+ *  partner without coordinates (an unplaced-row tile has no pair to give
+ *  away) or a self-swap. `rooms` MUST be the UNFILTERED list — see
+ *  `deriveBoardPixels`.
+ */
+export function buildLayoutMoves<T extends SpatialRoom>(
+  rooms: T[],
+  source: T,
+  target: LayoutDropLanding<T>,
+  tolerance: number = CLUSTER_TOLERANCE,
+): LayoutMove[] | null {
+  if (target.type === 'swap') {
+    const other = target.room
+    if (other.id === source.id) return null
+    if (source.roomX == null || source.roomY == null) return null
+    if (other.roomX == null || other.roomY == null) return null
+    return [
+      { id: source.id, roomX: other.roomX, roomY: other.roomY },
+      { id: other.id, roomX: source.roomX, roomY: source.roomY },
+    ]
+  }
+  const { x, y } = deriveBoardPixels(rooms, { col: target.col, row: target.row }, tolerance)
+  return [{ id: source.id, roomX: x, roomY: y }]
+}
+
 /** Guest-move drag eligibility (#225 decision comment):
  *  - source must be an occupied room;
  *  - target vacant (ว่าง) → ok;

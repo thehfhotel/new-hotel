@@ -6,7 +6,7 @@ import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { roomStatusView } from '@/lib/v2/status'
-import { deriveBoardPixels, type SpatialRoom } from '@/lib/v2/spatial-grid'
+import { buildLayoutMoves, type SpatialRoom } from '@/lib/v2/spatial-grid'
 import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
 import SpatialRoomGrid, { type LayoutDropTarget } from '@/components/v2/SpatialRoomGrid'
@@ -27,6 +27,9 @@ const ROOM_EVENTS = [
   'BookingCreated',
   'BookingModified',
   'BookingCancelled',
+  // #236: a จัดผัง drop on ANY terminal — the board is shared, so the other
+  // tabs must pick up the rearrangement instead of sitting on a stale board.
+  'RoomLayoutChanged',
 ]
 
 type ModalKind = 'checkin' | 'checkout' | 'extend' | 'change' | 'pos' | 'walkup'
@@ -96,6 +99,8 @@ export default function V2Rooms() {
 
   // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
   const reqRef = useRef(0)
+  // How many จัดผัง drops this terminal currently has in flight (#236).
+  const layoutInFlightRef = useRef(0)
 
   const fetchRooms = useCallback(async () => {
     const token = ++reqRef.current
@@ -120,7 +125,17 @@ export default function V2Rooms() {
   }, [fetchRooms])
 
   // Live-refresh on iHOTEL/other-app changes mirrored through the event stream.
-  const live = useLiveRefresh(branch, ROOM_EVENTS, fetchRooms)
+  //
+  // `RoomLayoutChanged` also comes back to the terminal that caused it (the
+  // stream has no origin filter). Refetching then would race this tab's own
+  // optimistic coords during a rapid จัดผัง session, so a drop in flight
+  // suppresses the refetch — the optimistic state already IS what the server
+  // just persisted, and a failed drop resyncs explicitly in its catch.
+  const liveRefresh = useCallback(() => {
+    if (layoutInFlightRef.current > 0) return
+    fetchRooms()
+  }, [fetchRooms])
+  const live = useLiveRefresh(branch, ROOM_EVENTS, liveRefresh)
 
   const filtered = useMemo(() => {
     const f = FILTERS.find((x) => x.value === filter) || FILTERS[0]
@@ -198,19 +213,9 @@ export default function V2Rooms() {
    *  round-trip through computeSpatialLayout into the intended cell; a swap
    *  exchanges the two rooms' existing pairs verbatim (decision 2). */
   const handleLayoutDrop = async (source: SpatialRoom, target: LayoutDropTarget) => {
-    let moves: { id: number; roomX: number; roomY: number }[]
-    if (target.type === 'swap') {
-      const other = target.room
-      // Both sides are placed (the grid guarantees it); coords are present.
-      if (source.roomX == null || source.roomY == null || other.roomX == null || other.roomY == null) return
-      moves = [
-        { id: source.id, roomX: other.roomX, roomY: other.roomY },
-        { id: other.id, roomX: source.roomX, roomY: source.roomY },
-      ]
-    } else {
-      const { x, y } = deriveBoardPixels(rooms, { col: target.col, row: target.row })
-      moves = [{ id: source.id, roomX: x, roomY: y }]
-    }
+    // `rooms` (unfiltered) is deliberate — see buildLayoutMoves/deriveBoardPixels.
+    const moves = buildLayoutMoves(rooms, source, target)
+    if (!moves) return // swap partner has no coords, or self-drop — no-op
 
     // Optimistic apply; remember only the touched rooms' prior coords so a
     // revert can't clobber an interleaved drop on other tiles.
@@ -228,6 +233,7 @@ export default function V2Rooms() {
     )
     setLayoutError(null)
 
+    layoutInFlightRef.current += 1
     try {
       const res = await branchFetch('/api/rooms/layout', {
         method: 'PUT',
@@ -249,6 +255,8 @@ export default function V2Rooms() {
       )
       setLayoutError(err instanceof Error ? err.message : 'บันทึกผังห้องไม่สำเร็จ')
       fetchRooms() // resync with server truth
+    } finally {
+      layoutInFlightRef.current -= 1
     }
   }
 

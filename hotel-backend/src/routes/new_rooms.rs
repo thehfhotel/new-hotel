@@ -23,7 +23,9 @@ use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::intent::{UpdateRoomPayload, WritebackIntent};
-use crate::outbox::{generate_idempotency_key, OutboxRepository};
+use crate::outbox::{
+    generate_idempotency_key, DomainEvent, EventBus, EventSource, OutboxRepository,
+};
 use crate::repository::room::{RoomRow, RoomWrite};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 
@@ -659,6 +661,37 @@ pub struct RoomLayoutRequest {
     pub moves: Vec<RoomLayoutMove>,
 }
 
+/// Validate a `PUT /api/rooms/layout` body — the whole rule set, pure so it
+/// is unit-testable without a pool (the handler itself needs `AppState`).
+///
+/// Returns the 400 message on rejection, `Ok(())` when the drop is legal:
+///
+/// * 1 entry = move/place, 2 = swap. Anything else is a client bug — the drop
+///   gesture can only ever touch one or two tiles.
+/// * A swap must name two DIFFERENT rooms.
+/// * Negative coords are LEGAL: iHOTEL's free-pixel WinForms canvas can
+///   persist them, and a verbatim swap with such a tile must round-trip the
+///   exact values (review finding 2026-07-10). Only the `(0,0)` unplaced
+///   sentinel is forbidden — a drop must never write it, or the tile silently
+///   falls off BOTH boards.
+fn validate_layout_moves(moves: &[RoomLayoutMove]) -> Result<(), String> {
+    if moves.is_empty() || moves.len() > 2 {
+        return Err("moves must contain 1 (move/place) or 2 (swap) entries".to_string());
+    }
+    if moves.len() == 2 && moves[0].id == moves[1].id {
+        return Err("swap entries must reference two different rooms".to_string());
+    }
+    for m in moves {
+        if m.room_x == 0 && m.room_y == 0 {
+            return Err(format!(
+                "(0,0) is the unplaced sentinel and cannot be written (room {})",
+                m.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Response for `PUT /api/rooms/layout`. `ok` is the locked #236 wire
 /// contract; `success`/`message` follow the sibling `MutationResponse`
 /// style so generic clients keep working.
@@ -696,31 +729,7 @@ pub async fn update_room_layout(
         ));
     }
 
-    // 1 = move/place, 2 = swap. Anything else is a client bug — the drop
-    // gesture can only ever touch one or two tiles.
-    if body.moves.is_empty() || body.moves.len() > 2 {
-        return Err(ApiError::BadRequest(
-            "moves must contain 1 (move/place) or 2 (swap) entries".to_string(),
-        ));
-    }
-    if body.moves.len() == 2 && body.moves[0].id == body.moves[1].id {
-        return Err(ApiError::BadRequest(
-            "swap entries must reference two different rooms".to_string(),
-        ));
-    }
-    for m in &body.moves {
-        // Negative coords are LEGAL: iHOTEL's free-pixel WinForms canvas can
-        // persist them, and a verbatim swap with such a tile must round-trip
-        // the exact values (review finding 2026-07-10). Only the (0,0)
-        // unplaced sentinel is forbidden — a drop must never write it, or
-        // the tile silently falls off both boards.
-        if m.room_x == 0 && m.room_y == 0 {
-            return Err(ApiError::BadRequest(format!(
-                "(0,0) is the unplaced sentinel and cannot be written (room {})",
-                m.id
-            )));
-        }
-    }
+    validate_layout_moves(&body.moves).map_err(ApiError::BadRequest)?;
 
     // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
     // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
@@ -778,6 +787,23 @@ pub async fn update_room_layout(
     OutboxRepository::enqueue(&mut tx, &intent, idempotency_key)
         .await
         .map_err(ApiError::from)?;
+
+    // The board is SHARED across reception terminals, so a drop has to reach
+    // the other tabs. ONE event per drop (a swap is one intent, one event),
+    // published in the SAME transaction as the canonical UPDATE — PG buffers
+    // the NOTIFY until COMMIT, so a rolled-back drop is never announced.
+    // Nothing else emits for a coordinate change: the CT echo of our own
+    // legacy write only produces `RoomMarkedClean`/`Dirty` events
+    // (`sync/mappers/room.rs`), so without this the other terminals would sit
+    // on a stale board until some unrelated room event happened to fire.
+    EventBus::publish(
+        &mut tx,
+        &DomainEvent::RoomLayoutChanged {
+            room_id: aggregate_id,
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        },
+    )
+    .await?;
 
     tx.commit().await?;
 
@@ -1246,5 +1272,83 @@ mod tests {
         let offset = q.clamped_offset();
         assert!(offset > 0, "no wraparound: {offset}");
         assert_eq!(offset, (i32::MAX as i64 - 1) * i32::MAX as i64);
+    }
+
+    // ---------------------------------------------------------------
+    // PUT /api/rooms/layout — จัดผัง drop validation (#236)
+    // ---------------------------------------------------------------
+
+    fn mv(id: i32, room_x: i32, room_y: i32) -> RoomLayoutMove {
+        RoomLayoutMove { id, room_x, room_y }
+    }
+
+    /// The two shapes the จัดผัง gesture can produce: a place/move (1 tile)
+    /// and a swap (2 tiles).
+    #[test]
+    fn layout_accepts_one_move_and_a_two_room_swap() {
+        assert!(validate_layout_moves(&[mv(1, 120, 240)]).is_ok());
+        assert!(validate_layout_moves(&[mv(1, 120, 240), mv(2, 10, 10)]).is_ok());
+    }
+
+    /// A drop touches one or two tiles — never zero, never three. An empty
+    /// body would commit a writeback intent with no statements.
+    #[test]
+    fn layout_rejects_empty_and_more_than_two_moves() {
+        let err = validate_layout_moves(&[]).unwrap_err();
+        assert!(err.contains("1 (move/place) or 2 (swap)"), "{err}");
+        let err =
+            validate_layout_moves(&[mv(1, 10, 10), mv(2, 20, 20), mv(3, 30, 30)]).unwrap_err();
+        assert!(err.contains("1 (move/place) or 2 (swap)"), "{err}");
+    }
+
+    /// A "swap" of a room with itself would emit two conflicting UPDATEs for
+    /// one `Room_no` — last writer wins, and the board silently loses a tile.
+    #[test]
+    fn layout_rejects_a_swap_of_a_room_with_itself() {
+        let err = validate_layout_moves(&[mv(7, 10, 10), mv(7, 20, 20)]).unwrap_err();
+        assert!(err.contains("two different rooms"), "{err}");
+    }
+
+    /// `(0,0)` is the unplaced sentinel (`lib/v2/spatial-grid.ts::isUnplaced`).
+    /// Writing it would drop the tile off BOTH boards, so it is rejected in
+    /// either slot of a swap — not just the first.
+    #[test]
+    fn layout_rejects_the_zero_zero_unplaced_sentinel_in_any_slot() {
+        let err = validate_layout_moves(&[mv(4, 0, 0)]).unwrap_err();
+        assert!(err.contains("unplaced sentinel"), "{err}");
+        assert!(err.contains("room 4"), "names the offending room: {err}");
+
+        let err = validate_layout_moves(&[mv(4, 10, 10), mv(5, 0, 0)]).unwrap_err();
+        assert!(err.contains("room 5"), "{err}");
+    }
+
+    /// A zero on ONE axis is a real position (`isUnplaced` requires both), so
+    /// it must survive validation — the board's left/top edge is legal.
+    #[test]
+    fn layout_accepts_a_zero_on_a_single_axis() {
+        assert!(validate_layout_moves(&[mv(1, 0, 140)]).is_ok());
+        assert!(validate_layout_moves(&[mv(1, 140, 0)]).is_ok());
+    }
+
+    /// iHOTEL's free-pixel WinForms canvas can persist negative coords, and a
+    /// verbatim swap with such a tile must round-trip them (review finding
+    /// 2026-07-10 — an earlier revision rejected them and broke the swap).
+    #[test]
+    fn layout_accepts_negative_coordinates() {
+        assert!(validate_layout_moves(&[mv(1, -30, -12)]).is_ok());
+        assert!(validate_layout_moves(&[mv(1, -30, -12), mv(2, 110, 10)]).is_ok());
+    }
+
+    /// The SSE contract: the frontend's `ROOM_EVENTS` list in
+    /// `app/v2/rooms/page.tsx` filters on this exact string, so renaming the
+    /// variant silently stops other terminals from refreshing after a drop.
+    #[test]
+    fn room_layout_changed_event_name_matches_the_frontend_filter() {
+        let event = DomainEvent::RoomLayoutChanged {
+            room_id: Uuid::nil(),
+            source: EventSource::our_app(Uuid::nil(), Uuid::nil()),
+        };
+        assert_eq!(event.type_name(), "RoomLayoutChanged");
+        assert_eq!(event.aggregate_id(), Uuid::nil());
     }
 }

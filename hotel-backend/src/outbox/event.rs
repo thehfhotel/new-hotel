@@ -100,6 +100,18 @@ pub enum DomainEvent {
         room_id: Uuid,
         source: EventSource,
     },
+    /// A จัดผัง layout-edit drop moved one or two tiles on the SHARED room
+    /// board (#236) — `room_x`/`room_y` changed, nothing else about the room
+    /// did.
+    ///
+    /// Carries no coordinates on purpose: the board is a whole-list render
+    /// (`GET /api/rooms`), so every consumer refetches the list rather than
+    /// patching a tile. A swap emits ONE event (aggregate = the first moved
+    /// room) because the drop is one intent.
+    RoomLayoutChanged {
+        room_id: Uuid,
+        source: EventSource,
+    },
 }
 
 impl DomainEvent {
@@ -119,6 +131,7 @@ impl DomainEvent {
             DomainEvent::PaymentRefunded { .. } => "PaymentRefunded",
             DomainEvent::RoomMarkedClean { .. } => "RoomMarkedClean",
             DomainEvent::RoomMarkedDirty { .. } => "RoomMarkedDirty",
+            DomainEvent::RoomLayoutChanged { .. } => "RoomLayoutChanged",
         }
     }
 
@@ -139,7 +152,8 @@ impl DomainEvent {
             DomainEvent::PaymentReceived { check_in_id, .. }
             | DomainEvent::PaymentRefunded { check_in_id, .. } => *check_in_id,
             DomainEvent::RoomMarkedClean { room_id, .. }
-            | DomainEvent::RoomMarkedDirty { room_id, .. } => *room_id,
+            | DomainEvent::RoomMarkedDirty { room_id, .. }
+            | DomainEvent::RoomLayoutChanged { room_id, .. } => *room_id,
         }
     }
 
@@ -161,7 +175,8 @@ impl DomainEvent {
             | DomainEvent::PaymentReceived { source, .. }
             | DomainEvent::PaymentRefunded { source, .. }
             | DomainEvent::RoomMarkedClean { source, .. }
-            | DomainEvent::RoomMarkedDirty { source, .. } => source,
+            | DomainEvent::RoomMarkedDirty { source, .. }
+            | DomainEvent::RoomLayoutChanged { source, .. } => source,
         }
     }
 }
