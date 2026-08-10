@@ -631,3 +631,65 @@ single-field diff in the pg/mssql JSONs and the sync logs show `skipped=1` at th
 legacy edit time with zero errors, suspect a comparator gap before a dropped
 event: diff the fields in `existing_matches()` against the reconcile-hash inputs
 for that entity — they must be a superset.
+
+---
+
+## 2026-08-10 — HF Ville calendar: 4 nights dropped, CT aged out (true positive)
+
+**Alert.** `level_drift_alert` at `site=hfville`, `mirror_ht_room_calendar`,
+1 unresolved row, detected 2026-08-09 08:10Z (15:10 ICT), still open 21h later
+across every sweep. `missing_pg`, legacy 1663 vs pg 1659 (delta 4). A separate
+`HF Ville DEGRADED→UP` pair fired 2026-08-07 09:26→09:28 ICT (WireGuard down
+during a PPPoE re-dial, self-healed in 2 min) — **not** the same event: two days
+apart, and the app path stayed up (`ts=0 wg=1`). That one needed no action.
+
+**Why the first hypothesis was wrong.** The leading guess was the #282 class —
+a false `missing_pg` where the night is present but `rcal_legacy_id` is NULL, so
+the `WHERE rcal_legacy_id IS NOT NULL` count cannot see it. That was killed by
+direct query: the four `(107, night)` tiles were **absent from
+`ht_room_calendar` entirely**, not merely unbound. Do not assume a known
+false-positive class explains a new row on the same probe.
+
+**Evidence.** Set-diff of `DISTINCT (room_no, night)` over the era window
+resolved the delta to exactly four pairs, nothing in the opposite direction:
+room **107**, nights `2026-07-28`, `08-05`, `08-06`, `08-08` (legacy ids 4692,
+4799, 4815, 4832). Ruled out in order: room-mapping artifact (room 107 present,
+`room_id=7`, 56 tiles, 0 orphan calendar rows); FK defer (all five referenced
+check-ins present in canonical); hidden characters in `room_no` (byte-identical
+`313037` on the row that synced, 4648, and the four that did not); stalled
+watermark (**current at 43660 = `ct_current`**, never held). Canonical held 169
+tiles with ids *above* the last synced one and its max id equalled legacy's —
+so this was a **selective silent drop, not a stall**. A full id-level diff found
+zero canonical ids absent from legacy, and the only other in-era misses
+(2361, 2568, 2569, 4223/4224/4225, 4567, 4609) are legacy **duplicate rows for
+one `(room, night)`** — legacy permits them, canonical is unique on
+`(rcal_room_id, rcal_date)`, so the upsert keeps one and orphans the rest by
+design. Benign, and worth not re-deriving.
+
+**Cause (strong hypothesis, not proven).** Transient loss of the legacy link
+mid-tick, with the affected keys skipped rather than retried. The Ville uplink
+is genuinely unstable — **211 `Timed out in bb8` plus 109 connection errors in
+72h** on `sync-hfville` — and the watermark advanced throughout. Room 107 is
+coincidence: it is whichever room happened to have activity during a blip. The
+CT versions for all four are now far below `CHANGE_TRACKING_MIN_VALID_VERSION`
+(42589 vs current 43660), so **no tick can ever redeliver them** — precisely the
+case the alert text describes. This is the same structural family as the
+2026-05-18 silent-drop incident (per-key failures must gate the watermark on
+`!errored`); whether an un-gated path survives that fix is **not established
+here** and is tracked separately.
+
+**Fix.** `backfill_room_calendar --since=2026-03-26` against `sync-hfville`
+(re-drives the mapper from a direct legacy SELECT, so it bypasses the aged-out
+CT window). Dry run independently reported the same 4 candidates; live run wrote
+4, errored 0, all with `checkin_resolved=true`. The mirror probe re-hashes and
+closes its own aggregate row — the bin deliberately does not touch
+`ht_reconcile_log`. **Alert verdict: true positive, correctly calibrated.** It
+caught durable, unrecoverable divergence the sweep could not close. No threshold
+change.
+
+**Rule of thumb for next time.** On a `mirror_ht_room_calendar` `missing_pg`
+row, the first query is whether the `(room, night)` tiles **exist at all** —
+that single check separates the #282 false-positive class (tile present,
+`rcal_legacy_id` NULL) from a genuine drop, and the two demand opposite
+responses. Then check `ct_min` against the event's version: below it, CT can
+never redeliver and only a backfill will close the gap.
