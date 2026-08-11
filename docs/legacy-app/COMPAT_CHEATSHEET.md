@@ -1940,3 +1940,29 @@ written exactly as shown.
 
 *End of cheatsheet. Last updated 2026-04-26 by source review of decompiled-clean tree
 and live DB on `localhost\db`.*
+
+## Smart-card reads can attach the WRONG person's card image (2026-08-11, live case)
+
+iHOTEL reads Thai ID cards via a sister exe (`KPThaiNationalIDCard.exe`, 2017
+build) that writes card data + photo to a **single shared handoff file** in the
+install dir (`thaiid.txt` + image file) which the forms then load — no per-read
+token. Two card reads close together (two desks, or one desk processing two
+guests back-to-back) can cross: the save for guest A attaches the file content
+from guest B's read. The install dir can also be a SHARED folder run by
+multiple terminals (adapter files for two machines observed on FRONT2's
+`F:\Hotel-2018- V.1.45`), which widens the race across desks.
+
+Live case: `Tb_Save_Image` rows 26531/26532, byte-identical image saved 13 s
+apart under two different customers — กรกนก's card attached to ศิวโรจน์'s
+registration (CH26-006517). Diagnosis discriminators, in order:
+1. Our mirror only writes what canonical holds — `ht_guest_documents` empty for
+   the customer ⇒ iHOTEL wrote the row, not `save_image.rs`.
+2. Byte-identical `DATALENGTH(pic)` on two rows seconds apart = same handoff
+   file consumed twice.
+3. `Tb_Save_Image` is not CT-tracked; sync is never implicated.
+
+Remediation: delete the misattached row (guard the DELETE on id + cust_no +
+DATALENGTH), re-read the real card. The image is never lost — the duplicate
+lives on the correct customer's row. Operator habit that prevents it: the
+`FrmShowPreviewSmartCard` preview must show the person standing at the desk
+BEFORE saving, and avoid simultaneous card reads on two terminals.
