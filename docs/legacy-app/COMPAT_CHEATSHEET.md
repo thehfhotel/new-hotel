@@ -1966,3 +1966,12 @@ DATALENGTH), re-read the real card. The image is never lost — the duplicate
 lives on the correct customer's row. Operator habit that prevents it: the
 `FrmShowPreviewSmartCard` preview must show the person standing at the desk
 BEFORE saving, and avoid simultaneous card reads on two terminals.
+
+**Addendum (same day):** the card-image save is guarded by skip-if-exists —
+`FrmManageCustomersNew.cs:3858` selects existing `ttype='บัตรประชาชน'` rows for
+the customer and **inserts only when none exist; otherwise it silently does
+nothing**. So (1) a wrongly-attached image is PERMANENT until manually deleted
+— re-reading the card never replaces it; (2) deleting the bad row is therefore
+the precondition for a fixing re-read, not just hygiene; (3) the preview
+(`FrmShowPreviewSmartCard`) renders DURING the save, not before it — an
+operator seeing the wrong face means the wrong image is already inserted.
