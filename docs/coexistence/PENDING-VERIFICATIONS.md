@@ -27,7 +27,7 @@ complete (with date + evidence link) rather than deleting them.
 | V9 | **Deposit refund on legacy-origin folios** — `cr_legacy_ds_id` backfill, then verify the WARN-no-op class is gone | deposit refunds for iHOTEL-created stays |
 | V10 | **Walk-up receipt VAT attribution scope** (finance decision + verify either app's tax report against `HT_Receipt_*`) — elevated: 4.3k receipts/yr | trusting tax reports |
 
-| V11 | **Layout-edit writeback echo round-trip** (#236) — move one tile in จัดผัง mode at night, verify `HT_Rooms.Room_X/Room_y` updated + iHOTEL board shows it + CT echo converges (no reconcile row survives a sweep tick), move it back, then flip `LAYOUT_WRITEBACK_ENABLED` | self-service — NO reception coordination needed (tile positions aren't guest-facing) | CONTEXT.md "Layout-edit drag"; issue #236 |
+
 
 ## Standing monitors (no action until they fire)
 
@@ -38,6 +38,13 @@ complete (with date + evidence link) rather than deleting them.
 Done items move to the bottom with evidence:
 
 ## Completed
+
+- ~~V11 Layout-edit writeback echo round-trip~~ — PASSED 2026-08-11 (self-service, at night):
+  room 301 moved (683,704)→(683,744) via the real `PUT /api/rooms/layout` route from an
+  authenticated session; writeback job 49 `move_room_tiles` succeeded; `HT_Rooms.Room_X/Room_y`
+  byte-parity both directions; CT echo converged into canonical <1 min each way; ZERO
+  `ht_reconcile_log` rows at any point; board restored to the exact original state.
+  `LAYOUT_WRITEBACK_ENABLED=true` (GH var) is now the permanent state — จัดผัง is LIVE.
 
 - ~~Checkin idempotency-gate comparator class~~ — fixed d09e756, verified live, incident logged (2026-07-06).
 - ~~PR #223/#224 OTA writeback Phase 0 + parked queue~~ — merged + deployed 2026-07-09 (CI + container restart verified; live promote test = V4).
