@@ -713,3 +713,50 @@ advance target on a later tick, once every CHANGETABLE read provably
 post-dates it), plus hard-error handling of CT control columns and gating of
 three un-gated per-key skips. The `MAX+1`-style "hole below a current max"
 diagnostic in the rule-of-thumb above still stands — that part was right.
+
+---
+
+## 2026-08-11 — HF Ville box hang: SSD I/O failure froze iHOTEL + box (hardware, not software)
+
+**Symptom.** Reception reported iHOTEL not responding ~11:30 Thai. Whole box
+unreachable: Tailscale offline, WG-path ping dead, SQL probes failing. CT
+watermark pinned the onset to **11:36** (stuck at version 44090). Manual
+reboot ~13:21 restored everything.
+
+**Root cause: storage.** `iaStorE` event 4155 — *"I/O on GV230916SXL0001534
+has failed"* ×2 at 12:43, between a first restart attempt (11:53 "Powering
+up") and the final reboot (13:21). That serial is the **256 GB SSD, disk 0,
+drive C: — the system drive**. A system-disk I/O stall wedges everything
+above it: iHOTEL froze (its SQL connection blocks), and the network stack
+went down with it (which is why the box vanished from every path at once).
+SMART reads Healthy / 0 errors afterward — an I/O-failed event with clean
+SMART is a classic pre-failure signature on commodity SSDs. **Replace that
+SSD soon.** Note `HOTEL`'s 412 MB data file lives on the healthy D: HDD
+(disguised as `D:\sqlexpress-data\hotel.dll`); only the 5 MB log is on C:.
+
+**Software exonerated, checked not assumed.** The middleware (installed the
+previous day) sat idle — the emission flag was armed but **zero writeback
+jobs ran at Ville in 12 h**, so zero toasts ever fired; the only toast that
+box has ever shown was the smoke test 21 h before onset. The new set-diff
+probe costs 9–16 ms per 15 min and was locked out with everyone else at
+11:36. Wrong failure shape for either.
+
+**Response (in order).** Disk health read → **`BACKUP DATABASE HOTEL`
+(COPY_ONLY) to D: (11.8 s) → pulled off-box to
+`evergreen:/home/deploy/db-backups/legacy-mssql/HOTEL_incident_20260811.bak`
+(412 MB)** → then diagnosis. Backup-before-forensics, because at that point
+a failing drive was suspected and one good read closes every recovery gap.
+
+**Recovery verified.** Watermark advanced 44090 → 44097 across all 19 tables
+within a tick of the box returning; ~2.5 h outage vs 2-day CT retention —
+nothing lost; the `!errored` hold + settle gate behaved exactly as designed.
+iHOTEL responding; middleware relaunched into session 1 (it did NOT
+autostart post-reboot — its HKCU Run entry is UNQUOTED unlike every sibling
+entry; verify on next natural boot).
+
+**Gap this exposed → #287.** No off-box backup of either site's legacy
+MSSQL existed. Canonical PG mirrors ~24 of 63 legacy tables (the
+operational core, converged to the minute) but NOT `TB_Pay_History` (Ville
+cash book: 0 rows canonical), `Tb_Save_Image` (iHOTEL-made scans),
+`HT_Receipt_Ds`, settings/users. Durable fix: nightly native `.bak` both
+sites pulled to evergreen + close the sync-coverage holes.
