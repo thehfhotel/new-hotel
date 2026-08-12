@@ -1,6 +1,6 @@
 'use client'
 
-// Deep links into the separate Housekeeping ops app (repo `~/housekeeping`,
+// Deep links into the separate Housekeeping ops app (repo `~/HF/housekeeping`,
 // housekeeping.thehfhotel.org), which now owns breakage reports (แจ้งซ่อม)
 // and stock requisitions (เบิกของ) — retired from this /hk surface. Rendered
 // on both the room list and room detail screens so either action is reachable
