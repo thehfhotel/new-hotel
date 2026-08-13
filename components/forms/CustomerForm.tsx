@@ -30,7 +30,7 @@ export interface CustomerFormData {
   customerType: string
   notes: string
   /**
-   * Loyalty membership link (migration 078; PG-canonical only). READ-ONLY in
+   * Loyalty membership link (migration 086; PG-canonical only). READ-ONLY in
    * this form's main save — edited via the dedicated MembershipEditor, which
    * PUTs `/api/customers/{id}/membership` through `onSaveMembership`.
    */

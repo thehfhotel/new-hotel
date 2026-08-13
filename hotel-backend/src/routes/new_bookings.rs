@@ -430,7 +430,7 @@ pub async fn create_booking(
         writeback_context,
         book_channel: body.book_channel.clone(),
         book_ext_ref: body.book_ext_ref.clone(),
-        // Manual / OTA-desk creates are never payment-holds (migration 078);
+        // Manual / OTA-desk creates are never payment-holds (migration 086);
         // only the loyalty channel (`routes::channel`) sets a deadline.
         hold_expires_at: None,
         // TODO: wire user_id from auth middleware

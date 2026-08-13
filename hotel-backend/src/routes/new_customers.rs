@@ -58,7 +58,7 @@ pub struct NewCustomer {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
-    /// Loyalty membership id (migration 078; PG-canonical only). Set/cleared
+    /// Loyalty membership id (migration 086; PG-canonical only). Set/cleared
     /// via `PUT /api/customers/{id}/membership` — NOT the general update.
     pub membership_id: Option<String>,
     pub active: bool,

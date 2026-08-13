@@ -18,7 +18,7 @@ interface MembershipEditorProps {
 }
 
 /**
- * Desk affordance for the loyalty membership link (migration 078): staff
+ * Desk affordance for the loyalty membership link (migration 086): staff
  * type or scan the membership id from the guest's member QR at check-in.
  * Renders inside the customer edit form (edit mode only) with its own
  * save/clear actions.

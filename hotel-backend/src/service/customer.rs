@@ -469,7 +469,7 @@ impl CustomerService {
         })
     }
 
-    /// Set or clear the guest's loyalty membership link (migration 078 —
+    /// Set or clear the guest's loyalty membership link (migration 086 —
     /// desk flow: staff type/scan the id from the member QR at check-in).
     ///
     /// **PG-CANONICAL ONLY, deliberately NO legacy writeback**: legacy

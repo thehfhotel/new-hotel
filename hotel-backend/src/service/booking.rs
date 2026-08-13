@@ -88,7 +88,7 @@ pub struct CreateBookingCommand {
     pub book_channel: Option<String>,
     pub book_ext_ref: Option<String>,
 
-    /// Payment-hold deadline (migration 078 — loyalty-channel TENTATIVE
+    /// Payment-hold deadline (migration 086 — loyalty-channel TENTATIVE
     /// holds). `Some(_)` ⇒ the row is stamped with `book_hold_expires_at`
     /// in the SAME transaction as the insert, so a hold can never commit
     /// without the deadline the expiry sweep keys on. `None` for every
@@ -351,7 +351,7 @@ impl BookingService {
         // enqueue fails, the row never becomes visible.
         self.repo.set_aggregate_id(&mut tx, book_id, aggregate_id).await?;
 
-        // Loyalty-channel hold deadline (migration 078) — same-transaction
+        // Loyalty-channel hold deadline (migration 086) — same-transaction
         // stamp so a hold can never commit without its expiry.
         if let Some(expires_at) = cmd.hold_expires_at {
             self.repo.set_hold_expiry(&mut tx, book_id, expires_at).await?;

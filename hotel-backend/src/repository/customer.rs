@@ -34,7 +34,7 @@ pub struct CustomerRow {
     pub cust_type: Option<String>,
     pub cust_notes: Option<String>,
     pub cust_active: Option<bool>,
-    /// Loyalty membership id (migration 078). PG-canonical only — never
+    /// Loyalty membership id (migration 086). PG-canonical only — never
     /// mirrored to legacy `HT_Customers` (no counterpart column).
     pub cust_membership_id: Option<String>,
     pub created_at: Option<NaiveDateTime>,
@@ -170,7 +170,7 @@ pub trait CustomerRepository: Send + Sync {
         cust_id: i32,
     ) -> Result<u64, sqlx::Error>;
 
-    /// Set or clear the loyalty membership id (migration 078). `None` clears.
+    /// Set or clear the loyalty membership id (migration 086). `None` clears.
     /// Returns rows affected (0 ⇒ customer does not exist). PG-CANONICAL ONLY
     /// — deliberately NO legacy writeback (legacy `HT_Customers` has no
     /// membership column) and excluded from the `UpdateCustomer` re-save.

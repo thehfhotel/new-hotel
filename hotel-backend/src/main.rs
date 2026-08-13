@@ -694,7 +694,7 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/customers/{id}/stats",
             get(routes::customers::get_customer_stats),
         )
-        // Loyalty membership link (migration 078) — desk set/clear. A
+        // Loyalty membership link (migration 086) — desk set/clear. A
         // dedicated PUT (not a field on the general customer update) so a
         // stale edit form can never clobber a freshly-scanned link, and so
         // clearing is expressible. PG-canonical only, no legacy writeback.

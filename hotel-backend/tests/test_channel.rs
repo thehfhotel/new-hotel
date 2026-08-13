@@ -10,7 +10,7 @@
 //!
 //! ## Running
 //!
-//! Requires a running PG with migration 078 applied. `common` reads
+//! Requires a running PG with migration 086 applied. `common` reads
 //! `DATABASE_URL` (fallback: local-dev DSN). CI runs `--test-threads=1`;
 //! every fixture row carries a `TEST_loyalty`-scoped marker unique to THIS
 //! file and is deleted by `cleanup` (exact-match, per the `common` rules).

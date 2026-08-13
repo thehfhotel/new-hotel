@@ -114,7 +114,7 @@ Consequences:
 
 ## Piece 2 — membership link on the guest profile
 
-* Migration **078**: `ht_customers.cust_membership_id VARCHAR(64)`
+* Migration **086**: `ht_customers.cust_membership_id VARCHAR(64)`
   (PG-canonical only — legacy `HT_Customers` has no membership column;
   excluded from the `UpdateCustomer` re-save and the sync mapper, same
   policy as `cust_dob`), plus `ht_bookings.book_hold_expires_at TIMESTAMPTZ`.

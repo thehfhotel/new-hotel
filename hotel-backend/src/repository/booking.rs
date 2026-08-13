@@ -257,7 +257,7 @@ pub trait BookingRepository: Send + Sync {
     ) -> Result<(), sqlx::Error>;
 
     /// Stamp the payment-hold deadline onto a freshly-inserted booking
-    /// (migration 078 — loyalty-channel TENTATIVE holds). Runs in the same
+    /// (migration 086 — loyalty-channel TENTATIVE holds). Runs in the same
     /// transaction as `insert_booking` so a hold can never commit without its
     /// expiry (a deadline-less hold would evade the scheduler sweep and linger
     /// as `pending` forever). PG-canonical only — not mirrored to legacy.

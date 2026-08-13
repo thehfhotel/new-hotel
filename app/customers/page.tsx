@@ -286,7 +286,7 @@ export default function CustomersPage() {
     fetchCustomers()
   }
 
-  // Loyalty membership link (migration 078) — dedicated endpoint, separate
+  // Loyalty membership link (migration 086) — dedicated endpoint, separate
   // from the general PUT so a stale form can never clobber a fresh link and
   // clearing (null) is expressible. branchFetch appends the active ?branch=.
   const handleSaveMembership = async (
