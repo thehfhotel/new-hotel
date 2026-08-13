@@ -345,3 +345,7 @@ This application uses a **split architecture**:
 - Frontend dev server: `pnpm dev` (runs on port 3003)
 - Frontend build: `pnpm build`
 - Backend: See `/hotel-backend/README.md` for Rust development
+
+## Estate task board
+
+Cross-repo tasks live in ~/HF/hf-tasks (thehfhotel/hf-tasks). Read `tasks/INDEX.md` before cross-repo work; update task status as you work.
