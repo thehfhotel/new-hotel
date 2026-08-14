@@ -1,15 +1,27 @@
 /**
+ * @jest-environment jsdom
+ *
  * Pure-helper tests for the maid-facing housekeeping surface (/hk).
- * Covers the display/grouping logic in app/hk/hk-lib.ts — the API-shape
+ * Covers the display/grouping/branch logic in app/hk/hk-lib.ts — the API-shape
  * mapping is exercised end-to-end by the backend tests in
- * hotel-backend/src/routes/hk.rs.
+ * hotel-backend/src/routes/hk.rs. jsdom is required here (not the repo
+ * default `node` test environment) because the branch helpers below touch
+ * `localStorage` and `hkFetch`/`hkFetchMe` touch `fetch` via jsdom's window.
  */
 
 import {
   groupRoomsByFloor,
+  HK_API_BASE,
+  hkFetch,
+  hkFetchMe,
   HOUSEKEEPING_URL,
   progressLabel,
+  readStoredBranch,
+  resolveInitialBranch,
+  storeBranch,
   timeLabel,
+  type Branch,
+  type HkBranchOption,
   type HkRoom,
 } from '@/app/hk/hk-lib'
 
@@ -25,10 +37,27 @@ function room(overrides: Partial<HkRoom>): HkRoom {
   }
 }
 
+function branchOption(id: Branch, labelTh: string): HkBranchOption {
+  return { id, labelTh }
+}
+
+// jsdom's test environment provides neither a real `fetch` nor a global
+// `Response` constructor, so — matching this repo's existing convention in
+// __tests__/components/AuthContext.test.tsx — fetch responses are built as
+// plain objects cast to `Response`, not `new Response(...)`.
+function jsonResponse(status: number, body: unknown = { success: true }): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: () => Promise.resolve(body),
+  } as unknown as Response
+}
+
 describe('progressLabel', () => {
-  it('maps started/done/none to the Thai labels', () => {
+  it('maps started/done/dirty/none to the Thai labels', () => {
     expect(progressLabel('started').label).toBe('กำลังทำความสะอาด')
     expect(progressLabel('done').label).toBe('เสร็จแล้ว')
+    expect(progressLabel('dirty').label).toBe('แจ้งห้องไม่สะอาด')
     expect(progressLabel(null).label).toBe('ยังไม่เริ่ม')
     expect(progressLabel(undefined).label).toBe('ยังไม่เริ่ม')
   })
@@ -37,9 +66,10 @@ describe('progressLabel', () => {
     const classes = new Set([
       progressLabel('started').className,
       progressLabel('done').className,
+      progressLabel('dirty').className,
       progressLabel(null).className,
     ])
-    expect(classes.size).toBe(3)
+    expect(classes.size).toBe(4)
   })
 })
 
@@ -94,5 +124,170 @@ describe('timeLabel', () => {
 
   it('returns empty string for garbage', () => {
     expect(timeLabel('not-a-date')).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Branch selection (§A3, §A4)
+// ---------------------------------------------------------------------------
+
+describe('readStoredBranch / storeBranch', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+  })
+
+  it('round-trips a stored branch', () => {
+    storeBranch('hfville')
+    expect(readStoredBranch()).toBe('hfville')
+    expect(window.localStorage.getItem('hk.branch')).toBe('hfville')
+  })
+
+  it('returns null when nothing is stored', () => {
+    expect(readStoredBranch()).toBeNull()
+  })
+
+  it('treats an unknown stored value as unset, never as a default', () => {
+    window.localStorage.setItem('hk.branch', 'hfbogus')
+    expect(readStoredBranch()).toBeNull()
+  })
+
+  it('falls back to null (never a default) when localStorage.getItem throws', () => {
+    const spy = jest
+      .spyOn(window.localStorage.__proto__, 'getItem')
+      .mockImplementation(() => {
+        throw new Error('private mode')
+      })
+    try {
+      expect(readStoredBranch()).toBeNull()
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('storeBranch swallows a throwing localStorage.setItem (private mode) without crashing', () => {
+    const spy = jest
+      .spyOn(window.localStorage.__proto__, 'setItem')
+      .mockImplementation(() => {
+        throw new Error('private mode')
+      })
+    try {
+      expect(() => storeBranch('hfhotel')).not.toThrow()
+    } finally {
+      spy.mockRestore()
+    }
+  })
+})
+
+describe('resolveInitialBranch', () => {
+  const hfhotelOnly = [branchOption('hfhotel', 'ฮาร์เบอร์ฟร้อนท์')]
+  const both = [branchOption('hfhotel', 'ฮาร์เบอร์ฟร้อนท์'), branchOption('hfville', 'วิลล์')]
+
+  it('auto-selects the single configured branch, regardless of storage', () => {
+    expect(resolveInitialBranch(hfhotelOnly, null)).toBe('hfhotel')
+    expect(resolveInitialBranch(hfhotelOnly, 'hfville')).toBe('hfhotel')
+  })
+
+  it('uses the stored branch when multiple branches are configured and it is still valid', () => {
+    expect(resolveInitialBranch(both, 'hfville')).toBe('hfville')
+    expect(resolveInitialBranch(both, 'hfhotel')).toBe('hfhotel')
+  })
+
+  it('returns null (never a default) when multiple branches are configured and nothing valid is stored', () => {
+    expect(resolveInitialBranch(both, null)).toBeNull()
+  })
+
+  it('discards a stale stored branch no longer in the configured list', () => {
+    expect(resolveInitialBranch(hfhotelOnly, 'hfville')).toBe('hfhotel') // single-branch case above
+    expect(resolveInitialBranch([branchOption('hfville', 'วิลล์')], 'hfhotel')).toBe('hfville')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// hkFetch / hkFetchMe (§A2, §A4)
+// ---------------------------------------------------------------------------
+
+describe('hkFetch', () => {
+  beforeEach(() => {
+    // jsdom's test environment does not polyfill `fetch` itself, so there is
+    // no existing property for `jest.spyOn` to wrap — assign a fresh mock.
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(200))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it('appends ?branch= for a path with no existing query string', async () => {
+    await hkFetch('/rooms', 'hfville')
+    expect(global.fetch).toHaveBeenCalledWith(`${HK_API_BASE}/rooms?branch=hfville`, undefined)
+  })
+
+  it('appends &branch= for a path that already has a query string', async () => {
+    await hkFetch('/rooms?limit=50', 'hfhotel')
+    expect(global.fetch).toHaveBeenCalledWith(
+      `${HK_API_BASE}/rooms?limit=50&branch=hfhotel`,
+      undefined
+    )
+  })
+
+  it('passes init through unchanged', async () => {
+    const init = { method: 'POST', body: '{"status":"done"}' }
+    await hkFetch('/rooms/12/cleaning', 'hfhotel', init)
+    expect(global.fetch).toHaveBeenCalledWith(
+      `${HK_API_BASE}/rooms/12/cleaning?branch=hfhotel`,
+      init
+    )
+  })
+
+  it('throws WITHOUT calling fetch when branch is null — a bug must never become a wrong-hotel request', async () => {
+    await expect(hkFetch('/rooms', null)).rejects.toThrow()
+    expect(global.fetch).not.toHaveBeenCalled()
+  })
+
+  it('throws a Thai message on 401', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(401))
+    await expect(hkFetch('/rooms', 'hfhotel')).rejects.toThrow(/ยืนยันตัวตน/)
+  })
+
+  it('throws a Thai message on 403', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(403))
+    await expect(hkFetch('/rooms', 'hfhotel')).rejects.toThrow(/ไม่มีสิทธิ์/)
+  })
+
+  it('throws a DISTINCT Thai message on 400 (branch rejected server-side) — not the same text as 401/403', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValueOnce(jsonResponse(400))
+    const message400 = await hkFetch('/rooms', 'hfhotel').catch((e: Error) => e.message)
+
+    ;(global.fetch as jest.Mock).mockResolvedValueOnce(jsonResponse(401))
+    const message401 = await hkFetch('/rooms', 'hfhotel').catch((e: Error) => e.message)
+
+    expect(message400).toMatch(/สาขา/)
+    expect(message400).not.toBe(message401)
+  })
+
+  it('returns the response as-is on other statuses (e.g. 404), no throw', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(404))
+    const res = await hkFetch('/rooms/999', 'hfhotel')
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('hkFetchMe', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(200))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it('calls /me with NO ?branch= — the one /hk endpoint that must work before a branch is chosen', async () => {
+    await hkFetchMe()
+    expect(global.fetch).toHaveBeenCalledWith(`${HK_API_BASE}/me`, undefined)
+  })
+
+  it('still fails closed on 401', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(401))
+    await expect(hkFetchMe()).rejects.toThrow(/ยืนยันตัวตน/)
   })
 })

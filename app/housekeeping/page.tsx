@@ -15,7 +15,9 @@ import RoomCleaningCard, {
   HousekeepingRoom,
   HousekeepingStatus,
 } from '@/components/housekeeping/RoomCleaningCard'
+import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 
 // API response type
 interface RoomsResponse {
@@ -33,14 +35,51 @@ interface RoomsResponse {
   }>
 }
 
-// Map API status to housekeeping status
-function mapToHousekeepingStatus(
-  status: string,
-  isClean: boolean
+/** One room's latest maid-reported progress today, from the wave-4 B6 read
+ * `GET /api/housekeeping/cleaning`. `at` is a genuine PG `timestamptz` — see
+ * the timezone note on `formatInstant` in RoomCleaningCard.tsx before adding
+ * any new place that displays it. */
+export interface CleaningFeedEntry {
+  roomId: number
+  roomNo: string
+  status: 'started' | 'done' | 'dirty'
+  badge: string
+  name: string | null
+  at: string
+}
+
+interface CleaningFeedResponse {
+  success: boolean
+  data: CleaningFeedEntry[]
+}
+
+const CLEANING_LIVE_EVENTS = ['RoomMarkedClean', 'RoomMarkedDirty', 'RoomCleaningStarted']
+
+/**
+ * The board's status column for one room — honest derivation (wave-4 §B6),
+ * replacing the dead `status === 'cleaning'` literal `/api/rooms` never
+ * emits (pinned by `new_rooms.rs`'s `room_stored_cleaning_is_still_derived_available`).
+ * A `started` event today takes priority over cleanliness so the middle
+ * column finally populates; otherwise it's exactly the old dirty/available
+ * split.
+ */
+export function deriveRoomStatus(
+  isClean: boolean,
+  cleaningStatus: CleaningFeedEntry['status'] | undefined
 ): HousekeepingStatus {
-  if (status === 'cleaning') return 'cleaning'
-  if (!isClean || status === 'dirty') return 'dirty'
+  if (cleaningStatus === 'started') return 'cleaning'
+  if (!isClean) return 'dirty'
   return 'available'
+}
+
+/** `name ?? badge` (§B6 — the CF IdP forwards only `apps`+`badge` today, so
+ * `name` is usually `null`). `undefined` (no event reported today) ⇒ `null`,
+ * matching the pre-existing "no assignment tracking" placeholder. */
+export function housekeeperDisplayName(
+  cleaning: Pick<CleaningFeedEntry, 'name' | 'badge'> | undefined
+): string | null {
+  if (!cleaning) return null
+  return cleaning.name ?? cleaning.badge
 }
 
 // Column configuration
@@ -72,6 +111,7 @@ const columns = [
 ]
 
 export default function HousekeepingPage() {
+  const { branch } = useBranch()
   const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<HousekeepingRoom[]>([])
   const [loading, setLoading] = useState(true)
@@ -92,31 +132,55 @@ export default function HousekeepingPage() {
     avgCleaningTimeMinutes: null, // Would need tracking data
   }
 
-  // Fetch rooms data
-  const fetchRooms = useCallback(async () => {
+  // Fetch rooms + today's maid-reported progress (wave-4 §B6) and merge them
+  // into the board. Two separate reads on purpose — `GET /api/housekeeping/
+  // cleaning` is deliberately a new, separate endpoint rather than a widened
+  // `/api/rooms` (see the route's own doc comment) — joined here by roomId.
+  const fetchAll = useCallback(async () => {
     try {
-      const response = await branchFetch('/api/rooms?limit=200')
-      if (!response.ok) {
+      const [roomsResponse, cleaningResponse] = await Promise.all([
+        branchFetch('/api/rooms?limit=200'),
+        branchFetch('/api/housekeeping/cleaning'),
+      ])
+      if (!roomsResponse.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลห้องได้')
       }
 
-      const data: RoomsResponse = await response.json()
+      const data: RoomsResponse = await roomsResponse.json()
       if (!data.success) {
         throw new Error('ไม่สามารถดึงข้อมูลห้องได้')
       }
 
-      // Transform API data to housekeeping format
-      const housekeepingRooms: HousekeepingRoom[] = data.data.map((room) => ({
-        id: room.id,
-        roomNo: room.roomNo,
-        roomTypeName: room.roomTypeName,
-        floor: room.floor,
-        status: mapToHousekeepingStatus(room.status, room.isClean),
-        lastCheckoutTime: null, // Would need checkout tracking
-        statusChangedAt: room.updatedAt,
-        housekeeperName: null, // Would need assignment tracking
-        notes: room.notes,
-      }))
+      // The cleaning feed is a read-side enhancement, not the board's
+      // foundation: if it fails, degrade to cleanliness-only columns
+      // (the pre-existing dirty/available split) rather than losing the
+      // whole board over a secondary call.
+      let cleaningByRoom = new Map<number, CleaningFeedEntry>()
+      if (cleaningResponse.ok) {
+        const cleaningData: CleaningFeedResponse = await cleaningResponse.json()
+        if (cleaningData.success) {
+          cleaningByRoom = new Map(cleaningData.data.map((c) => [c.roomId, c]))
+        }
+      }
+
+      // Transform + merge API data into housekeeping format
+      const housekeepingRooms: HousekeepingRoom[] = data.data.map((room) => {
+        const cleaning = cleaningByRoom.get(room.id)
+        return {
+          id: room.id,
+          roomNo: room.roomNo,
+          roomTypeName: room.roomTypeName,
+          floor: room.floor,
+          status: deriveRoomStatus(room.isClean, cleaning?.status),
+          lastCheckoutTime: null, // Would need checkout tracking
+          // `cleaning.at` is a real timestamptz (never the UTC-hack path —
+          // see RoomCleaningCard.tsx's formatInstant); falls back to the
+          // room's own updatedAt when nothing was reported today.
+          statusChangedAt: cleaning?.at ?? room.updatedAt,
+          housekeeperName: housekeeperDisplayName(cleaning),
+          notes: room.notes,
+        }
+      })
 
       setRooms(housekeepingRooms)
       setError(null)
@@ -128,16 +192,24 @@ export default function HousekeepingPage() {
     }
   }, [branchFetch])
 
-  // Initial fetch and auto-refresh every 30 seconds
+  // Initial fetch, plus a 60s safety poll — the belt to SSE's braces below
+  // (wave-4 §B6: "keeping a 60s safety poll, not 30s"). The board itself
+  // updates live via useLiveRefresh; this interval only covers a missed/
+  // dropped SSE connection.
   useEffect(() => {
-    fetchRooms()
+    fetchAll()
 
     const interval = setInterval(() => {
-      fetchRooms()
-    }, 30000)
+      fetchAll()
+    }, 60000)
 
     return () => clearInterval(interval)
-  }, [fetchRooms])
+  }, [fetchAll])
+
+  // Live-refresh on maid-reported progress, from this app's own /hk surface
+  // or mirrored back in by the inbound CT room mapper when reception flips a
+  // room in iHOTEL directly (sync/mappers/room.rs also publishes these two).
+  useLiveRefresh(branch, CLEANING_LIVE_EVENTS, fetchAll)
 
   // Handle room status change.
   //
@@ -199,7 +271,7 @@ export default function HousekeepingPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
       // Refresh to get correct state
-      fetchRooms()
+      fetchAll()
     }
   }
 
@@ -261,7 +333,7 @@ export default function HousekeepingPage() {
 
           {/* Refresh Button */}
           <button
-            onClick={fetchRooms}
+            onClick={fetchAll}
             disabled={loading}
             className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-500 rounded-lg hover:bg-gray-100 disabled:opacity-50"
           >
@@ -340,7 +412,7 @@ export default function HousekeepingPage() {
 
       {/* Auto-refresh indicator */}
       <div className="text-center text-sm text-gray-400">
-        ระบบจะรีเฟรชอัตโนมัติทุก 30 วินาที
+        อัปเดตแบบเรียลไทม์ · สำรองรีเฟรชทุก 60 วินาที
       </div>
     </div>
   )

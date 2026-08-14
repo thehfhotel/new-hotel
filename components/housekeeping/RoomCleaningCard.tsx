@@ -53,15 +53,41 @@ function formatTimeElapsed(minutes: number): string {
   return `${hours} ชม. ${mins} น.`
 }
 
-// Format datetime for display (Thai local time)
-function formatDateTime(dateString: string | null): string {
+// Format a naive LEGACY datetime for display (Thai local time). The `'UTC'`
+// override here is NOT "this value is UTC" — it is "this value has no
+// timezone at all; the digits it carries already ARE Thai wall-clock time,
+// so pin the formatter to +0 to print them unchanged instead of letting the
+// browser re-interpret them as a UTC instant and shift them again."
+// Reserved for fields still fed by legacy-mirrored data. `lastCheckoutTime`
+// is the only caller today (currently always `null` pending real checkout
+// tracking — see the "Would need checkout tracking" comment in page.tsx).
+export function formatDateTime(dateString: string | null): string {
   if (!dateString) return '-'
   const date = new Date(dateString)
   return date.toLocaleTimeString('th-TH', {
     hour: '2-digit',
     minute: '2-digit',
-    timeZone: 'UTC', // Database stores Thai time as UTC
+    timeZone: 'UTC', // Legacy-naive value already IS Thai wall time — see above.
   })
+}
+
+// Format a genuine PG `timestamptz` for display — a real instant (e.g.
+// `ht_hk_cleaning_events.hkev_created_at`, surfaced as `at` by
+// `GET /api/housekeeping/cleaning` and fed into `statusChangedAt` below).
+// Deliberately NO `timeZone: 'UTC'` override: unlike `formatDateTime` above,
+// this value is NOT a naive legacy datetime standing in for Thai time — it
+// already carries its own correct offset, so the browser's normal local-time
+// conversion is exactly right. Forcing UTC digits here would silently shift
+// the display ~7 hours from Bangkok time. This is wave-4 hk-interfaces.md's
+// "single highest-risk spot for a silent 7-hour display bug" — keep this
+// function and `formatDateTime` separate rather than merging them; see
+// `__tests__/components/housekeeping/RoomCleaningCard.test.tsx` for the
+// regression test that pins the divergence.
+export function formatInstant(dateString: string | null): string {
+  if (!dateString) return ''
+  const date = new Date(dateString)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
 }
 
 export default function RoomCleaningCard({
@@ -164,7 +190,10 @@ export default function RoomCleaningCard({
         {room.housekeeperName && (
           <div className="flex items-center gap-2 text-sm text-gray-500">
             <User className="w-4 h-4" />
-            <span>{room.housekeeperName}</span>
+            <span>
+              {room.housekeeperName}
+              {room.statusChangedAt && ` · ${formatInstant(room.statusChangedAt)}`}
+            </span>
           </div>
         )}
       </div>
