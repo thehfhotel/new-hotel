@@ -615,6 +615,18 @@ services:
       # file, by contrast, aborts the entire stack start.
       - ota_bridge_token
       - ota_bridge_token_previous
+      # /hk employee-location lookup (hotel-backend/src/hfid_location.rs).
+      # SAFE to declare only because the deploy payload has carried
+      # `.secrets.hfid_resolve_secret` since the previous deploy, so the host
+      # file exists. Same one-deploy stagger, and the same reason, as the OTA
+      # pair above: run-deploy.sh writes a file for EVERY key in `.secrets`
+      # including empty values, so an unset GH secret yields an empty file
+      # (the hydrator skips it, no lookup client is built, the gate fails
+      # closed with 503) — whereas a compose `secrets:` entry pointing at a
+      # MISSING file aborts the ENTIRE stack start, not just backend.
+      #
+      # Backend only; no worker resolves badges.
+      - hfid_resolve_secret
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -1445,3 +1457,16 @@ secrets:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token
   ota_bridge_token_previous:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token_previous
+  # Shared secret for the `/hk` employee-location lookup
+  # (hotel-backend/src/hfid_location.rs → `X-Reader-Secret`). Declared ONE
+  # DEPLOY AFTER the docker-build.yml payload key that creates the file — see
+  # the note above about a missing file aborting the whole stack.
+  #
+  # It MUST hold the identical string as fingerprint-time-logger's
+  # `READER_RESOLVE_SECRET` (HF ID guards its entire app↔central surface with
+  # that one secret — there is no separate credential to find). Same value as
+  # this stack's own `READER_RESOLVE_SECRET`; the distinct name keeps the two
+  # consumers independently rotatable. See CLAUDE.md → "Credentials & Docker
+  # secrets" for the three-names-one-secret table.
+  hfid_resolve_secret:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/hfid_resolve_secret

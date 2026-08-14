@@ -260,7 +260,8 @@ impl HkPolicy {
         let location_enforcement_enabled = std::env::var(HK_LOCATION_ENFORCEMENT_ENV)
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let location = HfidLocationClient::from_config(HfidLocationConfig::from_env()).map(Arc::new);
+        let location =
+            HfidLocationClient::from_config(HfidLocationConfig::from_env()).map(Arc::new);
         Self {
             branches,
             mark_dirty_enabled,

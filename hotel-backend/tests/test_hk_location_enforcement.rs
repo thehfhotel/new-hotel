@@ -252,9 +252,15 @@ async fn row1b_flag_off_me_serves_the_whole_allowlist_unchanged() {
         json.get("badge").and_then(|v| v.as_str()),
         Some(NULL_LOCATION_BADGE)
     );
-    assert_eq!(json.get("markDirtyEnabled").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        json.get("markDirtyEnabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
 
-    let branches = json.get("branches").and_then(|v| v.as_array()).expect("branches");
+    let branches = json
+        .get("branches")
+        .and_then(|v| v.as_array())
+        .expect("branches");
     let ids: Vec<&str> = branches
         .iter()
         .filter_map(|b| b.get("id").and_then(|v| v.as_str()))
@@ -405,7 +411,11 @@ async fn row6_inactive_or_pending_employee_is_refused() {
             r#"{"status":"done"}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{badge} must be refused: {resp}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{badge} must be refused: {resp}"
+        );
         assert_envelope(&resp, LOCATION_UNKNOWN_ERROR, badge);
     }
 }
@@ -514,9 +524,13 @@ async fn row10_me_reports_no_location_with_an_empty_branch_list() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
-    assert!(me_branch_ids(&json).is_empty(), "no branch may be offered: {body}");
+    assert!(
+        me_branch_ids(&json).is_empty(),
+        "no branch may be offered: {body}"
+    );
     assert_eq!(
-        json.get("branchesUnavailableReason").and_then(|v| v.as_str()),
+        json.get("branchesUnavailableReason")
+            .and_then(|v| v.as_str()),
         Some(REASON_NO_LOCATION),
         "{body}"
     );
@@ -536,7 +550,8 @@ async fn row11_me_reports_lookup_unavailable_distinctly() {
         let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
         assert!(me_branch_ids(&json).is_empty(), "{body}");
         assert_eq!(
-            json.get("branchesUnavailableReason").and_then(|v| v.as_str()),
+            json.get("branchesUnavailableReason")
+                .and_then(|v| v.as_str()),
             Some(REASON_LOOKUP_UNAVAILABLE),
             "{body}"
         );
@@ -565,7 +580,8 @@ async fn row12_ville_employee_has_no_branch_until_hk_branches_widens() {
         "hfhotel must NOT be offered as a consolation branch: {body}"
     );
     assert_eq!(
-        json.get("branchesUnavailableReason").and_then(|v| v.as_str()),
+        json.get("branchesUnavailableReason")
+            .and_then(|v| v.as_str()),
         Some(REASON_NO_LOCATION),
         "a real but unserved property is not a retryable outage: {body}"
     );

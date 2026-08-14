@@ -144,7 +144,8 @@ pub enum LocationOutcome {
     /// HF ID answered: employee found, active, `location` recognised.
     Resolved(EmployeeLocation),
     /// HF ID answered definitively, but there is no usable branch (null
-    /// `location`, `found=false`, or an inactive employee). Not retryable.
+    /// `location`, `found=false`, or an inactive / pending-approval employee).
+    /// Not retryable.
     NoLocation,
     /// No answer was obtained (unconfigured, transport, non-2xx, undecodable,
     /// or an unrecognised `location` value). Possibly retryable.
@@ -278,7 +279,10 @@ impl LocationLookup for HttpLocationLookup {
             // READER_RESOLVE_SECRET is unset); 401 = our secret disagrees with
             // its. Both are "no answer", never "no location".
             Err(ureq::Error::Status(code, _)) => {
-                tracing::warn!(status = code, "HF ID location lookup returned a non-2xx status");
+                tracing::warn!(
+                    status = code,
+                    "HF ID location lookup returned a non-2xx status"
+                );
                 LocationOutcome::Unavailable
             }
             Err(err) => {
@@ -494,7 +498,16 @@ mod tests {
         );
         // Everything else is None — case variants included. Folding case here
         // would be a guess, and a guessed branch is the bug this closes.
-        for bad in ["", "  ", "hf", "hf_ville", "HFVILLE", "HF-VILLE", "HF_VILLE_2", "ALL"] {
+        for bad in [
+            "",
+            "  ",
+            "hf",
+            "hf_ville",
+            "HFVILLE",
+            "HF-VILLE",
+            "HF_VILLE_2",
+            "ALL",
+        ] {
             assert_eq!(EmployeeLocation::parse(bad), None, "{bad:?} must not parse");
         }
     }
@@ -641,7 +654,10 @@ mod tests {
             client.resolve("421").await,
             LocationOutcome::Resolved(EmployeeLocation::Hf)
         );
-        assert_eq!(client.resolve("421").await, LocationOutcome::Resolved(EmployeeLocation::Hf));
+        assert_eq!(
+            client.resolve("421").await,
+            LocationOutcome::Resolved(EmployeeLocation::Hf)
+        );
         assert_eq!(lookup.calls(), 1, "second call served from cache");
 
         tokio::time::sleep(Duration::from_millis(60)).await;
