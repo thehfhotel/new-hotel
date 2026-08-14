@@ -34,6 +34,9 @@ pub struct CustomerRow {
     pub cust_type: Option<String>,
     pub cust_notes: Option<String>,
     pub cust_active: Option<bool>,
+    /// Loyalty membership id (migration 086). PG-canonical only — never
+    /// mirrored to legacy `HT_Customers` (no counterpart column).
+    pub cust_membership_id: Option<String>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -166,6 +169,29 @@ pub trait CustomerRepository: Send + Sync {
         tx: &mut Transaction<'_, Postgres>,
         cust_id: i32,
     ) -> Result<u64, sqlx::Error>;
+
+    /// Set or clear the loyalty membership id (migration 086). `None` clears.
+    /// Returns rows affected (0 ⇒ customer does not exist). PG-CANONICAL ONLY
+    /// — deliberately NO legacy writeback (legacy `HT_Customers` has no
+    /// membership column) and excluded from the `UpdateCustomer` re-save.
+    async fn set_membership(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cust_id: i32,
+        membership_id: Option<&str>,
+    ) -> Result<u64, sqlx::Error>;
+
+    /// Exact match-or-miss lookup used by the loyalty channel's
+    /// match-or-create guest resolution: same phone (trimmed, exact) AND same
+    /// name (case-insensitive first/last), active customers only. Newest row
+    /// wins when historical duplicates exist. Returns the `cust_id`.
+    async fn find_by_phone_name(
+        &self,
+        pool: &PgPool,
+        phone: &str,
+        first_name: &str,
+        last_name: Option<&str>,
+    ) -> Result<Option<i32>, sqlx::Error>;
 }
 
 /// Default `CustomerRepository` implementation backed by sqlx + PostgreSQL.
@@ -273,6 +299,7 @@ impl CustomerRepository for PgCustomerRepository {
                 cust_type,
                 cust_notes,
                 cust_active,
+                cust_membership_id,
                 created_at,
                 updated_at
             FROM ht_customers
@@ -304,6 +331,7 @@ impl CustomerRepository for PgCustomerRepository {
                 cust_type: row.try_get::<String, _>("cust_type").ok(),
                 cust_notes: row.try_get::<String, _>("cust_notes").ok(),
                 cust_active: row.try_get::<bool, _>("cust_active").ok(),
+                cust_membership_id: row.try_get::<String, _>("cust_membership_id").ok(),
                 created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
                 updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
             })
@@ -326,6 +354,7 @@ impl CustomerRepository for PgCustomerRepository {
                 cust_type,
                 cust_notes,
                 cust_active,
+                cust_membership_id,
                 created_at,
                 updated_at
             FROM ht_customers
@@ -347,6 +376,7 @@ impl CustomerRepository for PgCustomerRepository {
             cust_type: r.cust_type,
             cust_notes: r.cust_notes,
             cust_active: r.cust_active,
+            cust_membership_id: r.cust_membership_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }))
@@ -502,5 +532,60 @@ impl CustomerRepository for PgCustomerRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    async fn set_membership(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cust_id: i32,
+        membership_id: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE ht_customers
+            SET cust_membership_id = $1,
+                updated_at = NOW()
+            WHERE cust_id = $2
+            "#,
+            membership_id,
+            cust_id
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn find_by_phone_name(
+        &self,
+        pool: &PgPool,
+        phone: &str,
+        first_name: &str,
+        last_name: Option<&str>,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        // Exact phone + case-insensitive name match. A missing/blank last
+        // name on either side collapses to '' so "phone + first name only"
+        // matches a profile that also has no last name — but never one that
+        // does (a different guest sharing the family phone must not merge).
+        let rec = sqlx::query!(
+            r#"
+            SELECT cust_id
+            FROM ht_customers
+            WHERE cust_active = true
+              AND btrim(COALESCE(cust_phone, '')) = btrim($1)
+              AND btrim($1) <> ''
+              AND lower(btrim(cust_firstname)) = lower(btrim($2))
+              AND lower(btrim(COALESCE(cust_lastname, ''))) = lower(btrim(COALESCE($3, '')))
+            ORDER BY cust_id DESC
+            LIMIT 1
+            "#,
+            phone,
+            first_name,
+            last_name
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(rec.map(|r| r.cust_id))
     }
 }

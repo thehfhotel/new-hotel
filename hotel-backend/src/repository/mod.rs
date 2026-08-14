@@ -23,6 +23,9 @@
 //! injected without changing route code.
 
 pub mod booking;
+// Loyalty-channel cross-aggregate queries (availability / holds / stay
+// snapshot). Free functions, not a trait — see the module doc for why.
+pub mod channel;
 pub mod checkin;
 pub mod customer;
 pub mod inventory;

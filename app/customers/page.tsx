@@ -226,6 +226,7 @@ export default function CustomersPage() {
         address: data.address ?? '',
         customerType: data.customerType ?? '',
         notes: data.notes ?? '',
+        membershipId: data.membershipId ?? null,
       })
       setFormMode('edit')
       setShowForm(true)
@@ -283,6 +284,31 @@ export default function CustomersPage() {
     // Refresh the list and dismiss the detail modal (its data is now stale).
     closeModal()
     fetchCustomers()
+  }
+
+  // Loyalty membership link (migration 086) — dedicated endpoint, separate
+  // from the general PUT so a stale form can never clobber a fresh link and
+  // clearing (null) is expressible. branchFetch appends the active ?branch=.
+  const handleSaveMembership = async (
+    customerId: number,
+    membershipId: string | null
+  ) => {
+    const response = await branchFetch(
+      `/api/customers/${customerId}/membership`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ membershipId }),
+      }
+    )
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'ไม่สามารถบันทึกรหัสสมาชิกได้')
+    }
+    // Keep the open form's snapshot in sync so reopening shows the new link.
+    setEditingCustomer((prev) =>
+      prev && prev.id === customerId ? { ...prev, membershipId } : prev
+    )
   }
 
   // Soft-delete (DELETE) the customer, then refresh.
@@ -713,6 +739,7 @@ export default function CustomersPage() {
         onClose={() => setShowForm(false)}
         onSave={handleSaveCustomer}
         onDelete={formMode === 'edit' ? handleDeleteCustomer : undefined}
+        onSaveMembership={formMode === 'edit' ? handleSaveMembership : undefined}
         initialData={editingCustomer}
         mode={formMode}
       />

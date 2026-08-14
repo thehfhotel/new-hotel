@@ -255,6 +255,31 @@ pub trait BookingRepository: Send + Sync {
         book_id: i32,
         aggregate_id: uuid::Uuid,
     ) -> Result<(), sqlx::Error>;
+
+    /// Stamp the payment-hold deadline onto a freshly-inserted booking
+    /// (migration 086 — loyalty-channel TENTATIVE holds). Runs in the same
+    /// transaction as `insert_booking` so a hold can never commit without its
+    /// expiry (a deadline-less hold would evade the scheduler sweep and linger
+    /// as `pending` forever). PG-canonical only — not mirrored to legacy.
+    async fn set_hold_expiry(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), sqlx::Error>;
+
+    /// Stamp `book_channel` WITHOUT an external ref — the channel-only leg of
+    /// the provenance pair (`set_booking_provenance` requires both halves of
+    /// the migration-076 natural key). Used by the loyalty channel, whose
+    /// holds carry no caller-side booking id but must be identifiable
+    /// (`book_channel='loyalty'` drives the expiry sweep + the channel-API
+    /// guard that follow-up calls only touch channel bookings).
+    async fn set_booking_channel(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        channel: &str,
+    ) -> Result<(), sqlx::Error>;
 }
 
 /// Default `BookingRepository` impl backed by sqlx + PostgreSQL.
@@ -819,6 +844,36 @@ impl BookingRepository for PgBookingRepository {
         .bind(aggregate_id)
         .execute(&mut **tx)
         .await?;
+        Ok(())
+    }
+
+    async fn set_hold_expiry(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), sqlx::Error> {
+        // Runtime `sqlx::query()` — same convention as `set_aggregate_id`
+        // above (single-column stamp, keeps the `.sqlx` cache churn minimal).
+        sqlx::query("UPDATE ht_bookings SET book_hold_expires_at = $2 WHERE book_id = $1")
+            .bind(book_id)
+            .bind(expires_at)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_booking_channel(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        channel: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE ht_bookings SET book_channel = $2 WHERE book_id = $1")
+            .bind(book_id)
+            .bind(channel)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 }
