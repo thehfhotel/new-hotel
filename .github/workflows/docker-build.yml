@@ -938,6 +938,19 @@ jobs:
           VILLE_DB_PASSWORD:       ${{ secrets.POSTGRES_PASSWORD }}
           SLACK_WEBHOOK_URL:       ${{ secrets.SLACK_WEBHOOK }}
           READER_RESOLVE_SECRET:   ${{ secrets.READER_RESOLVE_SECRET }}
+          # OTA booking bridge shared bearer (docs/ota-bridge.md). Delivered via
+          # the payload's `secrets:` block ONLY — never as an `env:` entry in the
+          # container. MUST equal ota-desk's `PMS_BRIDGE_TOKEN`.
+          #
+          # These two land BEFORE anything reads them, on purpose: run-deploy.sh
+          # writes a file for EVERY key in `.secrets`, including empty values, so
+          # with the GH secret unset the file exists but is empty — the Rust
+          # hydrator skips it (empty == missing), the env var stays unset, and the
+          # gate has nothing to accept. A compose `secrets:` entry pointing at a
+          # MISSING file, by contrast, aborts the entire stack start. Hence the
+          # payload key ships one deploy ahead of the compose declaration.
+          OTA_BRIDGE_TOKEN:          ${{ secrets.OTA_BRIDGE_TOKEN }}
+          OTA_BRIDGE_TOKEN_PREVIOUS: ${{ secrets.OTA_BRIDGE_TOKEN_PREVIOUS }}
           CF_ACCESS_HK_AUD:        ${{ secrets.CF_ACCESS_HK_AUD }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
@@ -969,7 +982,9 @@ jobs:
           # NOTE (ADR 0004): the reconcile / CT-watermark operational flags
           # (RECONCILE_FORCE_CONVERGE_ENABLED, RECONCILE_REINGEST_MISSING_PG_ENABLED,
           # WORKER_RECONCILE_ENABLED, SYNC_PER_TABLE_WATERMARK, and their
-          # HFVILLE_ siblings) are deliberately NOT listed here. Their state
+          # HFVILLE_ siblings) — AND the OTA booking-bridge flags
+          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md) — are
+          # deliberately NOT listed here. Their state
           # lives in docker-compose.yml defaults, which is the single source of
           # truth. Adding any of them back would make those defaults
           # unreachable — run-deploy.sh materialises .env wholesale from this
@@ -1079,6 +1094,8 @@ jobs:
             --arg VILLE_DB_PASSWORD   "$VILLE_DB_PASSWORD" \
             --arg SLACK_WEBHOOK_URL   "$SLACK_WEBHOOK_URL" \
             --arg READER_RESOLVE_SECRET "$READER_RESOLVE_SECRET" \
+            --arg OTA_BRIDGE_TOKEN          "${OTA_BRIDGE_TOKEN:-}" \
+            --arg OTA_BRIDGE_TOKEN_PREVIOUS "${OTA_BRIDGE_TOKEN_PREVIOUS:-}" \
             --arg CF_ACCESS_HK_AUD    "$CF_ACCESS_HK_AUD" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
@@ -1134,6 +1151,8 @@ jobs:
                 postgres_password:  $POSTGRES_PASSWORD,
                 ville_db_password:  $VILLE_DB_PASSWORD,
                 slack_webhook_url:  $SLACK_WEBHOOK_URL,
+                ota_bridge_token:          $OTA_BRIDGE_TOKEN,
+                ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

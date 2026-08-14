@@ -24,18 +24,24 @@
 //! * `channel_token` — shared-bearer service-token gate for the loyalty-app
 //!   booking channel `/api/channel/*` (machine-to-machine; ships dark behind
 //!   `LOYALTY_CHANNEL_ENABLED`). IS a tower layer.
+//! * `ota_token` — shared-bearer gate for the OTA booking bridge `/api/ota/*`
+//!   (`routes::ota`, docs/ota-bridge.md). Same shape as `channel_token` plus a
+//!   permissive-then-enforce mode, because it replaces an already-live
+//!   unauthenticated caller (ota-desk). IS a tower layer.
 
 pub mod auth;
 pub mod cf_access;
 pub mod channel_token;
 pub mod hfid_assertion;
 pub mod hk_access;
+pub mod ota_token;
 pub mod permissions;
 pub mod rate_limit;
 pub mod ville_guard;
 
 pub use auth::require_auth;
 pub use channel_token::{require_channel_token, ChannelTokenState};
+pub use ota_token::{require_ota_token, token_fingerprint, OtaTokenState};
 pub use permissions::{permissions_for_user, require_permission};
 pub use rate_limit::{login_rate_limit, LoginRateLimitState};
 pub use ville_guard::{is_ville_exempt_path, ville_write_blocked, ville_write_guard};

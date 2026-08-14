@@ -202,6 +202,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loyalty_config.stay_hook_configured()
     );
 
+    // OTA booking bridge (docs/ota-bridge.md). The machine surface `ota-desk`
+    // calls: five existing handlers re-mounted under `/api/ota/*` behind a
+    // shared bearer, plus the purpose-built reconciler read. Ships DARK
+    // (`OTA_BRIDGE_ENABLED` default off ⇒ every request 503).
+    //
+    // The token/previous fields render as `sha256(value)[0..6]`, NEVER the
+    // value — that fingerprint is how an operator confirms new-hotel's
+    // `OTA_BRIDGE_TOKEN` and ota-desk's `PMS_BRIDGE_TOKEN` hold the identical
+    // string without either side printing a secret.
+    let ota_config = config::OtaBridgeConfig::from_env();
+    let ota_line = format!(
+        "OTA bridge: enabled={} enforce={} token={} previous={}",
+        ota_config.enabled,
+        ota_config.enforce,
+        app_middleware::token_fingerprint(ota_config.token.as_deref()),
+        app_middleware::token_fingerprint(ota_config.previous_token.as_deref()),
+    );
+    if ota_config.enabled && !ota_config.enforce {
+        // Permissive: un-credentialed calls are being ACCEPTED. This is a
+        // deliberate migration window, but it must be loud — the operator
+        // flips OTA_BRIDGE_ENFORCE once the per-request WARNs stop.
+        tracing::warn!("{ota_line} — PERMISSIVE, unauthenticated calls are accepted");
+    } else {
+        tracing::info!("{ota_line}");
+    }
+
     // Create AppState — canonical PG only. As of the 2026-06-11 coexistence
     // audit AppState carries no MSSQL handle: routes/repositories never touch
     // the legacy DB (docs/architecture.md "critical rule"); MSSQL is reserved
@@ -471,6 +497,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Router::new(),
     };
 
+    // OTA booking bridge (`/api/ota/*` — docs/ota-bridge.md). Re-mounts the
+    // FIVE EXISTING ota-desk handlers (customer search/create, room list,
+    // booking validate/create) unchanged behind a shared-bearer gate, plus the
+    // new `GET /api/ota/reconcile/bookings` read that replaces ota-desk's
+    // direct `mcp_ro` PostgreSQL query.
+    //
+    // Why a parallel prefix rather than gating `/api/*`: the PMS browser UI
+    // reaches those same routes through the Next.js rewrite, so requiring a
+    // bearer on them would break the desk. See `routes::ota` for the layering
+    // rationale — the whole stack (ota gate OUTSIDE ville_write_guard) is built
+    // by `routes::ota::router` so the integration tests mount the shipped
+    // wiring rather than a replica.
+    //
+    // Mounted OUTSIDE `require_auth` (the caller is a service, not a session
+    // user), exactly like `/api/channel/*`.
+    let ota_routes = match &final_app_state {
+        Some(state) => routes::ota::router_with_config(state.clone(), ota_config),
+        None => Router::new(),
+    };
+
     // Phase 4 PR4: mount the protected `/api/admin/*` endpoints. The
     // subrouter is wrapped with the same `require_auth` middleware
     // PR2 added to the canonical routes so an authenticated `User` extension
@@ -498,6 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(reader_routes)
         .merge(hk_routes)
         .merge(channel_routes)
+        .merge(ota_routes)
         .merge(admin_routes)
         .merge(health_routes)
         .merge(downloads_routes)

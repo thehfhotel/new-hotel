@@ -90,6 +90,14 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     // until the coordinated go-live wires the secret files.
     ("loyalty_channel_token", "LOYALTY_CHANNEL_TOKEN"),
     ("loyalty_service_token", "LOYALTY_SERVICE_TOKEN"),
+    // OTA booking bridge (docs/ota-bridge.md). Shared bearer ota-desk
+    // presents on /api/ota/* — MUST hold the identical string as ota-desk's
+    // `PMS_BRIDGE_TOKEN`. `..._PREVIOUS` is the rotation slot. Unset/empty ⇒
+    // the gate has nothing to accept: with OTA_BRIDGE_ENFORCE on that is a
+    // 503 (fail closed), and the surface is 503 anyway until
+    // OTA_BRIDGE_ENABLED is flipped.
+    ("ota_bridge_token", "OTA_BRIDGE_TOKEN"),
+    ("ota_bridge_token_previous", "OTA_BRIDGE_TOKEN_PREVIOUS"),
 ];
 
 /// Hydrate env vars from Docker secret files, then reconstruct

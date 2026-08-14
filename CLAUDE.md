@@ -131,6 +131,8 @@ Sensitive credentials (`DB_PASSWORD`, `POSTGRES_PASSWORD`, `VILLE_DB_PASSWORD`, 
 - `/home/deploy/secrets/postgres_password` — newdb superuser
 - `/home/deploy/secrets/ville_db_password` — alias of `postgres_password` until HF Ville gets a distinct DB credential (coexistence hardening — ADR 0002; formerly tied to the now-superseded "ADR 0001 Phase 8")
 - `/home/deploy/secrets/slack_webhook_url`
+- `/home/deploy/secrets/ota_bridge_token` — OTA booking-bridge shared bearer (`docs/ota-bridge.md`). **INVARIANT: must hold the IDENTICAL string as ota-desk's `PMS_BRIDGE_TOKEN`** — two names for one value, same idiom as `PORTAL_NOTIFY_TOKEN` ≡ portal `NOTIFY_INGRESS_TOKEN`. Verify without exposing it: both repos print `sha256(token)[0..6]` (here, in the `OTA bridge: …` startup line). An unset GH secret yields an EMPTY file, which the hydrator treats as absent — the gate then has nothing to accept and `/api/ota/*` fails closed.
+- `/home/deploy/secrets/ota_bridge_token_previous` — rotation slot for the above; accepted with a "finish the rotation" WARN. Normally empty.
 
 The deploy script (`/srv/run-deploy.sh` on evergreen, NOT in this repo) writes these from the JSON payload's `.secrets` block on every deploy, with mode `0400` and owner `deploy:docker`.
 

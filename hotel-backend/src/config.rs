@@ -567,6 +567,55 @@ impl LoyaltyConfig {
     }
 }
 
+/// OTA booking-bridge config (`/api/ota/*` — see `docs/ota-bridge.md`).
+///
+/// The bridge is the machine surface that `ota-desk` calls to create bookings
+/// and to read them back for reconciliation. Unlike the loyalty channel it
+/// re-mounts EXISTING handlers, which the desk UI also reaches on `/api/*`
+/// through the Next.js rewrite — so this parallel prefix exists precisely so a
+/// bearer can be required WITHOUT breaking the browser UI.
+///
+/// Two flags, both [`flag_enabled`] semantics, both default **off**, and both
+/// deliberately absent from `.github/workflows/docker-build.yml` per ADR 0004
+/// (their state lives in `docker-compose.yml` defaults; re-adding them to the
+/// workflow would make those defaults unreachable dead code):
+///
+/// * `OTA_BRIDGE_ENABLED` — master switch. Off ⇒ every `/api/ota/*` request
+///   answers 503, whatever credential it carries. Ships DARK.
+/// * `OTA_BRIDGE_ENFORCE` — off ⇒ **permissive**: a request with NO
+///   `Authorization` header is served (with a WARN) so ota-desk can be cut over
+///   without a flag-flip race. A presented-but-WRONG bearer is still 401 in
+///   this mode — see [`crate::middleware::ota_token`] for why that is the
+///   invariant that makes the enforce flip safe.
+///
+/// The tokens ride the `/run/secrets` hydrator (`secrets.rs` — files
+/// `ota_bridge_token` / `ota_bridge_token_previous`); env vars win.
+/// `OTA_BRIDGE_TOKEN` MUST hold the identical string as ota-desk's
+/// `PMS_BRIDGE_TOKEN` — two names for one shared value. `..._PREVIOUS` is the
+/// rotation slot: it is accepted, but with a "finish the rotation" WARN.
+#[derive(Debug, Clone, Default)]
+pub struct OtaBridgeConfig {
+    /// `OTA_BRIDGE_ENABLED` — master switch for the `/api/ota/*` surface.
+    pub enabled: bool,
+    /// `OTA_BRIDGE_ENFORCE` — require a bearer (vs. permissive migration mode).
+    pub enforce: bool,
+    /// `OTA_BRIDGE_TOKEN` — the primary shared bearer.
+    pub token: Option<String>,
+    /// `OTA_BRIDGE_TOKEN_PREVIOUS` — rotation slot; accepted with a WARN.
+    pub previous_token: Option<String>,
+}
+
+impl OtaBridgeConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enabled: flag_enabled("OTA_BRIDGE_ENABLED"),
+            enforce: flag_enabled("OTA_BRIDGE_ENFORCE"),
+            token: optional_env("OTA_BRIDGE_TOKEN"),
+            previous_token: optional_env("OTA_BRIDGE_TOKEN_PREVIOUS"),
+        }
+    }
+}
+
 /// Default central HF-ID base URL. Overridden with `HFID_BASE_URL` in any real
 /// deploy. This is the central HF-ID (fingerprint-time-logger) service's
 /// published port on the evergreen server LAN — verified reachable from inside

@@ -540,6 +540,26 @@ services:
       # Dir holding the card-reader middleware installers, served by
       # /api/downloads/middleware/{platform}. Bind-mounted read-only below.
       - MIDDLEWARE_ASSETS_DIR=${MIDDLEWARE_ASSETS_DIR:-/run/assets/middleware}
+      # OTA booking bridge (docs/ota-bridge.md) — the machine surface ota-desk
+      # calls on /api/ota/*. Both flags default OFF: the surface answers 503
+      # until ENABLED, then accepts un-credentialed calls (with a per-request
+      # WARN) until ENFORCE. The shared bearer itself is a SECRET, delivered as
+      # /run/secrets/ota_bridge_token — never an environment: entry.
+      #
+      # ADR 0004 applies to these two exactly as to the reconcile flags above:
+      # the DEFAULTS BELOW ARE THE LIVE PRODUCTION VALUES, they are deliberately
+      # NOT in .github/workflows/docker-build.yml, and they are NOT GitHub repo
+      # variables. Flip one by editing its default here — docker-compose.yml is
+      # in the workflow's `deploy` paths filter, so the edit triggers its own
+      # deploy and the flip is a one-line reviewable diff. Adding either key
+      # back to the workflow would make these defaults unreachable and silently
+      # revert the authentication posture on the next deploy.
+      #
+      # Flipping ENFORCE is NOT "just config": it is what turns an accepted
+      # unauthenticated ota-desk call into a 401. Precondition is 24h of zero
+      # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
+      - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-false}
+      - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-false}
     secrets:
       - db_password
       - postgres_password
