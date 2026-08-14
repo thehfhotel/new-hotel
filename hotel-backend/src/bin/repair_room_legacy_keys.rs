@@ -68,14 +68,39 @@
 //! UNIQUE `room_no`, partial UNIQUE `aggregate_id`, and a PLAIN index on
 //! `legacy_room_no`. There is **no unique index on `legacy_room_id_int`**, so
 //! two rows may transiently share one mid-transaction without tripping a
-//! constraint. Safe to run while sync is live: once the ids are right the
-//! mapper's preferred id-match resolves the correct row, and its
-//! `legacy_room_no = COALESCE($4, legacy_room_no)` re-stamps the correct number.
+//! constraint.
 //!
 //! Rooms present on only one side are **reported, never guessed** — a legacy
 //! `Room_no` with no canonical row, a canonical room with no legacy counterpart,
 //! and (fatal to matching) duplicate legacy `Room_no` values are all listed for
 //! the operator instead of being resolved by heuristic.
+//!
+//! ## Three operator guards (wave-4 review F1/F2/F3)
+//!
+//! 1. **Target binding.** The PG half (`DATABASE_URL`) and the MSSQL half
+//!    (`DbConfig::from_env`) are wired from INDEPENDENT env vars, and
+//!    `dotenvy` happily fills in an unset one from `hotel-backend/.env`. A
+//!    `SITE_ID=hfville` run that inherited HF Hotel's `DATABASE_URL` would read
+//!    Ville's legacy rooms and rewrite HF HOTEL's canonical pointers — and its
+//!    report would look exactly like a correct run. So both resolved targets
+//!    (`select current_database()` and `server:port/db`) are printed in the
+//!    report header, and `--apply` is REFUSED when the PG database does not
+//!    match the one `SITE_ID` implies (`hfhotel`→`hotelnew`,
+//!    `hfville`→`hotelville`), or when the legacy DB name contradicts a site
+//!    whose value is derivable from the deploy topology.
+//! 2. **Partial plans abort.** `--apply` REFUSES to write when any room is
+//!    unmatched on either side or ambiguous, because a canonical room the bin
+//!    could not match KEEPS its stale `legacy_room_id_int` — and a stale
+//!    pointer that now collides with a repaired one makes the inbound CT
+//!    resolver (`sync/mappers/room.rs`, `legacy_room_id_int = $1 OR
+//!    room_no = $2`, no tiebreak) non-deterministic. Pass `--allow-partial`
+//!    only when the leftovers have been reviewed and are understood.
+//! 3. **Built-in re-verify.** A successful `--apply` immediately re-reads BOTH
+//!    sides and re-plans. The CT room mapper reads outside this bin's lock, so
+//!    an in-flight tick can re-stamp a row microseconds after the repair
+//!    commits; the residual plan is the only thing that proves it did not. A
+//!    non-empty residual exits NON-ZERO — the fix is simply to re-run.
+//!    Quieter still: stop the site's sync worker for the ~1 s the apply takes.
 //!
 //! ## Usage
 //!
@@ -88,12 +113,22 @@
 //!
 //! # Live run — `--apply` is REQUIRED; `--dry-run` is accepted but redundant.
 //! …  cargo run --release --bin repair_room_legacy_keys -- --apply
+//!
+//! # Live run over a plan that still has unmatched/ambiguous rooms — only
+//! # after reading WHY they are unmatched in the dry-run report.
+//! …  cargo run --release --bin repair_room_legacy_keys -- --apply --allow-partial
 //! ```
+//!
+//! Exit status: `0` only when nothing was refused and (after `--apply`) the
+//! re-verify found ZERO residual repairs. Any refusal or residual is non-zero.
 //!
 //! Run once per site. HF Hotel is the bin's own correctness proof: a dry run
 //! there must report **0 rooms to repair**.
 //!
 //! ## Verification after `--apply` (HF Ville)
+//!
+//! The bin's own re-verify already asserts `Rooms still to repair: 0`. The
+//! independent SQL check, for the runbook:
 //!
 //! ```sql
 //! SELECT count(*) FILTER (WHERE room_no IS DISTINCT FROM legacy_room_no) AS mismatched,
@@ -243,6 +278,124 @@ pub fn plan_repairs(legacy: &[LegacyRoom], canonical: &[CanonicalRoom]) -> Plan 
 }
 
 // =============================================================================
+// Operator guards (pure — unit-tested below)
+// =============================================================================
+
+/// The canonical PG database a site's app owns (ADR 0001's per-site logical
+/// DB topology; `secrets.rs` reconstructs the URL from `NEW_DB_NAME`, which
+/// docker-compose pins to `hotelville` for every hfville service).
+pub fn expected_pg_database(site_id: &str) -> Option<&'static str> {
+    match site_id {
+        "hfhotel" => Some("hotelnew"),
+        "hfville" => Some("hotelville"),
+        _ => None,
+    }
+}
+
+/// The legacy MSSQL database a site talks to, WHERE IT IS DERIVABLE. HF
+/// Ville's is pinned in docker-compose (`DB_NAME=HOTEL` on every hfville
+/// service); HF Hotel's comes from a repo secret (`DB_NAME: ${{ secrets.DB_NAME }}`),
+/// so this bin cannot know it — it is printed for the operator, never enforced.
+pub fn expected_mssql_database(site_id: &str) -> Option<&'static str> {
+    match site_id {
+        "hfville" => Some("HOTEL"),
+        _ => None,
+    }
+}
+
+/// Refuse to write when the resolved databases contradict `SITE_ID`.
+///
+/// The two halves of this bin are wired from independent env vars, so a
+/// half-supplied environment (e.g. `SITE_ID`/`DB_*` exported for Ville but
+/// `DATABASE_URL` inherited from `.env`) reads one site and writes the other,
+/// producing a report indistinguishable from a correct run. MSSQL database
+/// names are case-insensitive, so that half compares case-insensitively.
+pub fn check_target_binding(
+    site_id: &str,
+    pg_database: &str,
+    mssql_database: &str,
+) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+
+    match expected_pg_database(site_id) {
+        Some(expected) if expected != pg_database => problems.push(format!(
+            "PostgreSQL database is {pg_database:?} but SITE_ID={site_id} implies {expected:?}"
+        )),
+        None => problems.push(format!(
+            "SITE_ID={site_id:?} is not one of the known sites (hfhotel, hfville), \
+             so the PostgreSQL target cannot be verified"
+        )),
+        _ => {}
+    }
+
+    if let Some(expected) = expected_mssql_database(site_id) {
+        if !expected.eq_ignore_ascii_case(mssql_database) {
+            problems.push(format!(
+                "legacy MSSQL database is {mssql_database:?} but SITE_ID={site_id} implies \
+                 {expected:?}"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "REFUSING to write: {}. The PG half (DATABASE_URL/NEW_DATABASE_URL) and the legacy \
+         half (DB_SERVER/MSSQL_PORT/DB_NAME) are wired from INDEPENDENT env vars and dotenvy \
+         fills in whichever one you left unset from hotel-backend/.env — a half-supplied \
+         environment reads one site and rewrites the other. Export every variable for the \
+         site you mean, then re-run.",
+        problems.join("; ")
+    ))
+}
+
+/// Refuse to write a plan that leaves rooms unmatched or ambiguous.
+///
+/// A canonical room the bin could not match KEEPS whatever
+/// `legacy_room_id_int` it already had. If that stale value collides with an
+/// id this run just assigned to another room, `sync/mappers/room.rs` resolves
+/// `legacy_room_id_int = $1 OR room_no = $2` with both rows satisfying the id
+/// predicate and NO tiebreak column — inbound `room_clean` / `room_maintenance`
+/// / `room_notes` then land on whichever row PG happens to return, and the
+/// `room_no IS DISTINCT FROM legacy_room_no` acceptance query does not catch it.
+pub fn apply_block_reason(plan: &Plan, allow_partial: bool) -> Option<String> {
+    if allow_partial {
+        return None;
+    }
+    let mut gaps: Vec<String> = Vec::new();
+    if !plan.legacy_without_canonical.is_empty() {
+        gaps.push(format!(
+            "{} legacy room(s) with no canonical row",
+            plan.legacy_without_canonical.len()
+        ));
+    }
+    if !plan.canonical_without_legacy.is_empty() {
+        gaps.push(format!(
+            "{} canonical room(s) with no legacy row (each KEEPS its current, possibly stale, \
+             legacy_room_id_int)",
+            plan.canonical_without_legacy.len()
+        ));
+    }
+    if !plan.ambiguous_legacy_room_nos.is_empty() {
+        gaps.push(format!(
+            "{} duplicated legacy Room_no value(s)",
+            plan.ambiguous_legacy_room_nos.len()
+        ));
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "REFUSING to apply a PARTIAL plan: {}. An unmatched canonical room keeps its stale \
+         pointer, which can collide with an id this run assigns elsewhere and make the inbound \
+         CT room resolver non-deterministic. Fix the gaps in iHOTEL / run backfill_rooms, or \
+         re-run with --allow-partial once you have read WHY each room is unmatched.",
+        gaps.join("; ")
+    ))
+}
+
+// =============================================================================
 // Runner
 // =============================================================================
 
@@ -260,6 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // DRY RUN IS THE DEFAULT. Writing requires an explicit `--apply`; there is
     // no way to write by forgetting a flag.
     let apply = env::args().any(|a| a == "--apply");
+    let allow_partial = env::args().any(|a| a == "--allow-partial");
     let site_id = env::args()
         .find_map(|a| a.strip_prefix("--site-id=").map(str::to_string))
         .or_else(|| env::var("SITE_ID").ok())
@@ -268,11 +422,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(
         site = %site_id,
         mode = if apply { "APPLY" } else { "DRY RUN" },
+        allow_partial,
         "repair_room_legacy_keys — starting"
     );
 
-    let pg = connect_pg().await?;
-    let legacy = fetch_legacy_rooms().await?;
+    // Resolve BOTH targets before anything is read or written, so the report
+    // header can name the databases actually used and the SITE_ID binding can
+    // be checked before a single row moves (F1).
+    let (pg, pg_database) = connect_pg().await?;
+    let db_config = hotel_backend::config::DbConfig::from_env();
+    let targets = Targets {
+        pg_database,
+        mssql_server: db_config.server.clone(),
+        mssql_port: db_config.port,
+        mssql_database: db_config.database.clone(),
+    };
+    let binding = check_target_binding(&site_id, &targets.pg_database, &targets.mssql_database);
+    if let Err(reason) = &binding {
+        if apply {
+            print_targets(&site_id, &targets, Some(reason));
+            return Err(reason.clone().into());
+        }
+    }
+
+    let legacy = fetch_legacy_rooms(&db_config).await?;
     let canonical = fetch_canonical_rooms(&pg).await?;
     tracing::info!(
         site = %site_id,
@@ -284,14 +457,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut plan = plan_repairs(&legacy.rooms, &canonical);
     plan.skipped_blank_legacy_room_no = legacy.skipped_blank;
 
+    // A partial plan is refused BEFORE the transaction opens — nothing is
+    // written, and the operator still gets the full report to act on (F2).
+    let blocked = if apply {
+        apply_block_reason(&plan, allow_partial)
+    } else {
+        None
+    };
+
     let start = Instant::now();
     let mut applied = 0u64;
-    if apply && !plan.is_noop() {
+    let mut residual: Option<Plan> = None;
+    if apply && blocked.is_none() && !plan.is_noop() {
         applied = apply_repairs(&pg, &plan).await?;
+
+        // Built-in re-verify (F3): the CT room mapper reads outside this bin's
+        // lock, so a tick in flight during the apply can re-stamp a row the
+        // instant we commit. Re-read BOTH sides and re-plan — a non-empty
+        // residual is the only proof that happened, and the caller's fix is
+        // simply to re-run.
+        let legacy_after = fetch_legacy_rooms(&db_config).await?;
+        let canonical_after = fetch_canonical_rooms(&pg).await?;
+        let mut after = plan_repairs(&legacy_after.rooms, &canonical_after);
+        after.skipped_blank_legacy_room_no = legacy_after.skipped_blank;
+        residual = Some(after);
     }
     let duration = start.elapsed();
 
-    print_report(&site_id, apply, &plan, applied, duration);
+    let mode = match (apply, blocked.is_some()) {
+        (true, true) => Mode::Refused,
+        (true, false) => Mode::Apply,
+        (false, _) => Mode::DryRun,
+    };
+    print_report(
+        &site_id,
+        &targets,
+        binding.as_ref().err().map(String::as_str),
+        mode,
+        &plan,
+        applied,
+        residual.as_ref(),
+        duration,
+    );
+
+    if let Some(reason) = blocked {
+        return Err(reason.into());
+    }
+    if let Some(after) = &residual {
+        if !after.is_noop() {
+            let reason = format!(
+                "APPLIED {applied} row(s), but the re-verify still plans {} repair(s) — the live \
+                 CT room mapper re-stamped a row during the apply. Nothing is broken; re-run \
+                 --apply (ideally with the site's sync worker stopped) until this reports 0.",
+                after.repairs.len()
+            );
+            return Err(reason.into());
+        }
+    }
 
     if !apply && !plan.is_noop() {
         tracing::warn!(
@@ -303,21 +525,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-/// Emit the operator-facing before/after table + summary (stdout, so it can be
-/// pasted straight into the runbook).
-fn print_report(
-    site_id: &str,
-    apply: bool,
-    plan: &Plan,
-    applied: u64,
-    duration: std::time::Duration,
-) {
+/// What the run actually did — kept distinct from `apply` so a refused apply
+/// can never print the word "APPLY" over a report where nothing was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    DryRun,
+    Apply,
+    Refused,
+}
+
+/// The databases this process actually resolved — printed so a report can be
+/// matched to the site it came from (F1).
+struct Targets {
+    pg_database: String,
+    mssql_server: String,
+    mssql_port: u16,
+    mssql_database: String,
+}
+
+/// The report header: WHICH databases this run resolved. Printed by both the
+/// dry run and the live run, and on its own when `--apply` is refused, so no
+/// report can be read without knowing what it was read from (F1).
+fn print_targets(site_id: &str, targets: &Targets, binding_error: Option<&str>) {
     println!();
     println!("=== Room legacy-key repair (ht_rooms_new.legacy_room_id_int / legacy_room_no) ===");
-    println!("Site:                    {site_id}");
+    println!("Site (SITE_ID):          {site_id}");
+    println!(
+        "PostgreSQL database:     {} (select current_database(){})",
+        targets.pg_database,
+        match expected_pg_database(site_id) {
+            Some(expected) => format!("; SITE_ID implies {expected}"),
+            None => "; SITE_ID implies nothing — unknown site".to_string(),
+        }
+    );
+    println!(
+        "Legacy MSSQL:            {}:{}/{}{}",
+        targets.mssql_server,
+        targets.mssql_port,
+        targets.mssql_database,
+        match expected_mssql_database(site_id) {
+            Some(expected) => format!(" (SITE_ID implies db {expected})"),
+            None => " (db not derivable from SITE_ID — not verified)".to_string(),
+        }
+    );
+    if let Some(error) = binding_error {
+        println!();
+        println!("*** TARGET MISMATCH ***");
+        println!("{error}");
+    }
+}
+
+/// Emit the operator-facing before/after table + summary (stdout, so it can be
+/// pasted straight into the runbook).
+#[allow(clippy::too_many_arguments)]
+fn print_report(
+    site_id: &str,
+    targets: &Targets,
+    binding_error: Option<&str>,
+    mode: Mode,
+    plan: &Plan,
+    applied: u64,
+    residual: Option<&Plan>,
+    duration: std::time::Duration,
+) {
+    print_targets(site_id, targets, binding_error);
     println!(
         "Mode:                    {}",
-        if apply { "APPLY" } else { "DRY RUN (no writes)" }
+        match mode {
+            Mode::Apply => "APPLY",
+            Mode::DryRun => "DRY RUN (no writes)",
+            Mode::Refused => "APPLY REFUSED (no writes)",
+        }
     );
     println!();
 
@@ -351,9 +629,13 @@ fn print_report(
     println!(
         "Rooms to repair:         {}{}",
         plan.repairs.len(),
-        if apply { "" } else { " (would repair)" }
+        if mode == Mode::Apply {
+            ""
+        } else {
+            " (would repair)"
+        }
     );
-    if apply {
+    if mode == Mode::Apply {
         println!("Rows updated:            {applied}");
     }
     println!("Already correct:         {}", plan.already_correct.len());
@@ -383,6 +665,32 @@ fn print_report(
         plan.skipped_blank_legacy_room_no
     );
     println!("Duration:                {duration:?}");
+
+    // Built-in post-apply re-verify (F3) — both sides re-read, plan recomputed.
+    if let Some(after) = residual {
+        println!();
+        println!("--- re-verify (both sides re-read after the apply) ---");
+        println!("Rooms still to repair:   {}", after.repairs.len());
+        if after.is_noop() {
+            println!("Re-verify:               PASS (0 residual repairs)");
+        } else {
+            println!(
+                "Re-verify:               FAIL — {}",
+                summarize(
+                    &after
+                        .repairs
+                        .iter()
+                        .map(|r| r.room_no.clone())
+                        .collect::<Vec<_>>()
+                )
+            );
+            println!(
+                "The live CT room mapper re-stamped a row during the apply (it reads outside \
+                 this bin's lock). Nothing is broken — re-run --apply, ideally with the site's \
+                 sync worker stopped, until this reports 0."
+            );
+        }
+    }
 
     if !plan.ambiguous_legacy_room_nos.is_empty() {
         println!();
@@ -457,12 +765,17 @@ struct LegacyRooms {
 }
 
 /// Read `(id, Room_no)` from legacy `HT_Rooms` — READ-ONLY.
-async fn fetch_legacy_rooms() -> Result<LegacyRooms, Box<dyn std::error::Error + Send + Sync>> {
-    let config = hotel_backend::config::DbConfig::from_env();
+///
+/// Takes the config the caller already resolved (and printed in the report
+/// header) so the rows can never come from a different server than the one the
+/// report names.
+async fn fetch_legacy_rooms(
+    config: &hotel_backend::config::DbConfig,
+) -> Result<LegacyRooms, Box<dyn std::error::Error + Send + Sync>> {
     let server = config.server.clone();
     let port = config.port;
     let database = config.database.clone();
-    let pool = hotel_backend::db::create_pool(&config)
+    let pool = hotel_backend::db::create_pool(config)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     tracing::info!("Connecting to legacy SQL Server at {server}:{port} (db {database})");
@@ -527,7 +840,11 @@ async fn fetch_canonical_rooms(
         .collect())
 }
 
-async fn connect_pg() -> Result<PgPool, Box<dyn std::error::Error + Send + Sync>> {
+/// Connect to canonical PG and ask the SERVER which database it landed in —
+/// never parsed out of the URL, which can carry a stale path, an override, or
+/// a `?dbname=` the driver ignores. The answer is what the report header shows
+/// and what the `SITE_ID` binding check is made against (F1).
+async fn connect_pg() -> Result<(PgPool, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = env::var("DATABASE_URL")
         .or_else(|_| env::var("NEW_DATABASE_URL"))
         .map_err(|_| "DATABASE_URL or NEW_DATABASE_URL must be set")?;
@@ -535,8 +852,12 @@ async fn connect_pg() -> Result<PgPool, Box<dyn std::error::Error + Send + Sync>
         .max_connections(PG_POOL_MAX)
         .connect(&url)
         .await?;
-    tracing::info!("Connected to PostgreSQL");
-    Ok(pool)
+    let database: String = sqlx::query("select current_database()")
+        .fetch_one(&pool)
+        .await?
+        .try_get::<String, _>(0)?;
+    tracing::info!(database = %database, "Connected to PostgreSQL");
+    Ok((pool, database))
 }
 
 // =============================================================================
@@ -714,5 +1035,150 @@ mod tests {
             plan_repairs(&legacy_rooms, &after).is_noop(),
             "a second run must be a no-op"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // F1 — SITE_ID ↔ resolved-database binding
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn site_id_implies_its_own_pg_database() {
+        assert_eq!(expected_pg_database("hfhotel"), Some("hotelnew"));
+        assert_eq!(expected_pg_database("hfville"), Some("hotelville"));
+        assert_eq!(expected_pg_database("hfvilel"), None);
+    }
+
+    #[test]
+    fn matching_targets_are_accepted() {
+        assert!(check_target_binding("hfville", "hotelville", "HOTEL").is_ok());
+        // HF Hotel's legacy DB_NAME comes from a repo secret — not derivable,
+        // so whatever it is must not be second-guessed.
+        assert!(check_target_binding("hfhotel", "hotelnew", "anything").is_ok());
+    }
+
+    /// THE failure this gate exists for: `SITE_ID`/`DB_*` exported for Ville
+    /// but `DATABASE_URL` left to dotenvy's `.env` (HF Hotel's). The run would
+    /// read Ville's legacy rooms and rewrite HF HOTEL's canonical pointers,
+    /// and its report would be indistinguishable from a correct Ville run.
+    #[test]
+    fn ville_site_against_hotel_pg_database_is_refused() {
+        let error = check_target_binding("hfville", "hotelnew", "HOTEL")
+            .expect_err("a Ville run against hotelnew must be refused");
+        assert!(error.contains("hotelnew"), "{error}");
+        assert!(error.contains("hotelville"), "{error}");
+        assert!(error.starts_with("REFUSING to write"), "{error}");
+    }
+
+    #[test]
+    fn hotel_site_against_ville_pg_database_is_refused() {
+        assert!(check_target_binding("hfhotel", "hotelville", "db").is_err());
+    }
+
+    /// MSSQL database names are case-insensitive, so a legitimately-cased
+    /// value must not be refused — but a genuinely different database must be.
+    #[test]
+    fn mssql_database_is_checked_case_insensitively_where_derivable() {
+        assert!(check_target_binding("hfville", "hotelville", "hotel").is_ok());
+        let error = check_target_binding("hfville", "hotelville", "HOTELNEW")
+            .expect_err("a Ville run against a non-HOTEL legacy db must be refused");
+        assert!(error.contains("HOTELNEW"), "{error}");
+    }
+
+    /// An unknown `SITE_ID` cannot imply anything, so nothing can be verified
+    /// — that is a refusal, not a pass.
+    #[test]
+    fn unknown_site_id_cannot_be_verified_and_is_refused() {
+        let error = check_target_binding("hfvilel", "hotelville", "HOTEL")
+            .expect_err("an unknown SITE_ID must not be silently trusted");
+        assert!(error.contains("not one of the known sites"), "{error}");
+    }
+
+    // -------------------------------------------------------------------
+    // F2 — a partial plan must not be applied
+    // -------------------------------------------------------------------
+
+    fn partial_plan_pieces() -> Vec<(&'static str, Plan)> {
+        vec![
+            (
+                "legacy_without_canonical",
+                Plan {
+                    repairs: vec![],
+                    legacy_without_canonical: vec![legacy(21, "203")],
+                    ..Plan::default()
+                },
+            ),
+            (
+                "canonical_without_legacy",
+                Plan {
+                    canonical_without_legacy: vec!["210".to_string()],
+                    ..Plan::default()
+                },
+            ),
+            (
+                "ambiguous_legacy_room_nos",
+                Plan {
+                    ambiguous_legacy_room_nos: vec!["101".to_string()],
+                    ..Plan::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn complete_plan_is_not_blocked() {
+        let plan = plan_repairs(
+            &[legacy(3, "102"), legacy(2, "116")],
+            &[
+                canonical(2, "102", Some(2), Some("116")),
+                canonical(16, "116", Some(16), Some("999")),
+            ],
+        );
+        assert_eq!(plan.repairs.len(), 2);
+        assert!(
+            apply_block_reason(&plan, false).is_none(),
+            "a plan with no gaps must apply without --allow-partial"
+        );
+    }
+
+    /// Each gap on its own blocks the apply: an unmatched canonical room keeps
+    /// a stale `legacy_room_id_int` that can collide with an id this run
+    /// assigns elsewhere, and the CT room resolver has no tiebreak.
+    #[test]
+    fn each_gap_blocks_the_apply() {
+        for (label, plan) in partial_plan_pieces() {
+            let reason = apply_block_reason(&plan, false)
+                .unwrap_or_else(|| panic!("{label} must block the apply"));
+            assert!(
+                reason.starts_with("REFUSING to apply a PARTIAL plan"),
+                "{label}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_partial_overrides_every_gap() {
+        for (label, plan) in partial_plan_pieces() {
+            assert!(
+                apply_block_reason(&plan, true).is_none(),
+                "{label} must be applyable under an explicit --allow-partial"
+            );
+        }
+    }
+
+    /// The live Ville shape reported at dry-run time (24 canonical rooms with
+    /// no legacy row) must NOT slip through as an unremarkable NOTE.
+    #[test]
+    fn ville_dry_run_shape_blocks_without_allow_partial() {
+        let plan = plan_repairs(
+            &[legacy(2, "116"), legacy(3, "102")],
+            &[
+                canonical(2, "102", Some(2), Some("116")),
+                canonical(16, "116", Some(16), Some("999")),
+                canonical(10, "210", Some(12), Some("210")),
+            ],
+        );
+        assert_eq!(plan.canonical_without_legacy, vec!["210".to_string()]);
+        let reason = apply_block_reason(&plan, false).expect("unmatched canonical must block");
+        assert!(reason.contains("canonical room(s) with no legacy row"), "{reason}");
     }
 }

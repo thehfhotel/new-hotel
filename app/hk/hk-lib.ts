@@ -110,20 +110,31 @@ export function storeBranch(branch: Branch): void {
 }
 
 /**
- * The branch a page should use on first render, BEFORE any tap (§A3):
- *  1. exactly one configured branch ⇒ auto-select it, no picker rendered —
- *     this is the shipping state (HF Hotel only) so maids see zero new UI.
- *  2. more than one AND a still-valid stored choice ⇒ that choice.
- *  3. more than one AND no stored choice, or a stored value that is no
- *     longer in `branches` ⇒ `null` — the caller must render the picker and
- *     block, never fall back to a default.
+ * The branch a page should use on first render, BEFORE any tap (§A3). The
+ * rules are evaluated in this order, and the ORDER IS THE POINT:
+ *  1. a stored value that is no longer in `branches` ⇒ `null`. Discard it and
+ *     re-ask — even when only one branch is left. This must be checked FIRST:
+ *     if the single-branch auto-select ran first, a Ville maid whose branch was
+ *     removed by a rollback (`HK_BRANCHES=hfhotel,hfville` → `hfhotel`) would be
+ *     silently moved to HF Hotel with no picker and no notice, and her next
+ *     report on ห้อง 203 would file against the OTHER hotel's room 203 — the
+ *     exact wrong-hotel bug this surface exists to close.
+ *  2. a still-valid stored choice ⇒ that choice.
+ *  3. nothing stored AND exactly one configured branch ⇒ auto-select it, no
+ *     picker rendered — this is the shipping state (HF Hotel only), so maids
+ *     who never chose see zero new UI.
+ *  4. anything else ⇒ `null` — the caller must render the picker and block,
+ *     never fall back to a default.
  */
 export function resolveInitialBranch(
   branches: HkBranchOption[],
   stored: Branch | null
 ): Branch | null {
+  if (stored) {
+    // Rule 1 before rule 3: a stale stored branch always re-asks.
+    return branches.some((b) => b.id === stored) ? stored : null
+  }
   if (branches.length === 1) return branches[0].id
-  if (stored && branches.some((b) => b.id === stored)) return stored
   return null
 }
 

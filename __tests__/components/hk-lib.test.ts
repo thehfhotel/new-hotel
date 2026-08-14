@@ -182,9 +182,8 @@ describe('resolveInitialBranch', () => {
   const hfhotelOnly = [branchOption('hfhotel', 'ฮาร์เบอร์ฟร้อนท์')]
   const both = [branchOption('hfhotel', 'ฮาร์เบอร์ฟร้อนท์'), branchOption('hfville', 'วิลล์')]
 
-  it('auto-selects the single configured branch, regardless of storage', () => {
+  it('auto-selects the single configured branch when nothing is stored (the shipping state)', () => {
     expect(resolveInitialBranch(hfhotelOnly, null)).toBe('hfhotel')
-    expect(resolveInitialBranch(hfhotelOnly, 'hfville')).toBe('hfhotel')
   })
 
   it('uses the stored branch when multiple branches are configured and it is still valid', () => {
@@ -192,13 +191,25 @@ describe('resolveInitialBranch', () => {
     expect(resolveInitialBranch(both, 'hfhotel')).toBe('hfhotel')
   })
 
+  it('keeps a stored branch that is still the only configured one', () => {
+    expect(resolveInitialBranch(hfhotelOnly, 'hfhotel')).toBe('hfhotel')
+  })
+
   it('returns null (never a default) when multiple branches are configured and nothing valid is stored', () => {
     expect(resolveInitialBranch(both, null)).toBeNull()
+    expect(resolveInitialBranch(both, 'hfhotel' as Branch)).toBe('hfhotel')
   })
 
   it('discards a stale stored branch no longer in the configured list', () => {
-    expect(resolveInitialBranch(hfhotelOnly, 'hfville')).toBe('hfhotel') // single-branch case above
-    expect(resolveInitialBranch([branchOption('hfville', 'วิลล์')], 'hfhotel')).toBe('hfville')
+    expect(resolveInitialBranch([branchOption('hfville', 'วิลล์')], 'hfhotel')).toBeNull()
+  })
+
+  // The rollback path this ordering exists for: HK_BRANCHES goes
+  // hfhotel,hfville → hfhotel while a Ville maid has 'hfville' stored. The
+  // single-branch auto-select must NOT run first and silently move her to
+  // HF Hotel — she gets the picker (rule 1 beats rule 3).
+  it('re-asks instead of auto-selecting the last branch standing after a rollback', () => {
+    expect(resolveInitialBranch(hfhotelOnly, 'hfville')).toBeNull()
   })
 })
 
