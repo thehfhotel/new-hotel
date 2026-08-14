@@ -565,6 +565,15 @@ services:
       - postgres_password
       - ville_db_password
       - slack_webhook_url
+      # OTA booking bridge (docs/ota-bridge.md). SAFE to declare only because
+      # the deploy payload has carried `.secrets.ota_bridge_token{,_previous}`
+      # since the previous deploy, so both host files exist. run-deploy.sh
+      # writes a file for EVERY key in .secrets — including empty values — so
+      # an unset GH secret yields an empty file: the hydrator skips it (empty ==
+      # missing), the env var stays unset and the gate fails closed. A MISSING
+      # file, by contrast, aborts the entire stack start.
+      - ota_bridge_token
+      - ota_bridge_token_previous
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -1385,3 +1394,13 @@ secrets:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/ville_db_password
   slack_webhook_url:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/slack_webhook_url
+  # OTA booking bridge shared bearer + its rotation slot (docs/ota-bridge.md).
+  # Declared ONE DEPLOY AFTER the docker-build.yml payload key that creates the
+  # files — see the note above about a missing file aborting the whole stack.
+  # `ota_bridge_token` MUST hold the identical string as ota-desk's
+  # `PMS_BRIDGE_TOKEN`; compare `sha256(token)[0..6]` on both sides rather than
+  # the values.
+  ota_bridge_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token
+  ota_bridge_token_previous:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token_previous
