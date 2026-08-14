@@ -112,6 +112,26 @@ pub enum DomainEvent {
         room_id: Uuid,
         source: EventSource,
     },
+
+    /// A maid tapped เริ่มทำความสะอาด on the `/hk` surface — the room is now
+    /// being cleaned.
+    ///
+    /// PG-ONLY BY DESIGN: unlike [`RoomMarkedClean`](Self::RoomMarkedClean) /
+    /// [`RoomMarkedDirty`](Self::RoomMarkedDirty) this event has NO writeback
+    /// twin. iHOTEL's in-progress field `Room_Clean_Time` feeds its room-power
+    /// countdown, so mirroring "started" is parity risk for no operational gain
+    /// (housekeeping-ops plan, decision #3; `routes::hk` module header).
+    ///
+    /// Its whole job is reception visibility: the แผนกแม่บ้าน board subscribes
+    /// to this name over SSE (`routes::events`) and re-renders the middle
+    /// "กำลังทำความสะอาด" column live, without the maid touching iHOTEL.
+    /// `by` is the maid label (verified HF ID display name, badge fallback) —
+    /// the same value `MarkRoomClean` carries.
+    RoomCleaningStarted {
+        room_id: Uuid,
+        by: String,
+        source: EventSource,
+    },
 }
 
 impl DomainEvent {
@@ -132,6 +152,7 @@ impl DomainEvent {
             DomainEvent::RoomMarkedClean { .. } => "RoomMarkedClean",
             DomainEvent::RoomMarkedDirty { .. } => "RoomMarkedDirty",
             DomainEvent::RoomLayoutChanged { .. } => "RoomLayoutChanged",
+            DomainEvent::RoomCleaningStarted { .. } => "RoomCleaningStarted",
         }
     }
 
@@ -153,7 +174,8 @@ impl DomainEvent {
             | DomainEvent::PaymentRefunded { check_in_id, .. } => *check_in_id,
             DomainEvent::RoomMarkedClean { room_id, .. }
             | DomainEvent::RoomMarkedDirty { room_id, .. }
-            | DomainEvent::RoomLayoutChanged { room_id, .. } => *room_id,
+            | DomainEvent::RoomLayoutChanged { room_id, .. }
+            | DomainEvent::RoomCleaningStarted { room_id, .. } => *room_id,
         }
     }
 
@@ -176,7 +198,8 @@ impl DomainEvent {
             | DomainEvent::PaymentRefunded { source, .. }
             | DomainEvent::RoomMarkedClean { source, .. }
             | DomainEvent::RoomMarkedDirty { source, .. }
-            | DomainEvent::RoomLayoutChanged { source, .. } => source,
+            | DomainEvent::RoomLayoutChanged { source, .. }
+            | DomainEvent::RoomCleaningStarted { source, .. } => source,
         }
     }
 }

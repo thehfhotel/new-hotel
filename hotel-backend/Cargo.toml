@@ -65,6 +65,13 @@ path = "src/bin/create_user.rs"
 name = "set_user_card"
 path = "src/bin/set_user_card.rs"
 
+# One-shot operator repair for ht_rooms_new.legacy_room_id_int / legacy_room_no
+# (wave-4 B0). Dry-run by default; --apply required to write. See
+# migrations/README.md "Companion utility bins".
+[[bin]]
+name = "repair_room_legacy_keys"
+path = "src/bin/repair_room_legacy_keys.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware).
 # 0.8 migration (2026-05-01): path param syntax changed from `/:id` to `/{id}`

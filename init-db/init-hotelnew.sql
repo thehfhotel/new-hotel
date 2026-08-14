@@ -403,10 +403,13 @@ CREATE TABLE IF NOT EXISTS ht_guest_doc_backfill_skip (
 -- PG-only (iHOTEL's Room_Clean_Time drives its room-power countdown).
 -- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
 -- ht_users. Per-site (connection-level scoping).
+-- Migration 087 widened hkev_status to also accept 'dirty' (maid-reported
+-- "ห้องยังไม่สะอาด", gated by HK_MARK_DIRTY_ENABLED) — inlined into the CHECK
+-- below; the schema_migrations seed row for 087 is near the end of this file.
 CREATE TABLE IF NOT EXISTS ht_hk_cleaning_events (
     hkev_id         BIGSERIAL    PRIMARY KEY,
     hkev_room_id    INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
-    hkev_status     TEXT         NOT NULL CHECK (hkev_status IN ('started', 'done')),
+    hkev_status     TEXT         NOT NULL CHECK (hkev_status IN ('started', 'done', 'dirty')),
     hkev_badge      TEXT         NOT NULL,
     hkev_name       TEXT,
     hkev_created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -2662,6 +2665,17 @@ ON CONFLICT (version) DO NOTHING;
 -- sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('077', '077_create_ht_housekeeping_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 087 — widen ht_hk_cleaning_events.hkev_status to accept 'dirty'
+-- (maid-reported "ห้องยังไม่สะอาด" on /hk, gated by HK_MARK_DIRTY_ENABLED,
+-- default off). The CHECK is inlined into the CREATE TABLE above, so a fresh
+-- seed already has the widened constraint; this row records the migration as
+-- applied so the drift check sees zero pending. The table stays PG-canonical
+-- only — only the ht_rooms_new.room_clean FLAG crosses to legacy, via the
+-- existing byte-pinned MarkRoomClean / MarkRoomDirty recipes.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('087', '087_hk_cleaning_events_dirty_status.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

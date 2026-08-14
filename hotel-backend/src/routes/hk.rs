@@ -6,9 +6,30 @@
 //! - `GET  /api/hk/me`                          — the verified maid identity.
 //! - `GET  /api/hk/rooms`                       — room list + today's progress.
 //! - `GET  /api/hk/rooms/{id}`                  — one room + today's events.
-//! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`).
+//! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`/`dirty`).
 //! - `POST /api/hk/rooms/{id}/broken-items`     — RETIRED, answers `410 Gone`.
 //! - `GET  /api/hk/broken-items/{id}/photo`     — stream a report's photo.
+//!
+//! ## `?branch=` is REQUIRED on every room endpoint (wave-4 A)
+//!
+//! It used to be optional, and `None` fell through to `Branch::default()` =
+//! HF Hotel (`routes::mode`). The `/hk` page never sent it, so a HF Ville maid's
+//! report was filed against HF Hotel — "pinned by omission", not by design.
+//!
+//! Now every room endpoint 400s without an explicit, exactly-spelled
+//! `hfhotel` / `hfville`. `branch=all` is refused too: `write_pool(Some(All))`
+//! returns the PRIMARY pool, so accepting it would re-open the identical bug
+//! under a different query string. `GET /api/hk/me` is the ONE exception — it is
+//! what tells the client which branches exist, so it must answer before a branch
+//! is chosen.
+//!
+//! Which branches a maid may pick is [`HkPolicy::branches`], from `HK_BRANCHES`
+//! (default `hfhotel`); a well-formed branch outside that list is `403`. Server
+//! is the enforcement point, the picker is only UX — a stale cached bundle that
+//! still omits `?branch=` fails loudly instead of silently mutating HF Hotel.
+//!
+//! The gate lives in the HANDLERS, i.e. INSIDE `require_hk_access`: an
+//! unauthenticated caller gets 401 and can never probe branch configuration.
 //!
 //! ## Identity & auth
 //!
@@ -36,8 +57,22 @@
 //! - `started` stays PG-only on purpose — iHOTEL's in-progress field
 //!   `Room_Clean_Time` feeds its room-power countdown, so mirroring it is
 //!   parity risk for no operational gain (housekeeping-ops plan, decision #3).
-//! - The repeat-tap guard lives in `mark_clean_if_dirty`'s conditional UPDATE,
-//!   so a maid double-tapping เสร็จแล้ว cannot double-write `HT_Housewife`.
+//!   It publishes [`crate::outbox::event::DomainEvent::RoomCleaningStarted`] so
+//!   reception's board sees the room go in-progress live over SSE.
+//! - **`cleaning` with `dirty` ships DARK (wave-4 B, invariant #6).** The
+//!   `MarkRoomDirty` write SHAPE is already live-verified
+//!   (`docs/coexistence/phase3-mark-dirty-runsheet.md`), but the TRIGGER is new
+//!   — a maid's phone, unattended, able to flag an occupied room mid-stay. So it
+//!   is gated by `HK_MARK_DIRTY_ENABLED` (default OFF ⇒ `403`) and needs
+//!   reception-coordinated live verification before the flag flips. A flag flip
+//!   here is NOT "just config".
+//! - The repeat-tap guard lives in the service's conditional UPDATE, so a maid
+//!   double-tapping เสร็จแล้ว cannot double-write `HT_Housewife`.
+//! - The whole tap (event row + flag flip + writeback enqueue + domain event)
+//!   commits in ONE transaction inside
+//!   [`crate::service::housekeeping::HousekeepingService::report_cleaning_progress`]
+//!   (invariants #1 + #2) — it used to be a bare pool INSERT followed by a
+//!   separate service transaction.
 //!
 //! Branch-aware via `?branch=` resolved through the unified
 //! [`AppState::write_pool`] chokepoint (Ship-B gate).
@@ -77,32 +112,191 @@ use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
-use crate::service::housekeeping::{HousekeepingService, MarkCleanCommand};
+use crate::service::housekeeping::{
+    CleaningProgressStatus, HousekeepingService, ReportCleaningCommand,
+};
 
 /// Cleaning-progress statuses a maid can report. `started` =
-/// เริ่มทำความสะอาด, `done` = เสร็จแล้ว. Matches the CHECK constraint on
-/// `ht_hk_cleaning_events.hkev_status` (migration 077).
-pub const VALID_CLEANING_STATUSES: [&str; 2] = ["started", "done"];
+/// เริ่มทำความสะอาด, `done` = เสร็จแล้ว, `dirty` = ห้องยังไม่สะอาด. Matches the
+/// CHECK constraint on `ht_hk_cleaning_events.hkev_status` (migration 077,
+/// widened by migration 087) — keep the two in lock-step.
+pub const VALID_CLEANING_STATUSES: [&str; 3] = ["started", "done", "dirty"];
 
-/// Branch selector shared by every hk route (`?branch=`; absent ⇒ HF Hotel).
+/// Env var listing the branches the `/hk` surface may serve. Comma-separated;
+/// unset ⇒ [`DEFAULT_HK_BRANCH`].
+pub const HK_BRANCHES_ENV: &str = "HK_BRANCHES";
+
+/// Env var gating `status:"dirty"` (invariant #6). Default OFF.
+pub const HK_MARK_DIRTY_ENV: &str = "HK_MARK_DIRTY_ENABLED";
+
+/// The one branch served when `HK_BRANCHES` is unset — HF Ville is admitted
+/// only after its legacy-key repair is verified (`bin/repair_room_legacy_keys`).
+pub const DEFAULT_HK_BRANCH: Branch = Branch::Hfhotel;
+
+/// 400 body for a missing / malformed `?branch=`.
+pub const BRANCH_REQUIRED_ERROR: &str = "branch query parameter is required (hfhotel|hfville)";
+
+/// 403 body for a well-formed branch that `HK_BRANCHES` does not list.
+pub const BRANCH_NOT_ENABLED_ERROR: &str = "branch not enabled for the housekeeping surface";
+
+/// 403 body when `status:"dirty"` arrives while `HK_MARK_DIRTY_ENABLED` is off.
+/// Thai, because a maid reads it (the frontend hides the button, so this is the
+/// stale-bundle path).
+pub const MARK_DIRTY_DISABLED_ERROR: &str =
+    "ยังไม่เปิดใช้งานการแจ้งห้องไม่สะอาด กรุณาแจ้งแผนกต้อนรับ";
+
+/// Runtime configuration of the `/hk` surface, resolved ONCE at startup and
+/// carried as a request extension by [`router`].
+///
+/// It lives here (not on `AppState`) deliberately: this is surface-local policy
+/// with no bearing on any other route, and keeping it out of `AppState` means
+/// the integration tests can mount the same handlers under a DIFFERENT policy
+/// without a process-global that two tests would fight over.
+#[derive(Debug, Clone)]
+pub struct HkPolicy {
+    /// Branches a maid may select, in `HK_BRANCHES` order. Never empty.
+    pub branches: Vec<Branch>,
+    /// `HK_MARK_DIRTY_ENABLED` — ships DARK (default `false`).
+    pub mark_dirty_enabled: bool,
+}
+
+impl HkPolicy {
+    /// Read `HK_BRANCHES` + `HK_MARK_DIRTY_ENABLED`. Call ONCE at startup.
+    pub fn from_env() -> Self {
+        let raw = std::env::var(HK_BRANCHES_ENV).ok();
+        let branches = parse_hk_branches(raw.as_deref());
+        let mark_dirty_enabled = std::env::var(HK_MARK_DIRTY_ENV)
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        Self {
+            branches,
+            mark_dirty_enabled,
+        }
+    }
+
+    /// Stable ids of the configured branches, for logging + `GET /api/hk/me`.
+    pub fn branch_ids(&self) -> Vec<&'static str> {
+        self.branches.iter().copied().map(branch_id).collect()
+    }
+}
+
+impl Default for HkPolicy {
+    fn default() -> Self {
+        Self {
+            branches: vec![DEFAULT_HK_BRANCH],
+            mark_dirty_enabled: false,
+        }
+    }
+}
+
+/// Stable wire id of a branch (matches the `?branch=` spelling).
+fn branch_id(branch: Branch) -> &'static str {
+    match branch {
+        Branch::Hfhotel => "hfhotel",
+        Branch::Hfville => "hfville",
+        Branch::All => "all",
+    }
+}
+
+/// Thai label shown in the picker. FIXED values, matching the estate labels the
+/// same maids already see in the Housekeeping ops app
+/// (`~/HF/housekeeping/src/shared/labels.ts`) — do not localize them here.
+fn branch_label_th(branch: Branch) -> &'static str {
+    match branch {
+        Branch::Hfhotel => "ฮาร์เบอร์ฟร้อนท์",
+        Branch::Hfville => "วิลล์",
+        Branch::All => "ทุกสาขา",
+    }
+}
+
+/// Parse `HK_BRANCHES`. PURE — unit-tested below.
+///
+/// Comma-separated, case-insensitive, order preserved, duplicates collapsed.
+/// An unknown token is dropped with a WARN, never a panic: a typo in an env var
+/// must not take the surface down at boot. If nothing usable survives (unset,
+/// blank, or every token unknown) the result is the documented default
+/// `[hfhotel]` — which can never admit HF Ville, so the fallback is safe.
+///
+/// `all` is NOT accepted: it maps to the primary pool in `write_pool`, so
+/// listing it would silently mean "HF Hotel" while reading as "both".
+fn parse_hk_branches(raw: Option<&str>) -> Vec<Branch> {
+    let mut out: Vec<Branch> = Vec::new();
+    for token in raw.unwrap_or_default().split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "hfhotel" => {
+                if !out.contains(&Branch::Hfhotel) {
+                    out.push(Branch::Hfhotel);
+                }
+            }
+            "hfville" => {
+                if !out.contains(&Branch::Hfville) {
+                    out.push(Branch::Hfville);
+                }
+            }
+            other => tracing::warn!(
+                token = other,
+                "{HK_BRANCHES_ENV}: unknown branch token dropped (expected hfhotel|hfville)"
+            ),
+        }
+    }
+    if out.is_empty() {
+        out.push(DEFAULT_HK_BRANCH);
+    }
+    out
+}
+
+/// Parse a `?branch=` value with NO defaulting and NO case-fudging. PURE.
+///
+/// `None` for absent / empty / unknown / `all` / wrong case — every one of
+/// which the caller turns into a 400. Only surrounding whitespace is forgiven.
+fn parse_branch_param(raw: Option<&str>) -> Option<Branch> {
+    match raw.map(str::trim) {
+        Some("hfhotel") => Some(Branch::Hfhotel),
+        Some("hfville") => Some(Branch::Hfville),
+        _ => None,
+    }
+}
+
+/// The required-branch gate: 400 when absent/malformed, 403 when well-formed
+/// but not enabled by `HK_BRANCHES`. PURE — unit-tested below.
+fn require_branch(policy: &HkPolicy, raw: Option<&str>) -> ApiResult<Branch> {
+    let branch = parse_branch_param(raw)
+        .ok_or_else(|| ApiError::BadRequest(BRANCH_REQUIRED_ERROR.to_string()))?;
+    if !policy.branches.contains(&branch) {
+        return Err(ApiError::Forbidden(BRANCH_NOT_ENABLED_ERROR.to_string()));
+    }
+    Ok(branch)
+}
+
+/// Branch selector shared by every hk room route. Deliberately a raw `String`,
+/// not `Option<Branch>`: serde would 400 with its OWN body shape for an unknown
+/// value and would happily accept `all`, so the validation is ours
+/// ([`require_branch`]) and every rejection carries the repo's
+/// `{success:false,error}` envelope.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HkBranchQuery {
-    pub branch: Option<Branch>,
+    pub branch: Option<String>,
 }
 
 /// Resolve the per-site canonical pool via the unified write chokepoint —
-/// same idiom as `routes::new_maintenance::resolve_pool`.
-fn resolve_pool(state: &AppState, branch: Option<Branch>) -> ApiResult<&PgPool> {
-    state.write_pool(branch)
+/// same idiom as `routes::new_maintenance::resolve_pool`. Takes a REQUIRED
+/// branch: the "no branch ⇒ primary pool" fallthrough is the bug this stream
+/// closes, so it is not expressible here.
+fn resolve_pool(state: &AppState, branch: Branch) -> ApiResult<&PgPool> {
+    state.write_pool(Some(branch))
 }
 
 /// Build a [`HousekeepingService`] bound to the branch's pool — identical
 /// construction to `routes::housekeeping::service_for`, so the maid surface
 /// and the front desk share one code path into the `MarkRoomClean` writeback
 /// (and one `Hfville → ville_pool` decision, via `write_pool`).
-fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<HousekeepingService> {
-    let pool = state.write_pool(branch)?.clone();
+fn service_for(state: &AppState, branch: Branch) -> ApiResult<HousekeepingService> {
+    let pool = state.write_pool(Some(branch))?.clone();
     Ok(HousekeepingService::new(
         state.rooms.clone(),
         state.outbox.clone(),
@@ -189,10 +383,36 @@ fn hk_source() -> EventSource {
 /// it and 401 when the guard admits it and auth then refuses — which
 /// distinguishes the two layers without needing a valid Access assertion.
 pub fn router(state: AppState) -> Router {
+    router_with_policy(state, HkPolicy::from_env())
+}
+
+/// [`router`] with an explicit [`HkPolicy`] — used by `main.rs` so the resolved
+/// `HK_BRANCHES` / `HK_MARK_DIRTY_ENABLED` can be logged at startup from the
+/// SAME value the router serves (parsing twice would let the log lie).
+pub fn router_with_policy(state: AppState, policy: HkPolicy) -> Router {
     let ville_guard = axum::middleware::from_fn_with_state(
         state.clone(),
         crate::middleware::ville_guard::ville_write_guard,
     );
+    routes_inside_access(state, policy)
+        .layer(axum::middleware::from_fn(
+            crate::middleware::hk_access::require_hk_access,
+        ))
+        .layer(ville_guard)
+}
+
+/// The `/hk` route table and everything that runs INSIDE the Cloudflare Access
+/// gate — handlers, the 8 MB body limit, and the [`HkPolicy`] extension.
+///
+/// ⚠️ **UNAUTHENTICATED.** This is NOT a mountable surface: it carries no
+/// identity check, and `main.rs` must never mount it. It is `pub` for exactly
+/// one reason — `tests/test_hk_branch_required.rs` has to observe the branch
+/// gate's own status codes (400/403), and through the full [`router`] every
+/// unauthenticated probe is 401 by design (the gate is INSIDE the Access layer
+/// precisely so nobody can probe branch config without an identity). The test
+/// injects its own `Extension<HkIdentity>` in the Access layer's place, then
+/// separately asserts through [`router`] that the real stack still answers 401.
+pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
     Router::new()
         .route("/api/hk/me", get(me))
         .route("/api/hk/rooms", get(list_rooms))
@@ -207,10 +427,7 @@ pub fn router(state: AppState) -> Router {
             get(broken_item_photo),
         )
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
-        .layer(axum::middleware::from_fn(
-            crate::middleware::hk_access::require_hk_access,
-        ))
-        .layer(ville_guard)
+        .layer(Extension(policy))
         .with_state(state)
 }
 
@@ -218,20 +435,40 @@ pub fn router(state: AppState) -> Router {
 // Response types
 // ============================================================================
 
-/// `GET /api/hk/me` — the verified identity, echoed for the header bar.
+/// One selectable property on the `/hk` branch picker.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HkBranchOption {
+    /// `hfhotel` | `hfville` — the exact `?branch=` spelling.
+    pub id: String,
+    pub label_th: String,
+}
+
+/// `GET /api/hk/me` — the verified identity plus the surface's configuration.
+///
+/// Serving `branches` here (instead of a `NEXT_PUBLIC_*` build-time constant)
+/// keeps ONE source of truth: `HK_BRANCHES` changes take effect on a backend
+/// restart, with no frontend rebuild and no chance of the two disagreeing about
+/// which property a maid may file against.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeResponse {
     pub success: bool,
     pub badge: String,
     pub display_name: Option<String>,
+    /// Branches this maid may pick, in `HK_BRANCHES` order. Never empty; a
+    /// single entry means the client auto-selects and renders NO picker.
+    pub branches: Vec<HkBranchOption>,
+    /// `HK_MARK_DIRTY_ENABLED`. `false` ⇒ the client hides the
+    /// "แจ้งห้องไม่สะอาด" button rather than offering a dead tap.
+    pub mark_dirty_enabled: bool,
 }
 
 /// Today's latest cleaning event for a room (the room's current progress).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleaningProgress {
-    /// `started` | `done`.
+    /// `started` | `done` | `dirty`.
     pub status: String,
     pub badge: String,
     pub name: Option<String>,
@@ -283,7 +520,8 @@ pub struct RoomDetailResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReportCleaningBody {
-    /// `started` | `done`.
+    /// `started` | `done` | `dirty`. `dirty` additionally requires
+    /// `HK_MARK_DIRTY_ENABLED` (else 403).
     pub status: String,
 }
 
@@ -293,9 +531,11 @@ pub struct ReportCleaningResponse {
     pub success: bool,
     pub room_id: i32,
     pub status: String,
-    /// `true` when this call performed the dirty→clean transition and so
-    /// enqueued the `MarkRoomClean` writeback. `false` for `started`, and for
-    /// a repeat `done` on an already-clean room (idempotent no-op).
+    /// `true` when this call performed the cleanliness transition and so
+    /// enqueued the matching writeback (`MarkRoomClean` for `done`,
+    /// `MarkRoomDirty` for `dirty`). `false` for `started` — which is
+    /// legacy-inert by design — and for a repeat that changed nothing
+    /// (idempotent no-op).
     ///
     /// ENQUEUED, NOT DELIVERED. This says a `writeback_jobs` row was committed
     /// alongside the canonical flip — nothing about iHOTEL having been written.
@@ -319,12 +559,12 @@ pub struct GoneResponse {
 // ============================================================================
 
 /// Normalize + validate a reported cleaning status.
-fn parse_cleaning_status(raw: &str) -> Result<&'static str, ApiError> {
+fn parse_cleaning_status(raw: &str) -> Result<CleaningProgressStatus, ApiError> {
     let wanted = raw.trim().to_lowercase();
     VALID_CLEANING_STATUSES
         .iter()
         .find(|s| **s == wanted)
-        .copied()
+        .and_then(|s| CleaningProgressStatus::from_literal(s))
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
                 "invalid status '{raw}' (expected one of {VALID_CLEANING_STATUSES:?})"
@@ -338,7 +578,11 @@ fn parse_cleaning_status(raw: &str) -> Result<&'static str, ApiError> {
 
 /// The Thai-day predicate: an event "counts today" when its timestamp falls on
 /// today's date in Asia/Bangkok. Both hotels run on Thai wall-clock days.
-const TODAY_BKK: &str =
+///
+/// Shared verbatim with `routes::housekeeping`'s reception feed
+/// (`GET /api/housekeeping/cleaning`) — ONE definition, so the maid's view of
+/// "today" and reception's can never drift apart at a day boundary.
+pub(crate) const TODAY_BKK: &str =
     "(hkev_created_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date";
 
 /// Fetch the active-room list with today's latest cleaning progress.
@@ -427,27 +671,6 @@ fn room_from_row(row: &sqlx::postgres::PgRow) -> HkRoom {
     }
 }
 
-/// Insert a cleaning-progress event. Returns the new event id.
-async fn insert_cleaning_event(
-    pool: &PgPool,
-    room_id: i32,
-    status: &str,
-    badge: &str,
-    name: Option<&str>,
-) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "INSERT INTO ht_hk_cleaning_events (hkev_room_id, hkev_status, hkev_badge, hkev_name) \
-         VALUES ($1, $2, $3, $4) RETURNING hkev_id",
-    )
-    .bind(room_id)
-    .bind(status)
-    .bind(badge)
-    .bind(name)
-    .fetch_one(pool)
-    .await?;
-    row.try_get("hkev_id")
-}
-
 /// Today's cleaning events for one room, recent first.
 async fn fetch_today_events(
     pool: &PgPool,
@@ -496,12 +719,29 @@ async fn require_room(pool: &PgPool, room_id: i32) -> ApiResult<()> {
 // Handlers
 // ============================================================================
 
-/// GET /api/hk/me — echo the verified identity for the page header.
-pub async fn me(Extension(identity): Extension<HkIdentity>) -> ApiResult<Json<MeResponse>> {
+/// GET /api/hk/me — the verified identity + surface config for the header bar
+/// and the branch picker.
+///
+/// The ONE hk endpoint that takes NO `?branch=`: it is what tells the client
+/// which branches exist, so requiring one would be circular.
+pub async fn me(
+    Extension(identity): Extension<HkIdentity>,
+    Extension(policy): Extension<HkPolicy>,
+) -> ApiResult<Json<MeResponse>> {
     Ok(Json(MeResponse {
         success: true,
         badge: identity.badge,
         display_name: identity.display_name,
+        branches: policy
+            .branches
+            .iter()
+            .copied()
+            .map(|b| HkBranchOption {
+                id: branch_id(b).to_string(),
+                label_th: branch_label_th(b).to_string(),
+            })
+            .collect(),
+        mark_dirty_enabled: policy.mark_dirty_enabled,
     }))
 }
 
@@ -509,8 +749,10 @@ pub async fn me(Extension(identity): Extension<HkIdentity>) -> ApiResult<Json<Me
 pub async fn list_rooms(
     State(state): State<AppState>,
     Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
 ) -> ApiResult<Json<RoomsResponse>> {
-    let pool = resolve_pool(&state, query.branch)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    let pool = resolve_pool(&state, branch)?;
     let data = fetch_rooms(pool).await?;
     Ok(Json(RoomsResponse {
         success: true,
@@ -523,8 +765,10 @@ pub async fn room_detail(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
     Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
 ) -> ApiResult<Json<RoomDetailResponse>> {
-    let pool = resolve_pool(&state, query.branch)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    let pool = resolve_pool(&state, branch)?;
     let room = fetch_room(pool, room_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
@@ -538,64 +782,57 @@ pub async fn room_detail(
 
 /// POST /api/hk/rooms/{id}/cleaning — report cleaning progress.
 ///
-/// `started` is PG-only (see the module header). `done` ADDITIONALLY drives
-/// the canonical clean flip + the `MarkRoomClean` legacy writeback through
-/// [`HousekeepingService::mark_clean_if_dirty`], so the front desk sees the
-/// maid's finished room in iHOTEL.
+/// A thin gate over
+/// [`HousekeepingService::report_cleaning_progress`](crate::service::housekeeping::HousekeepingService::report_cleaning_progress),
+/// which does the whole tap — append-only event row, conditional cleanliness
+/// flip, writeback enqueue, domain event — in ONE transaction (invariants #1,
+/// #2, #4). This handler owns only what the service must not: the required
+/// `?branch=` gate, status validation, the `HK_MARK_DIRTY_ENABLED` dark-ship
+/// gate, and the 404 for an unknown/inactive room.
 ///
-/// The maid's append-only event is recorded FIRST and unconditionally: it is
-/// the maid's own record of work done, and it must survive even if the
-/// writeback leg is unavailable (e.g. the Ville pool is down). The
-/// `writeback_enqueued` flag reports whether this call was the one that
-/// performed the dirty→clean transition — `false` on a repeat tap.
+/// Rejection ORDER is deliberate and pinned by `tests/test_hk_branch_required`:
+/// branch (400/403) BEFORE status (400) BEFORE the mark-dirty flag (403). A
+/// request with no branch must never be answered on the strength of its body.
 ///
-/// Consequence, accepted by design: because the event insert is a separate
-/// statement from the service transaction, a client retry after a 5xx can
-/// append a SECOND `ht_hk_cleaning_events` row for the same tap. That log is
-/// append-only by nature (`started`/`done` may legitimately repeat in a day)
-/// and the room's "current progress" reads only the LATEST row, so a duplicate
-/// is cosmetic. The thing that must not double — the legacy write — is guarded
-/// separately by `mark_clean_if_dirty`'s conditional UPDATE.
+/// `writeback_enqueued` means ENQUEUED, NOT DELIVERED — see
+/// [`ReportCleaningResponse::writeback_enqueued`].
 pub async fn report_cleaning(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
     Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
     Extension(identity): Extension<HkIdentity>,
     Json(body): Json<ReportCleaningBody>,
 ) -> ApiResult<Json<ReportCleaningResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
     let status = parse_cleaning_status(&body.status)?;
-    let pool = resolve_pool(&state, query.branch)?;
-    require_room(pool, room_id).await?;
-    insert_cleaning_event(
-        pool,
-        room_id,
-        status,
-        &identity.badge,
-        identity.display_name.as_deref(),
-    )
-    .await?;
 
-    // `done` ⇒ canonical flip + outbox enqueue + domain event in ONE tx.
-    // Idempotent: a repeat `done` on an already-clean room returns `None` and
-    // enqueues nothing (invariant #4).
-    let writeback_enqueued = if status == "done" {
-        let svc = service_for(&state, query.branch)?;
-        svc.mark_clean_if_dirty(MarkCleanCommand {
+    // Invariant #6: the mark-dirty TRIGGER is new even though the legacy write
+    // shape is proven. Off ⇒ 403, in Thai, with the maid's own envelope.
+    if status == CleaningProgressStatus::Dirty && !policy.mark_dirty_enabled {
+        return Err(ApiError::Forbidden(MARK_DIRTY_DISABLED_ERROR.to_string()));
+    }
+
+    let pool = resolve_pool(&state, branch)?;
+    require_room(pool, room_id).await?;
+
+    let svc = service_for(&state, branch)?;
+    let report = svc
+        .report_cleaning_progress(ReportCleaningCommand {
             room_id,
+            status,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
             by: maid_label(&identity),
             source: hk_source(),
         })
-        .await?
-        .is_some()
-    } else {
-        false
-    };
+        .await?;
 
     Ok(Json(ReportCleaningResponse {
         success: true,
         room_id,
-        status: status.to_string(),
-        writeback_enqueued,
+        status: status.as_str().to_string(),
+        writeback_enqueued: report.writeback_enqueued,
     }))
 }
 
@@ -626,8 +863,10 @@ pub async fn broken_item_photo(
     State(state): State<AppState>,
     Path(report_id): Path<i64>,
     Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
 ) -> ApiResult<Response> {
-    let pool = resolve_pool(&state, query.branch)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    let pool = resolve_pool(&state, branch)?;
     let row = sqlx::query(
         "SELECT hkbr_photo, hkbr_photo_mime FROM ht_hk_broken_reports WHERE hkbr_id = $1",
     )
@@ -665,15 +904,144 @@ mod tests {
     // ---- pure validation ----------------------------------------------
 
     #[test]
-    fn cleaning_status_accepts_only_started_and_done() {
-        assert_eq!(parse_cleaning_status("started").unwrap(), "started");
-        assert_eq!(parse_cleaning_status(" DONE ").unwrap(), "done");
-        for bad in ["", "cleaning", "finished", "เสร็จแล้ว"] {
+    fn cleaning_status_accepts_started_done_and_dirty() {
+        assert_eq!(
+            parse_cleaning_status("started").unwrap(),
+            CleaningProgressStatus::Started
+        );
+        assert_eq!(
+            parse_cleaning_status(" DONE ").unwrap(),
+            CleaningProgressStatus::Done
+        );
+        assert_eq!(
+            parse_cleaning_status("dirty").unwrap(),
+            CleaningProgressStatus::Dirty
+        );
+        // `clean` is the near-miss that matters: it is the word an author
+        // reaches for instead of `done`, and the CHECK constraint would reject
+        // it at the DB layer as a 500 rather than a 400.
+        for bad in ["", "cleaning", "clean", "finished", "เสร็จแล้ว"] {
             assert!(
                 parse_cleaning_status(bad).is_err(),
                 "'{bad}' must be rejected"
             );
         }
+    }
+
+    /// The route's accepted set MUST equal the service's, or a status the
+    /// route admits lands on a CHECK-constraint violation (500) instead of a
+    /// 400. Migration 087 widened the DB CHECK to the same three.
+    #[test]
+    fn valid_statuses_match_the_service_enum() {
+        for literal in VALID_CLEANING_STATUSES {
+            let parsed = CleaningProgressStatus::from_literal(literal)
+                .unwrap_or_else(|| panic!("service must accept '{literal}'"));
+            assert_eq!(parsed.as_str(), literal, "round-trip must be stable");
+        }
+    }
+
+    // ---- HK_BRANCHES parsing -------------------------------------------
+
+    #[test]
+    fn hk_branches_defaults_to_hfhotel() {
+        assert_eq!(parse_hk_branches(None), vec![Branch::Hfhotel]);
+        assert_eq!(parse_hk_branches(Some("")), vec![Branch::Hfhotel]);
+        assert_eq!(parse_hk_branches(Some("  , ,")), vec![Branch::Hfhotel]);
+    }
+
+    #[test]
+    fn hk_branches_parses_order_case_and_duplicates() {
+        assert_eq!(
+            parse_hk_branches(Some("hfhotel,hfville")),
+            vec![Branch::Hfhotel, Branch::Hfville]
+        );
+        // Order is the picker's order — `HK_BRANCHES` decides it.
+        assert_eq!(
+            parse_hk_branches(Some("hfville, hfhotel")),
+            vec![Branch::Hfville, Branch::Hfhotel]
+        );
+        // Env config is forgiving about case (the QUERY PARAM is not).
+        assert_eq!(
+            parse_hk_branches(Some("HFVILLE")),
+            vec![Branch::Hfville]
+        );
+        assert_eq!(
+            parse_hk_branches(Some("hfhotel,hfhotel")),
+            vec![Branch::Hfhotel]
+        );
+    }
+
+    /// A typo must not brick the surface at boot, and must never widen it:
+    /// unknown tokens (including `all`) are dropped, and an all-unknown value
+    /// falls back to the documented default — which cannot admit HF Ville.
+    #[test]
+    fn hk_branches_drops_unknown_tokens_and_never_widens() {
+        assert_eq!(parse_hk_branches(Some("all")), vec![Branch::Hfhotel]);
+        assert_eq!(parse_hk_branches(Some("nonsense")), vec![Branch::Hfhotel]);
+        assert_eq!(
+            parse_hk_branches(Some("hfville,nonsense")),
+            vec![Branch::Hfville]
+        );
+    }
+
+    // ---- the required-branch gate --------------------------------------
+
+    fn policy(branches: Vec<Branch>) -> HkPolicy {
+        HkPolicy {
+            branches,
+            mark_dirty_enabled: false,
+        }
+    }
+
+    /// Absent / empty / unparseable / wrong-case / `all` ⇒ 400, all with the
+    /// same stable message. `all` is the load-bearing one: `write_pool` maps it
+    /// to the PRIMARY pool, so accepting it would re-open the wrong-hotel bug
+    /// under a different query string.
+    #[test]
+    fn branch_param_is_required_and_never_defaults() {
+        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]);
+        for raw in [None, Some(""), Some("   "), Some("all"), Some("HFHOTEL"), Some("hf-hotel"), Some("hfhotel2")] {
+            let err = require_branch(&p, raw).expect_err("{raw:?} must be refused");
+            match err {
+                ApiError::BadRequest(msg) => assert_eq!(msg, BRANCH_REQUIRED_ERROR),
+                other => panic!("{raw:?} must be a 400, got {other:?}"),
+            }
+        }
+        assert_eq!(require_branch(&p, Some("hfhotel")).unwrap(), Branch::Hfhotel);
+        assert_eq!(require_branch(&p, Some("hfville")).unwrap(), Branch::Hfville);
+        // Surrounding whitespace is forgiven; case is not.
+        assert_eq!(
+            require_branch(&p, Some(" hfville ")).unwrap(),
+            Branch::Hfville
+        );
+    }
+
+    /// A well-formed branch outside `HK_BRANCHES` is 403 (not 400): the request
+    /// is understood, the property is simply not offered. This is what keeps HF
+    /// Ville off the picker until `repair_room_legacy_keys --apply` is verified.
+    #[test]
+    fn branch_outside_hk_branches_is_forbidden() {
+        let p = policy(vec![Branch::Hfhotel]);
+        let err = require_branch(&p, Some("hfville")).expect_err("hfville must be refused");
+        match err {
+            ApiError::Forbidden(msg) => assert_eq!(msg, BRANCH_NOT_ENABLED_ERROR),
+            other => panic!("expected 403, got {other:?}"),
+        }
+        // …and admitted once configured.
+        let widened = policy(vec![Branch::Hfhotel, Branch::Hfville]);
+        assert_eq!(
+            require_branch(&widened, Some("hfville")).unwrap(),
+            Branch::Hfville
+        );
+    }
+
+    /// The dark-ship default: no env ⇒ HF Hotel only, mark-dirty off.
+    #[test]
+    fn default_policy_ships_dark() {
+        let p = HkPolicy::default();
+        assert_eq!(p.branches, vec![Branch::Hfhotel]);
+        assert!(!p.mark_dirty_enabled);
+        assert_eq!(p.branch_ids(), vec!["hfhotel"]);
     }
 
     /// The maid label stamped into `HT_Housewife.h_name` prefers the verified
@@ -779,6 +1147,30 @@ mod tests {
         PgPool::connect(&url).await.ok()
     }
 
+    /// Append a cleaning event directly, for READ-path fixtures. The write path
+    /// itself lives in `service::housekeeping::report_cleaning_progress` (and is
+    /// tested there); this raw INSERT exists so these tests can also drive the
+    /// `hkev_status` CHECK constraint with values the service cannot express.
+    async fn seed_cleaning_event(
+        pool: &PgPool,
+        room_id: i32,
+        status: &str,
+        badge: &str,
+        name: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            "INSERT INTO ht_hk_cleaning_events (hkev_room_id, hkev_status, hkev_badge, hkev_name) \
+             VALUES ($1, $2, $3, $4) RETURNING hkev_id",
+        )
+        .bind(room_id)
+        .bind(status)
+        .bind(badge)
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+        row.try_get("hkev_id")
+    }
+
     /// Seed a marker room, exercise the full progress + broken-report flow,
     /// and verify the "today" room list reflects the LATEST event.
     #[tokio::test]
@@ -802,10 +1194,10 @@ mod tests {
         let room_id: i32 = row.try_get("room_id").unwrap();
 
         // started → done: the list must surface the LATEST event.
-        insert_cleaning_event(&pool, room_id, "started", "Q1001", Some("Nok"))
+        seed_cleaning_event(&pool, room_id, "started", "Q1001", Some("Nok"))
             .await
             .expect("started event must insert");
-        insert_cleaning_event(&pool, room_id, "done", "Q1001", Some("Nok"))
+        seed_cleaning_event(&pool, room_id, "done", "Q1001", Some("Nok"))
             .await
             .expect("done event must insert");
 
@@ -848,8 +1240,22 @@ mod tests {
         assert_eq!(events.len(), 2, "both events land in today's log");
         assert_eq!(events[0].status, "done", "recent-first ordering");
 
-        // CHECK constraint rejects an invalid status at the DB layer too.
-        let bad = insert_cleaning_event(&pool, room_id, "finished", "Q1001", None).await;
+        // Migration 087 widened the CHECK to accept 'dirty'. If this fails the
+        // migration has not been applied to this database — and the maid's
+        // mark-dirty tap would 500 instead of writing.
+        seed_cleaning_event(&pool, room_id, "dirty", "Q1001", Some("Nok"))
+            .await
+            .expect("migration 087 must allow hkev_status = 'dirty'");
+        let rooms = fetch_rooms(&pool).await.expect("room list must fetch");
+        let progress = rooms
+            .iter()
+            .find(|r| r.room_id == room_id)
+            .and_then(|r| r.cleaning.as_ref())
+            .expect("today's progress present");
+        assert_eq!(progress.status, "dirty", "latest event wins");
+
+        // CHECK constraint still rejects everything else at the DB layer.
+        let bad = seed_cleaning_event(&pool, room_id, "finished", "Q1001", None).await;
         assert!(bad.is_err(), "CHECK constraint must reject bad status");
 
         // Cleanup (cascades the events + reports).

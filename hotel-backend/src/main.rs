@@ -173,6 +173,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     tracing::info!("HF Ville writes: enabled={}", hfville_writes);
 
+    // `/hk` maid surface policy (wave-4 housekeeping stream). Read ONCE here so
+    // the startup log names the SAME values the router serves:
+    //
+    // - `HK_BRANCHES` (default `hfhotel`) — which properties a maid may file
+    //   against. HF Ville is NOT offered until `repair_room_legacy_keys --apply`
+    //   has fixed `hotelville.ht_rooms_new.legacy_room_id_int` and two clean
+    //   sync ticks confirm it; a Ville room writeback would otherwise flip the
+    //   WRONG iHOTEL room (no Ville room writeback has ever run).
+    // - `HK_MARK_DIRTY_ENABLED` (default OFF) — invariant #6. The MarkRoomDirty
+    //   write shape is live-verified, but a maid's phone as the TRIGGER is new,
+    //   so it needs its own reception-coordinated window before the flip.
+    let hk_policy = routes::hk::HkPolicy::from_env();
+    tracing::info!(
+        "/hk surface: branches={:?}, mark_dirty_enabled={}",
+        hk_policy.branch_ids(),
+        hk_policy.mark_dirty_enabled
+    );
+
     // Loyalty-app integration (docs/loyalty-channel.md). Inbound channel
     // ships DARK (flag + token both required); outbound stay hook is off
     // unless LOYALTY_APP_URL + LOYALTY_SERVICE_TOKEN are set.
@@ -407,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The whole stack is built by `routes::hk::router` so the integration
     // tests mount the shipped wiring rather than a replica.
     let hk_routes = match &final_app_state {
-        Some(state) => routes::hk::router(state.clone()),
+        Some(state) => routes::hk::router_with_policy(state.clone(), hk_policy),
         None => Router::new(),
     };
 
@@ -787,6 +805,14 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/housekeeping/rooms/{id}/maintenance",
             post(routes::housekeeping::set_maintenance),
+        )
+        // Reception's live view of TODAY's maid cleaning progress
+        // (`ht_hk_cleaning_events`, one row per room, latest event wins).
+        // Read-only; pairs with the `RoomCleaningStarted` / `RoomMarkedClean` /
+        // `RoomMarkedDirty` SSE names the แผนกแม่บ้าน board subscribes to.
+        .route(
+            "/api/housekeeping/cleaning",
+            get(routes::housekeeping::list_cleaning_progress),
         )
         // Bookings CRUD (canonical)
         .route(

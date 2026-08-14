@@ -20,14 +20,23 @@
 //! until `HFVILLE_WRITES_ENABLED` is flipped — this module relies on that
 //! existing safety net rather than re-checking the flag.
 //!
-//! All SQL the service runs is RUNTIME `sqlx::query` (no compile-time macro),
-//! so adding these routes needs no `.sqlx/` cache regeneration.
+//! **Reception read (wave-4 B6):** [`list_cleaning_progress`]
+//! (`GET /api/housekeeping/cleaning`) exposes today's maid-reported progress
+//! from `ht_hk_cleaning_events` so the แผนกแม่บ้าน board can show who is in a
+//! room and since when. Until it existed, that table was read by nothing
+//! outside `routes::hk` — the maid reported progress and reception could not
+//! see it.
+//!
+//! All SQL here and in the service is RUNTIME `sqlx::query` (no compile-time
+//! macro), so these routes need no `.sqlx/` cache regeneration.
 
 use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row as _;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
@@ -181,6 +190,117 @@ pub async fn set_maintenance(
     }))
 }
 
+// ============================================================================
+// Reception read — today's maid cleaning progress
+// ============================================================================
+
+/// One room's LATEST maid-reported cleaning event today (Thai day).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomCleaningProgress {
+    pub room_id: i32,
+    pub room_no: String,
+    /// `started` | `done` | `dirty`.
+    pub status: String,
+    /// Verified HF ID badge — ALWAYS present.
+    pub badge: String,
+    /// Display-name snapshot; usually `null` today (the CF IdP forwards only
+    /// `apps` + `badge`). Render `name ?? badge`.
+    pub name: Option<String>,
+    /// A real instant (`TIMESTAMPTZ`), NOT a naive legacy MSSQL datetime.
+    /// Render it with normal local-time formatting — the `timeZone:'UTC'` rule
+    /// applies ONLY to values mirrored from legacy (see `app/hk/hk-lib.ts`).
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleaningProgressResponse {
+    pub success: bool,
+    pub data: Vec<RoomCleaningProgress>,
+}
+
+/// GET /api/housekeeping/cleaning — today's cleaning progress, one row per room.
+///
+/// The reception (แผนกแม่บ้าน) board's live feed. Before this, `ht_hk_cleaning_events`
+/// was read by NOTHING outside `routes::hk` — the maid's progress existed and
+/// reception could not see it, and the board's middle "กำลังทำความสะอาด" column
+/// was permanently empty because it keyed off a `status='cleaning'` literal that
+/// `/api/rooms` never emits (pinned by `routes::new_rooms`'
+/// `room_stored_cleaning_is_still_derived_available`).
+///
+/// Deliberately a SEPARATE endpoint rather than widening `/api/rooms`:
+/// `routes::new_rooms` is a large shared file whose live-flags scan is pinned by
+/// tests, and leaving it untouched is what let the backend and frontend halves
+/// of this change be built in parallel.
+///
+/// Rooms with no event today are ABSENT from `data` (the frontend reads absent
+/// as "no progress reported"), so the response stays tiny — 0 rows on a quiet
+/// morning, at most one row per active room.
+///
+/// `?branch=` is OPTIONAL here, matching its sibling housekeeping routes:
+/// reception's `useBranchFetch` always sends one, and an omitted branch means
+/// the primary site exactly as it does for clean/dirty/maintenance. (The `/hk`
+/// MAID surface is the opposite — there the branch is mandatory, because a maid
+/// picks her own property and a wrong guess files against the wrong hotel.)
+pub async fn list_cleaning_progress(
+    State(state): State<AppState>,
+    Query(query): Query<HousekeepingQuery>,
+) -> ApiResult<Json<CleaningProgressResponse>> {
+    // Same per-site chokepoint as the mutating siblings, so this read can never
+    // disagree with the writes it renders.
+    let pool = state.write_pool(query.branch)?;
+
+    // `TODAY_BKK` is shared verbatim with `routes::hk` — ONE definition of
+    // "today", so the maid's list and reception's board cannot disagree at a
+    // day boundary. INNER JOIN LATERAL ⇒ only rooms with an event today.
+    let sql = format!(
+        r#"
+        SELECT
+            r.room_id,
+            r.room_no,
+            ev.hkev_status,
+            ev.hkev_badge,
+            ev.hkev_name,
+            ev.hkev_created_at
+        FROM ht_rooms_new r
+        JOIN LATERAL (
+            SELECT e.hkev_status, e.hkev_badge, e.hkev_name, e.hkev_created_at
+            FROM ht_hk_cleaning_events e
+            WHERE e.hkev_room_id = r.room_id AND {today}
+            ORDER BY e.hkev_created_at DESC, e.hkev_id DESC
+            LIMIT 1
+        ) ev ON TRUE
+        WHERE COALESCE(r.room_active, true) = true
+        ORDER BY r.room_no
+        "#,
+        today = super::hk::TODAY_BKK
+    );
+
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .fetch_all(pool)
+        .await?;
+
+    let data = rows
+        .iter()
+        .map(|row| RoomCleaningProgress {
+            room_id: row.try_get::<i32, _>("room_id").unwrap_or(0),
+            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            status: row.try_get::<String, _>("hkev_status").unwrap_or_default(),
+            badge: row.try_get::<String, _>("hkev_badge").unwrap_or_default(),
+            name: row.try_get::<String, _>("hkev_name").ok(),
+            at: row
+                .try_get::<DateTime<Utc>, _>("hkev_created_at")
+                .unwrap_or_else(|_| Utc::now()),
+        })
+        .collect();
+
+    Ok(Json(CleaningProgressResponse {
+        success: true,
+        data,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +353,87 @@ mod tests {
         assert!(on.maintenance);
         let off: MaintenanceBody = serde_json::from_str(r#"{"maintenance":false}"#).unwrap();
         assert!(!off.maintenance);
+    }
+
+    /// The reception feed must carry the LATEST event per room and must OMIT
+    /// rooms with no event today (absent = "no progress reported"). DB-backed;
+    /// skips gracefully without a local PG, same `try_pool` convention as
+    /// `service::housekeeping::tests`.
+    #[tokio::test]
+    async fn cleaning_feed_returns_latest_event_per_room_and_omits_quiet_rooms() {
+        use sqlx::PgPool;
+
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        let Ok(pool) = PgPool::connect(&url).await else {
+            eprintln!("skipping cleaning_feed_returns_latest_event_per_room — PG not reachable");
+            return;
+        };
+
+        for marker in ["ZT-HKF1", "ZT-HKF2"] {
+            let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+                .bind(marker)
+                .execute(&pool)
+                .await;
+        }
+        // ZT-HKF1 gets two events today; ZT-HKF2 stays quiet.
+        let reported: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-HKF1', false, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed reported room");
+        let quiet: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-HKF2', false, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed quiet room");
+
+        for status in ["started", "done"] {
+            sqlx::query(
+                "INSERT INTO ht_hk_cleaning_events \
+                     (hkev_room_id, hkev_status, hkev_badge, hkev_name) \
+                 VALUES ($1, $2, 'Q1001', 'นก')",
+            )
+            .bind(reported)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("seed cleaning event");
+        }
+
+        let state = AppState::new(pool.clone());
+        let Json(body) = list_cleaning_progress(
+            axum::extract::State(state),
+            axum::extract::Query(HousekeepingQuery { branch: None }),
+        )
+        .await
+        .expect("cleaning feed must answer");
+
+        assert!(body.success);
+        let row = body
+            .data
+            .iter()
+            .find(|r| r.room_id == reported)
+            .expect("the room with events today must appear");
+        assert_eq!(row.status, "done", "the LATEST event wins");
+        assert_eq!(row.badge, "Q1001");
+        assert_eq!(row.name.as_deref(), Some("นก"));
+        assert_eq!(row.room_no, "ZT-HKF1");
+        assert!(
+            !body.data.iter().any(|r| r.room_id == quiet),
+            "a room with no event today must be ABSENT, not present with a null status"
+        );
+
+        for id in [reported, quiet] {
+            let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
     }
 }

@@ -67,6 +67,77 @@ pub struct HousekeepingOutcome {
     pub aggregate_id: Uuid,
 }
 
+/// A maid-reported cleaning-progress state on the `/hk` surface.
+///
+/// Mirrors the `ht_hk_cleaning_events.hkev_status` CHECK constraint
+/// (migration 077, widened to include `dirty` by migration 087) — keep the two
+/// in lock-step: a status accepted here that the CHECK rejects turns a maid's
+/// tap into a 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleaningProgressStatus {
+    /// เริ่มทำความสะอาด — PG-only, never mirrored (see
+    /// [`DomainEvent::RoomCleaningStarted`]).
+    Started,
+    /// เสร็จแล้ว — flips `room_clean` to `true` and mirrors `MarkRoomClean`.
+    Done,
+    /// ห้องยังไม่สะอาด — flips `room_clean` to `false` and mirrors
+    /// `MarkRoomDirty`. Reachable only while `HK_MARK_DIRTY_ENABLED` is on
+    /// (invariant #6 — the route gates it; the service does not read env).
+    Dirty,
+}
+
+impl CleaningProgressStatus {
+    /// The literal stored in `ht_hk_cleaning_events.hkev_status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleaningProgressStatus::Started => "started",
+            CleaningProgressStatus::Done => "done",
+            CleaningProgressStatus::Dirty => "dirty",
+        }
+    }
+
+    /// Parse a already-normalized (trimmed, lowercased) status literal.
+    pub fn from_literal(raw: &str) -> Option<Self> {
+        match raw {
+            "started" => Some(CleaningProgressStatus::Started),
+            "done" => Some(CleaningProgressStatus::Done),
+            "dirty" => Some(CleaningProgressStatus::Dirty),
+            _ => None,
+        }
+    }
+}
+
+/// Command for [`HousekeepingService::report_cleaning_progress`] — one maid tap
+/// on `POST /api/hk/rooms/{id}/cleaning`.
+#[derive(Debug, Clone)]
+pub struct ReportCleaningCommand {
+    pub room_id: i32,
+    pub status: CleaningProgressStatus,
+    /// Verified HF ID badge — ALWAYS present (the Access middleware 401s
+    /// without one). Stamped into `hkev_badge`.
+    pub badge: String,
+    /// Display-name snapshot for `hkev_name` (usually `None` today — the CF IdP
+    /// forwards only `apps` + `badge`).
+    pub name: Option<String>,
+    /// Housekeeper label carried by the writeback intent into
+    /// `HT_Housewife.h_name` (display name, badge fallback — `routes::hk`
+    /// clamps it to the legacy `varchar(150)`).
+    pub by: String,
+    pub source: EventSource,
+}
+
+/// Outcome of [`HousekeepingService::report_cleaning_progress`].
+#[derive(Debug, Clone)]
+pub struct CleaningReport {
+    pub room_id: i32,
+    /// `ht_hk_cleaning_events.hkev_id` of the row this call appended.
+    pub event_id: i64,
+    /// `true` iff this call performed the cleanliness transition and therefore
+    /// enqueued a writeback job. ENQUEUED, NOT DELIVERED. Always `false` for
+    /// `started` (legacy-inert) and for a repeat that changed nothing.
+    pub writeback_enqueued: bool,
+}
+
 /// Service handle for the housekeeping aggregate.
 ///
 /// `events` Arc is held for Wave 4 — see [`super::customer`] note.
@@ -232,6 +303,146 @@ impl HousekeepingService {
         }))
     }
 
+    /// Record ONE maid cleaning-progress tap — the `/hk` surface's single
+    /// write path (`POST /api/hk/rooms/{id}/cleaning`).
+    ///
+    /// ## Why this exists (wave-4, housekeeping stream B3)
+    ///
+    /// `routes::hk::report_cleaning` used to INSERT the append-only event with
+    /// a bare pool query and only THEN call the service, which opened its own
+    /// transaction. The module documented the consequence itself: "a client
+    /// retry after a 5xx can append a SECOND row". This method closes that by
+    /// doing the whole tap — event row, conditional flag flip, writeback
+    /// enqueue, domain event — inside ONE transaction (invariants #1 + #2).
+    ///
+    /// ## Per-status behaviour
+    ///
+    /// | status | canonical flip | writeback | domain event |
+    /// |---|---|---|---|
+    /// | `started` | none | none | `RoomCleaningStarted` |
+    /// | `done` | `room_clean → true` when not already true | `MarkRoomClean` | `RoomMarkedClean` |
+    /// | `dirty` | `room_clean → false` when not already false | `MarkRoomDirty` | `RoomMarkedDirty` |
+    ///
+    /// ## Idempotency (invariant #4)
+    ///
+    /// The conditional UPDATE (`… IS DISTINCT FROM …`) takes the row lock, so
+    /// two concurrent taps serialize and the loser enqueues nothing — the same
+    /// argument written out at [`mark_clean_if_dirty`](Self::mark_clean_if_dirty),
+    /// applied symmetrically to `dirty`. The per-event v4 discriminator stays on
+    /// the idempotency key: rooms legitimately flip every day and
+    /// `writeback_jobs.idempotency_key` is permanently UNIQUE.
+    ///
+    /// The APPEND-ONLY event row is always written — `started`/`done` may
+    /// legitimately repeat within a day and the "current progress" read takes
+    /// only the LATEST row. What must not double is the legacy write, and that
+    /// is what the conditional flip guards.
+    ///
+    /// The route resolves 404 for unknown/inactive rooms before calling; the
+    /// `room_exists` probe here disambiguates "already in that state" from
+    /// "no such room" if the row disappears between the two.
+    pub async fn report_cleaning_progress(
+        &self,
+        cmd: ReportCleaningCommand,
+    ) -> ServiceResult<CleaningReport> {
+        if cmd.badge.trim().is_empty() {
+            return Err(ServiceError::validation(
+                "report_cleaning_progress requires a non-empty verified badge",
+            ));
+        }
+        if cmd.by.trim().is_empty() {
+            return Err(ServiceError::validation(
+                "report_cleaning_progress requires a non-empty `by` housekeeper identifier",
+            ));
+        }
+
+        let mut tx = self.pg.begin().await?;
+
+        // 1. The maid's own record of work done — append-only, unconditional.
+        let event_id = insert_cleaning_event(
+            &mut tx,
+            cmd.room_id,
+            cmd.status.as_str(),
+            &cmd.badge,
+            cmd.name.as_deref(),
+        )
+        .await?;
+
+        let aggregate_id = aggregate_uuid(AggregateKind::Room, cmd.room_id);
+
+        // 2. Branch on status: only the two terminal states touch cleanliness.
+        let (intent, event) = match cmd.status {
+            CleaningProgressStatus::Started => {
+                // Legacy-inert on purpose (iHOTEL's Room_Clean_Time drives its
+                // room-power countdown). Publish so reception's board lights up
+                // live over SSE, then commit.
+                let event = DomainEvent::RoomCleaningStarted {
+                    room_id: aggregate_id,
+                    by: cmd.by,
+                    source: cmd.source,
+                };
+                EventBus::publish(&mut tx, &event)
+                    .await
+                    .map_err(|err| ServiceError::outbox(err.to_string()))?;
+                tx.commit().await?;
+                return Ok(CleaningReport {
+                    room_id: cmd.room_id,
+                    event_id,
+                    writeback_enqueued: false,
+                });
+            }
+            CleaningProgressStatus::Done => {
+                if !set_room_clean_flag_if_dirty(&mut tx, cmd.room_id).await? {
+                    return finish_no_transition(tx, cmd.room_id, event_id).await;
+                }
+                (
+                    WritebackIntent::MarkRoomClean {
+                        room_id: aggregate_id,
+                        by: cmd.by.clone(),
+                    },
+                    DomainEvent::RoomMarkedClean {
+                        room_id: aggregate_id,
+                        by: cmd.by,
+                        source: cmd.source,
+                    },
+                )
+            }
+            CleaningProgressStatus::Dirty => {
+                if !set_room_clean_flag_if_clean(&mut tx, cmd.room_id).await? {
+                    return finish_no_transition(tx, cmd.room_id, event_id).await;
+                }
+                (
+                    WritebackIntent::MarkRoomDirty {
+                        room_id: aggregate_id,
+                        by: cmd.by,
+                    },
+                    DomainEvent::RoomMarkedDirty {
+                        room_id: aggregate_id,
+                        source: cmd.source,
+                    },
+                )
+            }
+        };
+
+        let key = generate_idempotency_key(&intent, Uuid::new_v4());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
+
+        EventBus::publish(&mut tx, &event)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        let _ = (&self.repo, &self.outbox, &self.events);
+
+        tx.commit().await?;
+
+        Ok(CleaningReport {
+            room_id: cmd.room_id,
+            event_id,
+            writeback_enqueued: true,
+        })
+    }
+
     /// Mark a room dirty — flip `room_clean=false`, enqueue the
     /// [`WritebackIntent::MarkRoomDirty`] mirror (cheatsheet §3.13), and
     /// publish the event — all in one transaction.
@@ -384,6 +595,77 @@ async fn set_room_clean_flag_if_dirty(
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Flip `ht_rooms_new.room_clean` to `false` ONLY when it is not already
+/// `false`. Returns whether this statement performed the transition — the
+/// mirror image of [`set_room_clean_flag_if_dirty`], and the mark-DIRTY half of
+/// the `/hk` idempotency guard.
+///
+/// `IS DISTINCT FROM false` (not `= true`) so a NULL `room_clean` — legacy-
+/// mirrored rows can carry one — counts as "not yet dirty" and IS flipped. An
+/// UNKNOWN cleanliness must reach iHOTEL as an explicit `Room_Clean='yes'`,
+/// never be swallowed as "already dirty".
+async fn set_room_clean_flag_if_clean(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+) -> ServiceResult<bool> {
+    let result = sqlx::query(
+        "UPDATE ht_rooms_new SET room_clean = false, updated_at = NOW() \
+          WHERE room_id = $1 AND room_clean IS DISTINCT FROM false",
+    )
+    .bind(room_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Append one maid cleaning-progress event inside the caller's transaction.
+/// Returns the new `hkev_id`.
+///
+/// Moved here from `routes::hk` (wave-4 B3) so the event row commits atomically
+/// with the flag flip + writeback enqueue it belongs to. Runtime `sqlx::query`
+/// — no `.sqlx/` cache regeneration.
+async fn insert_cleaning_event(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+    status: &str,
+    badge: &str,
+    name: Option<&str>,
+) -> ServiceResult<i64> {
+    let row = sqlx::query(
+        "INSERT INTO ht_hk_cleaning_events (hkev_room_id, hkev_status, hkev_badge, hkev_name) \
+         VALUES ($1, $2, $3, $4) RETURNING hkev_id",
+    )
+    .bind(room_id)
+    .bind(status)
+    .bind(badge)
+    .bind(name)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(sqlx::Row::try_get(&row, "hkev_id")?)
+}
+
+/// Close a cleaning report that performed NO cleanliness transition: keep the
+/// appended event, enqueue nothing, publish nothing — but 404 first if the room
+/// vanished (same disambiguation as `mark_clean_if_dirty`).
+async fn finish_no_transition(
+    mut tx: Transaction<'_, Postgres>,
+    room_id: i32,
+    event_id: i64,
+) -> ServiceResult<CleaningReport> {
+    if !room_exists(&mut tx, room_id).await? {
+        return Err(ServiceError::not_found(format!(
+            "room {room_id} does not exist"
+        )));
+    }
+    tx.commit().await?;
+    Ok(CleaningReport {
+        room_id,
+        event_id,
+        writeback_enqueued: false,
+    })
 }
 
 /// Existence probe used to distinguish "already clean" from "no such room"
@@ -592,6 +874,295 @@ mod tests {
             .bind(room_id)
             .execute(&pool)
             .await;
+    }
+
+    // ---- report_cleaning_progress (the /hk single write path) -----------
+
+    /// Helper: how many writeback jobs of `intent` exist for this room.
+    async fn job_count(pool: &PgPool, agg: Uuid, intent: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM writeback_jobs WHERE aggregate_id = $1 AND intent = $2",
+        )
+        .bind(agg)
+        .bind(intent)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn event_count(pool: &PgPool, agg: Uuid, event_type: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE aggregate_id = $1 AND event_type = $2",
+        )
+        .bind(agg)
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn room_clean(pool: &PgPool, room_id: i32) -> Option<bool> {
+        sqlx::query_scalar("SELECT room_clean FROM ht_rooms_new WHERE room_id = $1")
+            .bind(room_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn cleaning_cmd(room_id: i32, status: CleaningProgressStatus) -> ReportCleaningCommand {
+        ReportCleaningCommand {
+            room_id,
+            status,
+            badge: "Q1001".into(),
+            name: Some("นก".into()),
+            by: "นก".into(),
+            source: EventSource::System {
+                reason: "test".into(),
+            },
+        }
+    }
+
+    /// The whole `/hk` matrix in one place: `started` is legacy-inert,
+    /// `done`/`dirty` each flip the flag once and enqueue exactly one job, and
+    /// a repeat of either changes nothing (invariant #4) while STILL appending
+    /// the maid's event row (the log is append-only by nature).
+    #[tokio::test]
+    async fn report_cleaning_progress_started_done_dirty_and_repeats() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping report_cleaning_progress_started_done_dirty — PG not reachable");
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-RCP1'")
+            .execute(&pool)
+            .await;
+        // Seed DIRTY, the state a maid actually finds a room in.
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-RCP1', false, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed insert must succeed");
+        let agg = aggregate_uuid(AggregateKind::Room, room_id);
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+
+        let svc = build_service(pool.clone());
+
+        // --- started: PG-only. No flip, no writeback, but a live event. ---
+        let started = svc
+            .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Started))
+            .await
+            .expect("started must succeed");
+        assert!(
+            !started.writeback_enqueued,
+            "`started` is legacy-inert — iHOTEL's Room_Clean_Time drives its \
+             room-power countdown, so mirroring it is parity risk for no gain"
+        );
+        assert_eq!(
+            room_clean(&pool, room_id).await,
+            Some(false),
+            "`started` must not touch the cleanliness flag"
+        );
+        assert_eq!(job_count(&pool, agg, "mark_room_clean").await, 0);
+        assert_eq!(job_count(&pool, agg, "mark_room_dirty").await, 0);
+        assert_eq!(
+            event_count(&pool, agg, "RoomCleaningStarted").await,
+            1,
+            "reception's board is driven by this event — it MUST be published"
+        );
+
+        // --- done: flips to clean and enqueues exactly one MarkRoomClean. ---
+        let done = svc
+            .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Done))
+            .await
+            .expect("done must succeed");
+        assert!(done.writeback_enqueued);
+        assert_eq!(room_clean(&pool, room_id).await, Some(true));
+        assert_eq!(job_count(&pool, agg, "mark_room_clean").await, 1);
+
+        // A double-tap must not produce a second HT_Housewife audit row.
+        for _ in 0..3 {
+            let repeat = svc
+                .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Done))
+                .await
+                .expect("repeat done must succeed");
+            assert!(
+                !repeat.writeback_enqueued,
+                "a repeat `done` on an already-clean room must enqueue nothing"
+            );
+        }
+        assert_eq!(
+            job_count(&pool, agg, "mark_room_clean").await,
+            1,
+            "exactly one writeback across four `done` taps"
+        );
+
+        // --- dirty: the mirror image. ---
+        let dirty = svc
+            .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Dirty))
+            .await
+            .expect("dirty must succeed");
+        assert!(dirty.writeback_enqueued);
+        assert_eq!(room_clean(&pool, room_id).await, Some(false));
+        assert_eq!(job_count(&pool, agg, "mark_room_dirty").await, 1);
+        let repeat_dirty = svc
+            .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Dirty))
+            .await
+            .expect("repeat dirty must succeed");
+        assert!(!repeat_dirty.writeback_enqueued);
+        assert_eq!(
+            job_count(&pool, agg, "mark_room_dirty").await,
+            1,
+            "exactly one writeback across two `dirty` taps"
+        );
+
+        // The maid's log keeps EVERY tap — that is what makes it an audit
+        // trail; only the legacy write is deduplicated.
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ht_hk_cleaning_events WHERE hkev_room_id = $1",
+        )
+        .bind(room_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 7, "1 started + 4 done + 2 dirty");
+
+        // The maid's name rides the intent into HT_Housewife.h_name.
+        let stored: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM writeback_jobs \
+              WHERE aggregate_id = $1 AND intent = 'mark_room_dirty'",
+        )
+        .bind(agg)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored.pointer("/payload/by").and_then(|v| v.as_str()),
+            Some("นก")
+        );
+
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A NULL `room_clean` (legacy-mirrored rows can carry one) counts as
+    /// "not yet in that state" in BOTH directions — an unknown cleanliness must
+    /// reach iHOTEL explicitly, never be swallowed as "already there".
+    #[tokio::test]
+    async fn null_room_clean_is_flipped_in_both_directions() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping null_room_clean_is_flipped — PG not reachable");
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-RCP2'")
+            .execute(&pool)
+            .await;
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-RCP2', NULL, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed insert must succeed");
+        let agg = aggregate_uuid(AggregateKind::Room, room_id);
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+
+        let svc = build_service(pool.clone());
+        assert!(
+            svc.report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Dirty))
+                .await
+                .expect("dirty must succeed")
+                .writeback_enqueued,
+            "NULL cleanliness must be flipped to false and mirrored"
+        );
+        assert_eq!(room_clean(&pool, room_id).await, Some(false));
+
+        let _ = sqlx::query("UPDATE ht_rooms_new SET room_clean = NULL WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+        assert!(
+            svc.report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Done))
+                .await
+                .expect("done must succeed")
+                .writeback_enqueued,
+            "NULL cleanliness must be flipped to true and mirrored"
+        );
+
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Validation fires before any I/O. A blank `by` would land as a blank
+    /// `HT_Housewife.h_name`; a blank badge would produce an unattributable
+    /// audit row that no maid can be identified from.
+    #[tokio::test]
+    async fn report_cleaning_progress_rejects_blank_identity() {
+        let pool = PgPool::connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/never")
+            .expect("lazy pool needs no live server");
+        let svc = build_service(pool);
+        for (badge, by) in [("   ", "นก"), ("Q1001", "  ")] {
+            let err = svc
+                .report_cleaning_progress(ReportCleaningCommand {
+                    room_id: 1,
+                    status: CleaningProgressStatus::Done,
+                    badge: badge.into(),
+                    name: None,
+                    by: by.into(),
+                    source: EventSource::System {
+                        reason: "test".into(),
+                    },
+                })
+                .await
+                .expect_err("blank identity must be rejected");
+            assert!(matches!(err, ServiceError::Validation(_)), "got {err:?}");
+        }
+    }
+
+    /// The status literals this service writes MUST be exactly what the
+    /// `hkev_status` CHECK accepts (migration 077 + 087). A drift here turns a
+    /// maid's tap into a 500.
+    #[test]
+    fn cleaning_status_literals_are_stable() {
+        assert_eq!(CleaningProgressStatus::Started.as_str(), "started");
+        assert_eq!(CleaningProgressStatus::Done.as_str(), "done");
+        assert_eq!(CleaningProgressStatus::Dirty.as_str(), "dirty");
+        assert_eq!(
+            CleaningProgressStatus::from_literal("dirty"),
+            Some(CleaningProgressStatus::Dirty)
+        );
+        assert_eq!(CleaningProgressStatus::from_literal("clean"), None);
+        assert_eq!(CleaningProgressStatus::from_literal("DONE"), None);
     }
 
     /// Validation fires before any I/O — an empty `by` would land as a blank
