@@ -376,12 +376,19 @@ fn hk_source() -> EventSource {
 ///    up front, before any auth work, EXCEPT the exempt cleaning route.
 /// 2. `require_hk_access` — Cloudflare Access gate; fails closed (401) when
 ///    `CF_ACCESS_HK_AUD` is unset, so the surface ships dark.
-/// 3. body limit, then the handlers.
+/// 3. body limit, [`HkPolicy`] extension, then the handlers — which is where
+///    the required-`?branch=` gate lives. Putting it here rather than in a
+///    layer is deliberate: an unauthenticated caller must not be able to tell
+///    400 (malformed branch) from 403 (branch not offered) and enumerate which
+///    properties this deployment serves.
 ///
 /// That order is what `tests/test_hk_ville_guard.rs` asserts against: an
 /// unauthenticated `branch=hfville` request returns 403 when the guard refuses
 /// it and 401 when the guard admits it and auth then refuses — which
-/// distinguishes the two layers without needing a valid Access assertion.
+/// distinguishes the two layers without needing a valid Access assertion. It
+/// also explains why `tests/test_hk_branch_required.rs` mounts
+/// [`routes_inside_access`] for the branch gate's own status codes: through
+/// this stack every unauthenticated probe is 401, by design.
 pub fn router(state: AppState) -> Router {
     router_with_policy(state, HkPolicy::from_env())
 }
