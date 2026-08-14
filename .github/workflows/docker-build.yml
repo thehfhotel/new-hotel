@@ -952,6 +952,15 @@ jobs:
           OTA_BRIDGE_TOKEN:          ${{ secrets.OTA_BRIDGE_TOKEN }}
           OTA_BRIDGE_TOKEN_PREVIOUS: ${{ secrets.OTA_BRIDGE_TOKEN_PREVIOUS }}
           CF_ACCESS_HK_AUD:        ${{ secrets.CF_ACCESS_HK_AUD }}
+          # /hk maid surface policy (wave-4 housekeeping) — non-secret ship-dark
+          # flags, so GH *variables* not secrets. Same empty-safe-fallback
+          # pattern as the ROUND_WRITEBACK_ENABLED-style flags below; unset
+          # variables reproduce docker-compose.yml's own defaults exactly
+          # (HkPolicy::from_env() in hotel-backend/src/main.rs). Flip via
+          # `gh variable set HK_MARK_DIRTY_ENABLED -b true` (or HK_BRANCHES)
+          # + redeploy — see PENDING-VERIFICATIONS.md V12/V13.
+          HK_MARK_DIRTY_ENABLED:   ${{ vars.HK_MARK_DIRTY_ENABLED || 'false' }}
+          HK_BRANCHES:             ${{ vars.HK_BRANCHES || 'hfhotel' }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1097,6 +1106,8 @@ jobs:
             --arg OTA_BRIDGE_TOKEN          "${OTA_BRIDGE_TOKEN:-}" \
             --arg OTA_BRIDGE_TOKEN_PREVIOUS "${OTA_BRIDGE_TOKEN_PREVIOUS:-}" \
             --arg CF_ACCESS_HK_AUD    "$CF_ACCESS_HK_AUD" \
+            --arg HK_MARK_DIRTY_ENABLED "${HK_MARK_DIRTY_ENABLED:-false}" \
+            --arg HK_BRANCHES           "${HK_BRANCHES:-hfhotel}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1129,6 +1140,8 @@ jobs:
                 SLACK_WEBHOOK_URL:            $SLACK_WEBHOOK_URL,
                 READER_RESOLVE_SECRET:        $READER_RESOLVE_SECRET,
                 CF_ACCESS_HK_AUD:             $CF_ACCESS_HK_AUD,
+                HK_MARK_DIRTY_ENABLED:        $HK_MARK_DIRTY_ENABLED,
+                HK_BRANCHES:                  $HK_BRANCHES,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,

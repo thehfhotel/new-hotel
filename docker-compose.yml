@@ -217,6 +217,14 @@ services:
       # AUD tag of its path-scoped CF Access app; every /api/hk 401s
       # while unset (ships dark).
       - CF_ACCESS_HK_AUD=${CF_ACCESS_HK_AUD:-}
+      # /hk maid surface policy (wave-4 housekeeping). Same defaults as
+      # HkPolicy::from_env() in hotel-backend/src/main.rs. HK_BRANCHES
+      # defaults hfhotel-only — HF Ville needs repair_room_legacy_keys
+      # first (PENDING-VERIFICATIONS.md V13). HK_MARK_DIRTY_ENABLED ships
+      # OFF (invariant #6 — a maid's phone as the write TRIGGER needs its
+      # own reception-coordinated window, see PENDING-VERIFICATIONS.md V12).
+      - HK_MARK_DIRTY_ENABLED=${HK_MARK_DIRTY_ENABLED:-false}
+      - HK_BRANCHES=${HK_BRANCHES:-hfhotel}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap
