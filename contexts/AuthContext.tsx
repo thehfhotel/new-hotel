@@ -60,6 +60,20 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 const PUBLIC_PATHS = new Set<string>(['/login'])
 
 /**
+ * The /hk maid surface carries its OWN identity: the Cloudflare Access
+ * assertion (HF ID, grant `housekeeping`) verified server-side by the
+ * backend's hk_access middleware. Maids have no PMS user account, so the
+ * cookie-session AuthGuard must never bounce /hk to /login — in production
+ * that bounce lands on the Google-gated root Access app and renders as a
+ * white blank (the maid can never satisfy it). Prefix-matched because
+ * PUBLIC_PATHS is exact-match and /hk has subroutes — same shape as the
+ * chromeless check in components/AppShell.tsx.
+ */
+function isHkSurface(pathname: string | null): boolean {
+  return pathname === '/hk' || (pathname?.startsWith('/hk/') ?? false)
+}
+
+/**
  * Read-once flag: when `false` (the default in dev / pre-cutover) the
  * AuthGuard does NOT enforce a logged-in user. This avoids an infinite
  * /login redirect loop while the backend still ships AUTH_ENABLED=false
@@ -314,14 +328,16 @@ function IdleLogout() {
  *  - when AUTH_REQUIRED is false (dev / pre-cutover), pass-through —
  *    every page renders regardless of user state
  *  - when AUTH_REQUIRED is true and user is null and we're not already on
- *    /login, redirect to /login?redirect=<current> and render nothing
+ *    /login (or the self-authenticating /hk surface), redirect to
+ *    /login?redirect=<current> and render nothing
  */
 function AuthGuard({ children }: { children: ReactNode }) {
   const { user, loading } = useContext(AuthContext) as AuthContextValue
   const pathname = usePathname()
   const router = useRouter()
 
-  const isPublicPath = pathname ? PUBLIC_PATHS.has(pathname) : false
+  const isHk = isHkSurface(pathname)
+  const isPublicPath = isHk || (pathname ? PUBLIC_PATHS.has(pathname) : false)
   const shouldRedirect =
     AUTH_REQUIRED && !loading && user === null && !isPublicPath
 
@@ -333,7 +349,12 @@ function AuthGuard({ children }: { children: ReactNode }) {
 
   // Hydration shim: while the initial /me check is pending OR a redirect
   // is queued, render an empty fragment so we don't flash protected UI.
-  if (loading || shouldRedirect) {
+  //
+  // /hk opts out of the pending-check blank: it renders no session-dependent
+  // UI, and a maid's /api/auth/me can be slow or intercepted by the root
+  // Access app on her device — gating the paint on a probe she can never
+  // satisfy is exactly how this surface went white in the first place.
+  if ((loading && !isHk) || shouldRedirect) {
     return null
   }
 
