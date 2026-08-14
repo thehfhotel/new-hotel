@@ -133,6 +133,17 @@ Sensitive credentials (`DB_PASSWORD`, `POSTGRES_PASSWORD`, `VILLE_DB_PASSWORD`, 
 - `/home/deploy/secrets/slack_webhook_url`
 - `/home/deploy/secrets/ota_bridge_token` — OTA booking-bridge shared bearer (`docs/ota-bridge.md`). **INVARIANT: must hold the IDENTICAL string as ota-desk's `PMS_BRIDGE_TOKEN`** — two names for one value, same idiom as `PORTAL_NOTIFY_TOKEN` ≡ portal `NOTIFY_INGRESS_TOKEN`. Verify without exposing it: both repos print `sha256(token)[0..6]` (here, in the `OTA bridge: …` startup line). An unset GH secret yields an EMPTY file, which the hydrator treats as absent — the gate then has nothing to accept and `/api/ota/*` fails closed.
 - `/home/deploy/secrets/ota_bridge_token_previous` — rotation slot for the above; accepted with a "finish the rotation" WARN. Normally empty.
+- `/home/deploy/secrets/hfid_resolve_secret` → `HFID_RESOLVE_SECRET` — shared secret for the `/hk` employee-location lookup (`hotel-backend/src/hfid_location.rs`), sent as the `X-Reader-Secret` header on `POST {HFID_LOCATION_URL}`.
+
+  **`HFID_RESOLVE_SECRET` carries the same value as fingerprint-time-logger's `READER_RESOLVE_SECRET`.** HF ID guards its ENTIRE app↔central surface — `/resolve`, `/resolve-badge`, `/claim`, `/wait` — with that one secret, so there is no separate upstream credential to find; do not go hunting for one. It is therefore also the same value as this repo's own `READER_RESOLVE_SECRET` (card-login pairing, `service::reader`). Three names, one secret:
+
+  | name | where | consumer |
+  |---|---|---|
+  | `READER_RESOLVE_SECRET` | fingerprint-time-logger (HF ID) | the authority — guards its whole app↔central surface |
+  | `READER_RESOLVE_SECRET` | new-hotel | card-login pairing (`/claim`, `/wait`) |
+  | `HFID_RESOLVE_SECRET` | new-hotel | `/hk` badge→location lookup (`/resolve-badge`) |
+
+  The distinct new-hotel name is deliberate: it lets the two consumers be rotated independently later without a code change, and it keeps a `/hk` outage from being indistinguishable from a card-login outage. An unset GH secret yields an EMPTY file, which the hydrator treats as absent — no lookup client is built, and with `HK_LOCATION_ENFORCEMENT_ENABLED` on every `/hk` request fails closed with `503` (never a fallback to the `HK_BRANCHES` allowlist).
 
 The deploy script (`/srv/run-deploy.sh` on evergreen, NOT in this repo) writes these from the JSON payload's `.secrets` block on every deploy, with mode `0400` and owner `deploy:docker`.
 

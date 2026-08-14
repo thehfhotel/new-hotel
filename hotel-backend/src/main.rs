@@ -184,12 +184,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - `HK_MARK_DIRTY_ENABLED` (default OFF) — invariant #6. The MarkRoomDirty
     //   write shape is live-verified, but a maid's phone as the TRIGGER is new,
     //   so it needs its own reception-coordinated window before the flip.
+    // - `HK_LOCATION_ENFORCEMENT_ENABLED` (default OFF) — per-employee branch
+    //   enforcement against HF ID's `Employee.location`. `HK_BRANCHES` answers
+    //   "which properties does this deployment serve", never "which property
+    //   does THIS maid work at", so until this flips a Ville maid is still
+    //   offered HF Hotel. Flipping it needs `HFID_LOCATION_URL` +
+    //   `HFID_RESOLVE_SECRET` present FIRST (`location_lookup_configured`
+    //   below) — with the flag on and the lookup unconfigured, every /hk
+    //   request 503s. See PENDING-VERIFICATIONS.md V14.
     let hk_policy = routes::hk::HkPolicy::from_env();
     tracing::info!(
-        "/hk surface: branches={:?}, mark_dirty_enabled={}",
+        "/hk surface: branches={:?}, mark_dirty_enabled={}, \
+         location_enforcement_enabled={} (lookup configured: {})",
         hk_policy.branch_ids(),
-        hk_policy.mark_dirty_enabled
+        hk_policy.mark_dirty_enabled,
+        hk_policy.location_enforcement_enabled,
+        hk_policy.location_lookup_configured()
     );
+    if hk_policy.location_enforcement_enabled && !hk_policy.location_lookup_configured() {
+        tracing::error!(
+            "/hk location enforcement is ON but HFID_LOCATION_URL / HFID_RESOLVE_SECRET \
+             are not both set — every /hk request will answer 503. Set both (or flip \
+             HK_LOCATION_ENFORCEMENT_ENABLED back to false) and redeploy."
+        );
+    }
 
     // Loyalty-app integration (docs/loyalty-channel.md). Inbound channel
     // ships DARK (flag + token both required); outbound stay hook is off

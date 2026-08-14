@@ -225,6 +225,39 @@ services:
       # own reception-coordinated window, see PENDING-VERIFICATIONS.md V12).
       - HK_MARK_DIRTY_ENABLED=${HK_MARK_DIRTY_ENABLED:-false}
       - HK_BRANCHES=${HK_BRANCHES:-hfhotel}
+      # Per-employee location enforcement (wave-4 housekeeping C). HK_BRANCHES
+      # above answers "which properties does this DEPLOYMENT serve"; it never
+      # answered "which property does THIS MAID work at", so a HF Ville maid
+      # was offered HF Hotel in the picker and could file against the wrong
+      # property. With this ON, /api/hk/me serves HK_BRANCHES ∩ {the
+      # employee's HF ID location} and every room endpoint refuses a branch
+      # that is not hers.
+      #
+      # Ships OFF (invariant #6): flipping it can lock staff OUT of the
+      # surface — anyone whose HF ID Employee.location is NULL is refused, by
+      # design and with no fallback. Preconditions, in order (see
+      # PENDING-VERIFICATIONS.md V14): the owner sets every maid's location in
+      # HF ID (badge 421 is the only NULL today) → HFID_LOCATION_URL and
+      # HFID_RESOLVE_SECRET are both live → only THEN flip this.
+      #
+      # With the flag ON and the lookup unconfigured, EVERY /hk request 503s
+      # (fail closed — "unconfigured" must never equal "allowed"). The startup
+      # line logs `location_enforcement_enabled=… (lookup configured: …)`.
+      - HK_LOCATION_ENFORCEMENT_ENABLED=${HK_LOCATION_ENFORCEMENT_ENABLED:-false}
+      # FULL URL of HF ID's badge → location endpoint, path included —
+      # http://192.168.100.228:5000/api/private/reader/resolve-badge
+      # (fingerprint-time-logger app/api/reader.py). A full URL rather than a
+      # base + hardcoded path so a peer-side path change is a variable edit,
+      # not a code change.
+      #
+      # LAN ONLY — never route this through Cloudflare. It is a
+      # server-to-server call inside the property network sitting in the
+      # request path of every /hk read; an edge hop would add an auth surface,
+      # a failure mode and latency to it.
+      #
+      # Deliberately no default: unset must read as "unconfigured" (⇒ 503,
+      # fail closed), never as a confident lookup against a guessed path.
+      - HFID_LOCATION_URL=${HFID_LOCATION_URL:-}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap

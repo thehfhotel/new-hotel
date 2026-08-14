@@ -10,6 +10,7 @@
  */
 
 import {
+  branchesUnavailableMessage,
   groupRoomsByFloor,
   HK_API_BASE,
   hkFetch,
@@ -300,5 +301,75 @@ describe('hkFetchMe', () => {
   it('still fails closed on 401', async () => {
     ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(401))
     await expect(hkFetchMe()).rejects.toThrow(/ยืนยันตัวตน/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Employee-location enforcement (wave-4 §C) — the empty-branches contract
+// ---------------------------------------------------------------------------
+
+describe('branchesUnavailableMessage', () => {
+  it('gives no_location an admin-facing action, not a retry', () => {
+    const message = branchesUnavailableMessage('no_location')
+    expect(message).toMatch(/ผู้ดูแลระบบ/)
+    // Retrying cannot fix a missing/unserved location — the copy must not say
+    // "try again", or a maid will stand there tapping refresh.
+    expect(message).not.toMatch(/ลองใหม่/)
+  })
+
+  it('gives lookup_unavailable a RETRY action — it is a transient outage', () => {
+    const message = branchesUnavailableMessage('lookup_unavailable')
+    expect(message).toMatch(/ลองใหม่/)
+  })
+
+  it('renders the two reasons distinctly — collapsing them loses the action', () => {
+    expect(branchesUnavailableMessage('no_location')).not.toBe(
+      branchesUnavailableMessage('lookup_unavailable')
+    )
+  })
+
+  it('falls back to a real actionable message for null/unknown, never a blank panel', () => {
+    const fallback = branchesUnavailableMessage(null)
+    expect(fallback.length).toBeGreaterThan(0)
+    expect(fallback).toBe(branchesUnavailableMessage('no_location'))
+    expect(branchesUnavailableMessage(undefined)).toBe(fallback)
+    // A reason string from a newer backend must not blank the screen either.
+    expect(
+      branchesUnavailableMessage('something_new' as unknown as 'no_location')
+    ).toBe(fallback)
+  })
+})
+
+describe('resolveInitialBranch with an EMPTY branch list', () => {
+  // The whole point of location enforcement: `/me` can now legitimately serve
+  // `branches: []`. Nothing may be auto-selected out of an empty list — that
+  // would be the wrong-property bug with extra steps.
+  it('never auto-selects a branch when none is offered', () => {
+    expect(resolveInitialBranch([], null)).toBeNull()
+  })
+
+  it('discards a stored branch that is no longer offered at all', () => {
+    expect(resolveInitialBranch([], 'hfhotel')).toBeNull()
+    expect(resolveInitialBranch([], 'hfville')).toBeNull()
+  })
+})
+
+describe('hkFetch on 503 (location lookup unavailable)', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(503))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it('throws a RETRY-flavoured Thai message, distinct from the 403 copy', async () => {
+    await expect(hkFetch('/rooms', 'hfhotel')).rejects.toThrow(/ลองใหม่/)
+
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(403))
+    const forbidden = await hkFetch('/rooms', 'hfhotel').catch((e: Error) => e.message)
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(503))
+    const unavailable = await hkFetch('/rooms', 'hfhotel').catch((e: Error) => e.message)
+    expect(unavailable).not.toBe(forbidden)
   })
 })

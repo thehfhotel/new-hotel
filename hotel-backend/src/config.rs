@@ -667,6 +667,59 @@ impl ReaderConfig {
     }
 }
 
+/// Configuration for the HF ID badge → employee-location lookup that backs
+/// `/hk` location enforcement ([`crate::hfid_location`]).
+///
+///   * `url` (`HFID_LOCATION_URL`) — the FULL endpoint URL, path included, e.g.
+///     `http://192.168.100.228:5000/api/private/reader/resolve-badge`.
+///
+///     A full URL rather than [`DEFAULT_HFID_BASE_URL`] + a hardcoded path, on
+///     purpose: the peer service owns that path, and consuming it as config
+///     means a path change is a repo-variable edit rather than a code change.
+///     There is deliberately NO default — an unset value must read as
+///     "unconfigured" (⇒ `lookup_unavailable`, fail closed), and a default
+///     would instead produce a confident lookup against a guessed path.
+///
+///     It MUST be a plain LAN address. Never route this through Cloudflare:
+///     the call is server-to-server inside the property network, and an edge
+///     hop would add an auth surface, a failure mode and latency to a request
+///     that sits in the path of every `/hk` read.
+///
+///   * `resolve_secret` (`HFID_RESOLVE_SECRET`) — the shared secret sent as
+///     `X-Reader-Secret`. **It carries the same VALUE as HF ID's own
+///     `READER_RESOLVE_SECRET`** (and therefore as this repo's
+///     [`ReaderConfig::resolve_secret`]); the distinct name keeps the two
+///     consumers independently rotatable. See `CLAUDE.md` → "Credentials &
+///     Docker secrets".
+///
+/// Both halves are required. Either one missing ⇒
+/// [`crate::hfid_location::HfidLocationClient::from_config`] yields `None`,
+/// which with enforcement ON is `lookup_unavailable` — never a fallback to the
+/// `HK_BRANCHES` allowlist.
+///
+/// The secret ALSO flows through the `/run/secrets` hydrator (see `secrets.rs`
+/// — file `hfid_resolve_secret`); env vars still win.
+#[derive(Debug, Clone, Default)]
+pub struct HfidLocationConfig {
+    pub url: Option<String>,
+    pub resolve_secret: Option<String>,
+}
+
+impl HfidLocationConfig {
+    pub fn from_env() -> Self {
+        Self {
+            url: optional_env("HFID_LOCATION_URL"),
+            resolve_secret: optional_env("HFID_RESOLVE_SECRET"),
+        }
+    }
+
+    /// Whether both halves are present — for the startup log line, which must
+    /// report configured-ness WITHOUT printing either value.
+    pub fn is_configured(&self) -> bool {
+        self.url.is_some() && self.resolve_secret.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

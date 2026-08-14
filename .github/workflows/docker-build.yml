@@ -961,6 +961,36 @@ jobs:
           # + redeploy — see PENDING-VERIFICATIONS.md V12/V13.
           HK_MARK_DIRTY_ENABLED:   ${{ vars.HK_MARK_DIRTY_ENABLED || 'false' }}
           HK_BRANCHES:             ${{ vars.HK_BRANCHES || 'hfhotel' }}
+          # Per-employee location enforcement (wave-4 housekeeping C). Same
+          # GH-variable pattern as the two above; unset variables reproduce
+          # docker-compose.yml's own defaults exactly (HkPolicy::from_env()).
+          #
+          # HFID_LOCATION_URL is the FULL endpoint URL of HF ID's badge →
+          # location lookup, path included. It is a VARIABLE, not a secret — a
+          # LAN address is not a credential, and carrying it as config means
+          # the peer settling its final path costs a `gh variable set`, not a
+          # code change. Empty default = unconfigured = fail closed (503).
+          #
+          # Flip order matters and is NOT "just config" — enforcement locks out
+          # any employee whose HF ID location is NULL. See
+          # PENDING-VERIFICATIONS.md V14 for the checklist.
+          HK_LOCATION_ENFORCEMENT_ENABLED: ${{ vars.HK_LOCATION_ENFORCEMENT_ENABLED || 'false' }}
+          HFID_LOCATION_URL:               ${{ vars.HFID_LOCATION_URL || '' }}
+          # Shared secret for that lookup, sent as `X-Reader-Secret`. Delivered
+          # via the payload's `secrets:` block ONLY — never as an `env:` entry
+          # in the container.
+          #
+          # It carries the SAME VALUE as the estate's READER_RESOLVE_SECRET
+          # (above): HF ID guards its whole app↔central surface with one
+          # secret. The distinct name keeps the two consumers independently
+          # rotatable. Do not hunt for a separate upstream credential.
+          #
+          # Lands one deploy BEFORE the compose `secrets:` declaration, for the
+          # reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh writes
+          # a file for every `.secrets` key including empty values (harmless —
+          # the hydrator skips empty), whereas a compose `secrets:` entry
+          # pointing at a MISSING file aborts the entire stack start.
+          HFID_RESOLVE_SECRET:     ${{ secrets.HFID_RESOLVE_SECRET }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1108,6 +1138,9 @@ jobs:
             --arg CF_ACCESS_HK_AUD    "$CF_ACCESS_HK_AUD" \
             --arg HK_MARK_DIRTY_ENABLED "${HK_MARK_DIRTY_ENABLED:-false}" \
             --arg HK_BRANCHES           "${HK_BRANCHES:-hfhotel}" \
+            --arg HK_LOCATION_ENFORCEMENT_ENABLED "${HK_LOCATION_ENFORCEMENT_ENABLED:-false}" \
+            --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
+            --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1142,6 +1175,8 @@ jobs:
                 CF_ACCESS_HK_AUD:             $CF_ACCESS_HK_AUD,
                 HK_MARK_DIRTY_ENABLED:        $HK_MARK_DIRTY_ENABLED,
                 HK_BRANCHES:                  $HK_BRANCHES,
+                HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
+                HFID_LOCATION_URL:            $HFID_LOCATION_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
@@ -1166,6 +1201,7 @@ jobs:
                 slack_webhook_url:  $SLACK_WEBHOOK_URL,
                 ota_bridge_token:          $OTA_BRIDGE_TOKEN,
                 ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
+                hfid_resolve_secret:       $HFID_RESOLVE_SECRET,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

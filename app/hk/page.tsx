@@ -34,7 +34,7 @@ import {
   type HkRoom,
 } from './hk-lib'
 import HkOpsLinks from './HkOpsLinks'
-import { HkBranchChip, HkBranchPicker } from './HkBranchPicker'
+import { HkBranchChip, HkBranchesUnavailable, HkBranchPicker } from './HkBranchPicker'
 
 export default function HkRoomListPage() {
   const [me, setMe] = useState<HkMe | null>(null)
@@ -103,10 +103,16 @@ export default function HkRoomListPage() {
   const doneCount = rooms.filter((r) => r.cleaning?.status === 'done').length
   const startedCount = rooms.filter((r) => r.cleaning?.status === 'started').length
 
+  // The EMPTY case (§C): location enforcement resolved this maid to no branch
+  // at all. Blocks like the picker does, but offers nothing to tap — there is
+  // no branch to guess. Checked BEFORE `showPicker` so the "choose one" screen
+  // is never rendered with zero choices.
+  const showUnavailable = branchResolved && me && !meError && me.branches.length === 0
+
   // Blocking picker: identity resolved, more than one branch configured,
   // nothing valid stored. Never falls through to fetching rooms for a
   // guessed branch.
-  const showPicker = branchResolved && me && !meError && !branch
+  const showPicker = branchResolved && me && !meError && !branch && !showUnavailable
 
   return (
     <main>
@@ -136,9 +142,13 @@ export default function HkRoomListPage() {
         </div>
       )}
 
+      {showUnavailable && me && (
+        <HkBranchesUnavailable reason={me.branchesUnavailableReason ?? null} />
+      )}
+
       {showPicker && me && <HkBranchPicker branches={me.branches} onPick={pickBranch} />}
 
-      {!showPicker && !meError && (
+      {!showPicker && !showUnavailable && !meError && (
         <>
           {/* Room-list error notice */}
           {error && (

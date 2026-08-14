@@ -31,6 +31,38 @@
 //! The gate lives in the HANDLERS, i.e. INSIDE `require_hk_access`: an
 //! unauthenticated caller gets 401 and can never probe branch configuration.
 //!
+//! ## Per-employee location enforcement (wave-4 C — ships DARK)
+//!
+//! `HK_BRANCHES` answers "which properties does this DEPLOYMENT serve". It
+//! never answered "which property does THIS EMPLOYEE work at" — so `/api/hk/me`
+//! handed every maid the same global allowlist, and an HF Ville maid offered
+//! "ฮาร์เบอร์ฟร้อนท์" could file a cleaning report (and, for `done`, a real
+//! `MarkRoomClean` writeback) against the WRONG PROPERTY.
+//!
+//! HF ID holds the authoritative answer in `Employee.location`, so with
+//! `HK_LOCATION_ENFORCEMENT_ENABLED=true` this surface asks it
+//! ([`crate::hfid_location`]) and applies TWO rules:
+//!
+//! - `GET /api/hk/me` serves `branches` = `HK_BRANCHES` ∩ {the employee's own
+//!   location}. Empty ⇒ `[]` plus [`MeResponse::branches_unavailable_reason`],
+//!   so the client renders an actionable message instead of an empty picker.
+//! - every room endpoint — READS AND MUTATIONS ALIKE — additionally requires
+//!   the requested `?branch=` to EQUAL the employee's location
+//!   ([`require_location`]). Reads are included deliberately: the room list is
+//!   what a maid works from, and showing her the other property's rooms is
+//!   already the wrong-hotel bug, one tap earlier.
+//!
+//! **The hard property: there is no fallback.** A null location, a lookup
+//! miss, an inactive/pending employee, an unreachable HF ID, an unset URL or
+//! an unset secret all REFUSE (403 / 503). None of them may degrade to the
+//! allowlist or to `hfhotel`, and there is no per-badge carve-out — a
+//! carve-out is indistinguishable from the bug. See [`location_gate`], which
+//! is pure and exhaustive precisely so that property is checkable by reading
+//! one `match`.
+//!
+//! Flag OFF (the default) ⇒ no lookup is performed at all and every response
+//! is byte-identical to the pre-enforcement build.
+//!
 //! ## Identity & auth
 //!
 //! The router is wrapped by [`crate::middleware::hk_access::require_hk_access`]
@@ -95,6 +127,8 @@
 //! needs no `.sqlx/` cache regeneration — same policy as
 //! `routes::guest_documents` / `routes::new_maintenance`.
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -108,8 +142,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 
 use super::mode::{AppState, Branch};
+use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
+use crate::hfid_location::{EmployeeLocation, HfidLocationClient, LocationOutcome};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::housekeeping::{
@@ -129,6 +165,10 @@ pub const HK_BRANCHES_ENV: &str = "HK_BRANCHES";
 /// Env var gating `status:"dirty"` (invariant #6). Default OFF.
 pub const HK_MARK_DIRTY_ENV: &str = "HK_MARK_DIRTY_ENABLED";
 
+/// Env var gating per-employee location enforcement. Default OFF — with it
+/// off, this surface behaves byte-identically to the pre-enforcement build.
+pub const HK_LOCATION_ENFORCEMENT_ENV: &str = "HK_LOCATION_ENFORCEMENT_ENABLED";
+
 /// The one branch served when `HK_BRANCHES` is unset — HF Ville is admitted
 /// only after its legacy-key repair is verified (`bin/repair_room_legacy_keys`).
 pub const DEFAULT_HK_BRANCH: Branch = Branch::Hfhotel;
@@ -145,6 +185,34 @@ pub const BRANCH_NOT_ENABLED_ERROR: &str = "branch not enabled for the housekeep
 pub const MARK_DIRTY_DISABLED_ERROR: &str =
     "ยังไม่เปิดใช้งานการแจ้งห้องไม่สะอาด กรุณาแจ้งแผนกต้อนรับ";
 
+/// 403 body when the requested branch is not the employee's own location.
+/// ACTIONABLE: it names what to do (pick your own branch) and who to ask.
+pub const LOCATION_MISMATCH_ERROR: &str =
+    "สาขาที่เลือกไม่ตรงกับสาขาที่คุณสังกัด กรุณาเลือกสาขาของคุณ หรือติดต่อผู้ดูแลระบบ";
+
+/// 403 body when HF ID has no usable location for this employee — null
+/// `location`, an unknown badge, or an inactive/pending employee. The fix is
+/// an admin action, so that is what the message asks for.
+pub const LOCATION_UNKNOWN_ERROR: &str = "ยังไม่ได้กำหนดสาขาของพนักงาน — ติดต่อผู้ดูแลระบบ";
+
+/// 503 body when the location lookup could not answer (HF ID unreachable,
+/// non-2xx, undecodable, or `HFID_LOCATION_URL`/`HFID_RESOLVE_SECRET` unset).
+/// Distinct from [`LOCATION_UNKNOWN_ERROR`] on purpose: this one IS worth
+/// retrying, so the message says so instead of sending the maid to an admin
+/// for a blip.
+pub const LOCATION_LOOKUP_UNAVAILABLE_ERROR: &str =
+    "ระบบตรวจสอบสาขาพนักงานขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง หากยังไม่ได้ ให้ติดต่อผู้ดูแลระบบ";
+
+/// [`MeResponse::branches_unavailable_reason`] — HF ID answered definitively
+/// and there is no branch for this employee: no location on file, unknown
+/// badge, inactive/pending, or a location this deployment does not serve.
+/// Machine-readable and STABLE; the frontend maps it to its own Thai copy.
+pub const REASON_NO_LOCATION: &str = "no_location";
+
+/// [`MeResponse::branches_unavailable_reason`] — the lookup itself could not
+/// answer. Retryable, unlike [`REASON_NO_LOCATION`].
+pub const REASON_LOOKUP_UNAVAILABLE: &str = "lookup_unavailable";
+
 /// Runtime configuration of the `/hk` surface, resolved ONCE at startup and
 /// carried as a request extension by [`router`].
 ///
@@ -155,28 +223,63 @@ pub const MARK_DIRTY_DISABLED_ERROR: &str =
 #[derive(Debug, Clone)]
 pub struct HkPolicy {
     /// Branches a maid may select, in `HK_BRANCHES` order. Never empty.
+    ///
+    /// This is the DEPLOYMENT's allowlist. With location enforcement on it is
+    /// only the first of two gates — it is intersected with the individual
+    /// employee's own location, never used in place of it.
     pub branches: Vec<Branch>,
     /// `HK_MARK_DIRTY_ENABLED` — ships DARK (default `false`).
     pub mark_dirty_enabled: bool,
+    /// `HK_LOCATION_ENFORCEMENT_ENABLED` — ships DARK (default `false`).
+    /// `false` ⇒ [`require_location`] is a no-op and no lookup is issued, so
+    /// the surface is byte-identical to the pre-enforcement build.
+    pub location_enforcement_enabled: bool,
+    /// The HF ID badge → location client.
+    ///
+    /// `None` means `HFID_LOCATION_URL` / `HFID_RESOLVE_SECRET` are not both
+    /// set, i.e. there is nothing to ask. With enforcement ON that is
+    /// [`REASON_LOOKUP_UNAVAILABLE`] / `503` — deliberately NOT a pass-through,
+    /// because "unconfigured" and "allowed" must never be the same state.
+    pub location: Option<Arc<HfidLocationClient>>,
 }
 
 impl HkPolicy {
-    /// Read `HK_BRANCHES` + `HK_MARK_DIRTY_ENABLED`. Call ONCE at startup.
+    /// Read `HK_BRANCHES` + `HK_MARK_DIRTY_ENABLED` +
+    /// `HK_LOCATION_ENFORCEMENT_ENABLED` (and, for the last, the HF ID lookup
+    /// configuration). Call ONCE at startup.
+    ///
+    /// The client is built even when the flag is off: it holds no connection,
+    /// only a `ureq::Agent`, and building it unconditionally means the startup
+    /// line can report whether the flip would actually have somewhere to call.
     pub fn from_env() -> Self {
         let raw = std::env::var(HK_BRANCHES_ENV).ok();
         let branches = parse_hk_branches(raw.as_deref());
         let mark_dirty_enabled = std::env::var(HK_MARK_DIRTY_ENV)
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        let location_enforcement_enabled = std::env::var(HK_LOCATION_ENFORCEMENT_ENV)
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let location = HfidLocationClient::from_config(HfidLocationConfig::from_env()).map(Arc::new);
         Self {
             branches,
             mark_dirty_enabled,
+            location_enforcement_enabled,
+            location,
         }
     }
 
     /// Stable ids of the configured branches, for logging + `GET /api/hk/me`.
     pub fn branch_ids(&self) -> Vec<&'static str> {
         self.branches.iter().copied().map(branch_id).collect()
+    }
+
+    /// Whether the HF ID lookup has both halves of its configuration — for the
+    /// startup log. `false` while enforcement is ON means every `/hk` request
+    /// 503s, which is exactly what the flip checklist must catch BEFORE the
+    /// flag is flipped (PENDING-VERIFICATIONS.md V14).
+    pub fn location_lookup_configured(&self) -> bool {
+        self.location.is_some()
     }
 }
 
@@ -185,6 +288,8 @@ impl Default for HkPolicy {
         Self {
             branches: vec![DEFAULT_HK_BRANCH],
             mark_dirty_enabled: false,
+            location_enforcement_enabled: false,
+            location: None,
         }
     }
 }
@@ -270,6 +375,100 @@ fn require_branch(policy: &HkPolicy, raw: Option<&str>) -> ApiResult<Branch> {
         return Err(ApiError::Forbidden(BRANCH_NOT_ENABLED_ERROR.to_string()));
     }
     Ok(branch)
+}
+
+/// THE MAPPING. HF ID's `Employee.location` → our `?branch=` branch. PURE, and
+/// pinned by an explicit table test below.
+///
+/// The two vocabularies are NOT the same strings and must never be bridged by
+/// string manipulation. Lower-casing HF ID's values yields `"hf"` /
+/// `"hf_ville"`, neither of which [`parse_branch_param`] accepts — so a naive
+/// `to_lowercase()` bridge would turn every enforced request into a `400`
+/// that reads like a client bug. Forwarding the raw token is worse: `"HF"` is
+/// also refused, and `"HF_VILLE"` looks tantalisingly close to `hfville`.
+/// Keeping the mapping a total function over a two-variant enum means the
+/// compiler, not a reviewer, guarantees every location has exactly one branch.
+fn location_branch(location: EmployeeLocation) -> Branch {
+    match location {
+        EmployeeLocation::Hf => Branch::Hfhotel,
+        EmployeeLocation::HfVille => Branch::Hfville,
+    }
+}
+
+/// The per-employee location gate, given the lookup's answer and the requested
+/// branch. PURE and exhaustive — unit-tested below.
+///
+/// Every non-`Resolved` arm REFUSES. There is no arm that returns `Ok(())`
+/// without an equality check against the employee's own location, and none
+/// that falls back to [`DEFAULT_HK_BRANCH`] or to `policy.branches`. That is
+/// the hard property of this whole stream, and it is checkable by reading this
+/// one `match`.
+fn location_gate(outcome: LocationOutcome, requested: Branch) -> ApiResult<()> {
+    match outcome {
+        LocationOutcome::Resolved(location) => {
+            if location_branch(location) == requested {
+                Ok(())
+            } else {
+                Err(ApiError::Forbidden(LOCATION_MISMATCH_ERROR.to_string()))
+            }
+        }
+        // Definite answer, no usable branch. 403 (not 503): retrying changes
+        // nothing, an admin must act.
+        LocationOutcome::NoLocation => Err(ApiError::Forbidden(LOCATION_UNKNOWN_ERROR.to_string())),
+        // No answer. 503 (not 403): the request may well be legitimate, we
+        // simply cannot tell — and a maid must not be told "you are not
+        // allowed" because a LAN cable is loose.
+        LocationOutcome::Unavailable => Err(ApiError::ServiceUnavailable(
+            LOCATION_LOOKUP_UNAVAILABLE_ERROR.to_string(),
+        )),
+    }
+}
+
+/// Ask HF ID for this badge's location, or report [`LocationOutcome::Unavailable`]
+/// when no lookup is configured. NEVER returns a location it did not receive.
+async fn resolve_location(policy: &HkPolicy, badge: &str) -> LocationOutcome {
+    match policy.location.as_ref() {
+        Some(client) => client.resolve(badge).await,
+        // Enforcement is on but `HFID_LOCATION_URL` / `HFID_RESOLVE_SECRET`
+        // are not both set. Fail closed — an unconfigured lookup must not be
+        // indistinguishable from a permissive one.
+        None => {
+            tracing::warn!(
+                "{HK_LOCATION_ENFORCEMENT_ENV} is on but the HF ID location lookup is \
+                 unconfigured (need HFID_LOCATION_URL + HFID_RESOLVE_SECRET) — \
+                 every /hk request will 503"
+            );
+            LocationOutcome::Unavailable
+        }
+    }
+}
+
+/// The location gate as the room handlers call it: a no-op while the flag is
+/// off (NO lookup is issued — the dark path costs nothing and touches no
+/// network), the full [`location_gate`] when it is on.
+///
+/// Applied to READS as well as mutations. A maid who can list the other
+/// property's rooms is already looking at the wrong hotel; refusing only the
+/// write would leave the bug visible and one tap away.
+async fn require_location(
+    policy: &HkPolicy,
+    identity: &HkIdentity,
+    branch: Branch,
+) -> ApiResult<()> {
+    if !policy.location_enforcement_enabled {
+        return Ok(());
+    }
+    let outcome = resolve_location(policy, &identity.badge).await;
+    let result = location_gate(outcome, branch);
+    if result.is_err() {
+        tracing::warn!(
+            badge = %identity.badge,
+            requested_branch = branch_id(branch),
+            ?outcome,
+            "/hk location gate refused a request"
+        );
+    }
+    result
 }
 
 /// Branch selector shared by every hk room route. Deliberately a raw `String`,
@@ -419,6 +618,10 @@ pub fn router_with_policy(state: AppState, policy: HkPolicy) -> Router {
 /// precisely so nobody can probe branch config without an identity). The test
 /// injects its own `Extension<HkIdentity>` in the Access layer's place, then
 /// separately asserts through [`router`] that the real stack still answers 401.
+///
+/// EVERY handler here now extracts `Extension<HkIdentity>` (the location gate
+/// needs the badge on reads too, not just on the mutation), so a mount without
+/// an identity layer is a 500 rather than a silently unauthenticated surface.
 pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
     Router::new()
         .route("/api/hk/me", get(me))
@@ -463,12 +666,28 @@ pub struct MeResponse {
     pub success: bool,
     pub badge: String,
     pub display_name: Option<String>,
-    /// Branches this maid may pick, in `HK_BRANCHES` order. Never empty; a
-    /// single entry means the client auto-selects and renders NO picker.
+    /// Branches this maid may pick, in `HK_BRANCHES` order. A single entry
+    /// means the client auto-selects and renders NO picker.
+    ///
+    /// With location enforcement ON this is `HK_BRANCHES` ∩ {the employee's
+    /// own location}, so it is normally length 1 — and CAN be EMPTY, which is
+    /// what [`Self::branches_unavailable_reason`] explains. (Before
+    /// enforcement it was documented "never empty"; that invariant is now the
+    /// flag-off case only.)
     pub branches: Vec<HkBranchOption>,
     /// `HK_MARK_DIRTY_ENABLED`. `false` ⇒ the client hides the
     /// "แจ้งห้องไม่สะอาด" button rather than offering a dead tap.
     pub mark_dirty_enabled: bool,
+    /// Why [`Self::branches`] is empty, when it is: [`REASON_NO_LOCATION`] or
+    /// [`REASON_LOOKUP_UNAVAILABLE`]. `None` whenever `branches` is non-empty
+    /// (and always, while enforcement is off).
+    ///
+    /// ADDITIVE and always serialized (as `null` in the normal case) so the
+    /// field's presence is stable and the client can branch on the VALUE
+    /// rather than on whether the key exists. A machine-readable code rather
+    /// than a message: the Thai copy belongs to the client, which knows
+    /// whether it is rendering a picker or a room list.
+    pub branches_unavailable_reason: Option<&'static str>,
 }
 
 /// Today's latest cleaning event for a room (the room's current progress).
@@ -735,21 +954,82 @@ pub async fn me(
     Extension(identity): Extension<HkIdentity>,
     Extension(policy): Extension<HkPolicy>,
 ) -> ApiResult<Json<MeResponse>> {
+    let (branches, branches_unavailable_reason) = me_branches(&policy, &identity).await;
     Ok(Json(MeResponse {
         success: true,
         badge: identity.badge,
         display_name: identity.display_name,
-        branches: policy
-            .branches
-            .iter()
-            .copied()
+        branches: branches
+            .into_iter()
             .map(|b| HkBranchOption {
                 id: branch_id(b).to_string(),
                 label_th: branch_label_th(b).to_string(),
             })
             .collect(),
         mark_dirty_enabled: policy.mark_dirty_enabled,
+        branches_unavailable_reason,
     }))
+}
+
+/// The branch list `GET /api/hk/me` serves, plus the reason it is empty.
+///
+/// Flag off ⇒ the whole `HK_BRANCHES` allowlist, unchanged and with no lookup.
+/// Flag on ⇒ the INTERSECTION of the allowlist with the employee's own
+/// location, which is the picker-shaped half of the same rule
+/// [`location_gate`] enforces per request. The two must agree, or the picker
+/// would offer a branch every subsequent call then 403s.
+async fn me_branches(
+    policy: &HkPolicy,
+    identity: &HkIdentity,
+) -> (Vec<Branch>, Option<&'static str>) {
+    if !policy.location_enforcement_enabled {
+        return (policy.branches.clone(), None);
+    }
+    let outcome = resolve_location(policy, &identity.badge).await;
+    (
+        intersect_location(&policy.branches, outcome),
+        me_reason(&policy.branches, outcome),
+    )
+}
+
+/// `HK_BRANCHES` ∩ {employee's location}. PURE — unit-tested below.
+///
+/// At most one element, and never a branch outside `allowed`: the deployment
+/// allowlist still binds. An employee whose property this deployment does not
+/// serve yet (an `HF_VILLE` maid while `HK_BRANCHES=hfhotel`) therefore gets
+/// `[]`, NOT `hfhotel` — the intersection is what makes that fall out
+/// automatically instead of needing its own carve-out.
+fn intersect_location(allowed: &[Branch], outcome: LocationOutcome) -> Vec<Branch> {
+    match outcome {
+        LocationOutcome::Resolved(location) => {
+            let branch = location_branch(location);
+            if allowed.contains(&branch) {
+                vec![branch]
+            } else {
+                Vec::new()
+            }
+        }
+        LocationOutcome::NoLocation | LocationOutcome::Unavailable => Vec::new(),
+    }
+}
+
+/// The machine-readable reason accompanying an empty [`intersect_location`].
+/// PURE — unit-tested below.
+///
+/// Note the deliberate collapse: an employee at a real property this
+/// deployment does not serve reports [`REASON_NO_LOCATION`], not
+/// [`REASON_LOOKUP_UNAVAILABLE`]. The lookup WORKED; nothing is going to
+/// change by retrying, and `lookup_unavailable` would invite exactly that. The
+/// client's copy for this reason therefore covers both "no location on file"
+/// and "your branch is not enabled here" — both end at "contact an admin".
+fn me_reason(allowed: &[Branch], outcome: LocationOutcome) -> Option<&'static str> {
+    if !intersect_location(allowed, outcome).is_empty() {
+        return None;
+    }
+    match outcome {
+        LocationOutcome::Unavailable => Some(REASON_LOOKUP_UNAVAILABLE),
+        LocationOutcome::NoLocation | LocationOutcome::Resolved(_) => Some(REASON_NO_LOCATION),
+    }
 }
 
 /// GET /api/hk/rooms — the maid's room list with today's progress.
@@ -757,8 +1037,10 @@ pub async fn list_rooms(
     State(state): State<AppState>,
     Query(query): Query<HkBranchQuery>,
     Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
 ) -> ApiResult<Json<RoomsResponse>> {
     let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
     let pool = resolve_pool(&state, branch)?;
     let data = fetch_rooms(pool).await?;
     Ok(Json(RoomsResponse {
@@ -773,8 +1055,10 @@ pub async fn room_detail(
     Path(room_id): Path<i32>,
     Query(query): Query<HkBranchQuery>,
     Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
 ) -> ApiResult<Json<RoomDetailResponse>> {
     let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
     let pool = resolve_pool(&state, branch)?;
     let room = fetch_room(pool, room_id)
         .await?
@@ -801,6 +1085,11 @@ pub async fn room_detail(
 /// branch (400/403) BEFORE status (400) BEFORE the mark-dirty flag (403). A
 /// request with no branch must never be answered on the strength of its body.
 ///
+/// The location gate joins the FIRST tier, immediately after the allowlist
+/// check and still ahead of status validation: "you may not act on this
+/// property at all" outranks "that status is misspelled". While the flag is
+/// off it is a no-op, so the pinned order is unchanged for the dark build.
+///
 /// `writeback_enqueued` means ENQUEUED, NOT DELIVERED — see
 /// [`ReportCleaningResponse::writeback_enqueued`].
 pub async fn report_cleaning(
@@ -812,6 +1101,7 @@ pub async fn report_cleaning(
     Json(body): Json<ReportCleaningBody>,
 ) -> ApiResult<Json<ReportCleaningResponse>> {
     let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
     let status = parse_cleaning_status(&body.status)?;
 
     // Invariant #6: the mark-dirty TRIGGER is new even though the legacy write
@@ -871,8 +1161,10 @@ pub async fn broken_item_photo(
     Path(report_id): Path<i64>,
     Query(query): Query<HkBranchQuery>,
     Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
 ) -> ApiResult<Response> {
     let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
     let pool = resolve_pool(&state, branch)?;
     let row = sqlx::query(
         "SELECT hkbr_photo, hkbr_photo_mime FROM ht_hk_broken_reports WHERE hkbr_id = $1",
@@ -996,7 +1288,36 @@ mod tests {
     fn policy(branches: Vec<Branch>) -> HkPolicy {
         HkPolicy {
             branches,
-            mark_dirty_enabled: false,
+            ..HkPolicy::default()
+        }
+    }
+
+    /// A policy with location enforcement ON and a scripted lookup behind it.
+    fn enforcing(branches: Vec<Branch>, outcome: LocationOutcome) -> HkPolicy {
+        HkPolicy {
+            branches,
+            location_enforcement_enabled: true,
+            location: Some(Arc::new(HfidLocationClient::with_lookup(Arc::new(
+                FixedLookup(outcome),
+            )))),
+            ..HkPolicy::default()
+        }
+    }
+
+    struct FixedLookup(LocationOutcome);
+
+    #[async_trait::async_trait]
+    impl crate::hfid_location::LocationLookup for FixedLookup {
+        async fn lookup(&self, _badge: &str) -> LocationOutcome {
+            self.0
+        }
+    }
+
+    fn maid(badge: &str) -> HkIdentity {
+        HkIdentity {
+            badge: badge.to_string(),
+            display_name: None,
+            email: None,
         }
     }
 
@@ -1042,13 +1363,304 @@ mod tests {
         );
     }
 
-    /// The dark-ship default: no env ⇒ HF Hotel only, mark-dirty off.
+    /// The dark-ship default: no env ⇒ HF Hotel only, mark-dirty off,
+    /// location enforcement off and no lookup wired.
     #[test]
     fn default_policy_ships_dark() {
         let p = HkPolicy::default();
         assert_eq!(p.branches, vec![Branch::Hfhotel]);
         assert!(!p.mark_dirty_enabled);
         assert_eq!(p.branch_ids(), vec!["hfhotel"]);
+        assert!(
+            !p.location_enforcement_enabled,
+            "location enforcement must ship DARK"
+        );
+        assert!(!p.location_lookup_configured());
+    }
+
+    // ---- the employee-location gate -------------------------------------
+
+    /// THE MAPPING TABLE, pinned explicitly. HF→hfhotel, HF_VILLE→hfville, and
+    /// nothing else — this is the trap the whole stream turns on.
+    #[test]
+    fn employee_location_maps_onto_exactly_one_branch_each() {
+        assert_eq!(location_branch(EmployeeLocation::Hf), Branch::Hfhotel);
+        assert_eq!(location_branch(EmployeeLocation::HfVille), Branch::Hfville);
+        // The mapping is NOT string manipulation, and must never become it:
+        // HF ID's own spellings are refused outright by the `?branch=` parser,
+        // and so are their lower-cased forms. Both of the tempting shortcuts
+        // (forward the raw token / naive to_lowercase) would produce a 400.
+        for raw in ["HF", "HF_VILLE", "hf", "hf_ville"] {
+            assert_eq!(
+                parse_branch_param(Some(raw)),
+                None,
+                "{raw:?} must never be usable as a ?branch= value"
+            );
+        }
+        // …whereas the mapped branches round-trip through the wire spelling.
+        assert_eq!(
+            parse_branch_param(Some(branch_id(location_branch(EmployeeLocation::Hf)))),
+            Some(Branch::Hfhotel)
+        );
+        assert_eq!(
+            parse_branch_param(Some(branch_id(location_branch(EmployeeLocation::HfVille)))),
+            Some(Branch::Hfville)
+        );
+    }
+
+    /// The gate's full matrix. Every non-`Resolved` arm refuses, and the two
+    /// refusal KINDS are distinct: 403 for a definite "no", 503 for "cannot
+    /// tell". Nothing here can return `Ok` for a branch the employee does not
+    /// belong to.
+    #[test]
+    fn location_gate_admits_only_an_exact_match() {
+        // Match ⇒ admitted, both ways round.
+        assert!(location_gate(
+            LocationOutcome::Resolved(EmployeeLocation::Hf),
+            Branch::Hfhotel
+        )
+        .is_ok());
+        assert!(location_gate(
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            Branch::Hfville
+        )
+        .is_ok());
+
+        // Mismatch ⇒ 403 with the actionable message, both ways round.
+        for (outcome, requested) in [
+            (
+                LocationOutcome::Resolved(EmployeeLocation::Hf),
+                Branch::Hfville,
+            ),
+            (
+                LocationOutcome::Resolved(EmployeeLocation::HfVille),
+                Branch::Hfhotel,
+            ),
+        ] {
+            match location_gate(outcome, requested).expect_err("mismatch must refuse") {
+                ApiError::Forbidden(msg) => assert_eq!(msg, LOCATION_MISMATCH_ERROR),
+                other => panic!("expected 403, got {other:?}"),
+            }
+        }
+
+        // Null location / miss / inactive / pending ⇒ 403, actionable.
+        match location_gate(LocationOutcome::NoLocation, Branch::Hfhotel)
+            .expect_err("no location must refuse")
+        {
+            ApiError::Forbidden(msg) => assert_eq!(msg, LOCATION_UNKNOWN_ERROR),
+            other => panic!("expected 403, got {other:?}"),
+        }
+
+        // Unreachable / unconfigured ⇒ 503, NOT 403: the request may be
+        // legitimate, we simply cannot tell.
+        match location_gate(LocationOutcome::Unavailable, Branch::Hfhotel)
+            .expect_err("an unavailable lookup must refuse")
+        {
+            ApiError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, LOCATION_LOOKUP_UNAVAILABLE_ERROR)
+            }
+            other => panic!("expected 503, got {other:?}"),
+        }
+    }
+
+    /// The hard property, stated as a test: no outcome and no requested branch
+    /// combination ever admits a branch the employee does not belong to — in
+    /// particular nothing falls back to `DEFAULT_HK_BRANCH`.
+    #[test]
+    fn location_gate_never_falls_back_to_a_default_branch() {
+        let every_outcome = [
+            LocationOutcome::Resolved(EmployeeLocation::Hf),
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            LocationOutcome::NoLocation,
+            LocationOutcome::Unavailable,
+        ];
+        for outcome in every_outcome {
+            for requested in [Branch::Hfhotel, Branch::Hfville] {
+                let admitted = location_gate(outcome, requested).is_ok();
+                let should_admit = matches!(
+                    outcome,
+                    LocationOutcome::Resolved(loc) if location_branch(loc) == requested
+                );
+                assert_eq!(
+                    admitted, should_admit,
+                    "{outcome:?} + {requested:?} must {} be admitted",
+                    if should_admit { "" } else { "NOT" }
+                );
+            }
+        }
+    }
+
+    /// Flag OFF ⇒ the gate is a no-op AND no lookup is issued. The `location`
+    /// client here would answer `Unavailable` (⇒ 503) if it were ever asked,
+    /// so an `Ok` proves the dark path never reaches it.
+    #[tokio::test]
+    async fn location_gate_is_inert_while_the_flag_is_off() {
+        let dark = HkPolicy {
+            branches: vec![Branch::Hfhotel, Branch::Hfville],
+            location_enforcement_enabled: false,
+            location: Some(Arc::new(HfidLocationClient::with_lookup(Arc::new(
+                FixedLookup(LocationOutcome::Unavailable),
+            )))),
+            ..HkPolicy::default()
+        };
+        for branch in [Branch::Hfhotel, Branch::Hfville] {
+            assert!(
+                require_location(&dark, &maid("421"), branch).await.is_ok(),
+                "the dark build must not consult HF ID at all"
+            );
+        }
+    }
+
+    /// Enforcement ON with NO lookup configured (`HFID_LOCATION_URL` /
+    /// `HFID_RESOLVE_SECRET` unset) must fail closed with 503 — never pass
+    /// through. "Unconfigured" and "allowed" must not be the same state.
+    #[tokio::test]
+    async fn unconfigured_lookup_fails_closed_when_enforcement_is_on() {
+        let p = HkPolicy {
+            branches: vec![Branch::Hfhotel],
+            location_enforcement_enabled: true,
+            location: None,
+            ..HkPolicy::default()
+        };
+        match require_location(&p, &maid("421"), Branch::Hfhotel)
+            .await
+            .expect_err("an unconfigured lookup must refuse")
+        {
+            ApiError::ServiceUnavailable(msg) => {
+                assert_eq!(msg, LOCATION_LOOKUP_UNAVAILABLE_ERROR)
+            }
+            other => panic!("expected 503, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through the real client + cache: a HF_VILLE employee is
+    /// admitted for `hfville` and refused for `hfhotel`.
+    #[tokio::test]
+    async fn require_location_enforces_the_employees_own_branch() {
+        let p = enforcing(
+            vec![Branch::Hfhotel, Branch::Hfville],
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+        );
+        assert!(require_location(&p, &maid("421"), Branch::Hfville)
+            .await
+            .is_ok());
+        match require_location(&p, &maid("421"), Branch::Hfhotel)
+            .await
+            .expect_err("a Ville maid must not act on HF Hotel")
+        {
+            ApiError::Forbidden(msg) => assert_eq!(msg, LOCATION_MISMATCH_ERROR),
+            other => panic!("expected 403, got {other:?}"),
+        }
+    }
+
+    // ---- `GET /api/hk/me` branch filtering ------------------------------
+
+    /// Flag off ⇒ the allowlist verbatim, in order, with no reason field.
+    #[tokio::test]
+    async fn me_serves_the_whole_allowlist_while_enforcement_is_off() {
+        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]);
+        let (branches, reason) = me_branches(&p, &maid("421")).await;
+        assert_eq!(branches, vec![Branch::Hfhotel, Branch::Hfville]);
+        assert_eq!(reason, None);
+    }
+
+    /// Flag on ⇒ the intersection. One entry means the client auto-selects and
+    /// renders no picker — the maid sees only her own property.
+    #[tokio::test]
+    async fn me_filters_the_allowlist_to_the_employees_location() {
+        let p = enforcing(
+            vec![Branch::Hfhotel, Branch::Hfville],
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+        );
+        let (branches, reason) = me_branches(&p, &maid("421")).await;
+        assert_eq!(branches, vec![Branch::Hfville]);
+        assert_eq!(reason, None);
+    }
+
+    /// The intersection, stated directly — including the case that has no
+    /// carve-out: an `HF_VILLE` employee while `HK_BRANCHES` is hfhotel-only
+    /// gets `[]`, never `hfhotel`. (This is today's production shape, and the
+    /// reason V13 must widen `HK_BRANCHES` before Ville staff can work.)
+    #[test]
+    fn intersection_never_widens_past_the_allowlist() {
+        let hotel_only = [Branch::Hfhotel];
+        assert_eq!(
+            intersect_location(
+                &hotel_only,
+                LocationOutcome::Resolved(EmployeeLocation::HfVille)
+            ),
+            Vec::<Branch>::new(),
+            "an unserved property yields NO branch, not the default one"
+        );
+        assert_eq!(
+            intersect_location(&hotel_only, LocationOutcome::Resolved(EmployeeLocation::Hf)),
+            vec![Branch::Hfhotel]
+        );
+        for empty in [LocationOutcome::NoLocation, LocationOutcome::Unavailable] {
+            assert!(
+                intersect_location(&hotel_only, empty).is_empty(),
+                "{empty:?} must yield no branch"
+            );
+        }
+    }
+
+    /// The reason codes are stable strings and map as documented — including
+    /// the deliberate collapse of "real property, not served here" onto
+    /// `no_location` (the lookup worked; retrying is pointless).
+    #[test]
+    fn me_reason_is_set_only_when_the_intersection_is_empty() {
+        let both = [Branch::Hfhotel, Branch::Hfville];
+        let hotel_only = [Branch::Hfhotel];
+
+        assert_eq!(REASON_NO_LOCATION, "no_location");
+        assert_eq!(REASON_LOOKUP_UNAVAILABLE, "lookup_unavailable");
+
+        // Non-empty intersection ⇒ no reason.
+        assert_eq!(
+            me_reason(&both, LocationOutcome::Resolved(EmployeeLocation::HfVille)),
+            None
+        );
+        // Definite answers with no usable branch ⇒ no_location.
+        assert_eq!(
+            me_reason(&both, LocationOutcome::NoLocation),
+            Some(REASON_NO_LOCATION)
+        );
+        assert_eq!(
+            me_reason(
+                &hotel_only,
+                LocationOutcome::Resolved(EmployeeLocation::HfVille)
+            ),
+            Some(REASON_NO_LOCATION),
+            "a real but unserved property is not a retryable outage"
+        );
+        // No answer at all ⇒ lookup_unavailable.
+        assert_eq!(
+            me_reason(&both, LocationOutcome::Unavailable),
+            Some(REASON_LOOKUP_UNAVAILABLE)
+        );
+    }
+
+    /// `/me` and the per-request gate must agree: every branch `/me` offers
+    /// must be one `require_location` then admits, for the same employee.
+    /// A disagreement is the worst shape — a picker that offers a branch whose
+    /// every subsequent call 403s.
+    #[tokio::test]
+    async fn me_offers_only_branches_the_gate_will_admit() {
+        for outcome in [
+            LocationOutcome::Resolved(EmployeeLocation::Hf),
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            LocationOutcome::NoLocation,
+            LocationOutcome::Unavailable,
+        ] {
+            let p = enforcing(vec![Branch::Hfhotel, Branch::Hfville], outcome);
+            let (offered, _) = me_branches(&p, &maid("421")).await;
+            for branch in offered {
+                assert!(
+                    require_location(&p, &maid("421"), branch).await.is_ok(),
+                    "{outcome:?}: /me offered {branch:?} but the gate refuses it"
+                );
+            }
+        }
     }
 
     /// The maid label stamped into `HT_Housewife.h_name` prefers the verified

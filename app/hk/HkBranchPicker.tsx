@@ -14,10 +14,49 @@
 //   Renders nothing at all when only one branch is configured, matching
 //   §A3.1 ("branches.length === 1 ⇒ auto-select, no picker rendered — this
 //   is the shipping state, maids see zero new UI").
+//
+//   HkBranchesUnavailable — the EMPTY case (wave-4 §C). With per-employee
+//   location enforcement on, `branches` can come back `[]`: HF ID has no
+//   location for this employee, or her property is not served here, or the
+//   lookup could not answer. A picker with no buttons is a dead end that looks
+//   like a bug, so the empty list renders an actionable message instead —
+//   never a default branch to tap.
 
 import { useState } from 'react'
-import { MapPin } from 'lucide-react'
-import type { Branch, HkBranchOption } from './hk-lib'
+import { AlertCircle, MapPin } from 'lucide-react'
+import {
+  branchesUnavailableMessage,
+  type Branch,
+  type HkBranchesUnavailableReason,
+  type HkBranchOption,
+} from './hk-lib'
+
+interface HkBranchesUnavailableProps {
+  reason: HkBranchesUnavailableReason | null
+}
+
+/**
+ * Shown in the picker's place when `GET /api/hk/me` offers no branch at all.
+ * Deliberately renders NO tappable branch: an empty allowlist means "we do not
+ * know where you work", and offering a guess is the exact wrong-property bug
+ * location enforcement exists to close.
+ */
+export function HkBranchesUnavailable({ reason }: HkBranchesUnavailableProps) {
+  return (
+    <section className="mx-auto max-w-md px-2 py-8">
+      <div
+        role="alert"
+        className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900"
+      >
+        <AlertCircle className="mt-0.5 h-5 w-5 shrink-0" />
+        <div>
+          <p className="mb-1 font-semibold">ยังใช้งานไม่ได้</p>
+          <p>{branchesUnavailableMessage(reason)}</p>
+        </div>
+      </div>
+    </section>
+  )
+}
 
 interface HkBranchPickerProps {
   branches: HkBranchOption[]

@@ -25,14 +25,35 @@ export interface HkBranchOption {
   labelTh: string
 }
 
+/**
+ * Why `branches` is empty, when it is (`HkMe.branchesUnavailableReason`).
+ * Mirrors `REASON_NO_LOCATION` / `REASON_LOOKUP_UNAVAILABLE` in
+ * `hotel-backend/src/routes/hk.rs`. The two are NOT interchangeable:
+ * `no_location` needs an admin, `lookup_unavailable` needs a retry.
+ */
+export type HkBranchesUnavailableReason = 'no_location' | 'lookup_unavailable'
+
 export interface HkMe {
   success: boolean
   badge: string
   displayName: string | null
-  /** In `HK_BRANCHES` order. Length 1 ⇒ the client auto-selects, no picker. */
+  /**
+   * In `HK_BRANCHES` order. Length 1 ⇒ the client auto-selects, no picker.
+   *
+   * With `HK_LOCATION_ENFORCEMENT_ENABLED` on this is the allowlist
+   * INTERSECTED with the employee's own HF ID location, so it is normally
+   * length 1 — and CAN be EMPTY, which `branchesUnavailableReason` explains.
+   * An empty list is never a reason to fall back to a default branch.
+   */
   branches: HkBranchOption[]
   /** `HK_MARK_DIRTY_ENABLED` — hides the "แจ้งห้องไม่สะอาด" button when false. */
   markDirtyEnabled: boolean
+  /**
+   * Set exactly when `branches` is empty; `null` otherwise (and always while
+   * location enforcement is off). Always PRESENT — branch on the value, not on
+   * the key.
+   */
+  branchesUnavailableReason: HkBranchesUnavailableReason | null
 }
 
 export interface HkCleaningProgress {
@@ -159,6 +180,29 @@ const UNAUTHENTICATED_MESSAGE =
 const FORBIDDEN_MESSAGE = 'บัญชีของคุณไม่มีสิทธิ์ใช้งานระบบแม่บ้าน'
 const BRANCH_ERROR_MESSAGE = 'สาขาที่เลือกไม่ถูกต้องหรือยังไม่รองรับ กรุณาเลือกสาขาใหม่อีกครั้ง'
 const NO_BRANCH_MESSAGE = 'ยังไม่ได้เลือกสาขา กรุณาเลือกสาขาก่อนใช้งาน'
+const LOOKUP_UNAVAILABLE_MESSAGE =
+  'ระบบตรวจสอบสาขาพนักงานขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง หากยังไม่ได้ ให้ติดต่อผู้ดูแลระบบ'
+
+/**
+ * The actionable Thai copy for an empty `branches` list. PURE — unit-tested.
+ *
+ * `no_location` deliberately covers TWO server-side cases (no location on file
+ * for this employee, and a real location this deployment does not serve yet),
+ * because the maid's action is the same for both and neither is fixed by
+ * retrying. `lookup_unavailable` is the one that IS worth retrying, so its copy
+ * says so instead of sending her to an admin over a transient blip.
+ *
+ * `null`/unknown returns the `no_location` copy: an unrecognised reason from a
+ * newer backend must still produce a real, actionable message rather than a
+ * blank panel.
+ */
+export function branchesUnavailableMessage(
+  reason: HkBranchesUnavailableReason | null | undefined
+): string {
+  return reason === 'lookup_unavailable'
+    ? LOOKUP_UNAVAILABLE_MESSAGE
+    : 'ยังไม่ได้กำหนดสาขาของพนักงาน หรือสาขาของคุณยังไม่เปิดใช้งาน — กรุณาติดต่อผู้ดูแลระบบ'
+}
 
 /**
  * fetch() against `GET /api/hk/me` — the ONE `/hk` endpoint that takes NO
@@ -195,6 +239,11 @@ export async function hkFetch(
   if (response.status === 401) throw new Error(UNAUTHENTICATED_MESSAGE)
   if (response.status === 403) throw new Error(FORBIDDEN_MESSAGE)
   if (response.status === 400) throw new Error(BRANCH_ERROR_MESSAGE)
+  // 503 = the employee-location lookup could not answer (HF ID unreachable or
+  // unconfigured). Distinct from 403 on purpose: this one IS worth retrying,
+  // so the maid is told to retry rather than that she lacks permission.
+  // Unreachable while `HK_LOCATION_ENFORCEMENT_ENABLED` is off.
+  if (response.status === 503) throw new Error(LOOKUP_UNAVAILABLE_MESSAGE)
   return response
 }
 

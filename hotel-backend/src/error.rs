@@ -32,6 +32,16 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// 503 — the request is well-formed and permitted, but a DEPENDENCY this
+    /// handler needs could not be reached, so no authoritative answer exists
+    /// right now. Distinct from [`ApiError::Forbidden`] on purpose: 403 means
+    /// "the answer is no", 503 means "there is no answer yet, retrying may
+    /// help". Collapsing the two would let a client cache a refusal that was
+    /// really an outage — or, worse, invite a fallback. The message is
+    /// user-facing (`/hk` renders it to a maid in Thai).
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -61,6 +71,10 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            // The message is preserved (not swallowed like Internal/Database):
+            // it is the actionable text the caller must show, and it names no
+            // internal detail — the dependency's own error stays in the logs.
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             ApiError::Database(msg) => {
                 tracing::error!("Database error: {}", msg);
                 (

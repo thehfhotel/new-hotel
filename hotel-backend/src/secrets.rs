@@ -98,6 +98,20 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     // OTA_BRIDGE_ENABLED is flipped.
     ("ota_bridge_token", "OTA_BRIDGE_TOKEN"),
     ("ota_bridge_token_previous", "OTA_BRIDGE_TOKEN_PREVIOUS"),
+    // `/hk` employee-location enforcement (crate::hfid_location). Shared
+    // secret sent as `X-Reader-Secret` on the HF ID badge → location lookup.
+    //
+    // SAME VALUE as `reader_resolve_secret` / `READER_RESOLVE_SECRET` above —
+    // HF ID guards its whole app↔central surface with ONE secret
+    // (`READER_RESOLVE_SECRET` over there). The second name exists so the two
+    // consumers (card-login pairing, location lookup) stay independently
+    // rotatable. Do not go looking for a distinct upstream credential; there
+    // isn't one. See CLAUDE.md → "Credentials & Docker secrets".
+    //
+    // Unset/empty ⇒ the lookup client is never built, and with
+    // HK_LOCATION_ENFORCEMENT_ENABLED on that is `lookup_unavailable`
+    // (503 / `branches: []`) — never a fallback to the HK_BRANCHES allowlist.
+    ("hfid_resolve_secret", "HFID_RESOLVE_SECRET"),
 ];
 
 /// Hydrate env vars from Docker secret files, then reconstruct

@@ -72,10 +72,15 @@ fn maid() -> HkIdentity {
     }
 }
 
+/// Location enforcement is left at its DARK default here on purpose: this
+/// suite pins the `HK_BRANCHES` gate, and the gate's status codes must be
+/// unchanged by the wave-4 C build. `tests/test_hk_location_enforcement.rs`
+/// owns the enforcement-on matrix.
 fn policy(branches: Vec<Branch>, mark_dirty_enabled: bool) -> HkPolicy {
     HkPolicy {
         branches,
         mark_dirty_enabled,
+        ..HkPolicy::default()
     }
 }
 
