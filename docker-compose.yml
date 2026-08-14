@@ -558,7 +558,7 @@ services:
       # Flipping ENFORCE is NOT "just config": it is what turns an accepted
       # unauthenticated ota-desk call into a 401. Precondition is 24h of zero
       # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
-      - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-false}
+      - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-true}
       - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-false}
     secrets:
       - db_password
