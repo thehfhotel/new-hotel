@@ -105,6 +105,15 @@ jobs:
             frontend:
               - 'app/**'
               - 'components/**'
+              # `contexts/**` + `types/**` were MISSING until 2026-08-15 while
+              # the block above claimed to be "the COMPLETE list". Both are
+              # real, imported Next.js source (contexts/AuthContext.tsx,
+              # BranchContext.tsx, ModeContext.tsx, SkinContext.tsx;
+              # types/*.ts), so a commit touching only one of them passed CI
+              # GREEN, built nothing, and deployed nothing — a change that
+              # looks shipped and is not.
+              - 'contexts/**'
+              - 'types/**'
               - 'lib/**'
               - 'public/**'
               - '__tests__/**'
