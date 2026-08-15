@@ -4,8 +4,9 @@
 //
 // Shows every active room of the CHOSEN property with today's maid-reported
 // cleaning progress; tapping a room opens /hk/rooms/[id] to report progress.
-// แจ้งซ่อม / เบิกของ deep-link to the separate Housekeeping ops app via
-// HkOpsLinks. Identity is resolved server-side from the Cloudflare Access
+// แจ้งซ่อม / เบิกของ are NOT reachable from here: both are top-level tiles on
+// the LINE rich menu, and a second route to the same place is a cost for this
+// audience. Identity is resolved server-side from the Cloudflare Access
 // assertion (silent HF ID); a 401/403 renders the fail-closed notice — there
 // is deliberately NO login UI.
 //
@@ -33,7 +34,6 @@ import {
   type HkMe,
   type HkRoom,
 } from './hk-lib'
-import HkOpsLinks from './HkOpsLinks'
 import { HkBranchChip, HkBranchesUnavailable, HkBranchPicker } from './HkBranchPicker'
 
 export default function HkRoomListPage() {
@@ -183,8 +183,6 @@ export default function HkRoomListPage() {
               </button>
             </div>
           )}
-
-          <HkOpsLinks />
 
           {/* Room list grouped by floor */}
           {loading && rooms.length === 0 && !error ? (

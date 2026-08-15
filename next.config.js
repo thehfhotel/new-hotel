@@ -16,6 +16,15 @@ const nextConfig = {
       // middleware (a local hardware bridge). http:// is fine from an https page
       // because Chrome treats localhost/127.0.0.1 as a secure context (no
       // mixed-content block); without these the fetch is refused by connect-src.
+      //
+      // The narrowness of this list is LOAD-BEARING AS A DIAGNOSTIC, not just a
+      // hardening measure: when a request carries the wrong Cloudflare Access
+      // `aud` the edge answers with a cross-origin login redirect, connect-src
+      // refuses it, and the bug announces itself as a red console error instead
+      // of failing silently. Do NOT widen connect-src to quiet such an error —
+      // fix the `aud` (or delete the call that should never have fired). The
+      // dead /api/auth/me probe on the /hk maid surface was found exactly this
+      // way and removed rather than exempted.
       "connect-src 'self' https://cloudflareinsights.com http://localhost:9898 http://127.0.0.1:9898",
       "frame-ancestors 'none'",
       "base-uri 'self'",

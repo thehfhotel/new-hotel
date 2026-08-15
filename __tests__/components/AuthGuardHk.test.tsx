@@ -9,9 +9,17 @@
  * /hk like any protected page: user null → render null (white blank) →
  * bounce to /login, which in production sits behind the Google-only root
  * Access app the maid can never satisfy. These tests pin the exemption.
+ *
+ * They also pin its corollary — /hk issues NO /api/auth/* request at all.
+ * That probe was dead by construction (a maid has no session to find) and in
+ * production it rode the ROOT Access app's `aud`, so the edge answered with a
+ * cross-origin login redirect that connect-src refused: a red CSP error on
+ * every maid pageload. The zero-request assertions below are two-way — they
+ * fail if the probe is reintroduced on /hk specifically OR by a refactor that
+ * moves it somewhere unconditional.
  */
 
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 
 // next/navigation ties into Next's router runtime, which isn't bootstrapped
 // in jsdom — same mock shape as __tests__/components/AuthContext.test.tsx.
@@ -33,8 +41,14 @@ jest.mock('next/navigation', () => ({
 // every render dies on `Cannot read properties of null (reading 'useState')`.
 const ORIGINAL_AUTH_REQUIRED = process.env.NEXT_PUBLIC_AUTH_REQUIRED
 process.env.NEXT_PUBLIC_AUTH_REQUIRED = 'true'
-const { AuthProvider } =
+const { AuthProvider, useAuth } =
   require('@/contexts/AuthContext') as typeof import('@/contexts/AuthContext')
+
+/** Surfaces the provider's own state so tests can assert it settles. */
+function AuthStateProbe() {
+  const { loading } = useAuth()
+  return <span data-testid="auth-loading">{String(loading)}</span>
+}
 
 /** A 401 from every auth endpoint — exactly a maid's state on /hk. */
 function unauthorized(): Response {
@@ -67,7 +81,7 @@ describe('AuthGuard with NEXT_PUBLIC_AUTH_REQUIRED=true and no session', () => {
   })
 
   test.each(['/hk', '/hk/rooms/12'])(
-    '%s renders children and never bounces to /login',
+    '%s renders children, issues NO /api/auth/* request, and never bounces to /login',
     async (path) => {
       mockPathname.mockReturnValue(path)
 
@@ -79,23 +93,48 @@ describe('AuthGuard with NEXT_PUBLIC_AUTH_REQUIRED=true and no session', () => {
 
       expect(screen.getByTestId('hk-content')).toBeInTheDocument()
 
-      // Let the anonymous /me → cf-login chain settle: the guard must still
-      // be showing the maid her page once the session probe has concluded
-      // "logged out", and must not have queued a redirect.
-      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-      expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
-        '/api/auth/me',
-        '/api/auth/cf-login',
-      ])
+      // Drain the mount effects and the microtask queue. The control case
+      // below fires its /me → cf-login chain inside exactly this window, so
+      // "still zero" here means suppressed — not merely not-yet.
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(
+        fetchMock.mock.calls
+          .map((c) => String(c[0]))
+          .filter((url) => url.startsWith('/api/auth/')),
+      ).toEqual([])
+      // Nothing else should be reaching the network from this tree either.
+      expect(fetchMock).not.toHaveBeenCalled()
       expect(screen.getByTestId('hk-content')).toBeInTheDocument()
       expect(mockReplace).not.toHaveBeenCalled()
     },
   )
 
-  test('/hk paints even while the session probe is still in flight', async () => {
-    // The probe never settles (a maid's /api/auth/me can be intercepted by
-    // the root Access app on her device). /hk owns its own identity, so its
-    // paint must not be gated on the AuthProvider `loading` window.
+  test('/hk settles the provider out of `loading` without probing', async () => {
+    // The /hk pages read no session state, but the provider's state must
+    // still be coherent — a permanently-`loading` provider would re-arm the
+    // AuthGuard blank the moment anyone removed its /hk opt-out.
+    mockPathname.mockReturnValue('/hk')
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    )
+
+    await waitFor(() =>
+      expect(screen.getByTestId('auth-loading')).toHaveTextContent('false'),
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('/hk paints even when an auth round-trip would never settle', async () => {
+    // Belt-and-braces on the AuthGuard's own contract: /hk owns its identity,
+    // so its paint must never be gated on a session probe — including one a
+    // future change might reintroduce that hangs (a maid's /api/auth/me can
+    // be intercepted by the root Access app on her device).
     mockPathname.mockReturnValue('/hk')
     fetchMock.mockReturnValue(new Promise<Response>(() => {}))
 
@@ -109,7 +148,7 @@ describe('AuthGuard with NEXT_PUBLIC_AUTH_REQUIRED=true and no session', () => {
     expect(mockReplace).not.toHaveBeenCalled()
   })
 
-  test('control: a protected path still redirects and renders nothing', async () => {
+  test('control: a protected path still probes, then redirects and renders nothing', async () => {
     mockPathname.mockReturnValue('/v2/rooms')
 
     render(
@@ -117,6 +156,14 @@ describe('AuthGuard with NEXT_PUBLIC_AUTH_REQUIRED=true and no session', () => {
         <div data-testid="protected-content">front desk</div>
       </AuthProvider>,
     )
+
+    // The probe is removed on /hk ONLY — everywhere else it must still run,
+    // including the cf-login healing attempt after the anonymous 401.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([
+      '/api/auth/me',
+      '/api/auth/cf-login',
+    ])
 
     await waitFor(() =>
       expect(mockReplace).toHaveBeenCalledWith(

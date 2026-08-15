@@ -1,10 +1,12 @@
 'use client'
 
-// Room screen (/hk/rooms/[roomId]) — report cleaning progress for one room,
-// plus deep links to the Housekeeping ops app for แจ้งซ่อม / เบิกของ. Part of
-// the maid-facing housekeeping surface (employee-login plan Phase 4, wave-4
-// §A+B). The reporter identity is stamped SERVER-SIDE from the verified
-// Cloudflare Access assertion; nothing identity-like is sent from this form.
+// Room screen (/hk/rooms/[roomId]) — report cleaning progress for one room.
+// Part of the maid-facing housekeeping surface (employee-login plan Phase 4,
+// wave-4 §A+B). แจ้งซ่อม / เบิกของ are NOT linked from here: both are
+// top-level tiles on the LINE rich menu, and a second route to the same place
+// is a cost for this audience. The reporter identity is stamped SERVER-SIDE
+// from the verified Cloudflare Access assertion; nothing identity-like is
+// sent from this form.
 //
 // The branch is never chosen here — only the room LIST page (/hk) offers the
 // picker. This screen only ever READS what's already stored (§A1: never
@@ -37,7 +39,6 @@ import {
   type HkMe,
   type HkRoomDetail,
 } from '../../hk-lib'
-import HkOpsLinks from '../../HkOpsLinks'
 
 export default function HkRoomPage() {
   const params = useParams<{ roomId: string }>()
@@ -269,8 +270,6 @@ export default function HkRoomPage() {
               </ul>
             )}
           </section>
-
-          <HkOpsLinks />
         </>
       )}
     </main>
