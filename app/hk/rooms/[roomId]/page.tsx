@@ -24,12 +24,15 @@ import {
   AlertTriangle,
   Check,
   ChevronLeft,
+  Info,
   Loader2,
   Sparkles,
 } from 'lucide-react'
 import {
   hkFetch,
   hkFetchMe,
+  legacyStatusNote,
+  markDirtyConfirmMessage,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -53,6 +56,12 @@ export default function HkRoomPage() {
   const [error, setError] = useState<string | null>(null)
   const [posting, setPosting] = useState<CleaningStatus | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  // Two-step confirm for แจ้งห้องไม่สะอาด (wave-5 R2b). It used to fire on a
+  // single tap, and a mis-tap flips a real room dirty in iHOTEL — reception
+  // then sends someone to a room nobody asked about. `done` / `started` stay
+  // single-tap: they are the normal flow, and a confirm on every tap is a
+  // confirm nobody reads.
+  const [confirmingDirty, setConfirmingDirty] = useState(false)
 
   // Resolve the already-chosen branch from storage; only /hk itself may pick
   // one. `resolveInitialBranch` still discards a stale value (branch removed
@@ -131,6 +140,10 @@ export default function HkRoomPage() {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
       setPosting(null)
+      // Collapse the confirm only once the request has SETTLED — so the
+      // ยืนยัน button can carry the spinner while it is in flight, and a
+      // failed report does not leave a re-armed one-tap button behind.
+      setConfirmingDirty(false)
     }
   }
 
@@ -182,6 +195,18 @@ export default function HkRoomPage() {
         <div className="mb-4 flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">
           <Check className="h-5 w-5 shrink-0" />
           <span>{notice}</span>
+        </div>
+      )}
+
+      {/* CR-1 fallback notice — same copy and same amber treatment as the room
+          list, so the two screens never disagree about what she is looking at. */}
+      {!error && legacyStatusNote(detail?.legacyStatusStale) && (
+        <div
+          role="status"
+          className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+        >
+          <Info className="mt-0.5 h-5 w-5 shrink-0" />
+          <span>{legacyStatusNote(detail?.legacyStatusStale)}</span>
         </div>
       )}
 
@@ -241,23 +266,53 @@ export default function HkRoomPage() {
             {/* Mark-dirty (§B5): dark-shipped, HK_MARK_DIRTY_ENABLED-gated via
                 /api/hk/me. Hidden entirely rather than offered as a dead tap
                 that would 403. */}
-            {markDirtyEnabled && (
-              <button
-                type="button"
-                onClick={() => reportCleaning('dirty')}
-                disabled={posting !== null}
-                className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-red-300 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800 active:bg-red-100 disabled:opacity-50"
-              >
-                {posting === 'dirty' ? (
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                ) : (
-                  <>
-                    <AlertTriangle className="h-4 w-4" />
-                    แจ้งห้องไม่สะอาด
-                  </>
-                )}
-              </button>
-            )}
+            {markDirtyEnabled &&
+              (confirmingDirty ? (
+                /* Step 2 — the confirm. Rendered IN PLACE of the button, not
+                   over it: a modal/`window.confirm` on a phone in a corridor is
+                   easy to dismiss by reflex, while replacing the control forces
+                   a deliberate second tap. ยกเลิก is listed FIRST and is the
+                   visually calmer option, so the reflex tap is the safe one. */
+                <div className="mt-3 rounded-xl border border-red-300 bg-red-50 p-3">
+                  <p className="mb-3 flex items-start gap-1.5 text-sm font-semibold text-red-800">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{markDirtyConfirmMessage(room.roomNo)}</span>
+                  </p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingDirty(false)}
+                      disabled={posting !== null}
+                      className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                    >
+                      ยกเลิก
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => reportCleaning('dirty')}
+                      disabled={posting !== null}
+                      className="flex items-center justify-center rounded-lg border border-red-400 bg-red-600 px-3 py-3 text-sm font-semibold text-white active:bg-red-700 disabled:opacity-50"
+                    >
+                      {posting === 'dirty' ? (
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      ) : (
+                        'ยืนยัน'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                /* Step 1 — arms the confirm. Fires NO request. */
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDirty(true)}
+                  disabled={posting !== null}
+                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-red-300 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800 active:bg-red-100 disabled:opacity-50"
+                >
+                  <AlertTriangle className="h-4 w-4" />
+                  แจ้งห้องไม่สะอาด
+                </button>
+              ))}
 
             {detail && detail.events.length > 0 && (
               <ul className="mt-3 space-y-1 text-xs text-gray-500">

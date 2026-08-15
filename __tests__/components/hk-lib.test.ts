@@ -16,6 +16,9 @@ import {
   hkFetch,
   hkFetchMe,
   HOUSEKEEPING_URL,
+  LEGACY_STATUS_STALE_NOTE,
+  legacyStatusNote,
+  markDirtyConfirmMessage,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -371,5 +374,49 @@ describe('hkFetch on 503 (location lookup unavailable)', () => {
     ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(503))
     const unavailable = await hkFetch('/rooms', 'hfhotel').catch((e: Error) => e.message)
     expect(unavailable).not.toBe(forbidden)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CR-1 — the iHOTEL-unavailable note (owner decision, wave-5 R2a)
+// ---------------------------------------------------------------------------
+
+describe('legacyStatusNote', () => {
+  it('returns the Thai note only when the backend says the read fell back', () => {
+    expect(legacyStatusNote(true)).toBe(LEGACY_STATUS_STALE_NOTE)
+    expect(legacyStatusNote(false)).toBeNull()
+  })
+
+  // The load-bearing one. `undefined` is what an OLDER backend (or a rollback)
+  // sends. Reading silence as "stale" would paint a permanent warning banner
+  // over a perfectly healthy list — and a banner that is always on is a banner
+  // the maid stops reading, which costs us the real one.
+  it('treats a missing flag as NOT stale, never as a warning', () => {
+    expect(legacyStatusNote(undefined)).toBeNull()
+    expect(legacyStatusNote(null)).toBeNull()
+  })
+
+  // The copy has one job: tell her the status came from PMS, not iHOTEL, and
+  // that reception's screen may differ. Pinned so a future edit cannot quietly
+  // drop the part that changes her behaviour.
+  it('names PMS, names iHOTEL, and warns that reception may differ', () => {
+    expect(LEGACY_STATUS_STALE_NOTE).toContain('PMS')
+    expect(LEGACY_STATUS_STALE_NOTE).toContain('iHOTEL')
+    expect(LEGACY_STATUS_STALE_NOTE).toContain('แผนกต้อนรับ')
+  })
+})
+
+describe('markDirtyConfirmMessage', () => {
+  // The prompt must NAME THE ROOM: a maid in a corridor of near-identical
+  // doors is confirming which room, not just the intent.
+  it('names the room being flagged', () => {
+    expect(markDirtyConfirmMessage('104')).toContain('104')
+    expect(markDirtyConfirmMessage('203')).toContain('203')
+    expect(markDirtyConfirmMessage('104')).not.toContain('203')
+  })
+
+  it('asks a yes/no question in Thai', () => {
+    expect(markDirtyConfirmMessage('104')).toContain('ยืนยัน')
+    expect(markDirtyConfirmMessage('104')).toContain('?')
   })
 })

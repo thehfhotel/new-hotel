@@ -14,6 +14,7 @@ pub mod db;
 pub mod domain;
 pub mod error;
 pub mod hfid_location;
+pub mod legacy_room_status;
 pub mod middleware;
 pub mod models;
 pub mod notifications;

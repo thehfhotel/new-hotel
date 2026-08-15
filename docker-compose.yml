@@ -225,6 +225,34 @@ services:
       # own reception-coordinated window, see PENDING-VERIFICATIONS.md V12).
       - HK_MARK_DIRTY_ENABLED=${HK_MARK_DIRTY_ENABLED:-false}
       - HK_BRANCHES=${HK_BRANCHES:-hfhotel}
+      # CR-1 (iHOTEL-WINS room status on /hk): HF Ville's LEGACY MSSQL target
+      # for the READ-ONLY `SELECT Room_no, Room_Clean FROM HT_Rooms` the maid
+      # list is reconciled against (hotel-backend/src/legacy_room_status.rs).
+      #
+      # HF Hotel needs NOTHING here: this container already carries DB_SERVER /
+      # DB_NAME / DB_USER / MSSQL_PORT + the db_password secret (above) for the
+      # scheduler's reconcile backstop, and the reader reuses that same pool.
+      #
+      # Values mirror the `sync-hfville` / `writeback-hfville` sidecars
+      # verbatim (Ville legacy MSSQL via the WG path, DNAT through MikroTik).
+      # Literals-as-defaults, exactly like those sidecars — no deploy-payload
+      # entry and no new GH variable is needed. The password reuses
+      # /run/secrets/db_password (both sites' legacy MSSQL share one `sa`
+      # credential today); set VILLE_MSSQL_PASSWORD to split them when one
+      # site rotates first.
+      #
+      # Named VILLE_MSSQL_* and NOT VILLE_DB_* on purpose — the latter is the
+      # Ville POSTGRES mirror further down. Two databases sharing an env
+      # prefix is how a read ends up pointed at the wrong server.
+      #
+      # The backend connects here ONLY when HK_BRANCHES admits hfville (V13),
+      # so while HK_BRANCHES=hfhotel this opens zero connections. Unset or
+      # unreachable is a supported state: /hk falls back to the canonical PG
+      # value with a visible Thai note.
+      - VILLE_MSSQL_SERVER=${VILLE_MSSQL_SERVER:-192.168.11.51}
+      - VILLE_MSSQL_PORT=${VILLE_MSSQL_PORT:-1436}
+      - VILLE_MSSQL_NAME=${VILLE_MSSQL_NAME:-HOTEL}
+      - VILLE_MSSQL_USER=${VILLE_MSSQL_USER:-sa}
       # Per-employee location enforcement (wave-4 housekeeping C). HK_BRANCHES
       # above answers "which properties does this DEPLOYMENT serve"; it never
       # answered "which property does THIS MAID work at", so a HF Ville maid

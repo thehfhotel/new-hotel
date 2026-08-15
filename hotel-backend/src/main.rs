@@ -192,14 +192,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   `HFID_RESOLVE_SECRET` present FIRST (`location_lookup_configured`
     //   below) — with the flag on and the lookup unconfigured, every /hk
     //   request 503s. See PENDING-VERIFICATIONS.md V14.
-    let hk_policy = routes::hk::HkPolicy::from_env();
+    let hk_policy = attach_hk_legacy_readers(routes::hk::HkPolicy::from_env(), &legacy_pool).await;
     tracing::info!(
         "/hk surface: branches={:?}, mark_dirty_enabled={}, \
-         location_enforcement_enabled={} (lookup configured: {})",
+         location_enforcement_enabled={} (lookup configured: {}), \
+         ihotel_room_status={:?}",
         hk_policy.branch_ids(),
         hk_policy.mark_dirty_enabled,
         hk_policy.location_enforcement_enabled,
-        hk_policy.location_lookup_configured()
+        hk_policy.location_lookup_configured(),
+        hk_policy.legacy_room_clean_branches()
     );
     if hk_policy.location_enforcement_enabled && !hk_policy.location_lookup_configured() {
         tracing::error!(
@@ -588,6 +590,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Attach the per-branch iHOTEL room-status readers the `/hk` surface serves
+/// its room-clean values from (CR-1 — owner decision, see `routes::hk`).
+///
+/// ## HF Hotel reuses the pool that already exists
+///
+/// This binary has built a legacy MSSQL pool since long before `/hk` existed
+/// (the scheduler's reconcile backstop), and the API container is already
+/// given `DB_SERVER` / `DB_NAME` / `DB_USER` / `MSSQL_PORT` + the
+/// `db_password` secret to build it. So the shipping branch needs NO new
+/// connection, NO new env var, and NO deploy-payload entry — the reader
+/// borrows the existing pool, whose `PoisonAwareManager` already guarantees a
+/// timed-out read cannot hand a desynced connection back to the scheduler.
+///
+/// ## HF Ville is built only when it is actually served
+///
+/// Ville's legacy server is reached today only by the `sync-hfville` /
+/// `writeback-hfville` sidecars. Building its pool unconditionally would open
+/// a new connection to a shared production server for a branch `/hk` refuses
+/// to serve (`HK_BRANCHES` is `hfhotel` until V13), so it is built ONLY when
+/// the branch is admitted. The reader therefore arms itself exactly when
+/// Ville is admitted, and today's deploy touches Ville's legacy server zero
+/// times.
+///
+/// ## Every failure here is non-fatal
+///
+/// No reader for a branch means the maid sees the canonical PG mirror plus a
+/// visible Thai note — a supported, tested state
+/// (`routes::hk::merge_legacy_room_clean`). A legacy server that is down at
+/// boot must never stop the API from serving, so an unconfigured or
+/// unreachable target is a WARN and nothing more.
+async fn attach_hk_legacy_readers(
+    policy: routes::hk::HkPolicy,
+    legacy_pool: &Option<db::DbPool>,
+) -> routes::hk::HkPolicy {
+    use crate::routes::mode::Branch;
+    use hotel_backend::legacy_room_status::MssqlRoomCleanSource;
+    use std::sync::Arc;
+
+    let mut policy = policy;
+
+    // --- HF Hotel: reuse the pool this binary already has -----------------
+    if policy.branches.contains(&Branch::Hfhotel) {
+        match legacy_pool {
+            Some(pool) => {
+                policy = policy.with_legacy_room_clean(
+                    Branch::Hfhotel,
+                    Arc::new(MssqlRoomCleanSource::new(pool.clone(), "hfhotel")),
+                );
+                tracing::info!(
+                    "/hk iHOTEL room-status reader attached for hfhotel (reusing the \
+                     existing legacy pool)"
+                );
+            }
+            None => tracing::warn!(
+                "/hk iHOTEL room-status reader NOT attached for hfhotel — no legacy \
+                 pool. The maid list falls back to the canonical PG mirror with the \
+                 stale note."
+            ),
+        }
+    }
+
+    // --- HF Ville: only once the branch is admitted -----------------------
+    if policy.branches.contains(&Branch::Hfville) {
+        match config::VilleLegacyDbConfig::from_env() {
+            Some(cfg) => {
+                tracing::info!(
+                    "/hk iHOTEL room-status: connecting HF Ville legacy MSSQL at {}:{} (db {})",
+                    cfg.server,
+                    cfg.port,
+                    cfg.database
+                );
+                match create_pool(&cfg).await {
+                    Ok(pool) => {
+                        policy = policy.with_legacy_room_clean(
+                            Branch::Hfville,
+                            Arc::new(MssqlRoomCleanSource::new(pool, "hfville")),
+                        );
+                        tracing::info!("/hk iHOTEL room-status reader attached for hfville");
+                    }
+                    Err(e) => tracing::warn!(
+                        "/hk iHOTEL room-status reader NOT attached for hfville ({}) — \
+                         falling back to the canonical PG mirror with the stale note",
+                        e
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                "/hk iHOTEL room-status reader NOT attached for hfville — no usable \
+                 password (set VILLE_MSSQL_PASSWORD, or DB_PASSWORD while both sites \
+                 share the sa credential). Falling back to the canonical PG mirror."
+            ),
+        }
+    }
+
+    policy
 }
 
 /// SSE endpoint path, excluded from the access log below.

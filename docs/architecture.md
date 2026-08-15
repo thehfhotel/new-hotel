@@ -167,6 +167,19 @@ The double-walled box (`╔ ... ╗`) is the **decommission boundary**. Everythi
 
 **Critical rule:** Routes never call repositories directly. Routes never know about MSSQL. Repositories never call MSSQL. Only the **adapter workers** touch external systems. This is what makes decommission a single config flip.
 
+> **One named READ adapter sits in the request path (CR-1, 2026-08-15).**
+> `legacy_room_status` — a crate-root outbound adapter, same placement as
+> `hfid_location` — issues one read-only `SELECT Room_no, Room_Clean FROM
+> HT_Rooms` so the `/hk` maid surface can show iHOTEL's cleanliness rather than
+> our mirror (owner decision: reception works the iHOTEL board, so the maid
+> must too). The rule still holds where it earns its keep: `routes::hk` depends
+> on the `RoomCleanSource` **trait**, never on tiberius; nothing in
+> `repository/` changed; no WRITE was added. Decommission stays a config flip —
+> drop the reader and the surface falls back to canonical PG on its own, which
+> is the same path a legacy outage already takes. Do NOT read this as licence
+> for a second one: a new legacy read from a route needs the same explicit
+> justification, a fail-soft fallback, and a bounded timeout.
+
 ### Example: "create a booking"
 
 **Today's code (mixed concerns in one file):**

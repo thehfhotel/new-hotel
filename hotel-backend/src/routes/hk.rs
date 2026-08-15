@@ -106,8 +106,39 @@
 //!   (invariants #1 + #2) — it used to be a bare pool INSERT followed by a
 //!   separate service transaction.
 //!
+//! ## iHOTEL-WINS room status (CR-1, owner decision locked 2026-08-15)
+//!
+//! What a maid sees in [`HkRoom::room_clean`] is **iHOTEL's**
+//! `HT_Rooms.Room_Clean`, not our canonical mirror. Reception works the iHOTEL
+//! board; a maid working a different answer for the same room is the whole
+//! problem. Canonical `ht_rooms_new.room_clean` becomes the MIRROR — the value
+//! shown only when iHOTEL cannot be reached.
+//!
+//! The read itself is [`crate::legacy_room_status`] (read-only, `Room_no`-keyed,
+//! 3s budget); the POLICY is here, in three rules that are unit-tested as pure
+//! functions ([`merge_legacy_room_clean`]):
+//!
+//! 1. **iHOTEL wins** for every room it has an answer for. A room absent from
+//!    the legacy answer (unmatched `Room_no`, unrecognised literal) keeps its
+//!    canonical value — never guessed.
+//! 2. **Unreachable ⇒ fall back, and SAY SO.** Every room keeps its canonical
+//!    value and the response carries `legacyStatusStale: true`, which the
+//!    client renders as a visible Thai note. Stale-but-shown beats a dead
+//!    screen on a stairwell — the fallback is a first-class state, not an
+//!    error path. There is no 5xx on this surface for a legacy outage.
+//! 3. **Divergence is LOGGED, never shown.** A PG↔iHOTEL disagreement is a free
+//!    sync-drift signal for the operator (`warn`, with `room_no` and BOTH
+//!    values). It is not shown to the maid: she has exactly one job per room
+//!    and no action to take about which database is behind.
+//!
+//! Deliberately UNCACHED. Staleness is the failure mode this whole change
+//! exists to remove, and the load is one 34-58 row `SELECT` per room-list load
+//! from a surface with a handful of users.
+//!
 //! Branch-aware via `?branch=` resolved through the unified
-//! [`AppState::write_pool`] chokepoint (Ship-B gate).
+//! [`AppState::write_pool`] chokepoint (Ship-B gate). The legacy reader is
+//! resolved by the SAME branch through [`HkPolicy::legacy_room_clean`], so a
+//! Ville maid's list can only ever be reconciled against Ville's legacy server.
 //!
 //! ## HF Ville admission
 //!
@@ -127,6 +158,7 @@
 //! needs no `.sqlx/` cache regeneration — same policy as
 //! `routes::guest_documents` / `routes::new_maintenance`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -146,6 +178,7 @@ use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::hfid_location::{EmployeeLocation, HfidLocationClient, LocationOutcome};
+use crate::legacy_room_status::{RoomCleanOutcome, RoomCleanSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::housekeeping::{
@@ -241,6 +274,21 @@ pub struct HkPolicy {
     /// [`REASON_LOOKUP_UNAVAILABLE`] / `503` — deliberately NOT a pass-through,
     /// because "unconfigured" and "allowed" must never be the same state.
     pub location: Option<Arc<HfidLocationClient>>,
+    /// Per-branch iHOTEL room-status readers (CR-1), keyed by the stable
+    /// branch id ([`branch_id`]) so a Ville maid's list can only ever be
+    /// reconciled against Ville's legacy server.
+    ///
+    /// A MISSING entry is a first-class, supported state — it means exactly
+    /// what an unreachable legacy means: fall back to the canonical PG value
+    /// and show the Thai stale note. That is deliberate and is what lets this
+    /// ship compatible: the HF Hotel entry reuses the legacy pool `main.rs`
+    /// already builds, and the Ville entry only appears once `HK_BRANCHES`
+    /// admits Ville (V13), so today's deploy opens NO new legacy connection.
+    ///
+    /// Contrast [`Self::location`], which fails CLOSED — answering wrongly
+    /// there sends a maid to the wrong hotel; answering nothing here would
+    /// only blank a screen she needs.
+    pub legacy_room_clean: BTreeMap<&'static str, Arc<dyn RoomCleanSource>>,
 }
 
 impl HkPolicy {
@@ -267,7 +315,30 @@ impl HkPolicy {
             mark_dirty_enabled,
             location_enforcement_enabled,
             location,
+            // Populated by `main.rs` via `with_legacy_room_clean` — it owns
+            // the legacy pools (and is the ONE place that already has HF
+            // Hotel's). Empty here means the fallback path, which is a
+            // correct, shippable state.
+            legacy_room_clean: BTreeMap::new(),
         }
+    }
+
+    /// Attach a branch's iHOTEL room-status reader. Called by `main.rs` once
+    /// per branch that has one; branches without a reader use the fallback.
+    pub fn with_legacy_room_clean(
+        mut self,
+        branch: Branch,
+        source: Arc<dyn RoomCleanSource>,
+    ) -> Self {
+        self.legacy_room_clean.insert(branch_id(branch), source);
+        self
+    }
+
+    /// Branch ids that have a live iHOTEL reader — for the startup log, so an
+    /// operator can see at a glance whether `/hk` is serving iHOTEL truth or
+    /// the canonical mirror.
+    pub fn legacy_room_clean_branches(&self) -> Vec<&'static str> {
+        self.legacy_room_clean.keys().copied().collect()
     }
 
     /// Stable ids of the configured branches, for logging + `GET /api/hk/me`.
@@ -291,6 +362,7 @@ impl Default for HkPolicy {
             mark_dirty_enabled: false,
             location_enforcement_enabled: false,
             location: None,
+            legacy_room_clean: BTreeMap::new(),
         }
     }
 }
@@ -710,7 +782,13 @@ pub struct HkRoom {
     pub room_no: String,
     pub floor: Option<i32>,
     pub building: Option<String>,
-    /// Front-desk cleanliness flag (informational — which rooms need work).
+    /// Cleanliness as **iHOTEL** reports it (CR-1) — `true` = clean.
+    ///
+    /// Sourced from legacy `HT_Rooms.Room_Clean` (INVERTED: `'no'` = clean)
+    /// whenever iHOTEL answers for this `room_no`. Falls back to canonical
+    /// `ht_rooms_new.room_clean` when the legacy read is unavailable (see the
+    /// response's `legacy_status_stale`) or when iHOTEL has no usable value for
+    /// this particular room. See [`merge_legacy_room_clean`].
     pub room_clean: bool,
     /// Today's latest maid-reported progress; `None` = nothing reported yet.
     pub cleaning: Option<CleaningProgress>,
@@ -721,6 +799,16 @@ pub struct HkRoom {
 pub struct RoomsResponse {
     pub success: bool,
     pub data: Vec<HkRoom>,
+    /// `true` when the iHOTEL read could not answer and every `roomClean`
+    /// above is therefore the canonical PG MIRROR rather than iHOTEL truth
+    /// (CR-1 rule 2). The client renders a visible Thai note; it must never
+    /// render an error page — a stale list is usable, a blank one is not.
+    ///
+    /// ADDITIVE and always serialized, so a client can branch on the VALUE
+    /// rather than on whether the key exists. A machine-readable flag rather
+    /// than a message: the Thai copy belongs to the client, same precedent as
+    /// [`MeResponse::branches_unavailable_reason`].
+    pub legacy_status_stale: bool,
 }
 
 /// One cleaning event in the room-detail log.
@@ -741,6 +829,10 @@ pub struct RoomDetailResponse {
     pub room: HkRoom,
     /// Today's cleaning events, recent first.
     pub events: Vec<CleaningEvent>,
+    /// Same meaning as [`RoomsResponse::legacy_status_stale`]. Carried here
+    /// too so the two screens can never tell the maid different stories about
+    /// the same room.
+    pub legacy_status_stale: bool,
 }
 
 /// Body for `POST /api/hk/rooms/{id}/cleaning`.
@@ -797,6 +889,95 @@ fn parse_cleaning_status(raw: &str) -> Result<CleaningProgressStatus, ApiError> 
                 "invalid status '{raw}' (expected one of {VALID_CLEANING_STATUSES:?})"
             ))
         })
+}
+
+// ============================================================================
+// iHOTEL-wins merge (CR-1) — pure, unit-tested below
+// ============================================================================
+
+/// Overwrite each room's `room_clean` with iHOTEL's answer, and report whether
+/// the maid is looking at a fallback.
+///
+/// Returns `true` when the caller must set `legacy_status_stale` — i.e. the
+/// legacy read did not answer at all and every value left in `rooms` is the
+/// canonical PG mirror.
+///
+/// The three CR-1 rules, in one place (see the module docs):
+///
+/// * iHOTEL wins per room it has a usable value for;
+/// * a room iHOTEL has no usable value for keeps its canonical value SILENTLY
+///   — that is a mapping gap, not a staleness event, and flagging the whole
+///   list for one unmatched room would train the maid to ignore the note;
+/// * every disagreement is logged at `warn` with `room_no` and BOTH values,
+///   and NONE of it reaches the response.
+///
+/// PURE apart from the log line, which is exactly why the divergence rule is
+/// testable without a database or a legacy server.
+pub(crate) fn merge_legacy_room_clean(
+    rooms: &mut [HkRoom],
+    outcome: &RoomCleanOutcome,
+    branch: Branch,
+) -> bool {
+    let legacy = match outcome {
+        RoomCleanOutcome::Available(map) => map,
+        // Rule 2. Values stay as fetched from PG; the caller tells the client.
+        RoomCleanOutcome::Unavailable => return true,
+    };
+
+    let mut divergences = 0usize;
+    for room in rooms.iter_mut() {
+        let Some(&legacy_clean) = legacy.get(room.room_no.trim()) else {
+            continue;
+        };
+        if legacy_clean != room.room_clean {
+            divergences += 1;
+            // Rule 3 — operator-facing ONLY. `room_no` plus both values is
+            // everything needed to chase it into the CT watcher or the
+            // legacy-key repair (`bin/repair_room_legacy_keys`), which is the
+            // known cause of this class at HF Ville.
+            tracing::warn!(
+                branch = branch_id(branch),
+                room_no = %room.room_no,
+                ihotel_clean = legacy_clean,
+                pms_clean = room.room_clean,
+                "/hk room-clean divergence: iHOTEL and canonical PG disagree — \
+                 showing iHOTEL (CR-1); canonical is the mirror"
+            );
+        }
+        // Rule 1.
+        room.room_clean = legacy_clean;
+    }
+
+    if divergences > 0 {
+        tracing::warn!(
+            branch = branch_id(branch),
+            divergences,
+            rooms = rooms.len(),
+            "/hk served iHOTEL room-clean status over a diverging canonical mirror"
+        );
+    }
+    false
+}
+
+/// Ask this branch's iHOTEL reader, or report [`RoomCleanOutcome::Unavailable`]
+/// when the branch has none configured.
+///
+/// "No reader" and "reader failed" are the SAME answer on purpose: both mean
+/// the maid is about to see the canonical mirror, and she must be told so
+/// either way. Collapsing them keeps the fallback path single — the one that
+/// ships today, and the one an operator can reason about at 6am.
+async fn resolve_legacy_room_clean(policy: &HkPolicy, branch: Branch) -> RoomCleanOutcome {
+    match policy.legacy_room_clean.get(branch_id(branch)) {
+        Some(source) => source.room_clean().await,
+        None => {
+            tracing::debug!(
+                branch = branch_id(branch),
+                "/hk has no iHOTEL room-status reader for this branch — \
+                 serving the canonical PG mirror with the stale note"
+            );
+            RoomCleanOutcome::Unavailable
+        }
+    }
 }
 
 // ============================================================================
@@ -1043,10 +1224,15 @@ pub async fn list_rooms(
     let branch = require_branch(&policy, query.branch.as_deref())?;
     require_location(&policy, &identity, branch).await?;
     let pool = resolve_pool(&state, branch)?;
-    let data = fetch_rooms(pool).await?;
+    let mut data = fetch_rooms(pool).await?;
+    // CR-1: iHOTEL wins. A legacy failure NEVER fails the request — it
+    // degrades to the canonical mirror plus the client-rendered Thai note.
+    let outcome = resolve_legacy_room_clean(&policy, branch).await;
+    let legacy_status_stale = merge_legacy_room_clean(&mut data, &outcome, branch);
     Ok(Json(RoomsResponse {
         success: true,
         data,
+        legacy_status_stale,
     }))
 }
 
@@ -1065,10 +1251,17 @@ pub async fn room_detail(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
     let events = fetch_today_events(pool, room_id).await?;
+    // CR-1: the SAME merge as the list, so a maid who taps into a room never
+    // sees a different answer than the tile she tapped.
+    let mut rooms = [room];
+    let outcome = resolve_legacy_room_clean(&policy, branch).await;
+    let legacy_status_stale = merge_legacy_room_clean(&mut rooms, &outcome, branch);
+    let [room] = rooms;
     Ok(Json(RoomDetailResponse {
         success: true,
         room,
         events,
+        legacy_status_stale,
     }))
 }
 
@@ -1661,6 +1854,187 @@ mod tests {
                     "{outcome:?}: /me offered {branch:?} but the gate refuses it"
                 );
             }
+        }
+    }
+
+    // ---- CR-1: iHOTEL-wins room status ---------------------------------
+
+    /// A room as PG would hand it to us — `clean` is the CANONICAL value the
+    /// merge is allowed to overwrite.
+    fn pg_room(room_no: &str, clean: bool) -> HkRoom {
+        HkRoom {
+            room_id: 1,
+            room_no: room_no.to_string(),
+            floor: Some(1),
+            building: None,
+            room_clean: clean,
+            cleaning: None,
+        }
+    }
+
+    /// iHOTEL's answer, in CANONICAL polarity (the inversion already applied
+    /// by `legacy_room_status::legacy_clean_to_is_clean`).
+    fn ihotel(entries: &[(&str, bool)]) -> RoomCleanOutcome {
+        RoomCleanOutcome::Available(
+            entries
+                .iter()
+                .map(|(no, clean)| ((*no).to_string(), *clean))
+                .collect(),
+        )
+    }
+
+    /// Rule 1, both directions. This is the whole CR: iHOTEL's value replaces
+    /// canonical, whichever way they disagree.
+    #[test]
+    fn ihotel_wins_over_the_canonical_mirror_in_both_directions() {
+        let mut rooms = vec![
+            // PG says clean, iHOTEL says dirty (the checked-out-but-unsynced
+            // case reception is already looking at).
+            pg_room("104", true),
+            // PG says dirty, iHOTEL says clean (a stale mirror after someone
+            // cleaned it in iHOTEL).
+            pg_room("203", false),
+        ];
+        let stale = merge_legacy_room_clean(
+            &mut rooms,
+            &ihotel(&[("104", false), ("203", true)]),
+            Branch::Hfhotel,
+        );
+        assert!(!stale, "iHOTEL answered — nothing is stale");
+        assert!(!rooms[0].room_clean, "104 must follow iHOTEL (dirty)");
+        assert!(rooms[1].room_clean, "203 must follow iHOTEL (clean)");
+    }
+
+    /// Agreement is the common case and must be a no-op, not an accidental
+    /// flip. Pinned so a future refactor of the polarity can't pass rule 1's
+    /// disagreement test by inverting everything.
+    #[test]
+    fn agreement_leaves_every_room_untouched() {
+        let mut rooms = vec![pg_room("104", true), pg_room("203", false)];
+        let stale = merge_legacy_room_clean(
+            &mut rooms,
+            &ihotel(&[("104", true), ("203", false)]),
+            Branch::Hfhotel,
+        );
+        assert!(!stale);
+        assert!(rooms[0].room_clean);
+        assert!(!rooms[1].room_clean);
+    }
+
+    /// Rule 2 — the fallback the owner locked: legacy unreachable ⇒ the maid
+    /// still gets her list, with the canonical values UNCHANGED, and the
+    /// response is flagged so the client can say so in Thai. There is no
+    /// error path here; a dead legacy must never blank the screen.
+    #[test]
+    fn unavailable_legacy_falls_back_to_pms_and_flags_stale() {
+        let mut rooms = vec![pg_room("104", true), pg_room("203", false)];
+        let stale =
+            merge_legacy_room_clean(&mut rooms, &RoomCleanOutcome::Unavailable, Branch::Hfhotel);
+        assert!(stale, "the client MUST be told it is showing the mirror");
+        assert!(rooms[0].room_clean, "canonical value is preserved verbatim");
+        assert!(!rooms[1].room_clean, "canonical value is preserved verbatim");
+    }
+
+    /// A branch with NO reader configured is the same displayable state as an
+    /// unreachable one — that is what makes this ship compatible before the
+    /// Ville reader exists (and before `HK_BRANCHES` admits Ville).
+    #[tokio::test]
+    async fn a_branch_without_a_reader_reports_unavailable() {
+        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]);
+        assert!(p.legacy_room_clean_branches().is_empty());
+        assert_eq!(
+            resolve_legacy_room_clean(&p, Branch::Hfville).await,
+            RoomCleanOutcome::Unavailable
+        );
+    }
+
+    /// The reader is picked by BRANCH. A Ville maid must never be reconciled
+    /// against HF Hotel's legacy server — that is the wrong-hotel bug this
+    /// whole surface exists to close, one database deeper.
+    #[tokio::test]
+    async fn readers_are_resolved_per_branch() {
+        #[derive(Debug)]
+        struct Fixed(RoomCleanOutcome);
+        #[async_trait::async_trait]
+        impl RoomCleanSource for Fixed {
+            async fn room_clean(&self) -> RoomCleanOutcome {
+                self.0.clone()
+            }
+        }
+
+        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]).with_legacy_room_clean(
+            Branch::Hfhotel,
+            Arc::new(Fixed(ihotel(&[("104", false)]))),
+        );
+        assert_eq!(p.legacy_room_clean_branches(), vec!["hfhotel"]);
+        assert_eq!(
+            resolve_legacy_room_clean(&p, Branch::Hfhotel).await,
+            ihotel(&[("104", false)])
+        );
+        // Ville has no reader — fallback, NOT HF Hotel's answer.
+        assert_eq!(
+            resolve_legacy_room_clean(&p, Branch::Hfville).await,
+            RoomCleanOutcome::Unavailable
+        );
+    }
+
+    /// A room iHOTEL has no usable value for (unmatched `Room_no`, or a
+    /// `Room_Clean` literal the reader refused to interpret) keeps its
+    /// canonical value SILENTLY. It must not flag the whole list stale —
+    /// a note that fires for one unmatched room trains the maid to ignore it.
+    #[test]
+    fn a_room_missing_from_ihotel_keeps_its_canonical_value_without_flagging() {
+        let mut rooms = vec![pg_room("104", true), pg_room("999", false)];
+        let stale =
+            merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+        assert!(!stale, "one unmatched room is not a staleness event");
+        assert!(!rooms[0].room_clean, "104 follows iHOTEL");
+        assert!(!rooms[1].room_clean, "999 keeps its canonical value");
+    }
+
+    /// Legacy `Room_no` values are `varchar` and padded in places; the join
+    /// must survive that or every room silently falls back.
+    #[test]
+    fn room_numbers_are_matched_trimmed() {
+        let mut rooms = vec![pg_room(" 104 ", true)];
+        merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+        assert!(!rooms[0].room_clean);
+    }
+
+    /// An EMPTY answer from iHOTEL is still an answer — nothing is stale, and
+    /// every room simply keeps its canonical value. (An empty `HT_Rooms` is
+    /// not a thing; this pins that "no rows" can't be mistaken for "outage",
+    /// because the two produce different notes on the maid's screen.)
+    #[test]
+    fn an_empty_ihotel_answer_is_not_stale() {
+        let mut rooms = vec![pg_room("104", true)];
+        let stale = merge_legacy_room_clean(&mut rooms, &ihotel(&[]), Branch::Hfhotel);
+        assert!(!stale);
+        assert!(rooms[0].room_clean);
+    }
+
+    /// Divergence is an OPERATOR signal. Nothing about it may reach the wire —
+    /// the maid has one job per room and no action to take about which
+    /// database is behind. Pinned by serializing the response and asserting
+    /// the payload carries no divergence-shaped field.
+    #[test]
+    fn divergence_is_never_serialized_to_the_maid() {
+        let mut rooms = vec![pg_room("104", true)];
+        let stale =
+            merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+        let body = serde_json::to_string(&RoomsResponse {
+            success: true,
+            data: rooms,
+            legacy_status_stale: stale,
+        })
+        .expect("serializes");
+        assert!(body.contains("\"roomClean\":false"), "{body}");
+        assert!(body.contains("\"legacyStatusStale\":false"), "{body}");
+        for leaked in ["diverg", "pmsClean", "ihotel", "mirror"] {
+            assert!(
+                !body.to_lowercase().contains(leaked),
+                "response must not surface divergence ({leaked}): {body}"
+            );
         }
     }
 

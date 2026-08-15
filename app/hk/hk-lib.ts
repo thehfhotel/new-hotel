@@ -72,8 +72,33 @@ export interface HkRoom {
   roomNo: string
   floor: number | null
   building: string | null
+  /**
+   * Cleanliness as **iHOTEL** reports it (CR-1) — `true` = clean.
+   *
+   * The server merges legacy `HT_Rooms.Room_Clean` over the canonical PMS
+   * value so the maid and reception read the same room the same way. When the
+   * legacy read cannot answer, this is the PMS mirror instead and the
+   * response's `legacyStatusStale` says so. Nothing about the divergence
+   * itself reaches the client — the maid gets ONE value to act on.
+   */
   roomClean: boolean
   cleaning: HkCleaningProgress | null
+}
+
+/** `GET /hk/api/rooms`. */
+export interface HkRoomsResponse {
+  success: boolean
+  data: HkRoom[]
+  /**
+   * `true` ⇒ iHOTEL could not be reached and every `roomClean` above is the
+   * PMS mirror. Render `LEGACY_STATUS_STALE_NOTE` — never an error state: a
+   * stale list is workable, a blank one strands a maid on a stairwell.
+   *
+   * Optional on the type (not on the wire) so an older cached bundle talking
+   * to a newer backend, or the reverse, degrades to "no note" rather than
+   * `undefined` leaking into the UI.
+   */
+  legacyStatusStale?: boolean
 }
 
 export interface HkCleaningEvent {
@@ -88,6 +113,9 @@ export interface HkRoomDetail {
   success: boolean
   room: HkRoom
   events: HkCleaningEvent[]
+  /** Same meaning as `HkRoomsResponse.legacyStatusStale`. Present on both so
+   * the two screens can never tell the maid different stories. */
+  legacyStatusStale?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +306,49 @@ export function progressLabel(status: CleaningStatus | null | undefined): {
         className: 'bg-gray-100 text-gray-600 border-gray-300',
       }
   }
+}
+
+/**
+ * Shown when `legacyStatusStale` is true (CR-1 rule 2): the room-clean column
+ * on screen is the PMS mirror because iHOTEL could not be reached.
+ *
+ * Deliberately says three things, in the order a maid needs them: WHAT she is
+ * looking at (PMS's own status), WHY (iHOTEL unreachable), and the ONE
+ * consequence that changes her behaviour (it may disagree with reception's
+ * screen, so ask before assuming). It is a NOTICE, not an error — the list
+ * beneath it is fully usable and every button still works.
+ *
+ * Lives here, not on the server, for the same reason `branchesUnavailableMessage`
+ * does: the server sends a machine-readable flag and the client owns the Thai.
+ */
+export const LEGACY_STATUS_STALE_NOTE =
+  'ขณะนี้เชื่อมต่อระบบ iHOTEL ไม่ได้ สถานะความสะอาดที่แสดงมาจากระบบ PMS ซึ่งอาจไม่ตรงกับหน้าจอแผนกต้อนรับ'
+
+/**
+ * The Thai note for a room list / room detail response, or `null` when there
+ * is nothing to say. PURE — unit-tested.
+ *
+ * `undefined` (an older backend that does not send the field) returns `null`:
+ * silence must never be read as "stale", or every maid gets a permanent
+ * warning banner during a rollback and learns to ignore it.
+ */
+export function legacyStatusNote(stale: boolean | null | undefined): string | null {
+  return stale === true ? LEGACY_STATUS_STALE_NOTE : null
+}
+
+/**
+ * Confirm copy for แจ้งห้องไม่สะอาด (mark-dirty).
+ *
+ * The button used to fire on a SINGLE tap, and a mis-tap is not free: it flips
+ * the room dirty in iHOTEL, which puts a real room back on reception's board
+ * and sends someone to look at it. So the destructive action gets a second
+ * tap — and the prompt NAMES THE ROOM, because a maid holding a phone in a
+ * corridor of near-identical doors needs to confirm the room, not just the
+ * intent. เสร็จแล้ว / เริ่มทำความสะอาด stay single-tap: they are the normal
+ * flow, and a confirm on every tap is a confirm nobody reads.
+ */
+export function markDirtyConfirmMessage(roomNo: string): string {
+  return `ยืนยันแจ้งว่า ห้อง ${roomNo} ยังไม่สะอาด?`
 }
 
 /** Group rooms by floor for the list screen; floorless rooms go last. */

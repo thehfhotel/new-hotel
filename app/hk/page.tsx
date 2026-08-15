@@ -20,11 +20,12 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { AlertCircle, Loader2, RefreshCw, Sparkles } from 'lucide-react'
+import { AlertCircle, Info, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import {
   groupRoomsByFloor,
   hkFetch,
   hkFetchMe,
+  legacyStatusNote,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -33,6 +34,7 @@ import {
   type Branch,
   type HkMe,
   type HkRoom,
+  type HkRoomsResponse,
 } from './hk-lib'
 import { HkBranchChip, HkBranchesUnavailable, HkBranchPicker } from './HkBranchPicker'
 
@@ -44,6 +46,10 @@ export default function HkRoomListPage() {
   const [rooms, setRooms] = useState<HkRoom[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // CR-1: the room-clean column normally shows iHOTEL's answer. When the
+  // backend could not reach iHOTEL it serves the PMS mirror and sets this, and
+  // the maid is TOLD — a stale list she can work beats an error page.
+  const [legacyStale, setLegacyStale] = useState(false)
 
   // Step 1: identity + which branches exist. Runs once; never guesses a
   // branch itself — it only ever resolves what's already valid.
@@ -78,9 +84,10 @@ export default function HkRoomListPage() {
     try {
       const res = await hkFetch('/rooms', branch)
       if (!res.ok) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
-      const roomsData: { success: boolean; data: HkRoom[] } = await res.json()
+      const roomsData: HkRoomsResponse = await res.json()
       if (!roomsData.success) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
       setRooms(roomsData.data)
+      setLegacyStale(roomsData.legacyStatusStale === true)
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
@@ -97,6 +104,9 @@ export default function HkRoomListPage() {
     storeBranch(next)
     setRooms([])
     setError(null)
+    // The note describes the OTHER branch's read; carrying it across would
+    // claim iHOTEL is unreachable for a property we have not asked about yet.
+    setLegacyStale(false)
     setBranch(next)
   }
 
@@ -155,6 +165,19 @@ export default function HkRoomListPage() {
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
               <AlertCircle className="mt-0.5 h-5 w-5 shrink-0" />
               <span>{error}</span>
+            </div>
+          )}
+
+          {/* CR-1 fallback notice: iHOTEL unreachable, showing the PMS mirror.
+              AMBER, not red, and above the list rather than in place of it —
+              this is a notice about the data, not a failure of the screen. */}
+          {!error && legacyStatusNote(legacyStale) && (
+            <div
+              role="status"
+              className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"
+            >
+              <Info className="mt-0.5 h-5 w-5 shrink-0" />
+              <span>{legacyStatusNote(legacyStale)}</span>
             </div>
           )}
 

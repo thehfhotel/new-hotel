@@ -1,0 +1,205 @@
+/**
+ * @jest-environment jsdom
+ *
+ * Wave-5 R2 — the maid's room screen (`app/hk/rooms/[roomId]/page.tsx`).
+ *
+ * Two behaviours, both of which cost a real person real work when they break:
+ *
+ * 1. **The mark-dirty confirm (R2b).** แจ้งห้องไม่สะอาด used to POST on a
+ *    single tap. A mis-tap flips the room dirty in iHOTEL, which puts it back
+ *    on reception's board and sends someone to look at a room nobody asked
+ *    about. The first tap must issue NO request; only ยืนยัน may. เสร็จแล้ว
+ *    and เริ่มทำความสะอาด must stay single-tap — a confirm on every tap is a
+ *    confirm nobody reads.
+ * 2. **The iHOTEL-unavailable note (R2a / CR-1).** When the backend could not
+ *    reach iHOTEL it serves the PMS mirror and flags it. The maid must SEE
+ *    that, and must still get a fully working screen — stale-but-shown beats a
+ *    dead screen on a stairwell.
+ *
+ * `hkFetch` / `hkFetchMe` are mocked at the module boundary: this suite is
+ * about what the page DOES with an answer, and `hk-lib.test.ts` already owns
+ * the URL construction and the pure helpers.
+ */
+
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+
+const mockHkFetch = jest.fn()
+const mockHkFetchMe = jest.fn()
+
+jest.mock('next/navigation', () => ({
+  useParams: () => ({ roomId: '7' }),
+}))
+
+jest.mock('@/app/hk/hk-lib', () => {
+  const actual = jest.requireActual('@/app/hk/hk-lib')
+  return {
+    ...actual,
+    hkFetch: (...args: unknown[]) => mockHkFetch(...args),
+    hkFetchMe: (...args: unknown[]) => mockHkFetchMe(...args),
+  }
+})
+
+import HkRoomPage from '@/app/hk/rooms/[roomId]/page'
+import { LEGACY_STATUS_STALE_NOTE } from '@/app/hk/hk-lib'
+
+const ROOM = {
+  roomId: 7,
+  roomNo: '104',
+  floor: 1,
+  building: null,
+  roomClean: false,
+  cleaning: null,
+}
+
+function jsonResponse(body: unknown, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  }
+}
+
+/** `/me` with the mark-dirty button enabled and a single branch (so the page
+ * auto-selects it and never blocks on the picker). */
+function meResponse() {
+  return jsonResponse({
+    success: true,
+    badge: 'Q1001',
+    displayName: null,
+    branches: [{ id: 'hfhotel', labelTh: 'ฮาร์เบอร์ฟร้อนท์' }],
+    markDirtyEnabled: true,
+    branchesUnavailableReason: null,
+  })
+}
+
+/** Render the page with a scripted room-detail payload and wait for it. */
+async function renderRoom(detail: Record<string, unknown>) {
+  mockHkFetchMe.mockResolvedValue(meResponse())
+  mockHkFetch.mockResolvedValue(
+    jsonResponse({ success: true, room: ROOM, events: [], ...detail })
+  )
+  render(<HkRoomPage />)
+  await screen.findByText('ห้อง 104')
+}
+
+beforeEach(() => {
+  jest.clearAllMocks()
+  localStorage.clear()
+})
+
+describe('mark-dirty confirm step (R2b)', () => {
+  // THE regression this exists for: tapping แจ้งห้องไม่สะอาด must not file
+  // anything. Asserted on the POST count, not on the DOM, because that is the
+  // thing that reaches iHOTEL.
+  it('the first tap issues NO request — it only arms the confirm', async () => {
+    await renderRoom({})
+    const readCalls = mockHkFetch.mock.calls.length
+
+    fireEvent.click(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ }))
+
+    await screen.findByText(/ยืนยันแจ้งว่า ห้อง 104 ยังไม่สะอาด/)
+    expect(mockHkFetch.mock.calls.length).toBe(readCalls)
+    expect(
+      mockHkFetch.mock.calls.some(([, , init]) => (init as RequestInit | undefined)?.method === 'POST')
+    ).toBe(false)
+  })
+
+  it('ยืนยัน files the dirty report', async () => {
+    await renderRoom({})
+    fireEvent.click(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ }))
+    await screen.findByText(/ยืนยันแจ้งว่า ห้อง 104/)
+
+    fireEvent.click(screen.getByRole('button', { name: 'ยืนยัน' }))
+
+    await waitFor(() => {
+      const post = mockHkFetch.mock.calls.find(
+        ([, , init]) => (init as RequestInit | undefined)?.method === 'POST'
+      )
+      expect(post).toBeDefined()
+      expect(post?.[0]).toBe('/rooms/7/cleaning')
+      expect(JSON.parse((post?.[2] as RequestInit).body as string)).toEqual({ status: 'dirty' })
+    })
+  })
+
+  // The mis-tap path, end to end: arm it, change your mind, walk away with
+  // nothing filed and the original button back.
+  it('ยกเลิก files nothing and restores the button', async () => {
+    await renderRoom({})
+    fireEvent.click(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ }))
+    await screen.findByText(/ยืนยันแจ้งว่า ห้อง 104/)
+
+    fireEvent.click(screen.getByRole('button', { name: 'ยกเลิก' }))
+
+    await waitFor(() =>
+      expect(screen.queryByText(/ยืนยันแจ้งว่า ห้อง 104/)).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).toBeInTheDocument()
+    expect(
+      mockHkFetch.mock.calls.some(([, , init]) => (init as RequestInit | undefined)?.method === 'POST')
+    ).toBe(false)
+  })
+
+  // The normal flow must not grow friction. If these ever start needing a
+  // confirm, the confirm on the destructive action stops meaning anything.
+  it.each(['เสร็จแล้ว', 'เริ่มทำความสะอาด'])('%s stays single-tap', async (label) => {
+    await renderRoom({})
+    fireEvent.click(screen.getByRole('button', { name: label }))
+
+    await waitFor(() =>
+      expect(
+        mockHkFetch.mock.calls.some(
+          ([, , init]) => (init as RequestInit | undefined)?.method === 'POST'
+        )
+      ).toBe(true)
+    )
+  })
+
+  // The button is server-gated (HK_MARK_DIRTY_ENABLED via /me). With it off
+  // there must be no button AND no way to reach the confirm.
+  it('renders neither button nor confirm while markDirtyEnabled is false', async () => {
+    mockHkFetchMe.mockResolvedValue(
+      jsonResponse({
+        success: true,
+        badge: 'Q1001',
+        displayName: null,
+        branches: [{ id: 'hfhotel', labelTh: 'ฮาร์เบอร์ฟร้อนท์' }],
+        markDirtyEnabled: false,
+        branchesUnavailableReason: null,
+      })
+    )
+    mockHkFetch.mockResolvedValue(jsonResponse({ success: true, room: ROOM, events: [] }))
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+
+    expect(screen.queryByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'ยืนยัน' })).not.toBeInTheDocument()
+  })
+})
+
+describe('iHOTEL-unavailable note (R2a / CR-1)', () => {
+  it('shows the Thai note when the backend fell back to the PMS mirror', async () => {
+    await renderRoom({ legacyStatusStale: true })
+    expect(screen.getByText(LEGACY_STATUS_STALE_NOTE)).toBeInTheDocument()
+  })
+
+  it('shows nothing when iHOTEL answered', async () => {
+    await renderRoom({ legacyStatusStale: false })
+    expect(screen.queryByText(LEGACY_STATUS_STALE_NOTE)).not.toBeInTheDocument()
+  })
+
+  // A rollback (or an older backend) omits the field. Silence must not be read
+  // as "stale" — a banner that is always on is a banner nobody reads.
+  it('shows nothing when the backend omits the flag entirely', async () => {
+    await renderRoom({})
+    expect(screen.queryByText(LEGACY_STATUS_STALE_NOTE)).not.toBeInTheDocument()
+  })
+
+  // The whole point of the fallback: the screen still WORKS. A stale note must
+  // never come with a disabled or missing set of buttons.
+  it('leaves the screen fully usable while stale', async () => {
+    await renderRoom({ legacyStatusStale: true })
+    expect(screen.getByText(LEGACY_STATUS_STALE_NOTE)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'เสร็จแล้ว' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).toBeEnabled()
+  })
+})

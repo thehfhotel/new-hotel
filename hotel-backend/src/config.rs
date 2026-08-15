@@ -258,6 +258,63 @@ impl ServerConfig {
     }
 }
 
+/// HF Ville's LEGACY MSSQL target, for read-only reads issued from the API
+/// backend (CR-1 — the `/hk` iHOTEL room-status read, `crate::legacy_room_status`).
+///
+/// The API container already carries HF Hotel's legacy target
+/// ([`DbConfig::from_env`] — `DB_SERVER` / `DB_NAME` / `DB_USER` / `MSSQL_PORT`
+/// + the `db_password` secret), because `main.rs` builds a legacy pool for the
+/// scheduler's reconcile backstop. It carries NO Ville target: Ville's legacy
+/// server is reached only by the `sync-hfville` / `writeback-hfville`
+/// sidecars, which hardcode it in `docker-compose.yml`. This mirrors those
+/// sidecars so a branch-aware read can resolve BOTH sites, and it keeps their
+/// values as DEFAULTS so the deploy payload needs no new entry.
+///
+/// **Every field is optional and the whole thing may resolve to `None`.** A
+/// missing password (the only value that cannot be defaulted) yields `None`,
+/// which the `/hk` merge treats exactly like an unreachable legacy: show the
+/// canonical PG value with the visible Thai note. Unconfigured is a degraded
+/// display, never a failure to boot — that is what lets this ship compatible.
+///
+/// Named `VILLE_MSSQL_*`, deliberately NOT `VILLE_DB_*`: the latter is already
+/// taken by [`VilleDbConfig`], the Ville POSTGRES mirror. Two different
+/// databases sharing an env prefix is how a read ends up pointed at the wrong
+/// server.
+#[derive(Debug, Clone)]
+pub struct VilleLegacyDbConfig;
+
+impl VilleLegacyDbConfig {
+    /// Resolve HF Ville's legacy-MSSQL target, or `None` when there is no
+    /// usable password.
+    ///
+    /// The password falls back to `DB_PASSWORD` because both sites' legacy
+    /// MSSQL share one `sa` credential today — the same reuse (and the same
+    /// caveat) `docker-compose.yml`'s `sync-hfville` documents. Set
+    /// `VILLE_MSSQL_PASSWORD` to split them when one site rotates first.
+    pub fn from_env() -> Option<DbConfig> {
+        let password = env::var("VILLE_MSSQL_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| env::var("DB_PASSWORD").ok().filter(|v| !v.is_empty()))?;
+        Some(DbConfig {
+            server: env::var("VILLE_MSSQL_SERVER")
+                .unwrap_or_else(|_| "192.168.11.51".to_string()),
+            port: parse_mssql_port("VILLE_MSSQL_PORT", 1436),
+            database: env::var("VILLE_MSSQL_NAME").unwrap_or_else(|_| "HOTEL".to_string()),
+            user: env::var("VILLE_MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
+            password,
+            // Small on purpose: this pool serves ONE read (`SELECT Room_no,
+            // Room_Clean FROM HT_Rooms`) on a surface with a handful of
+            // concurrent maids. It must never be able to crowd the shared
+            // legacy server the way a writeback pool could.
+            pool_max: env::var("VILLE_MSSQL_POOL_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        })
+    }
+}
+
 /// Database configuration for HF Ville mirror (PostgreSQL via cloudflared tunnel)
 #[derive(Debug, Clone)]
 pub struct VilleDbConfig {
@@ -1031,5 +1088,88 @@ mod tests {
         // Used by `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` lookup.
         let site = SiteConfig::parse("hfville");
         assert_eq!(site.id_upper(), "HFVILLE");
+    }
+
+    // -------------------------------------------------------------------
+    // VilleLegacyDbConfig — HF Ville's LEGACY MSSQL target for the CR-1
+    // `/hk` room-status read. Unlike every other config here, being
+    // UNCONFIGURED must resolve to None rather than panic: it degrades the
+    // maid's screen to the PG mirror, it does not stop the boot. (A
+    // MALFORMED port still panics, via the shared `parse_mssql_port` — a
+    // typo must never silently dial the default instance.)
+    // -------------------------------------------------------------------
+
+    const VILLE_MSSQL_VARS: &[&str] = &[
+        "VILLE_MSSQL_PASSWORD",
+        "VILLE_MSSQL_SERVER",
+        "VILLE_MSSQL_PORT",
+        "VILLE_MSSQL_NAME",
+        "VILLE_MSSQL_USER",
+        "VILLE_MSSQL_POOL_MAX",
+        "DB_PASSWORD",
+    ];
+
+    /// Defaults reproduce `docker-compose.yml`'s `sync-hfville` block exactly
+    /// (192.168.11.51:1436/HOTEL as `sa`) — if these drift, a Ville maid is
+    /// shown another server's rooms.
+    #[test]
+    fn ville_legacy_defaults_match_the_sync_hfville_sidecar() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "shared-sa");
+        let cfg = VilleLegacyDbConfig::from_env().expect("DB_PASSWORD is enough to resolve");
+        assert_eq!(cfg.server, "192.168.11.51");
+        assert_eq!(cfg.port, 1436);
+        assert_eq!(cfg.database, "HOTEL");
+        assert_eq!(cfg.user, "sa");
+        assert_eq!(cfg.pool_max, 2, "the read pool must stay tiny");
+    }
+
+    /// No password anywhere ⇒ `None`, and NO panic. This is the "ships
+    /// compatible" property: a deployment without the secret still boots and
+    /// simply shows the canonical PG value with the stale note.
+    #[test]
+    fn ville_legacy_is_none_without_a_password_and_never_panics() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        assert!(VilleLegacyDbConfig::from_env().is_none());
+        // Empty is treated as missing — a CI substitution can render `VAR=''`.
+        env::set_var("DB_PASSWORD", "");
+        env::set_var("VILLE_MSSQL_PASSWORD", "");
+        assert!(VilleLegacyDbConfig::from_env().is_none());
+    }
+
+    /// A site-specific password wins over the shared `DB_PASSWORD`, so the
+    /// two sites can be split the day one rotates ahead of the other.
+    #[test]
+    fn ville_legacy_password_prefers_the_site_specific_secret() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "hfhotel-sa");
+        env::set_var("VILLE_MSSQL_PASSWORD", "ville-sa");
+        let cfg = VilleLegacyDbConfig::from_env().expect("resolves");
+        assert_eq!(cfg.password, "ville-sa");
+    }
+
+    /// Overrides are honoured — the deploy topology can move without a code
+    /// change (same contract as `DB_SERVER` / `MSSQL_PORT` for HF Hotel).
+    #[test]
+    fn ville_legacy_overrides_are_honoured() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "shared-sa");
+        env::set_var("VILLE_MSSQL_SERVER", "10.0.0.9");
+        env::set_var("VILLE_MSSQL_PORT", "1440");
+        env::set_var("VILLE_MSSQL_NAME", "HOTEL2");
+        env::set_var("VILLE_MSSQL_USER", "reader");
+        let cfg = VilleLegacyDbConfig::from_env().expect("resolves");
+        assert_eq!(cfg.server, "10.0.0.9");
+        assert_eq!(cfg.port, 1440);
+        assert_eq!(cfg.database, "HOTEL2");
+        assert_eq!(cfg.user, "reader");
     }
 }
