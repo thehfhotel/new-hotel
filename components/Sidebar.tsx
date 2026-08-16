@@ -10,7 +10,6 @@ import {
   BookOpen,
   BedDouble,
   Sparkles,
-  Wrench,
   Package,
   Receipt,
   BarChart3,
@@ -62,8 +61,7 @@ const sections: NavSection[] = [
   {
     title: 'ปฏิบัติการ',
     items: [
-      { href: '/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
-      { href: '/maintenance', label: 'แจ้งซ่อม', icon: <Wrench size={20} /> },
+      { href: '/v2/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
       { href: '/inventory', label: 'คลังสินค้า', icon: <Package size={20} /> },
       { href: '/card-reader', label: 'อ่านบัตร', icon: <CreditCard size={20} /> },
     ],

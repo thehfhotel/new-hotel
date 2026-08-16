@@ -31,12 +31,19 @@
 //! ## Keyed on `Room_no`, NOT on `legacy_room_id_int`
 //!
 //! `bin/repair_room_legacy_keys` settled which pointer is truthful against live
-//! data: the room-NUMBER path is correct, the id path is corrupt at HF Ville
-//! (30 of 34 rooms carry a `legacy_room_no` belonging to a different room).
+//! data: the room-NUMBER path is correct, the ID path was corrupt at HF Ville
+//! (30 of 34 rooms carried a `legacy_room_id_int` pointing at a different
+//! legacy room — NOT `legacy_room_no`, which was the truthful side; the bin's
+//! own correctness proof was that it reported 0 changes at HF Hotel).
+//! Repaired and verified 2026-08-16: `hotelville.ht_rooms_new` reports 0/34
+//! mismatched pointers (58/0 at HF Hotel as the control).
+//!
 //! Reading by `Room_no` is therefore both the correct join AND the one that
 //! makes the maid's screen agree with the iHOTEL board she is being reconciled
 //! against — it is what surfaces the Ville 104/203-class divergence instead of
-//! reproducing it.
+//! reproducing it. Keying on `Room_no` stays correct after the repair: it is
+//! the column iHOTEL's own board is keyed on, so it cannot reintroduce a
+//! pointer class of bug even if the id column drifts again.
 //!
 //! ## Read-only, and outside the write boundary
 //!
@@ -71,8 +78,9 @@
 //! an error page instead of her room list. Stale-but-shown beats dead screen —
 //! the owner's call, and the reason the timeout is short.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -136,6 +144,60 @@ pub fn legacy_clean_to_is_clean(raw: Option<&str>) -> Option<bool> {
         Some("no") => Some(true),   // no cleaning needed ⇒ IS clean
         Some("yes") => Some(false), // needs cleaning ⇒ dirty
         _ => None,
+    }
+}
+
+/// The per-branch iHOTEL readers, in a shape that can be shared with surfaces
+/// OUTSIDE `routes::hk`.
+///
+/// `HkPolicy` owns the authoritative map (it is the thing `main.rs` attaches
+/// readers to at startup). Reception's board needs the SAME readers — the whole
+/// point of the wave-5 change is that the maid and the receptionist read one
+/// truth — but it lives on the main router, which has no `HkPolicy`. Rather
+/// than build a second set of readers (a second legacy connection per site, and
+/// two things to keep in step), `main.rs` clones the map into this newtype and
+/// layers it as an `Extension` on the main router.
+///
+/// A newtype rather than a bare `BTreeMap` so the axum `Extension` is keyed on
+/// a type that means something: a second `BTreeMap<&str, Arc<…>>` extension
+/// would silently collide with this one.
+///
+/// Keys are the wire branch ids (`hfhotel` / `hfville`) — the `?branch=`
+/// spelling, so the reader and the PG pool are chosen off the same token.
+#[derive(Clone, Debug, Default)]
+pub struct RoomCleanReaders(BTreeMap<&'static str, Arc<dyn RoomCleanSource>>);
+
+impl RoomCleanReaders {
+    pub fn new(readers: BTreeMap<&'static str, Arc<dyn RoomCleanSource>>) -> Self {
+        Self(readers)
+    }
+
+    /// Branch ids that have a live reader — for the startup log.
+    pub fn branches(&self) -> Vec<&'static str> {
+        self.0.keys().copied().collect()
+    }
+
+    /// Ask a branch's reader, or report [`RoomCleanOutcome::Unavailable`] when
+    /// that branch has none.
+    ///
+    /// "No reader configured" and "reader failed" collapse to the SAME answer,
+    /// deliberately and identically to `routes::hk`'s
+    /// `resolve_legacy_room_clean`: both mean the caller is about to render the
+    /// canonical PG mirror, and the screen must say so either way. Two surfaces
+    /// disagreeing about what "stale" means would be worse than either being
+    /// wrong.
+    pub async fn read(&self, branch_id: &str) -> RoomCleanOutcome {
+        match self.0.get(branch_id) {
+            Some(source) => source.room_clean().await,
+            None => {
+                tracing::debug!(
+                    branch = branch_id,
+                    "no iHOTEL room-status reader for this branch — serving the \
+                     canonical PG mirror with the stale flag"
+                );
+                RoomCleanOutcome::Unavailable
+            }
+        }
     }
 }
 

@@ -20,11 +20,13 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderValue, Method},
     middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
-    Router,
+    Extension, Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use hotel_backend::legacy_room_status::RoomCleanReaders;
 
 use crate::config::{auth_enabled_from_env, AppConfig};
 use crate::db::{create_pg_pool, create_pool, pg_pool_options};
@@ -360,8 +362,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // are PG-only as of Phase 8 — they read from `ht_*_legacy` mirror tables
     // populated by the CT mappers + drift-reconcile job. MSSQL is write-only
     // (writeback worker) for the legacy .NET app.
+    //
+    // Reception's board reads the SAME iHOTEL readers the maid's `/hk` surface
+    // reads (wave-5 IF-1) — one truth, so the two screens cannot disagree about
+    // a room. `hk_policy` owns them; clone the map (Arc bumps only, no new
+    // legacy connection) before it is moved into the `/hk` router below.
+    let room_clean_readers = RoomCleanReaders::new(hk_policy.legacy_room_clean.clone());
+    tracing::info!(
+        "reception housekeeping board: iHOTEL readers for {:?}",
+        room_clean_readers.branches()
+    );
+
     let new_routes = if let Some(ref app_state) = final_app_state {
-        build_new_routes(app_state.clone())
+        build_new_routes(app_state.clone(), room_clean_readers)
     } else {
         Router::new()
     };
@@ -797,7 +810,7 @@ fn parse_allowed_origins() -> AllowOrigin {
 /// operator opts in. The middleware is applied to THIS subrouter only
 /// — `/api/auth/*` and `/health` are mounted separately in `main()`
 /// and stay public.
-fn build_new_routes(app_state: AppState) -> Router {
+fn build_new_routes(app_state: AppState, room_clean_readers: RoomCleanReaders) -> Router {
     let auth_layer =
         axum_middleware::from_fn_with_state(app_state.clone(), app_middleware::require_auth);
 
@@ -1352,7 +1365,13 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/products/{id}/stock-adjust",
             post(routes::new_products::adjust_stock),
         )
-        // Maintenance Management
+        // Maintenance — READ-ONLY HISTORY as of wave-5 (2026-08-16). The PMS
+        // แจ้งซ่อม intake duplicated the Housekeeping ops app, which the owner
+        // made the system of record for work orders, so the three writes answer
+        // 410 Gone (Thai body naming the housekeeping app) and the Kanban UI
+        // that drove them is deleted. The GETs stay so the existing rows remain
+        // readable — the table held 0 rows at both properties when this landed.
+        // Same disposition as the retired `ht_hk_broken_reports` intake.
         .route(
             "/api/maintenance/categories",
             get(routes::new_maintenance::list_categories),
@@ -1360,15 +1379,16 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/maintenance/requests",
             get(routes::new_maintenance::list_requests)
-                .post(routes::new_maintenance::create_request),
+                .post(routes::new_maintenance::retired_create_request),
         )
         .route(
             "/api/maintenance/requests/{id}",
-            get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request),
+            get(routes::new_maintenance::get_request)
+                .put(routes::new_maintenance::retired_update_request),
         )
         .route(
             "/api/maintenance/requests/{id}/status",
-            put(routes::new_maintenance::update_request_status),
+            put(routes::new_maintenance::retired_update_request_status),
         )
         // Sync status
         .route("/api/sync/status", get(routes::new_sync::get_sync_status))
@@ -1379,6 +1399,12 @@ fn build_new_routes(app_state: AppState) -> Router {
         // the 2026-07-29 exhaustion incident).
         .route("/api/events", get(routes::events::stream))
         .with_state(app_state)
+        // iHOTEL room-status readers for `GET /api/housekeeping/cleaning`
+        // (wave-5 IF-1). Read-only adapters, shared with `/hk` rather than
+        // rebuilt, so the maid and reception merge the same answer. Absent =
+        // the supported fallback (canonical mirror + stale flag), which is why
+        // the handler extracts it as `Option<Extension<_>>`.
+        .layer(Extension(room_clean_readers))
         // Phase 4 PR2: gate every route above behind the cookie-session
         // auth middleware. The middleware itself is a no-op when
         // `AUTH_ENABLED=false` (the production default), so this is

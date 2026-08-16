@@ -30,13 +30,50 @@ function view(label: string, tone: V2Tone): V2StatusView {
   return { label, tone, cls: `s-${tone}`, dot: `d-${tone}` }
 }
 
-/** Room status from /api/rooms (`status` + isClean/isMaintenance).
+/** The derived housekeeping axis, as served by
+ *  `GET /api/housekeeping/cleaning` (`housekeeping[].hkStatus`). This is the
+ *  MERGED, iHOTEL-wins truth for a room's cleanliness — a second axis that
+ *  runs alongside the availability status, not a value inside it. */
+export type HkStatus = 'clean' | 'cleaning' | 'dirty'
+
+export const HK_STATUS_LABELS: Record<HkStatus, string> = {
+  clean: 'สะอาด',
+  cleaning: 'กำลังทำความสะอาด',
+  dirty: 'รอทำความสะอาด',
+}
+
+/** The vacant-room view refined by the housekeeping axis.
+ *
+ *  `cleaning` deliberately SHARES the `'dirt'` tone (Moccasin / "รอ
+ *  ทำความสะอาด") with `dirty` rather than getting a tone of its own: from
+ *  reception's point of view a room being cleaned right now is not yet
+ *  sellable-clean, so it must not read as green/ว่าง. The finer
+ *  in-progress-vs-not-started distinction is drawn by the v2 housekeeping
+ *  screen with its own group heading and badge, where it is actionable —
+ *  adding a tone here would mean a new V2Tone and a new CSS var pair. */
+function vacantHkView(hkStatus: HkStatus): V2StatusView {
+  if (hkStatus === 'clean') return view('ว่าง', 'vac')
+  return view(HK_STATUS_LABELS[hkStatus], 'dirt')
+}
+
+/** Room status from /api/rooms (`status` + isClean/isMaintenance), optionally
+ *  refined by the housekeeping axis (`hkStatus`).
  *
  *  Tones are the iHOTEL room-state hues (#227) so the color language matches
- *  what reception has read off FormRoomMain for years; Thai labels unchanged. */
+ *  what reception has read off FormRoomMain for years; Thai labels unchanged.
+ *
+ *  TWO AXES, and the order between them is fixed: AVAILABILITY (can this room
+ *  be sold, and to whom) is the outer axis and always wins — ซ่อมบำรุง /
+ *  มีผู้เข้าพัก / จองแล้ว / รอเช็คเอาท์ are returned no matter what
+ *  housekeeping says. HOUSEKEEPING (is it clean) is the inner axis and refines
+ *  ONLY the vacant (`available`) branch, which is the one place cleanliness
+ *  changes what reception can do with the room. Within that branch `hkStatus`
+ *  outranks `isClean`: `hkStatus` is the merged iHOTEL-wins truth, `isClean`
+ *  the older single-source flag. Omit `hkStatus` and the behaviour is exactly
+ *  the pre-existing `isClean` split. */
 export function roomStatusView(
   status: string,
-  opts?: { isClean?: boolean; isMaintenance?: boolean },
+  opts?: { isClean?: boolean; isMaintenance?: boolean; hkStatus?: HkStatus },
 ): V2StatusView {
   if (opts?.isMaintenance || status === 'maintenance') return view('ซ่อมบำรุง', 'mtn')
   switch (status) {
@@ -54,6 +91,10 @@ export function roomStatusView(
       // true=clean), so every free room looked dirty. That inversion is fixed +
       // backfilled (2026-06-30), so isClean is now accurate and safe to surface.
       // isClean === false → needs cleaning; true/undefined → clean (ว่าง).
+      //
+      // When the caller has the merged housekeeping axis it supersedes
+      // isClean here — same branch, better source. See vacantHkView.
+      if (opts?.hkStatus) return vacantHkView(opts.hkStatus)
       return opts?.isClean === false ? view('รอทำความสะอาด', 'dirt') : view('ว่าง', 'vac')
     default:
       return view(status || 'ไม่ทราบ', 'mut')

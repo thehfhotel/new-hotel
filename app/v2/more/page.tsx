@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation'
 import {
   Sparkles,
   CalendarRange,
-  Wrench,
   Package,
   CreditCard,
   BookUser,
@@ -27,6 +26,7 @@ import {
   ExternalLink,
   type LucideIcon,
 } from 'lucide-react'
+import { HOUSEKEEPING_URL } from '@/app/hk/hk-lib'
 import { useAuth } from '@/contexts/AuthContext'
 import { V2PageHeader } from '@/components/v2/primitives'
 
@@ -36,6 +36,9 @@ interface HubItem {
   desc: string
   icon: LucideIcon
   adminOnly?: boolean
+  /** When true, the item leaves the PMS for another app — rendered as a
+      plain `<a target="_blank">` instead of a client-side `next/link`. */
+  external?: boolean
 }
 
 interface HubSection {
@@ -43,14 +46,17 @@ interface HubSection {
   items: HubItem[]
 }
 
+const HUB_CARD_CLASS =
+  'v2-card p-4 flex items-start gap-3.5 transition-shadow hover:shadow-[var(--v2-shadow-md)] group'
+
 const SECTIONS: HubSection[] = [
   {
     title: 'ปฏิบัติการ',
     items: [
       { href: '/v2/calendar', label: 'ปฏิทินห้องว่าง', desc: 'ผังห้องว่างตามวันที่ (ห้อง × วัน)', icon: CalendarRange },
-      { href: '/housekeeping', label: 'งานแม่บ้าน', desc: 'สถานะความสะอาดของห้อง', icon: Sparkles },
+      { href: '/v2/housekeeping', label: 'งานแม่บ้าน', desc: 'สถานะความสะอาดของห้อง', icon: Sparkles },
       { href: '/v2/notes', label: 'โน้ตห้อง / พนักงาน', desc: 'ฝากข้อความถึงห้องและพนักงาน', icon: StickyNote },
-      { href: '/maintenance', label: 'แจ้งซ่อม', desc: 'งานซ่อมบำรุงและอุปกรณ์', icon: Wrench },
+      { href: `${HOUSEKEEPING_URL}/`, label: 'แจ้งซ่อม (แอปแม่บ้าน)', desc: 'เปิดแอปแม่บ้านในแท็บใหม่ — ระบบงานซ่อมและใบสั่งงาน', icon: ExternalLink, external: true },
       { href: '/inventory', label: 'คลังสินค้า', desc: 'สต๊อกและการเบิกจ่าย', icon: Package },
       { href: '/card-reader', label: 'อ่านบัตรประชาชน', desc: 'ดึงข้อมูลจากบัตรไทย', icon: CreditCard },
       { href: '/passport-scanner', label: 'สแกนพาสปอร์ต', desc: 'อ่าน MRZ หนังสือเดินทางต่างชาติ', icon: BookUser },
@@ -94,7 +100,7 @@ export default function V2More() {
       <V2PageHeader eyebrow="เพิ่มเติม" title="เครื่องมือทั้งหมด" />
 
       <p className="text-[13px] -mt-2" style={{ color: 'var(--v2-ink-3)' }}>
-        เครื่องมือเหล่านี้จะเปิดในหน้าจอเวอร์ชันเดิม
+        เครื่องมือบางรายการจะเปิดในหน้าจอเวอร์ชันเดิม และบางรายการจะเปิดแอปภายนอกในแท็บใหม่
       </p>
 
       {SECTIONS.map((section) => {
@@ -106,12 +112,8 @@ export default function V2More() {
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {items.map((item) => {
                 const Icon = item.icon
-                return (
-                  <Link
-                    key={item.href}
-                    href={item.href}
-                    className="v2-card p-4 flex items-start gap-3.5 transition-shadow hover:shadow-[var(--v2-shadow-md)] group"
-                  >
+                const card = (
+                  <>
                     <span
                       className="w-11 h-11 rounded-[12px] grid place-items-center shrink-0"
                       style={{ background: 'var(--v2-wine-50)', color: 'var(--v2-wine-600)' }}
@@ -125,6 +127,23 @@ export default function V2More() {
                       </div>
                       <div className="text-[12.5px] mt-0.5" style={{ color: 'var(--v2-ink-3)' }}>{item.desc}</div>
                     </div>
+                  </>
+                )
+                // External items leave the PMS for another origin, so they use a
+                // plain anchor — next/link would try to client-navigate.
+                return item.external ? (
+                  <a
+                    key={item.href}
+                    href={item.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={HUB_CARD_CLASS}
+                  >
+                    {card}
+                  </a>
+                ) : (
+                  <Link key={item.href} href={item.href} className={HUB_CARD_CLASS}>
+                    {card}
                   </Link>
                 )
               })}

@@ -161,7 +161,7 @@ export default function RoomActionSheet({
                 room_clean AND mirrors to iHOTEL HT_Rooms.Room_Clean) — surfaced
                 here now that room_clean is trustworthy (the inversion fix). */}
             {room.status === 'maintenance' ? (
-              <ActionButton icon={<CheckCircle2 size={17} />} label="พร้อมใช้งาน (เลิกแจ้งซ่อม)" onClick={() => onAction('ready')} />
+              <ActionButton icon={<CheckCircle2 size={17} />} label="เปิดห้องขาย" onClick={() => onAction('ready')} />
             ) : (
               <>
                 {room.isClean ? (
@@ -169,7 +169,7 @@ export default function RoomActionSheet({
                 ) : (
                   <ActionButton icon={<CheckCircle2 size={17} />} label="ทำความสะอาดแล้ว" onClick={() => onAction('clean')} />
                 )}
-                <ActionButton icon={<Wrench size={17} />} label="แจ้งซ่อม" onClick={() => onAction('maintenance')} />
+                <ActionButton icon={<Wrench size={17} />} label="ปิดห้องซ่อม" onClick={() => onAction('maintenance')} />
               </>
             )}
           </div>

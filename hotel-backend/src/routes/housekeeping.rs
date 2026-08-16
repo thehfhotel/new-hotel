@@ -27,6 +27,14 @@
 //! outside `routes::hk` — the maid reported progress and reception could not
 //! see it.
 //!
+//! **Reception truth (wave-5 IF-1):** the same endpoint additionally serves
+//! `legacyStatusStale`, `legacyClean[]` and the `housekeeping[]` axis — the
+//! iHOTEL-wins merged cleanliness the `/hk` maid surface already shows, plus
+//! the divergence it deliberately hides from her. Reception is the desk that
+//! reconciles the two boards, so it is the one audience the disagreement is
+//! actionable for. All read-side: ZERO new write shapes, and `cleaning` has no
+//! legacy counterpart to mirror.
+//!
 //! All SQL here and in the service is RUNTIME `sqlx::query` (no compile-time
 //! macro), so these routes need no `.sqlx/` cache regeneration.
 
@@ -42,6 +50,7 @@ use uuid::Uuid;
 use super::mode::{AppState, Branch};
 use crate::domain::user::User;
 use crate::error::ApiResult;
+use crate::legacy_room_status::{RoomCleanOutcome, RoomCleanReaders};
 use crate::outbox::event::EventSource;
 use crate::service::{
     HousekeepingService, MarkCleanCommand, MarkDirtyCommand, MarkMaintenanceCommand,
@@ -213,14 +222,194 @@ pub struct RoomCleaningProgress {
     pub at: DateTime<Utc>,
 }
 
+/// What iHOTEL said about one room's cleanliness, in CANONICAL polarity
+/// (`true` = IS clean). Only rooms iHOTEL had a usable value for appear —
+/// an unrecognised legacy literal is UNKNOWN, never guessed
+/// (`legacy_room_status::legacy_clean_to_is_clean`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyRoomClean {
+    pub room_no: String,
+    pub clean: bool,
+}
+
+/// One room on the HOUSEKEEPING axis — the second axis reception reads
+/// alongside `/api/rooms`' availability `status`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomHousekeeping {
+    pub room_no: String,
+    /// `clean` | `cleaning` | `dirty` — see [`derive_hk_status`].
+    pub hk_status: String,
+    /// iHOTEL and canonical PG disagree about this room's cleanliness.
+    ///
+    /// SHOWN to reception, deliberately — the opposite of the `/hk` maid
+    /// surface, which suppresses it (`routes::hk`'s
+    /// `the_maid_never_receives_the_canonical_second_opinion`). The maid has
+    /// exactly one job per room and no action to take about which database is
+    /// behind; the receptionist is the person who reconciles the two boards,
+    /// so for her the disagreement IS the actionable fact. Matching is the
+    /// norm, divergence is the anomaly.
+    pub divergent: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleaningProgressResponse {
     pub success: bool,
     pub data: Vec<RoomCleaningProgress>,
+    /// `true` when the iHOTEL read could not answer, so every `housekeeping[]`
+    /// entry below is derived from the canonical PG MIRROR rather than iHOTEL
+    /// truth. Same meaning and same four collapsed failure modes as
+    /// `routes::hk`'s `RoomsResponse::legacy_status_stale`.
+    ///
+    /// ADDITIVE and ALWAYS serialized, so a client branches on the VALUE
+    /// rather than on whether the key exists — a rollback must not be able to
+    /// paint a permanent stale banner.
+    pub legacy_status_stale: bool,
+    /// Raw iHOTEL answer per room. Empty when `legacy_status_stale`.
+    pub legacy_clean: Vec<LegacyRoomClean>,
+    /// EVERY active room on the housekeeping axis (unlike `data`, which only
+    /// carries rooms a maid reported on today).
+    pub housekeeping: Vec<RoomHousekeeping>,
 }
 
-/// GET /api/housekeeping/cleaning — today's cleaning progress, one row per room.
+/// The housekeeping axis. A SECOND AXIS, never an availability tier.
+///
+/// `overlay_live_status` (`routes::new_rooms`) deliberately excludes
+/// cleanliness from availability — iHOTEL does not gate check-in on the clean
+/// flag, so neither do we — and that exclusion is pinned by
+/// `room_stored_cleaning_is_still_derived_available`. This axis therefore sits
+/// BESIDE `status`, is computed at READ TIME (no second writer, no stored
+/// denormalization to distrust), and is exposed on THIS reception endpoint
+/// only — never on `/api/rooms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HkStatus {
+    Clean,
+    Cleaning,
+    Dirty,
+}
+
+impl HkStatus {
+    /// Wire literal. Kept lowercase and stable — the frontend's
+    /// `HK_STATUS_LABELS` keys off exactly these three.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Cleaning => "cleaning",
+            Self::Dirty => "dirty",
+        }
+    }
+}
+
+/// Derive one room's housekeeping status. PURE — unit-tested below.
+///
+/// `room_clean` is the MERGED value (iHOTEL wins where it has an opinion),
+/// not the raw canonical column. `latest_event_today` is the room's most
+/// recent `ht_hk_cleaning_events` literal for the Thai day, or `None` when the
+/// maid has not touched it today.
+///
+/// ## Evaluation order is load-bearing
+///
+/// `clean` is tested FIRST and unconditionally; `cleaning` and `dirty` then
+/// partition the not-clean space. That is what the locked design's table says:
+/// its `dirty` row carries the qualifier "latest not started" while its
+/// `clean` row carries no qualifier at all. If `cleaning` outranked `clean`,
+/// the `clean` row would need the same qualifier — it does not, so it wins.
+///
+/// The two only disagree in an anomaly anyway: the normal lifecycle is
+/// dirty → `started` (still `room_clean=false`) → `done` (flips it true), so a
+/// room that is clean AND mid-`started` means someone marked it clean out of
+/// band. Showing สะอาด there follows the merged truth rather than a stale
+/// event, which is the same precedence the rest of this endpoint applies.
+pub fn derive_hk_status(room_clean: bool, latest_event_today: Option<&str>) -> HkStatus {
+    if room_clean {
+        HkStatus::Clean
+    } else if latest_event_today == Some("started") {
+        // "latest event is 'started'" is exactly the design's "'started' with
+        // no later done/dirty" — the query already takes only the newest row.
+        HkStatus::Cleaning
+    } else {
+        HkStatus::Dirty
+    }
+}
+
+/// One room as read from PG, before the iHOTEL merge. Internal to the axis
+/// build so the merge can be unit-tested with no database and no legacy server.
+#[derive(Debug, Clone)]
+pub struct RoomCleanRow {
+    pub room_no: String,
+    pub room_clean: bool,
+    pub latest_event_today: Option<String>,
+}
+
+/// Merge iHOTEL over canonical PG and build both additive axes.
+///
+/// Returns `(legacy_status_stale, legacy_clean, housekeeping)`.
+///
+/// Same three CR-1 rules as `routes::hk::merge_legacy_room_clean` — iHOTEL
+/// wins per room it has a usable value for; a room it has no usable value for
+/// keeps its canonical value SILENTLY (a mapping gap is not a staleness
+/// event); an unanswerable read is stale, not an error — with ONE deliberate
+/// difference: the disagreement is RETURNED here instead of only logged.
+///
+/// PURE apart from the summary log line.
+pub fn build_housekeeping_axes(
+    rooms: &[RoomCleanRow],
+    outcome: &RoomCleanOutcome,
+    branch_id: &str,
+) -> (bool, Vec<LegacyRoomClean>, Vec<RoomHousekeeping>) {
+    let legacy = match outcome {
+        RoomCleanOutcome::Available(map) => Some(map),
+        RoomCleanOutcome::Unavailable => None,
+    };
+
+    let mut legacy_clean = Vec::new();
+    let mut housekeeping = Vec::with_capacity(rooms.len());
+    let mut divergences = 0usize;
+
+    for room in rooms {
+        let ihotel = legacy.and_then(|m| m.get(room.room_no.trim()).copied());
+        if let Some(clean) = ihotel {
+            legacy_clean.push(LegacyRoomClean {
+                room_no: room.room_no.clone(),
+                clean,
+            });
+        }
+        let divergent = matches!(ihotel, Some(clean) if clean != room.room_clean);
+        if divergent {
+            divergences += 1;
+        }
+        // iHOTEL wins where it has an opinion; otherwise canonical stands.
+        let merged = ihotel.unwrap_or(room.room_clean);
+        housekeeping.push(RoomHousekeeping {
+            room_no: room.room_no.clone(),
+            hk_status: derive_hk_status(merged, room.latest_event_today.as_deref())
+                .as_str()
+                .to_string(),
+            divergent,
+        });
+    }
+
+    if divergences > 0 {
+        // SUMMARY only, no per-room line: reception's board polls on a timer
+        // and on every SSE cleaning event, so a per-room warn here would emit
+        // the same rows every few seconds. The per-room detail already exists
+        // on the `/hk` path, and — the actual fix — it is now IN the response
+        // for the person who can act on it.
+        tracing::warn!(
+            branch = branch_id,
+            divergences,
+            rooms = rooms.len(),
+            "reception housekeeping board: iHOTEL and canonical PG disagree — \
+             showing iHOTEL, flagging the rooms as divergent"
+        );
+    }
+
+    (legacy.is_none(), legacy_clean, housekeeping)
+}
+
+/// GET /api/housekeeping/cleaning — reception's housekeeping truth.
 ///
 /// The reception (แผนกแม่บ้าน) board's live feed. Before this, `ht_hk_cleaning_events`
 /// was read by NOTHING outside `routes::hk` — the maid's progress existed and
@@ -229,10 +418,27 @@ pub struct CleaningProgressResponse {
 /// `/api/rooms` never emits (pinned by `routes::new_rooms`'
 /// `room_stored_cleaning_is_still_derived_available`).
 ///
+/// ## Wave-5: three ADDITIVE fields (IF-1)
+///
+/// `legacyStatusStale`, `legacyClean[]` and `housekeeping[{roomNo, hkStatus,
+/// divergent}]`. Reception now gets the SAME iHOTEL-wins merged truth the maid
+/// gets on `/hk`, so the two screens cannot disagree about a room — plus the
+/// divergence itself, which the maid surface deliberately suppresses (see
+/// [`RoomHousekeeping::divergent`]).
+///
+/// `hkStatus` is the second axis that finally makes กำลังทำความสะอาด real: it
+/// is derived from a maid's `started` event rather than from the dead
+/// `status='cleaning'` literal the old board matched on. Computed at READ
+/// TIME — no second writer, no stored denormalization.
+///
 /// Deliberately a SEPARATE endpoint rather than widening `/api/rooms`:
-/// `routes::new_rooms` is a large shared file whose live-flags scan is pinned by
-/// tests, and leaving it untouched is what let the backend and frontend halves
-/// of this change be built in parallel.
+/// `routes::new_rooms` is a large shared file whose live-flags scan and
+/// cleanliness-is-not-a-tier rule are pinned by tests, and both stay untouched.
+/// `overlay_live_status` is not modified by this change and must not be.
+///
+/// ZERO new write shapes: everything here is a read, and `cleaning` has no
+/// legacy counterpart at all (iHOTEL has no in-progress state; `Room_Clean_Time`
+/// is off limits — it drives a physical room-power countdown).
 ///
 /// Rooms with no event today are ABSENT from `data` (the frontend reads absent
 /// as "no progress reported"), so the response stays tiny — 0 rows on a quiet
@@ -246,6 +452,7 @@ pub struct CleaningProgressResponse {
 pub async fn list_cleaning_progress(
     State(state): State<AppState>,
     Query(query): Query<HousekeepingQuery>,
+    readers: Option<Extension<RoomCleanReaders>>,
 ) -> ApiResult<Json<CleaningProgressResponse>> {
     // Same per-site chokepoint as the mutating siblings, so this read can never
     // disagree with the writes it renders.
@@ -253,18 +460,24 @@ pub async fn list_cleaning_progress(
 
     // `TODAY_BKK` is shared verbatim with `routes::hk` — ONE definition of
     // "today", so the maid's list and reception's board cannot disagree at a
-    // day boundary. INNER JOIN LATERAL ⇒ only rooms with an event today.
+    // day boundary.
+    //
+    // LEFT JOIN LATERAL (widened from INNER, wave-5): the housekeeping AXIS
+    // needs every active room, not only the ones a maid touched today. `data`
+    // is still filtered to rooms WITH an event below, so its published
+    // contract — absent means "no progress reported" — is unchanged.
     let sql = format!(
         r#"
         SELECT
             r.room_id,
             r.room_no,
+            COALESCE(r.room_clean, true) AS room_clean,
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
             ev.hkev_created_at
         FROM ht_rooms_new r
-        JOIN LATERAL (
+        LEFT JOIN LATERAL (
             SELECT e.hkev_status, e.hkev_badge, e.hkev_name, e.hkev_created_at
             FROM ht_hk_cleaning_events e
             WHERE e.hkev_room_id = r.room_id AND {today}
@@ -281,29 +494,241 @@ pub async fn list_cleaning_progress(
         .fetch_all(pool)
         .await?;
 
-    let data = rows
+    // Rooms a maid reported on today — the ORIGINAL `data` contract. A room
+    // with no event today has a NULL `hkev_status` from the LEFT JOIN and is
+    // filtered out here exactly as the INNER JOIN used to drop it.
+    let data: Vec<RoomCleaningProgress> = rows
         .iter()
-        .map(|row| RoomCleaningProgress {
-            room_id: row.try_get::<i32, _>("room_id").unwrap_or(0),
-            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
-            status: row.try_get::<String, _>("hkev_status").unwrap_or_default(),
-            badge: row.try_get::<String, _>("hkev_badge").unwrap_or_default(),
-            name: row.try_get::<String, _>("hkev_name").ok(),
-            at: row
-                .try_get::<DateTime<Utc>, _>("hkev_created_at")
-                .unwrap_or_else(|_| Utc::now()),
+        .filter_map(|row| {
+            let status = row
+                .try_get::<Option<String>, _>("hkev_status")
+                .ok()
+                .flatten()?;
+            Some(RoomCleaningProgress {
+                room_id: row.try_get::<i32, _>("room_id").unwrap_or(0),
+                room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+                status,
+                badge: row
+                    .try_get::<Option<String>, _>("hkev_badge")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                name: row.try_get::<Option<String>, _>("hkev_name").ok().flatten(),
+                at: row
+                    .try_get::<DateTime<Utc>, _>("hkev_created_at")
+                    .unwrap_or_else(|_| Utc::now()),
+            })
         })
         .collect();
+
+    let axis_rows: Vec<RoomCleanRow> = rows
+        .iter()
+        .map(|row| RoomCleanRow {
+            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            room_clean: row.try_get::<bool, _>("room_clean").unwrap_or(true),
+            latest_event_today: row
+                .try_get::<Option<String>, _>("hkev_status")
+                .ok()
+                .flatten(),
+        })
+        .collect();
+
+    // Which site's iHOTEL to ask. `All` resolves to HF Hotel exactly as
+    // `AppState::write_pool` does, so the legacy read and the PG read can never
+    // describe two different properties.
+    let branch_id = match query.branch.unwrap_or_default() {
+        Branch::Hfville => "hfville",
+        Branch::Hfhotel | Branch::All => "hfhotel",
+    };
+    let outcome = match readers.as_deref() {
+        Some(readers) => readers.read(branch_id).await,
+        // No Extension layered (direct-call tests, or a router built without
+        // it): identical to an unreachable legacy — serve the canonical mirror
+        // and say so.
+        None => RoomCleanOutcome::Unavailable,
+    };
+
+    let (legacy_status_stale, legacy_clean, housekeeping) =
+        build_housekeeping_axes(&axis_rows, &outcome, branch_id);
 
     Ok(Json(CleaningProgressResponse {
         success: true,
         data,
+        legacy_status_stale,
+        legacy_clean,
+        housekeeping,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // Housekeeping axis (wave-5 IF-1) — pure, no DB, no legacy server
+    // ---------------------------------------------------------------
+
+    fn pg_room(room_no: &str, room_clean: bool, latest: Option<&str>) -> RoomCleanRow {
+        RoomCleanRow {
+            room_no: room_no.to_string(),
+            room_clean,
+            latest_event_today: latest.map(str::to_string),
+        }
+    }
+
+    fn ihotel(pairs: &[(&str, bool)]) -> RoomCleanOutcome {
+        RoomCleanOutcome::Available(
+            pairs
+                .iter()
+                .map(|(no, clean)| ((*no).to_string(), *clean))
+                .collect(),
+        )
+    }
+
+    /// The three-way derivation, exactly as the locked design's table.
+    #[test]
+    fn hk_status_derivation_matches_the_design_table() {
+        // dirty + a live `started` ⇒ the maid is in there NOW. This is the
+        // case that was impossible to represent before wave-5 and the whole
+        // reason the middle column existed but never filled.
+        assert_eq!(derive_hk_status(false, Some("started")), HkStatus::Cleaning);
+        // dirty, nothing started ⇒ waiting for a maid.
+        assert_eq!(derive_hk_status(false, None), HkStatus::Dirty);
+        assert_eq!(derive_hk_status(false, Some("done")), HkStatus::Dirty);
+        assert_eq!(derive_hk_status(false, Some("dirty")), HkStatus::Dirty);
+        // clean ⇒ clean.
+        assert_eq!(derive_hk_status(true, None), HkStatus::Clean);
+        assert_eq!(derive_hk_status(true, Some("done")), HkStatus::Clean);
+    }
+
+    /// The ONE case the two candidate orderings disagree on. Pinned because it
+    /// is a deliberate reading of the design table (the `dirty` row carries the
+    /// "latest not started" qualifier; the `clean` row carries none), not an
+    /// accident of `if` order.
+    #[test]
+    fn merged_clean_outranks_a_stale_started_event() {
+        assert_eq!(
+            derive_hk_status(true, Some("started")),
+            HkStatus::Clean,
+            "merged truth wins over an out-of-band `started` event"
+        );
+    }
+
+    /// Wire literals are the frontend's `HK_STATUS_LABELS` keys — pinned so a
+    /// rename here cannot silently blank three columns on reception's board.
+    #[test]
+    fn hk_status_wire_literals_are_stable() {
+        assert_eq!(HkStatus::Clean.as_str(), "clean");
+        assert_eq!(HkStatus::Cleaning.as_str(), "cleaning");
+        assert_eq!(HkStatus::Dirty.as_str(), "dirty");
+    }
+
+    /// iHOTEL wins in BOTH directions, and the disagreement is REPORTED (the
+    /// deliberate difference from the maid surface, which suppresses it).
+    #[test]
+    fn ihotel_wins_and_the_divergence_is_reported_to_reception() {
+        let rooms = vec![
+            pg_room("301", true, None),  // canonical says clean…
+            pg_room("302", false, None), // canonical says dirty…
+        ];
+        let (stale, legacy, hk) =
+            build_housekeeping_axes(&rooms, &ihotel(&[("301", false), ("302", true)]), "hfhotel");
+
+        assert!(!stale);
+        assert_eq!(
+            hk[0].hk_status, "dirty",
+            "iHOTEL's dirty beats canonical clean"
+        );
+        assert_eq!(
+            hk[1].hk_status, "clean",
+            "iHOTEL's clean beats canonical dirty"
+        );
+        assert!(hk[0].divergent && hk[1].divergent);
+        assert_eq!(legacy.len(), 2);
+        assert!(!legacy[0].clean && legacy[1].clean);
+    }
+
+    /// Agreement is not divergence — the anomaly flag must stay rare enough to
+    /// mean something.
+    #[test]
+    fn agreement_flags_nothing() {
+        let rooms = vec![pg_room("301", true, None), pg_room("302", false, None)];
+        let (stale, legacy, hk) =
+            build_housekeeping_axes(&rooms, &ihotel(&[("301", true), ("302", false)]), "hfhotel");
+
+        assert!(!stale);
+        assert!(hk.iter().all(|h| !h.divergent));
+        assert_eq!(legacy.len(), 2, "agreement still reports what iHOTEL said");
+    }
+
+    /// A room iHOTEL has no usable value for keeps its canonical value
+    /// SILENTLY — a mapping gap is not a staleness event, and flagging the
+    /// whole board for one unmatched room trains reception to ignore the note.
+    #[test]
+    fn a_room_ihotel_does_not_know_keeps_canonical_and_is_not_divergent() {
+        let rooms = vec![pg_room("301", false, Some("started"))];
+        let (stale, legacy, hk) = build_housekeeping_axes(&rooms, &ihotel(&[]), "hfhotel");
+
+        assert!(!stale, "an empty answer is still an answer, not an outage");
+        assert!(legacy.is_empty());
+        assert_eq!(hk[0].hk_status, "cleaning");
+        assert!(!hk[0].divergent);
+    }
+
+    /// An unreachable legacy is stale-but-usable: canonical values, no iHOTEL
+    /// list, and — critically — NOTHING flagged divergent, because a read that
+    /// did not happen cannot prove a disagreement.
+    #[test]
+    fn unavailable_legacy_is_stale_and_proves_no_divergence() {
+        let rooms = vec![pg_room("301", false, None), pg_room("302", true, None)];
+        let (stale, legacy, hk) =
+            build_housekeeping_axes(&rooms, &RoomCleanOutcome::Unavailable, "hfhotel");
+
+        assert!(stale);
+        assert!(legacy.is_empty());
+        assert_eq!(hk[0].hk_status, "dirty");
+        assert_eq!(hk[1].hk_status, "clean");
+        assert!(hk.iter().all(|h| !h.divergent));
+    }
+
+    /// Legacy `varchar` room numbers are space-padded in places; the merge must
+    /// match on the trimmed token or every room looks unknown.
+    #[test]
+    fn room_numbers_are_matched_trimmed() {
+        let rooms = vec![pg_room("  301  ", true, None)];
+        let (_, legacy, hk) =
+            build_housekeeping_axes(&rooms, &ihotel(&[("301", false)]), "hfhotel");
+        assert_eq!(legacy.len(), 1, "a padded canonical room_no still matches");
+        assert_eq!(hk[0].hk_status, "dirty");
+        assert!(hk[0].divergent);
+    }
+
+    /// The three new fields are ADDITIVE and ALWAYS serialized, in the agreed
+    /// camelCase spelling. A client must be able to branch on the VALUE, so a
+    /// rollback cannot paint a permanent stale banner by omitting the key.
+    #[test]
+    fn the_new_fields_are_always_serialized_in_camel_case() {
+        let body = serde_json::to_string(&CleaningProgressResponse {
+            success: true,
+            data: vec![],
+            legacy_status_stale: false,
+            legacy_clean: vec![LegacyRoomClean {
+                room_no: "301".to_string(),
+                clean: true,
+            }],
+            housekeeping: vec![RoomHousekeeping {
+                room_no: "301".to_string(),
+                hk_status: "cleaning".to_string(),
+                divergent: false,
+            }],
+        })
+        .expect("response serializes");
+
+        assert!(body.contains("\"legacyStatusStale\":false"), "{body}");
+        assert!(body.contains("\"legacyClean\""), "{body}");
+        assert!(body.contains("\"hkStatus\":\"cleaning\""), "{body}");
+        assert!(body.contains("\"divergent\":false"), "{body}");
+    }
 
     #[test]
     fn resolve_by_defaults_blank_and_missing() {
@@ -332,7 +757,10 @@ mod tests {
             email: None,
         };
         // Authenticated user overrides the body value.
-        assert_eq!(resolve_by(Some(&u), Some("Nok".to_string())), "housekeeper_a");
+        assert_eq!(
+            resolve_by(Some(&u), Some("Nok".to_string())),
+            "housekeeper_a"
+        );
     }
 
     /// The clean/dirty body must accept an empty object (`{}`) — the frontend
@@ -341,8 +769,7 @@ mod tests {
     fn action_body_accepts_empty_object() {
         let body: HousekeepingActionBody = serde_json::from_str("{}").unwrap();
         assert!(body.by.is_none());
-        let body: HousekeepingActionBody =
-            serde_json::from_str(r#"{"by":"Nok"}"#).unwrap();
+        let body: HousekeepingActionBody = serde_json::from_str(r#"{"by":"Nok"}"#).unwrap();
         assert_eq!(body.by.as_deref(), Some("Nok"));
     }
 
@@ -410,11 +837,32 @@ mod tests {
         let Json(body) = list_cleaning_progress(
             axum::extract::State(state),
             axum::extract::Query(HousekeepingQuery { branch: None }),
+            // No reader layered — the documented fallback: canonical mirror
+            // plus the stale flag.
+            None,
         )
         .await
         .expect("cleaning feed must answer");
 
         assert!(body.success);
+        assert!(
+            body.legacy_status_stale,
+            "no iHOTEL reader must degrade to the canonical mirror, flagged stale"
+        );
+        assert!(
+            body.legacy_clean.is_empty(),
+            "a stale read has no iHOTEL values"
+        );
+        // The AXIS covers every active room, including the quiet one that is
+        // (correctly) absent from `data`.
+        assert!(
+            body.housekeeping.iter().any(|h| h.room_no == "ZT-HKF2"),
+            "the housekeeping axis must carry rooms with no event today"
+        );
+        assert!(
+            body.housekeeping.iter().all(|h| !h.divergent),
+            "a stale read can prove no divergence, so nothing may be flagged"
+        );
         let row = body
             .data
             .iter()
