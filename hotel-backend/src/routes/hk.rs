@@ -63,6 +63,43 @@
 //! Flag OFF (the default) ⇒ no lookup is performed at all and every response
 //! is byte-identical to the pre-enforcement build.
 //!
+//! ### The one employee who works both properties (`housekeeping_admin`)
+//!
+//! Some staff genuinely cover both hotels, and the rule above locks them to
+//! one. The exception is an HF ID GRANT — [`crate::hfid_location::HK_ADMIN_GRANT`],
+//! read from the same `/resolve-badge` answer's `apps` list — which resolves to
+//! [`LocationOutcome::AnyLocation`] and means "not bound to one property".
+//!
+//! Its effect here is exactly one line in each of the two rules above:
+//! [`intersect_location`] serves the WHOLE allowlist (so `/api/hk/me` offers
+//! both properties and the existing multi-branch picker appears, with no
+//! frontend change), and [`location_gate`] admits any branch that already
+//! cleared [`require_branch`].
+//!
+//! That last clause is the safety property, and it is why this is a widening
+//! and not a hole: `HK_BRANCHES` still binds, because every handler runs
+//! [`require_branch`] BEFORE [`require_location`]. A grant-holder gets the
+//! properties this deployment serves — never one it does not.
+//!
+//! The grant overrides `location` ENTIRELY, a NULL location included. That is
+//! deliberate and is NOT the silent-default hole this stream closed: a null
+//! location is an absence (nobody decided anything — still refused), while the
+//! grant is a decision someone made against a named employee and can be
+//! audited in HF ID. What it does not override is `found`/`active`/`pending` —
+//! see [`crate::hfid_location`], where the check order enforces that.
+//!
+//! It is not a way IN. [`crate::middleware::hk_access::HK_GRANT`]
+//! (`"housekeeping"`) is what opens this surface, at the Access policy and in
+//! the middleware behind it; `housekeeping_admin` alone is 403 before any of
+//! the above runs. The grant widens branches for people who already hold
+//! `housekeeping` — it never substitutes for it.
+//!
+//! **It ships DARK-COMPATIBLE**: no flag, because the darkness is the grant
+//! itself. While no badge holds it, every lookup answers exactly what it
+//! answered before and every response on this surface is byte-unchanged. The
+//! activation is the owner ticking the box in HF ID, and it takes effect
+//! within [`crate::hfid_location::LOCATION_CACHE_TTL`].
+//!
 //! ## Identity & auth
 //!
 //! The router is wrapped by [`crate::middleware::hk_access::require_hk_access`]
@@ -525,6 +562,17 @@ fn location_gate(outcome: LocationOutcome, requested: Branch) -> ApiResult<()> {
                 Err(ApiError::Forbidden(LOCATION_MISMATCH_ERROR.to_string()))
             }
         }
+        // The `housekeeping_admin` grant: this employee is not bound to one
+        // property, so any branch that got this far is theirs to act on.
+        //
+        // "That got this far" is doing real work and is not an accident of
+        // ordering: every handler calls `require_branch` FIRST, so `requested`
+        // is already known to be in `HK_BRANCHES`. The grant therefore widens
+        // an employee to the DEPLOYMENT's allowlist and no further — an admin
+        // asking for a branch this deployment does not serve is refused by the
+        // allowlist before this function is ever called. That is the outer
+        // bound, and it is the one thing the grant cannot cross.
+        LocationOutcome::AnyLocation => Ok(()),
         // Definite answer, no usable branch. 403 (not 503): retrying changes
         // nothing, an admin must act.
         LocationOutcome::NoLocation => Err(ApiError::Forbidden(LOCATION_UNKNOWN_ERROR.to_string())),
@@ -1310,6 +1358,14 @@ fn intersect_location(allowed: &[Branch], outcome: LocationOutcome) -> Vec<Branc
                 Vec::new()
             }
         }
+        // `housekeeping_admin`: "any location" ∩ the allowlist IS the
+        // allowlist — every branch this deployment serves, in `HK_BRANCHES`
+        // order, and never one it does not. Today that is both properties, so
+        // the existing multi-branch picker appears for exactly these
+        // employees with no frontend change: `resolveInitialBranch` returns
+        // `null` for a two-entry list with nothing stored (app/hk/hk-lib.ts),
+        // which is precisely the "render the picker and block" signal.
+        LocationOutcome::AnyLocation => allowed.to_vec(),
         LocationOutcome::NoLocation | LocationOutcome::Unavailable => Vec::new(),
     }
 }
@@ -1329,7 +1385,14 @@ fn me_reason(allowed: &[Branch], outcome: LocationOutcome) -> Option<&'static st
     }
     match outcome {
         LocationOutcome::Unavailable => Some(REASON_LOOKUP_UNAVAILABLE),
-        LocationOutcome::NoLocation | LocationOutcome::Resolved(_) => Some(REASON_NO_LOCATION),
+        // `AnyLocation` reaches here only when the ALLOWLIST is empty, which no
+        // env can produce (`parse_hk_branches` always yields at least one
+        // branch). It is grouped with the definite answers rather than with the
+        // outage because that is what it would be: the lookup worked, this
+        // deployment simply serves nothing — not a thing a retry fixes.
+        LocationOutcome::NoLocation
+        | LocationOutcome::Resolved(_)
+        | LocationOutcome::AnyLocation => Some(REASON_NO_LOCATION),
     }
 }
 
@@ -1790,24 +1853,77 @@ mod tests {
         }
     }
 
+    /// …with ONE exception, and it is an explicit grant rather than a fallback:
+    /// `housekeeping_admin` (⇒ `AnyLocation`) clears the gate for either
+    /// branch. Note what this test canNOT show, because the gate never sees it:
+    /// a branch outside `HK_BRANCHES` — `require_branch` has already 403'd it.
+    /// That composition is asserted by
+    /// `admin_grant_cannot_cross_the_hk_branches_allowlist` below.
+    #[test]
+    fn location_gate_admits_an_admin_grant_on_either_branch() {
+        for requested in [Branch::Hfhotel, Branch::Hfville] {
+            assert!(
+                location_gate(LocationOutcome::AnyLocation, requested).is_ok(),
+                "a grant-holder must be admitted on {requested:?}"
+            );
+        }
+    }
+
+    /// The outer bound, stated as a test: the grant widens an employee to the
+    /// DEPLOYMENT's allowlist and not one branch further. `require_branch`
+    /// runs first in every handler, so a grant-holder asking for a branch this
+    /// deployment does not serve gets the ALLOWLIST 403 — the operator reads
+    /// "widen HK_BRANCHES", which is the actual fix, rather than a location
+    /// message about an employee who is not the problem.
+    #[test]
+    fn admin_grant_cannot_cross_the_hk_branches_allowlist() {
+        let hotel_only = policy(vec![Branch::Hfhotel]);
+        match require_branch(&hotel_only, Some("hfville"))
+            .expect_err("an unserved branch must be refused before the location gate")
+        {
+            ApiError::Forbidden(msg) => assert_eq!(msg, BRANCH_NOT_ENABLED_ERROR),
+            other => panic!("expected 403, got {other:?}"),
+        }
+        // The grant is irrelevant to that decision — it is not even consulted,
+        // which is exactly why the allowlist is an outer bound and not a
+        // second opinion.
+        assert_eq!(
+            intersect_location(&[Branch::Hfhotel], LocationOutcome::AnyLocation),
+            vec![Branch::Hfhotel],
+            "an hfhotel-only deployment offers a grant-holder hfhotel ONLY"
+        );
+    }
+
     /// The hard property, stated as a test: no outcome and no requested branch
     /// combination ever admits a branch the employee does not belong to — in
     /// particular nothing falls back to `DEFAULT_HK_BRANCH`.
+    ///
+    /// `should_admit` is an exhaustive `match`, not a `matches!`: a future
+    /// outcome variant must be classified here DELIBERATELY (the compiler will
+    /// stop on this arm) rather than sliding silently into "not admitted" —
+    /// or, far worse, into an admitting default.
     #[test]
     fn location_gate_never_falls_back_to_a_default_branch() {
         let every_outcome = [
             LocationOutcome::Resolved(EmployeeLocation::Hf),
             LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            LocationOutcome::AnyLocation,
             LocationOutcome::NoLocation,
             LocationOutcome::Unavailable,
         ];
         for outcome in every_outcome {
             for requested in [Branch::Hfhotel, Branch::Hfville] {
                 let admitted = location_gate(outcome, requested).is_ok();
-                let should_admit = matches!(
-                    outcome,
-                    LocationOutcome::Resolved(loc) if location_branch(loc) == requested
-                );
+                let should_admit = match outcome {
+                    // Bound to one property: that property only.
+                    LocationOutcome::Resolved(loc) => location_branch(loc) == requested,
+                    // Explicitly granted every property this deployment
+                    // serves. `requested` reached the gate, so `require_branch`
+                    // already proved it is one of them.
+                    LocationOutcome::AnyLocation => true,
+                    // Nothing else admits anything, ever.
+                    LocationOutcome::NoLocation | LocationOutcome::Unavailable => false,
+                };
                 assert_eq!(
                     admitted, should_admit,
                     "{outcome:?} + {requested:?} must {} be admitted",
@@ -1929,6 +2045,40 @@ mod tests {
                 "{empty:?} must yield no branch"
             );
         }
+        // The grant is the one widening — to the allowlist, IN ITS ORDER, and
+        // no further. Both rows matter: the first is what a grant-holder is
+        // offered today (both properties ⇒ the picker), the second is that the
+        // widening is still bounded by what this deployment serves.
+        assert_eq!(
+            intersect_location(
+                &[Branch::Hfhotel, Branch::Hfville],
+                LocationOutcome::AnyLocation
+            ),
+            vec![Branch::Hfhotel, Branch::Hfville],
+            "a grant-holder is offered every served property, in HK_BRANCHES order"
+        );
+        assert_eq!(
+            intersect_location(&hotel_only, LocationOutcome::AnyLocation),
+            vec![Branch::Hfhotel],
+            "…and never one the deployment does not serve"
+        );
+    }
+
+    /// `/api/hk/me` for a grant-holder: BOTH properties, no reason — which is
+    /// the shape the existing frontend already turns into a picker
+    /// (`resolveInitialBranch` returns `null` for a 2-entry list with nothing
+    /// stored, and `HkBranchChip` renders its switcher whenever
+    /// `branches.length > 1`). That is why this capability needs no frontend
+    /// change: it produces a response shape the client has always handled.
+    #[tokio::test]
+    async fn me_offers_a_grant_holder_every_served_property() {
+        let p = enforcing(
+            vec![Branch::Hfhotel, Branch::Hfville],
+            LocationOutcome::AnyLocation,
+        );
+        let (branches, reason) = me_branches(&p, &maid("ADMIN")).await;
+        assert_eq!(branches, vec![Branch::Hfhotel, Branch::Hfville]);
+        assert_eq!(reason, None, "nothing is missing, so nothing to explain");
     }
 
     /// The reason codes are stable strings and map as documented — including
@@ -1965,6 +2115,9 @@ mod tests {
             me_reason(&both, LocationOutcome::Unavailable),
             Some(REASON_LOOKUP_UNAVAILABLE)
         );
+        // A grant-holder is never short of a branch, so never carries a reason.
+        assert_eq!(me_reason(&both, LocationOutcome::AnyLocation), None);
+        assert_eq!(me_reason(&hotel_only, LocationOutcome::AnyLocation), None);
     }
 
     /// `/me` and the per-request gate must agree: every branch `/me` offers
@@ -1976,6 +2129,9 @@ mod tests {
         for outcome in [
             LocationOutcome::Resolved(EmployeeLocation::Hf),
             LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            // The grant-holder row is the one that would break loudest: `/me`
+            // offers TWO branches here, and BOTH must clear the gate.
+            LocationOutcome::AnyLocation,
             LocationOutcome::NoLocation,
             LocationOutcome::Unavailable,
         ] {

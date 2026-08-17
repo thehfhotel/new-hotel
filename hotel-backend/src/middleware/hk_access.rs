@@ -463,6 +463,48 @@ qHreiO5t7e6J+dsQVkE3dg==
         assert!(matches!(err, HkAccessError::NotGranted), "got: {err:?}");
     }
 
+    /// **`housekeeping_admin` is not a way in.** It WIDENS which branches an
+    /// employee may work (`hfid_location::HK_ADMIN_GRANT` → every branch in
+    /// `HK_BRANCHES`); it never substitutes for the grant that opens the
+    /// surface. Someone holding admin WITHOUT `housekeeping` must be refused
+    /// here — before any branch logic runs — and this is the layer that does
+    /// it, both at the Cloudflare edge policy (`HF ID grant: housekeeping`)
+    /// and in this re-check behind it.
+    ///
+    /// The trap this pins is textual: `"housekeeping_admin"` has
+    /// `"housekeeping"` as a PREFIX. The comparison above is exact equality,
+    /// so it refuses — but a future `starts_with` / `contains` "fix" would
+    /// silently hand the whole maid surface to every admin-only badge. That is
+    /// the regression this test exists to catch.
+    #[test]
+    fn admin_grant_alone_does_not_open_the_surface() {
+        for apps in [
+            json!(["housekeeping_admin"]),
+            json!(["hotel", "housekeeping_admin"]),
+        ] {
+            let mut claims = valid_claims();
+            claims["custom"]["apps"] = apps.clone();
+            let token = sign(&claims, Some("hk-key-1"));
+            let err = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+                .expect_err("admin without the housekeeping grant must be refused");
+            assert!(matches!(err, HkAccessError::NotGranted), "{apps}: {err:?}");
+            assert_eq!(
+                err.status(),
+                StatusCode::FORBIDDEN,
+                "{apps}: identity is proven, the permission is simply absent"
+            );
+        }
+
+        // …and holding BOTH is the ordinary admin: admitted here, then widened
+        // downstream by `routes::hk`. This is the pairing the owner ticks.
+        let mut claims = valid_claims();
+        claims["custom"]["apps"] = json!(["hotel", "housekeeping", "housekeeping_admin"]);
+        let token = sign(&claims, Some("hk-key-1"));
+        let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+            .expect("housekeeping + admin must verify");
+        assert_eq!(id.badge, "Q1001");
+    }
+
     #[test]
     fn absent_apps_claim_defers_to_edge_policy() {
         // CF may not forward the apps claim at all; the Access policy

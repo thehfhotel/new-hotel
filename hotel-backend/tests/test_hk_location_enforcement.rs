@@ -44,6 +44,7 @@
 //! NO database required: every row here is answered before any pool is
 //! touched, and the pool is lazy.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -51,7 +52,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
 use hotel_backend::hfid_location::{
-    EmployeeLocation, HfidLocationClient, LocationLookup, LocationOutcome,
+    outcome_for_resolve_badge_body, EmployeeLocation, HfidLocationClient, LocationLookup,
+    LocationOutcome,
 };
 use hotel_backend::middleware::hk_access::HkIdentity;
 use hotel_backend::routes::hk::{
@@ -114,6 +116,82 @@ fn enforcing(branches: Vec<Branch>) -> HkPolicy {
         location: Some(Arc::new(HfidLocationClient::with_lookup(Arc::new(
             MatrixLookup,
         )))),
+        ..HkPolicy::default()
+    }
+}
+
+// ============================================================================
+// The `housekeeping_admin` grant (owner-approved "admin can pick location")
+// ============================================================================
+//
+// These rows are driven by REAL `/resolve-badge` BODIES rather than by
+// hand-written outcomes, because the thing under test IS the body → outcome
+// collapse: an admin with a location and an admin with a NULL location must
+// reach the same place, and asserting that from a hand-written `AnyLocation`
+// would assume it instead of proving it.
+
+/// Verbatim live payload shape (fingerprint-time-logger `5b45a235`), with the
+/// grant present. Badge 421 is the one employee with a NULL location today,
+/// which is exactly why it is the interesting admin row: without the grant it
+/// is refused outright (row 4), with it, every served property is offered.
+const ADMIN_WITH_LOCATION: &str = r#"{"found":true,"badge":"A1","display_name":"หัวหน้าแม่บ้าน",
+    "apps":["hotel","housekeeping","housekeeping_admin"],"active":true,"pending":false,
+    "location":"HF"}"#;
+
+const ADMIN_WITH_NULL_LOCATION: &str = r#"{"found":true,"badge":"421","display_name":"นก",
+    "apps":["hotel","housekeeping","housekeeping_admin"],"active":true,"pending":false,
+    "location":null}"#;
+
+/// TODAY'S LIVE SHAPE for badge 421 — the grant absent from `apps`. This is
+/// the darkness proof in test form: the payload the live lookup actually
+/// returns right now must behave exactly as it did before this feature
+/// existed (⇒ 403, no location on file).
+const NON_ADMIN_NULL_LOCATION: &str = r#"{"found":true,"badge":"421","display_name":"นก",
+    "apps":["hotel","housekeeping"],"active":true,"pending":false,"location":null}"#;
+
+/// A plain HF Hotel maid, grant absent. The byte-unchanged control.
+const NON_ADMIN_WITH_LOCATION: &str = r#"{"found":true,"badge":"HOTEL-MAID","display_name":null,
+    "apps":["hotel","housekeeping"],"active":true,"pending":false,"location":"HF"}"#;
+
+/// Badge → the `/resolve-badge` BODY HF ID would return, decoded through the
+/// production interpretation. Counts calls, so the cache rows can prove a
+/// grant is replayed from cache rather than re-asked.
+struct PayloadLookup {
+    calls: AtomicUsize,
+}
+
+impl PayloadLookup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+        })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LocationLookup for PayloadLookup {
+    async fn lookup(&self, badge: &str) -> LocationOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let body = match badge {
+            "ADMIN-LOCATED" => ADMIN_WITH_LOCATION,
+            "ADMIN-NULL" => ADMIN_WITH_NULL_LOCATION,
+            "NON-ADMIN-NULL" => NON_ADMIN_NULL_LOCATION,
+            "NON-ADMIN-LOCATED" => NON_ADMIN_WITH_LOCATION,
+            _ => r#"{"found":false,"active":false,"location":null}"#,
+        };
+        outcome_for_resolve_badge_body(body)
+    }
+}
+
+/// Enforcement ON with the payload-driven lookup behind it.
+fn enforcing_payloads(branches: Vec<Branch>, lookup: Arc<PayloadLookup>) -> HkPolicy {
+    HkPolicy {
+        branches,
+        location_enforcement_enabled: true,
+        location: Some(Arc::new(HfidLocationClient::with_lookup(lookup))),
         ..HkPolicy::default()
     }
 }
@@ -623,4 +701,308 @@ async fn row13_unauthenticated_probes_never_reach_the_location_gate() {
             "{uri}: the location gate must never run for an unauthenticated caller"
         );
     }
+}
+
+// ============================================================================
+// Rows 14-19 — the `housekeeping_admin` grant
+// ============================================================================
+
+/// Row 14. An admin WITH a location is offered every served property, and may
+/// act on all of them. The location on file is not consulted — the grant
+/// replaces it rather than being intersected with it.
+#[tokio::test]
+async fn row14_admin_with_a_location_gets_every_served_branch() {
+    let lookup = PayloadLookup::new();
+    let (status, body) = call(
+        enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], lookup.clone()),
+        maid("ADMIN-LOCATED"),
+        "GET",
+        "/api/hk/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(
+        me_branch_ids(&json),
+        vec!["hfhotel".to_string(), "hfville".to_string()],
+        "an admin whose location is HF must still be offered BOTH: {body}"
+    );
+    assert!(
+        json["branchesUnavailableReason"].is_null(),
+        "nothing is missing, so nothing to explain: {body}"
+    );
+
+    // …and every endpoint admits her on either branch.
+    for (method, uri, req_body) in ROOM_ENDPOINTS {
+        for branch in ["hfhotel", "hfville"] {
+            let (status, resp) = call(
+                enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], lookup.clone()),
+                maid("ADMIN-LOCATED"),
+                method,
+                &with_branch(uri, branch),
+                req_body,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an admin must not be location-refused: {method} {uri}?branch={branch} → {resp}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an admin must not 503: {method} {uri}?branch={branch} → {resp}"
+            );
+        }
+    }
+}
+
+/// Row 15. **The load-bearing row.** An admin whose `location` is NULL gets
+/// every served property too — the grant overrides location ENTIRELY.
+///
+/// This is deliberately NOT the silent-default hole this stream closed. The
+/// difference is where the answer comes from: a null location alone is an
+/// ABSENCE and still refuses (row 4, and row 17 below on the very same badge),
+/// whereas the grant is an explicit tick against a named employee in HF ID,
+/// auditable there. Row 17 is what keeps the two apart.
+#[tokio::test]
+async fn row15_admin_with_a_null_location_still_gets_every_served_branch() {
+    let lookup = PayloadLookup::new();
+    let (status, body) = call(
+        enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], lookup.clone()),
+        maid("ADMIN-NULL"),
+        "GET",
+        "/api/hk/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(
+        me_branch_ids(&json),
+        vec!["hfhotel".to_string(), "hfville".to_string()],
+        "a NULL location must not narrow a grant-holder: {body}"
+    );
+
+    for (method, uri, req_body) in ROOM_ENDPOINTS {
+        for branch in ["hfhotel", "hfville"] {
+            let (status, resp) = call(
+                enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], lookup.clone()),
+                maid("ADMIN-NULL"),
+                method,
+                &with_branch(uri, branch),
+                req_body,
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a NULL-location admin must be admitted: {method} {uri}?branch={branch} → {resp}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a NULL-location admin must not 503: {method} {uri}?branch={branch} → {resp}"
+            );
+        }
+    }
+}
+
+/// Row 16. **The allowlist is the outer bound and the grant cannot cross it.**
+/// An admin asking for a branch `HK_BRANCHES` does not list is still 403 — and
+/// with the ALLOWLIST message, not a location one, so the operator reads
+/// "widen HK_BRANCHES" rather than going to look at an employee record that is
+/// not the problem.
+#[tokio::test]
+async fn row16_admin_is_still_bounded_by_the_hk_branches_allowlist() {
+    for badge in ["ADMIN-LOCATED", "ADMIN-NULL"] {
+        for (method, uri, req_body) in ROOM_ENDPOINTS {
+            let (status, resp) = call(
+                enforcing_payloads(vec![Branch::Hfhotel], PayloadLookup::new()),
+                maid(badge),
+                method,
+                &with_branch(uri, "hfville"),
+                req_body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{badge} must not reach an unserved property: {method} {uri} → {resp}"
+            );
+            assert_envelope(
+                &resp,
+                BRANCH_NOT_ENABLED_ERROR,
+                &format!("{badge} → {method} {uri}?branch=hfville"),
+            );
+        }
+        // …and `/me` offers only what the deployment serves.
+        let (status, body) = call(
+            enforcing_payloads(vec![Branch::Hfhotel], PayloadLookup::new()),
+            maid(badge),
+            "GET",
+            "/api/hk/me",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+        assert_eq!(
+            me_branch_ids(&json),
+            vec!["hfhotel".to_string()],
+            "{badge}: a grant widens to the allowlist, never past it: {body}"
+        );
+    }
+}
+
+/// Row 17. **The darkness proof.** Today's LIVE payload for badge 421 — same
+/// employee, same null location, `apps` WITHOUT the grant — behaves exactly as
+/// it did before this feature existed: `[]` + `no_location` from `/me`, and
+/// 403 `LOCATION_UNKNOWN_ERROR` on every room endpoint and branch.
+///
+/// Pair this with row 15: the two rows differ ONLY by one string in `apps`.
+/// That is the whole capability, and it is why nothing changes until the owner
+/// ticks the box.
+#[tokio::test]
+async fn row17_the_same_badge_without_the_grant_is_byte_unchanged() {
+    let (status, body) = call(
+        enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], PayloadLookup::new()),
+        maid("NON-ADMIN-NULL"),
+        "GET",
+        "/api/hk/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert!(
+        me_branch_ids(&json).is_empty(),
+        "no grant ⇒ no branch for a null location: {body}"
+    );
+    assert_eq!(
+        json.get("branchesUnavailableReason")
+            .and_then(|v| v.as_str()),
+        Some(REASON_NO_LOCATION),
+        "{body}"
+    );
+
+    for (method, uri, req_body) in ROOM_ENDPOINTS {
+        for branch in ["hfhotel", "hfville"] {
+            let (status, resp) = call(
+                enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], PayloadLookup::new()),
+                maid("NON-ADMIN-NULL"),
+                method,
+                &with_branch(uri, branch),
+                req_body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a non-holder with a null location must still refuse: \
+                 {method} {uri}?branch={branch} → {resp}"
+            );
+            assert_envelope(
+                &resp,
+                LOCATION_UNKNOWN_ERROR,
+                &format!("non-holder null location → {method} {uri}?branch={branch}"),
+            );
+        }
+    }
+}
+
+/// Row 18. A located NON-holder is unchanged too: her own branch passes, the
+/// other is 403 with the MISMATCH message. Re-asserted here against the
+/// payload-driven lookup (rows 2-3 assert it against hand-written outcomes) so
+/// the `apps`-consuming decode path is proven not to have disturbed the
+/// ordinary maid — which is every maid, today.
+#[tokio::test]
+async fn row18_a_located_non_holder_is_unchanged_through_the_payload_path() {
+    let policy =
+        || enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], PayloadLookup::new());
+
+    let (status, body) = call(policy(), maid("NON-ADMIN-LOCATED"), "GET", "/api/hk/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(
+        me_branch_ids(&json),
+        vec!["hfhotel".to_string()],
+        "a plain HF maid still sees exactly her own property: {body}"
+    );
+
+    for (method, uri, req_body) in ROOM_ENDPOINTS {
+        let (status, resp) = call(
+            policy(),
+            maid("NON-ADMIN-LOCATED"),
+            method,
+            &with_branch(uri, "hfhotel"),
+            req_body,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "her own branch must pass: {method} {uri} → {resp}"
+        );
+
+        let (status, resp) = call(
+            policy(),
+            maid("NON-ADMIN-LOCATED"),
+            method,
+            &with_branch(uri, "hfville"),
+            req_body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the other property must still refuse: {method} {uri} → {resp}"
+        );
+        assert_envelope(
+            &resp,
+            LOCATION_MISMATCH_ERROR,
+            &format!("non-holder → {method} {uri}?branch=hfville"),
+        );
+    }
+}
+
+/// Row 19. The 60s cache carries the GRANT, not just a location: a second
+/// request for the same admin badge is served from cache and still offers both
+/// properties, on ONE lookup. (The revocation direction — a widening must not
+/// outlive the grant — is pinned by the TTL test in `src/hfid_location.rs`,
+/// which can shorten the TTL; here the point is that the cached entry replays
+/// the grant rather than decaying into a location or into nothing.)
+#[tokio::test]
+async fn row19_the_cache_carries_the_grant_alongside_the_location() {
+    let lookup = PayloadLookup::new();
+    let policy = enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], lookup.clone());
+
+    for attempt in 1..=3 {
+        // One policy, therefore one client and one cache, across all three.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/hk/me")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = inner(policy.clone(), maid("ADMIN-NULL"))
+            .oneshot(req)
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body reads");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("body is JSON");
+        assert_eq!(
+            me_branch_ids(&json),
+            vec!["hfhotel".to_string(), "hfville".to_string()],
+            "attempt {attempt}: a cached grant must replay as the full allowlist"
+        );
+    }
+    assert_eq!(
+        lookup.calls(),
+        1,
+        "one LAN round-trip, then the cache — the grant is cached like a location"
+    );
 }
