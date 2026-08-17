@@ -42,6 +42,7 @@ import {
   type HkMe,
   type HkRoomDetail,
 } from '../../hk-lib'
+import { useHkAutoRefresh } from '../../use-hk-auto-refresh'
 
 export default function HkRoomPage() {
   const params = useParams<{ roomId: string }>()
@@ -89,33 +90,47 @@ export default function HkRoomPage() {
     }
   }, [])
 
-  const load = useCallback(async () => {
-    if (!Number.isFinite(roomId)) {
-      setError('ไม่พบห้องนี้')
-      setLoading(false)
-      return
-    }
-    if (!branch) return
-    setLoading(true)
-    try {
-      const res = await hkFetch(`/rooms/${roomId}`, branch)
-      if (!res.ok) {
-        throw new Error(res.status === 404 ? 'ไม่พบห้องนี้' : 'ไม่สามารถดึงข้อมูลห้องได้')
+  // `background` is the auto-refresh path — same contract as the room list:
+  // no spinner, and a transient failure keeps the last good screen instead of
+  // raising a banner a maid in a lift lobby can do nothing about.
+  const load = useCallback(
+    async (background = false) => {
+      if (!Number.isFinite(roomId)) {
+        setError('ไม่พบห้องนี้')
+        setLoading(false)
+        return
       }
-      const data: HkRoomDetail = await res.json()
-      if (!data.success) throw new Error('ไม่สามารถดึงข้อมูลห้องได้')
-      setDetail(data)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
-    } finally {
-      setLoading(false)
-    }
-  }, [roomId, branch])
+      if (!branch) return
+      if (!background) setLoading(true)
+      try {
+        const res = await hkFetch(`/rooms/${roomId}`, branch)
+        if (!res.ok) {
+          throw new Error(res.status === 404 ? 'ไม่พบห้องนี้' : 'ไม่สามารถดึงข้อมูลห้องได้')
+        }
+        const data: HkRoomDetail = await res.json()
+        if (!data.success) throw new Error('ไม่สามารถดึงข้อมูลห้องได้')
+        setDetail(data)
+        setError(null)
+      } catch (err) {
+        if (!background) setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+      } finally {
+        if (!background) setLoading(false)
+      }
+    },
+    [roomId, branch]
+  )
 
   useEffect(() => {
     if (branch) load()
   }, [branch, load])
+
+  // Same "doesn't sync" fix as the list: reception can flip this very room in
+  // iHOTEL while the maid has its screen open. DISABLED while her own report
+  // is in flight — `reportCleaning` does its own `load()` on completion, and a
+  // poll landing mid-POST could otherwise paint the pre-write answer back over
+  // the room she just finished.
+  const refreshDetail = useCallback(() => load(true), [load])
+  useHkAutoRefresh(refreshDetail, Boolean(branch) && posting === null)
 
   const reportCleaning = async (status: CleaningStatus) => {
     if (!branch) return

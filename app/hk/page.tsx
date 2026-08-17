@@ -37,6 +37,7 @@ import {
   type HkRoomsResponse,
 } from './hk-lib'
 import { HkBranchChip, HkBranchesUnavailable, HkBranchPicker } from './HkBranchPicker'
+import { useHkAutoRefresh } from './use-hk-auto-refresh'
 
 export default function HkRoomListPage() {
   const [me, setMe] = useState<HkMe | null>(null)
@@ -78,27 +79,47 @@ export default function HkRoomListPage() {
 
   // Step 2: rooms, once a branch is known. Re-runs whenever the maid picks
   // or switches branch.
-  const loadRooms = useCallback(async () => {
-    if (!branch) return
-    setLoading(true)
-    try {
-      const res = await hkFetch('/rooms', branch)
-      if (!res.ok) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
-      const roomsData: HkRoomsResponse = await res.json()
-      if (!roomsData.success) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
-      setRooms(roomsData.data)
-      setLegacyStale(roomsData.legacyStatusStale === true)
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
-    } finally {
-      setLoading(false)
-    }
-  }, [branch])
+  //
+  // `background` is the auto-refresh path (`useHkAutoRefresh`), and it is
+  // deliberately QUIETER than a load the maid asked for:
+  //  * no spinner — the refresh icon must not twitch every minute on a screen
+  //    she is reading, and the list is already on screen anyway;
+  //  * a failure is SWALLOWED, keeping the last good list. A maid walks
+  //    through stairwells and lift lobbies; a poll that fails because she lost
+  //    signal for eight seconds is a self-recovering blip, and painting a red
+  //    banner for it every minute only teaches her to ignore the banner that
+  //    matters. Genuine breakage still surfaces on the next tap of รีเฟรช, on
+  //    a branch switch, or on the next reload.
+  const loadRooms = useCallback(
+    async (background = false) => {
+      if (!branch) return
+      if (!background) setLoading(true)
+      try {
+        const res = await hkFetch('/rooms', branch)
+        if (!res.ok) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
+        const roomsData: HkRoomsResponse = await res.json()
+        if (!roomsData.success) throw new Error('ไม่สามารถดึงข้อมูลห้องได้ กรุณาลองใหม่')
+        setRooms(roomsData.data)
+        setLegacyStale(roomsData.legacyStatusStale === true)
+        setError(null)
+      } catch (err) {
+        if (!background) setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+      } finally {
+        if (!background) setLoading(false)
+      }
+    },
+    [branch]
+  )
 
   useEffect(() => {
     if (branch) loadRooms()
   }, [branch, loadRooms])
+
+  // The fix for "status doesn't sync": this page is opened from a LINE tile
+  // and the WebView keeps it alive for hours, so without this it shows the
+  // rooms as they were when the maid started her round and never again.
+  const refreshRooms = useCallback(() => loadRooms(true), [loadRooms])
+  useHkAutoRefresh(refreshRooms, Boolean(branch))
 
   const pickBranch = (next: Branch) => {
     storeBranch(next)
@@ -197,7 +218,7 @@ export default function HkRoomListPage() {
               </div>
               <button
                 type="button"
-                onClick={loadRooms}
+                onClick={() => loadRooms()}
                 disabled={loading}
                 aria-label="รีเฟรช"
                 className="rounded-lg border border-gray-300 p-2 text-gray-500 active:bg-gray-100 disabled:opacity-50"
