@@ -133,7 +133,47 @@
 //!
 //! Deliberately UNCACHED. Staleness is the failure mode this whole change
 //! exists to remove, and the load is one 34-58 row `SELECT` per room-list load
-//! from a surface with a handful of users.
+//! from a surface with a handful of users. The write path (below) reads the
+//! same way and for the same reason — caching the answer there would put the
+//! defect it fixes back, one layer down.
+//!
+//! ## The WRITE judges the same truth (defect D1, wave-5)
+//!
+//! The display was iHOTEL-wins while the write guard judged canonical
+//! `ht_rooms_new.room_clean` — the CT mirror. A lagging mirror therefore made a
+//! maid see DIRTY (iHOTEL), tap เสร็จแล้ว, and get บันทึกแล้ว while the guard
+//! called it "already clean", enqueued nothing, and left the room dirty on
+//! reception's board. Read and write judged two different databases; the
+//! 0a30079 read-sync fix made the window easier to hit by refreshing the
+//! display promptly.
+//!
+//! `POST …/cleaning` now hands the service iHOTEL's answer for that one room
+//! ([`legacy_hint_for_room`]) and the service decides on BOTH truths
+//! ([`crate::service::housekeeping::decide_cleanliness`]): canonical dirty ⇒
+//! transition (unchanged); canonical already clean but iHOTEL dirty ⇒ MIRROR
+//! REPAIR — no flip, but the writeback the tap earned.
+//!
+//! Three properties this deliberately keeps:
+//!
+//! 1. **The legacy read stays OUTSIDE the PG transaction**, before the service
+//!    call, on the adapter's own 3s budget. No transaction is ever held open
+//!    across a WG-tunnelled round-trip.
+//! 2. **Unreachable ⇒ today's behaviour, never worse.** `Unavailable` is
+//!    `LegacyCleanliness::Unknown`, which is canonical-only judgement — the
+//!    same failure surface as before D1. A maid's tap is never failed, and
+//!    never blocked on legacy availability.
+//! 3. **Only would-be-no-op taps pay for the read** ([`needs_legacy_opinion`]),
+//!    so a normal dirty→clean tap is exactly as fast as before.
+//!
+//! Both poles are covered, because the display is iHOTEL-wins at both: the
+//! `dirty` tap gets the mirror-image repair (canonical already dirty, iHOTEL
+//! clean ⇒ `MarkRoomDirty`). It stays behind `HK_MARK_DIRTY_ENABLED` — the
+//! guard change does not widen that gate, it only makes the tap honest once the
+//! gate is open.
+//!
+//! No writeback RECIPE changes: the intents, their SQL and their byte-parity
+//! literals are untouched. D1 is a decision-layer defect and the fix lives in
+//! the decision layer.
 //!
 //! Branch-aware via `?branch=` resolved through the unified
 //! [`AppState::write_pool`] chokepoint (Ship-B gate). The legacy reader is
@@ -182,7 +222,7 @@ use crate::legacy_room_status::{RoomCleanOutcome, RoomCleanSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::housekeeping::{
-    CleaningProgressStatus, HousekeepingService, ReportCleaningCommand,
+    CleaningProgressStatus, HousekeepingService, LegacyCleanliness, ReportCleaningCommand,
 };
 
 /// Cleaning-progress statuses a maid can report. `started` =
@@ -981,6 +1021,65 @@ async fn resolve_legacy_room_clean(policy: &HkPolicy, branch: Branch) -> RoomCle
 }
 
 // ============================================================================
+// D1 write guard — the WRITE half of "iHOTEL wins" (wave-5). Pure, unit-tested.
+// ============================================================================
+
+/// The canonical cleanliness a reported status is asking for. `None` for
+/// `started`, which never touches cleanliness and never mirrors.
+pub(crate) fn target_clean_for(status: CleaningProgressStatus) -> Option<bool> {
+    match status {
+        CleaningProgressStatus::Started => None,
+        CleaningProgressStatus::Done => Some(true),
+        CleaningProgressStatus::Dirty => Some(false),
+    }
+}
+
+/// Pick ONE room's answer out of a legacy read outcome.
+///
+/// The same three-way answer [`merge_legacy_room_clean`] applies to the display,
+/// reduced to the single room a tap is about: a room ABSENT from the legacy
+/// answer (unmatched `Room_no`, unrecognised `Room_Clean` literal) is
+/// [`LegacyCleanliness::Unknown`], never guessed — exactly as the display keeps
+/// such a room's canonical value rather than inventing one. `Unavailable` is
+/// Unknown too, which is what makes a legacy outage degrade the write path to
+/// its pre-D1 behaviour instead of blocking or failing a maid's tap.
+pub(crate) fn legacy_hint_for_room(outcome: &RoomCleanOutcome, room_no: &str) -> LegacyCleanliness {
+    match outcome {
+        RoomCleanOutcome::Available(map) => match map.get(room_no.trim()) {
+            Some(true) => LegacyCleanliness::Clean,
+            Some(false) => LegacyCleanliness::Dirty,
+            None => LegacyCleanliness::Unknown,
+        },
+        RoomCleanOutcome::Unavailable => LegacyCleanliness::Unknown,
+    }
+}
+
+/// Whether this tap needs iHOTEL's opinion before the service decides.
+///
+/// ONLY when canonical alone would answer "already in that state" — i.e. only
+/// on the taps that would otherwise become the silent no-op D1 is about. A tap
+/// that carries a real canonical transition is already going to enqueue, so
+/// asking iHOTEL could not change the outcome and would only spend the reader's
+/// 3s budget on the maid's request path.
+///
+/// Consequence worth stating plainly: during a legacy outage the ONLY taps that
+/// wait for the budget are the ones that will answer "nothing to do" anyway, and
+/// a normal dirty→clean tap is as fast as it was before D1.
+///
+/// The canonical value here is read outside the transaction, so it can be stale
+/// by the time the service takes the row lock. Both directions of that race are
+/// benign: it can only have moved to the target state via our own concurrent
+/// duplicate tap, a front-desk mark-clean (which enqueues its own writeback), or
+/// the CT watcher applying legacy's own value — and in every one of those cases
+/// the no-op the service then decides on is the CORRECT answer.
+pub(crate) fn needs_legacy_opinion(target_clean: Option<bool>, canonical: Option<bool>) -> bool {
+    match target_clean {
+        Some(target) => canonical == Some(target),
+        None => false,
+    }
+}
+
+// ============================================================================
 // SQL helpers (pool-parameterized so the DB-backed tests drive them directly)
 // ============================================================================
 
@@ -1109,18 +1208,38 @@ async fn fetch_today_events(
         .collect())
 }
 
-/// 404-checking room existence probe (active rooms only).
-async fn require_room(pool: &PgPool, room_id: i32) -> ApiResult<()> {
-    let exists = sqlx::query(
-        "SELECT 1 FROM ht_rooms_new WHERE room_id = $1 AND COALESCE(room_active, true) = true",
+/// What the 404 probe now brings back with it: the room's legacy join key and
+/// its canonical cleanliness, both needed by the D1 write guard.
+///
+/// Folded into the EXISTING existence probe rather than added as a second
+/// query — the handler already had to make this round-trip.
+struct RoomGuardRow {
+    /// `HT_Rooms.Room_no` — the key [`crate::legacy_room_status`] answers on
+    /// (the proven-truthful pointer; see that module's header).
+    room_no: String,
+    /// Canonical `ht_rooms_new.room_clean`; `None` = SQL NULL.
+    ///
+    /// Read OUTSIDE the service's transaction, so it is a hint only: it decides
+    /// whether the legacy read is worth issuing, never what gets written. The
+    /// service re-reads under the row lock and decides there.
+    room_clean: Option<bool>,
+}
+
+/// 404-checking room probe (active rooms only), returning what the write guard
+/// needs.
+async fn require_room(pool: &PgPool, room_id: i32) -> ApiResult<RoomGuardRow> {
+    let row = sqlx::query(
+        "SELECT room_no, room_clean FROM ht_rooms_new \
+          WHERE room_id = $1 AND COALESCE(room_active, true) = true",
     )
     .bind(room_id)
     .fetch_optional(pool)
-    .await?;
-    if exists.is_none() {
-        return Err(ApiError::NotFound(format!("room {room_id} not found")));
-    }
-    Ok(())
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
+    Ok(RoomGuardRow {
+        room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+        room_clean: row.try_get::<Option<bool>, _>("room_clean").unwrap_or(None),
+    })
 }
 
 // ============================================================================
@@ -1305,13 +1424,27 @@ pub async fn report_cleaning(
     }
 
     let pool = resolve_pool(&state, branch)?;
-    require_room(pool, room_id).await?;
+    let room = require_room(pool, room_id).await?;
+
+    // D1: judge the write against the SAME truth the maid's screen was rendered
+    // from. Only asked when canonical alone would have said "already done" —
+    // see `needs_legacy_opinion`. Unreachable / unmapped ⇒ `Unknown` ⇒ the
+    // service falls back to its pre-D1, canonical-only judgement. A maid's tap
+    // is NEVER failed or gated on legacy availability.
+    let target_clean = target_clean_for(status);
+    let legacy_room_clean = if needs_legacy_opinion(target_clean, room.room_clean) {
+        let outcome = resolve_legacy_room_clean(&policy, branch).await;
+        legacy_hint_for_room(&outcome, &room.room_no)
+    } else {
+        LegacyCleanliness::Unknown
+    };
 
     let svc = service_for(&state, branch)?;
     let report = svc
         .report_cleaning_progress(ReportCleaningCommand {
             room_id,
             status,
+            legacy_room_clean,
             badge: identity.badge.clone(),
             name: identity.display_name.clone(),
             by: maid_label(&identity),
@@ -2115,6 +2248,78 @@ mod tests {
         let clamped_wide = truncate_h_name(&emoji_ish);
         assert!(clamped_wide.len() <= MAX_H_NAME_BYTES);
         assert!(clamped_wide.chars().count() <= MAX_H_NAME_CHARS);
+    }
+
+    // ---- D1 write guard: the WRITE half of iHOTEL-wins ------------------
+
+    /// The hint handed to the service is the SAME per-room answer the display
+    /// merge uses — including its polarity. Getting this backwards would make
+    /// every mirror-lag repair fire on the wrong pole.
+    #[test]
+    fn the_write_hint_carries_ihotels_answer_for_that_one_room() {
+        let outcome = ihotel(&[("104", false), ("203", true)]);
+        assert_eq!(
+            legacy_hint_for_room(&outcome, "104"),
+            LegacyCleanliness::Dirty
+        );
+        assert_eq!(
+            legacy_hint_for_room(&outcome, "203"),
+            LegacyCleanliness::Clean
+        );
+        // Padded legacy `varchar` room numbers must still join — same trim the
+        // display merge does, or the guard silently falls back for every room.
+        assert_eq!(
+            legacy_hint_for_room(&outcome, " 104 "),
+            LegacyCleanliness::Dirty
+        );
+    }
+
+    /// Everything the display treats as "no usable value" is `Unknown` on the
+    /// write path too: an unreachable legacy AND a room iHOTEL had no usable
+    /// literal for. Both must degrade to canonical-only judgement — never to a
+    /// guess, and never to an error on a maid's tap.
+    #[test]
+    fn no_usable_legacy_answer_is_unknown_not_a_guess() {
+        assert_eq!(
+            legacy_hint_for_room(&RoomCleanOutcome::Unavailable, "104"),
+            LegacyCleanliness::Unknown
+        );
+        assert_eq!(
+            legacy_hint_for_room(&ihotel(&[("104", false)]), "999"),
+            LegacyCleanliness::Unknown
+        );
+    }
+
+    /// The read is issued ONLY for taps canonical alone would have called a
+    /// no-op — the ones D1 is about. A tap that already carries a real
+    /// transition must not spend the reader's 3s budget on the maid's request
+    /// path, and `started` must never consult legacy at all (it is
+    /// legacy-inert by design).
+    #[test]
+    fn only_would_be_no_op_taps_consult_ihotel() {
+        // `done` on a room canonical already calls clean — the D1 case.
+        assert!(needs_legacy_opinion(Some(true), Some(true)));
+        // `dirty` on a room canonical already calls dirty — the mirror image.
+        assert!(needs_legacy_opinion(Some(false), Some(false)));
+        // Real transitions: the outcome cannot change, so do not ask.
+        assert!(!needs_legacy_opinion(Some(true), Some(false)));
+        assert!(!needs_legacy_opinion(Some(false), Some(true)));
+        // NULL canonical is a transition in both directions — do not ask.
+        assert!(!needs_legacy_opinion(Some(true), None));
+        assert!(!needs_legacy_opinion(Some(false), None));
+        // `started` never mirrors.
+        assert!(!needs_legacy_opinion(None, Some(true)));
+        assert!(!needs_legacy_opinion(None, Some(false)));
+    }
+
+    /// The status → target-state mapping the guard is built on. `started` must
+    /// stay `None`: giving it a target would make a maid's "I have begun" flip
+    /// a room's cleanliness and write to iHOTEL.
+    #[test]
+    fn target_state_per_status_is_pinned() {
+        assert_eq!(target_clean_for(CleaningProgressStatus::Done), Some(true));
+        assert_eq!(target_clean_for(CleaningProgressStatus::Dirty), Some(false));
+        assert_eq!(target_clean_for(CleaningProgressStatus::Started), None);
     }
 
     /// The retired broken-item intake answers 410 (permanently gone), not 404

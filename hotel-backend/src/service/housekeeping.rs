@@ -21,6 +21,22 @@ use crate::repository::room::RoomRepository;
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
 
+/// How long a MIRROR REPAIR (defect D1) is suppressed after a writeback for the
+/// same room + intent was already enqueued.
+///
+/// Only the repair path consults it — a real canonical transition is never
+/// suppressed. It exists because iHOTEL keeps answering "dirty" until our own
+/// `MarkRoomClean` job actually drains, so a maid double-tapping เสร็จแล้ว
+/// during that gap would otherwise force a SECOND job for the same cleaning.
+///
+/// 5 minutes matches `writeback::recipes::mark_clean`'s own
+/// `WHERE NOT EXISTS … DATEADD(minute, -5, GETDATE())` guard on the
+/// `HT_Housewife` audit insert: inside the window a duplicate would be swallowed
+/// legacy-side anyway, and beyond it BOTH sides treat the write as a legitimate
+/// re-clean. Deliberately finite — if a repair is emitted, drains, and iHOTEL
+/// STILL disagrees minutes later, re-emitting is the correct healing behaviour.
+const MIRROR_REPAIR_DEDUP_MINUTES: i32 = 5;
+
 /// Command for [`HousekeepingService::mark_clean`].
 #[derive(Debug, Clone)]
 pub struct MarkCleanCommand {
@@ -107,12 +123,108 @@ impl CleaningProgressStatus {
     }
 }
 
+/// What iHOTEL said about THIS room at the moment of the tap — the write-guard
+/// half of the CR-1 "iHOTEL wins" decision (defect D1, wave-5).
+///
+/// ## Why the guard needs this at all
+///
+/// `/hk`'s DISPLAY is iHOTEL-wins (`routes::hk::merge_legacy_room_clean`), but
+/// the write guard used to judge against canonical `ht_rooms_new.room_clean` —
+/// the CT MIRROR. When the mirror lagged iHOTEL, a maid saw DIRTY (iHOTEL
+/// truth), tapped เสร็จแล้ว, the guard read the mirror, said "already clean",
+/// no-opped, and answered บันทึกแล้ว — while NOTHING reached iHOTEL and the
+/// room stayed dirty on reception's board. Read and write judged two different
+/// databases. This carries the read's answer into the write.
+///
+/// ## Deliberately a plain enum
+///
+/// No tiberius, no [`crate::legacy_room_status`] type: the service stays PG +
+/// outbox only (invariant #1). `routes::hk` performs the read (outside the PG
+/// transaction, on its own 3s budget) and hands the answer down as data.
+///
+/// [`Unknown`](Self::Unknown) is the FALLBACK and the default: no reader for
+/// the branch, legacy unreachable, budget elapsed, room absent from the answer,
+/// unrecognised `Room_Clean` literal, or the read deliberately skipped. It
+/// reproduces today's canonical-only behaviour exactly — a maid's tap is never
+/// blocked, delayed past its budget, or failed because a legacy server blinked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegacyCleanliness {
+    /// No usable answer ⇒ judge on canonical alone (today's behaviour).
+    #[default]
+    Unknown,
+    /// iHOTEL says the room IS clean (`Room_Clean='no'`).
+    Clean,
+    /// iHOTEL says the room needs cleaning (`Room_Clean='yes'`).
+    Dirty,
+}
+
+impl LegacyCleanliness {
+    /// Canonical polarity (`true` = IS clean), or `None` when unknown.
+    pub fn is_clean(self) -> Option<bool> {
+        match self {
+            LegacyCleanliness::Unknown => None,
+            LegacyCleanliness::Clean => Some(true),
+            LegacyCleanliness::Dirty => Some(false),
+        }
+    }
+}
+
+/// What one `done`/`dirty` tap should actually do, decided under the room lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanlinessDecision {
+    /// Canonical is not yet at the target state: flip it and mirror it. The
+    /// pre-D1 behaviour, unchanged.
+    Transition,
+    /// Canonical already matches the target, but iHOTEL still disagrees —
+    /// the mirror-lag case. Nothing to flip; enqueue the writeback so the tap
+    /// actually reaches the board reception works from.
+    MirrorRepair,
+    /// Both truths already agree with the target. Nothing to do.
+    NoOp,
+}
+
+/// The D1 guard, as a pure function of the two truths and the target state.
+///
+/// `target_clean` is `true` for `done`, `false` for `dirty`. `canonical` is
+/// `ht_rooms_new.room_clean` READ UNDER THE ROW LOCK (`None` = SQL NULL).
+///
+/// Three rules, and the order matters:
+///
+/// 1. Canonical not at the target ⇒ [`Transition`](CleanlinessDecision::Transition).
+///    Identical to the old `room_clean IS DISTINCT FROM <target>` predicate,
+///    NULL included: an unknown cleanliness must reach iHOTEL explicitly.
+/// 2. Canonical at the target but iHOTEL says the OPPOSITE ⇒
+///    [`MirrorRepair`](CleanlinessDecision::MirrorRepair). This is the whole
+///    defect: the maid acted on what iHOTEL told her, so the write must go.
+/// 3. Anything else — the two agree, or iHOTEL has no usable answer ⇒
+///    [`NoOp`](CleanlinessDecision::NoOp). `Unknown` lands here on purpose:
+///    an unreachable legacy degrades to EXACTLY today's behaviour, never to
+///    "enqueue anyway" (that would spam `HT_Housewife` during an outage) and
+///    never to an error (a maid's tap must not depend on a legacy server).
+pub fn decide_cleanliness(
+    target_clean: bool,
+    canonical: Option<bool>,
+    legacy: LegacyCleanliness,
+) -> CleanlinessDecision {
+    if canonical != Some(target_clean) {
+        return CleanlinessDecision::Transition;
+    }
+    if legacy.is_clean() == Some(!target_clean) {
+        return CleanlinessDecision::MirrorRepair;
+    }
+    CleanlinessDecision::NoOp
+}
+
 /// Command for [`HousekeepingService::report_cleaning_progress`] — one maid tap
 /// on `POST /api/hk/rooms/{id}/cleaning`.
 #[derive(Debug, Clone)]
 pub struct ReportCleaningCommand {
     pub room_id: i32,
     pub status: CleaningProgressStatus,
+    /// iHOTEL's answer for THIS room at tap time (defect D1). Default
+    /// [`LegacyCleanliness::Unknown`] = judge on canonical alone, i.e. the
+    /// pre-D1 behaviour. Ignored for `started` (legacy-inert).
+    pub legacy_room_clean: LegacyCleanliness,
     /// Verified HF ID badge — ALWAYS present (the Access middleware 401s
     /// without one). Stamped into `hkev_badge`.
     pub badge: String,
@@ -320,26 +432,51 @@ impl HousekeepingService {
     /// | status | canonical flip | writeback | domain event |
     /// |---|---|---|---|
     /// | `started` | none | none | `RoomCleaningStarted` |
-    /// | `done` | `room_clean → true` when not already true | `MarkRoomClean` | `RoomMarkedClean` |
-    /// | `dirty` | `room_clean → false` when not already false | `MarkRoomDirty` | `RoomMarkedDirty` |
+    /// | `done` | `room_clean → true` when not already true | `MarkRoomClean` when canonical OR iHOTEL said dirty | `RoomMarkedClean` |
+    /// | `dirty` | `room_clean → false` when not already false | `MarkRoomDirty` when canonical OR iHOTEL said clean | `RoomMarkedDirty` |
+    ///
+    /// ## Which truth the guard judges against (defect D1, wave-5)
+    ///
+    /// `done`/`dirty` no longer judge canonical alone. The tap is decided by
+    /// [`decide_cleanliness`] over BOTH truths — canonical under the row lock,
+    /// and [`ReportCleaningCommand::legacy_room_clean`], iHOTEL's answer for
+    /// this room as `routes::hk` read it (the same answer the maid's screen was
+    /// rendered from). A canonical mirror that lags iHOTEL used to swallow the
+    /// tap silently; now it produces a `MirrorRepair` — no flip (canonical is
+    /// already at the target) but a real writeback, so the room actually clears
+    /// on reception's board.
+    ///
+    /// `LegacyCleanliness::Unknown` (unreachable, no reader, unmapped room, or
+    /// the read skipped) degrades to EXACTLY the pre-D1 behaviour.
     ///
     /// ## Idempotency (invariant #4)
     ///
-    /// The conditional UPDATE (`… IS DISTINCT FROM …`) takes the row lock, so
-    /// two concurrent taps serialize and the loser enqueues nothing — the same
-    /// argument written out at [`mark_clean_if_dirty`](Self::mark_clean_if_dirty),
-    /// applied symmetrically to `dirty`. The per-event v4 discriminator stays on
-    /// the idempotency key: rooms legitimately flip every day and
-    /// `writeback_jobs.idempotency_key` is permanently UNIQUE.
+    /// The guard opens with `SELECT … FOR UPDATE` on the room row — the SAME
+    /// row lock the old conditional UPDATE took, acquired one statement earlier
+    /// so the decision can consider two truths instead of one. Two concurrent
+    /// taps still serialize on it: the loser blocks, then re-reads the winner's
+    /// committed row (READ COMMITTED re-evaluates a locked row after the lock is
+    /// granted) and decides against the NEW state. The read-then-write hazard the
+    /// old comment warned about is a hazard only WITHOUT the lock.
+    ///
+    /// A repair additionally passes [`mirror_repair_suppressed`]: iHOTEL keeps
+    /// saying "dirty" until our own job drains, so the second tap of a
+    /// double-tap is deduplicated against the job the first one enqueued
+    /// (whether that job came from a transition or a repair). Net effect: at
+    /// most one writeback per real transition, exactly as before.
+    ///
+    /// The per-event v4 discriminator stays on the idempotency key: rooms
+    /// legitimately flip every day and `writeback_jobs.idempotency_key` is
+    /// permanently UNIQUE.
     ///
     /// The APPEND-ONLY event row is always written — `started`/`done` may
     /// legitimately repeat within a day and the "current progress" read takes
     /// only the LATEST row. What must not double is the legacy write, and that
-    /// is what the conditional flip guards.
+    /// is what the guard above protects.
     ///
     /// The route resolves 404 for unknown/inactive rooms before calling; the
-    /// `room_exists` probe here disambiguates "already in that state" from
-    /// "no such room" if the row disappears between the two.
+    /// locking read here re-checks existence, so a row that disappears between
+    /// the two still 404s instead of reporting a silent success.
     pub async fn report_cleaning_progress(
         &self,
         cmd: ReportCleaningCommand,
@@ -390,36 +527,105 @@ impl HousekeepingService {
                     writeback_enqueued: false,
                 });
             }
-            CleaningProgressStatus::Done => {
-                if !set_room_clean_flag_if_dirty(&mut tx, cmd.room_id).await? {
-                    return finish_no_transition(tx, cmd.room_id, event_id).await;
+            // `done` and `dirty` are ONE path with opposite polarity — the D1
+            // guard is symmetric, so writing it twice is how the two poles
+            // drift apart.
+            CleaningProgressStatus::Done | CleaningProgressStatus::Dirty => {
+                let target_clean = matches!(cmd.status, CleaningProgressStatus::Done);
+
+                // Serialization point. Everything below decides against the
+                // value read HERE, under the lock.
+                let Some(canonical) = lock_room_clean(&mut tx, cmd.room_id).await? else {
+                    return Err(ServiceError::not_found(format!(
+                        "room {} does not exist",
+                        cmd.room_id
+                    )));
+                };
+
+                let (intent, event) = if target_clean {
+                    (
+                        WritebackIntent::MarkRoomClean {
+                            room_id: aggregate_id,
+                            by: cmd.by.clone(),
+                        },
+                        DomainEvent::RoomMarkedClean {
+                            room_id: aggregate_id,
+                            by: cmd.by.clone(),
+                            source: cmd.source.clone(),
+                        },
+                    )
+                } else {
+                    (
+                        WritebackIntent::MarkRoomDirty {
+                            room_id: aggregate_id,
+                            by: cmd.by.clone(),
+                        },
+                        DomainEvent::RoomMarkedDirty {
+                            room_id: aggregate_id,
+                            source: cmd.source.clone(),
+                        },
+                    )
+                };
+
+                match decide_cleanliness(target_clean, canonical, cmd.legacy_room_clean) {
+                    CleanlinessDecision::NoOp => {
+                        // Both truths already agree with the target: keep the
+                        // maid's event row, enqueue nothing, publish nothing.
+                        tx.commit().await?;
+                        return Ok(CleaningReport {
+                            room_id: cmd.room_id,
+                            event_id,
+                            writeback_enqueued: false,
+                        });
+                    }
+                    CleanlinessDecision::Transition => {
+                        let flipped = if target_clean {
+                            set_room_clean_flag_if_dirty(&mut tx, cmd.room_id).await?
+                        } else {
+                            set_room_clean_flag_if_clean(&mut tx, cmd.room_id).await?
+                        };
+                        if !flipped {
+                            // Unreachable while we hold the row lock (nothing
+                            // else can have moved the row since the read). If it
+                            // ever happens, degrade to the pre-D1 no-op rather
+                            // than enqueue a write we can no longer justify.
+                            tx.commit().await?;
+                            return Ok(CleaningReport {
+                                room_id: cmd.room_id,
+                                event_id,
+                                writeback_enqueued: false,
+                            });
+                        }
+                    }
+                    CleanlinessDecision::MirrorRepair => {
+                        if mirror_repair_suppressed(&mut tx, aggregate_id, intent.intent_name())
+                            .await?
+                        {
+                            // Our own earlier writeback for this room has not
+                            // reached iHOTEL yet — that, not a lagging mirror,
+                            // is why legacy still disagrees. Do not double-write.
+                            tx.commit().await?;
+                            return Ok(CleaningReport {
+                                room_id: cmd.room_id,
+                                event_id,
+                                writeback_enqueued: false,
+                            });
+                        }
+                        // Operator signal, same family as `routes::hk`'s
+                        // divergence warn: N of these = the CT mirror was behind
+                        // iHOTEL at the moment a maid acted, and the tap would
+                        // have been silently lost before wave-5 D1.
+                        tracing::warn!(
+                            room_id = cmd.room_id,
+                            target_clean,
+                            intent = intent.intent_name(),
+                            "/hk mirror repair: canonical already matched the tap but iHOTEL \
+                             disagreed — enqueuing the writeback the maid's tap earned (D1)"
+                        );
+                    }
                 }
-                (
-                    WritebackIntent::MarkRoomClean {
-                        room_id: aggregate_id,
-                        by: cmd.by.clone(),
-                    },
-                    DomainEvent::RoomMarkedClean {
-                        room_id: aggregate_id,
-                        by: cmd.by,
-                        source: cmd.source,
-                    },
-                )
-            }
-            CleaningProgressStatus::Dirty => {
-                if !set_room_clean_flag_if_clean(&mut tx, cmd.room_id).await? {
-                    return finish_no_transition(tx, cmd.room_id, event_id).await;
-                }
-                (
-                    WritebackIntent::MarkRoomDirty {
-                        room_id: aggregate_id,
-                        by: cmd.by,
-                    },
-                    DomainEvent::RoomMarkedDirty {
-                        room_id: aggregate_id,
-                        source: cmd.source,
-                    },
-                )
+
+                (intent, event)
             }
         };
 
@@ -647,25 +853,71 @@ async fn insert_cleaning_event(
     Ok(sqlx::Row::try_get(&row, "hkev_id")?)
 }
 
-/// Close a cleaning report that performed NO cleanliness transition: keep the
-/// appended event, enqueue nothing, publish nothing — but 404 first if the room
-/// vanished (same disambiguation as `mark_clean_if_dirty`).
-async fn finish_no_transition(
-    mut tx: Transaction<'_, Postgres>,
+/// Read `ht_rooms_new.room_clean` for one room AND take its row lock — the
+/// serialization point of the D1 guard.
+///
+/// `Ok(None)` = no such room (the caller 404s, same disambiguation
+/// `room_exists` gives `mark_clean_if_dirty`). `Ok(Some(None))` = the row
+/// exists with a NULL `room_clean`, which
+/// [`decide_cleanliness`] treats as "not at the target" in both directions.
+///
+/// `FOR UPDATE` is what keeps the guard idempotent now that the decision spans
+/// two statements: a second concurrent tap blocks here until the first commits,
+/// then (READ COMMITTED) re-reads the row it just wrote. Same lock the old
+/// conditional UPDATE took — no new lock is introduced, only taken earlier.
+async fn lock_room_clean(
+    tx: &mut Transaction<'_, Postgres>,
     room_id: i32,
-    event_id: i64,
-) -> ServiceResult<CleaningReport> {
-    if !room_exists(&mut tx, room_id).await? {
-        return Err(ServiceError::not_found(format!(
-            "room {room_id} does not exist"
-        )));
+) -> ServiceResult<Option<Option<bool>>> {
+    let row = sqlx::query("SELECT room_clean FROM ht_rooms_new WHERE room_id = $1 FOR UPDATE")
+        .bind(room_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    match row {
+        Some(row) => Ok(Some(sqlx::Row::try_get::<Option<bool>, _>(
+            &row,
+            "room_clean",
+        )?)),
+        None => Ok(None),
     }
-    tx.commit().await?;
-    Ok(CleaningReport {
-        room_id,
-        event_id,
-        writeback_enqueued: false,
-    })
+}
+
+/// Whether a MIRROR REPAIR for this room + intent must be suppressed because we
+/// already have a writeback in flight (or a very recent one) that explains why
+/// iHOTEL still disagrees.
+///
+/// Two halves, both needed:
+///
+/// * `status IN ('pending','in_progress')` — the causal case. A queued job IS
+///   the reason legacy still reads dirty; enqueuing another would put a second
+///   `HT_Housewife` row in for one cleaning.
+/// * `created_at > now() - 5 minutes` — the bounded case. If the queue is stuck
+///   or a job parked/failed, repeated taps must not pile up jobs; one per
+///   window per room is the ceiling.
+///
+/// Called ONLY on the repair path — a genuine canonical transition is never
+/// suppressed, so a legitimate re-clean after the room went dirty again still
+/// enqueues immediately. Runs after [`lock_room_clean`], so under READ COMMITTED
+/// its snapshot already includes anything a serialized rival tap committed.
+async fn mirror_repair_suppressed(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: Uuid,
+    intent_name: &str,
+) -> ServiceResult<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM writeback_jobs \
+          WHERE aggregate_id = $1 \
+            AND intent = $2 \
+            AND (status IN ('pending', 'in_progress') \
+                 OR created_at > now() - make_interval(mins => $3)) \
+          LIMIT 1",
+    )
+    .bind(aggregate_id)
+    .bind(intent_name)
+    .bind(MIRROR_REPAIR_DEDUP_MINUTES)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Existence probe used to distinguish "already clean" from "no such room"
@@ -909,10 +1161,21 @@ mod tests {
             .unwrap()
     }
 
+    /// A tap with NO iHOTEL opinion — the pre-D1 shape, so every legacy-free
+    /// assertion in this suite keeps testing canonical-only judgement.
     fn cleaning_cmd(room_id: i32, status: CleaningProgressStatus) -> ReportCleaningCommand {
+        cleaning_cmd_with_legacy(room_id, status, LegacyCleanliness::Unknown)
+    }
+
+    fn cleaning_cmd_with_legacy(
+        room_id: i32,
+        status: CleaningProgressStatus,
+        legacy_room_clean: LegacyCleanliness,
+    ) -> ReportCleaningCommand {
         ReportCleaningCommand {
             room_id,
             status,
+            legacy_room_clean,
             badge: "Q1001".into(),
             name: Some("นก".into()),
             by: "นก".into(),
@@ -1123,6 +1386,218 @@ mod tests {
             .await;
     }
 
+    /// D1 end to end, on the `done` pole: the mirror lags (canonical CLEAN,
+    /// iHOTEL DIRTY), so the tap the old guard swallowed must now enqueue the
+    /// writeback — and a double-tap must NOT enqueue a second one, because
+    /// iHOTEL keeps answering "dirty" until our own job drains.
+    #[tokio::test]
+    async fn mirror_lag_repairs_a_done_tap_once_and_only_once() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping mirror_lag_repairs_a_done_tap_once — PG not reachable");
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-D1A'")
+            .execute(&pool)
+            .await;
+        // Seed CLEAN: the CT mirror still carries yesterday's answer while
+        // iHOTEL has already been told the guest checked out.
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-D1A', true, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed insert must succeed");
+        let agg = aggregate_uuid(AggregateKind::Room, room_id);
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+
+        let svc = build_service(pool.clone());
+
+        // Pre-D1 behaviour, pinned: with NO iHOTEL opinion this exact tap is
+        // the silent no-op the owner reported.
+        let blind = svc
+            .report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Done))
+            .await
+            .expect("done must succeed");
+        assert!(
+            !blind.writeback_enqueued,
+            "canonical-only judgement must still no-op — that is the fallback \
+             a legacy outage degrades to"
+        );
+        assert_eq!(job_count(&pool, agg, "mark_room_clean").await, 0);
+
+        // THE FIX: the maid saw iHOTEL's DIRTY, so her tap earns the writeback.
+        let repaired = svc
+            .report_cleaning_progress(cleaning_cmd_with_legacy(
+                room_id,
+                CleaningProgressStatus::Done,
+                LegacyCleanliness::Dirty,
+            ))
+            .await
+            .expect("done must succeed");
+        assert!(
+            repaired.writeback_enqueued,
+            "iHOTEL said dirty — the tap MUST reach iHOTEL (defect D1)"
+        );
+        assert_eq!(job_count(&pool, agg, "mark_room_clean").await, 1);
+        assert_eq!(
+            room_clean(&pool, room_id).await,
+            Some(true),
+            "canonical already matched the target — a repair flips nothing"
+        );
+        assert_eq!(
+            event_count(&pool, agg, "RoomMarkedClean").await,
+            1,
+            "reception's board must learn about the room over SSE too"
+        );
+
+        // Double-tap while the job is still queued: iHOTEL still reads dirty,
+        // but that is OUR undelivered write, not a second dirty room.
+        for _ in 0..3 {
+            let repeat = svc
+                .report_cleaning_progress(cleaning_cmd_with_legacy(
+                    room_id,
+                    CleaningProgressStatus::Done,
+                    LegacyCleanliness::Dirty,
+                ))
+                .await
+                .expect("repeat done must succeed");
+            assert!(
+                !repeat.writeback_enqueued,
+                "a repeat tap must not force a second HT_Housewife audit row"
+            );
+        }
+        assert_eq!(
+            job_count(&pool, agg, "mark_room_clean").await,
+            1,
+            "exactly one writeback across four taps under a lagging mirror"
+        );
+
+        // The dedup gates ONLY repairs. A room that genuinely goes dirty again
+        // inside the same window and is cleaned again must still enqueue.
+        let _ = sqlx::query("UPDATE ht_rooms_new SET room_clean = false WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+        let real = svc
+            .report_cleaning_progress(cleaning_cmd_with_legacy(
+                room_id,
+                CleaningProgressStatus::Done,
+                LegacyCleanliness::Dirty,
+            ))
+            .await
+            .expect("re-clean must succeed");
+        assert!(
+            real.writeback_enqueued,
+            "a REAL canonical transition is never suppressed by the repair dedup"
+        );
+        assert_eq!(job_count(&pool, agg, "mark_room_clean").await, 2);
+
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// The symmetric pole, end to end: canonical already DIRTY while iHOTEL
+    /// still shows the room CLEAN. The maid's ห้องยังไม่สะอาด tap must reach
+    /// iHOTEL's grid, and repeat only once.
+    #[tokio::test]
+    async fn mirror_lag_repairs_a_dirty_tap_once_and_only_once() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping mirror_lag_repairs_a_dirty_tap_once — PG not reachable");
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-D1B'")
+            .execute(&pool)
+            .await;
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ('ZT-D1B', false, true) RETURNING room_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed insert must succeed");
+        let agg = aggregate_uuid(AggregateKind::Room, room_id);
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+
+        let svc = build_service(pool.clone());
+
+        assert!(
+            !svc.report_cleaning_progress(cleaning_cmd(room_id, CleaningProgressStatus::Dirty))
+                .await
+                .expect("dirty must succeed")
+                .writeback_enqueued,
+            "canonical-only judgement still no-ops (the pre-D1 fallback)"
+        );
+
+        assert!(
+            svc.report_cleaning_progress(cleaning_cmd_with_legacy(
+                room_id,
+                CleaningProgressStatus::Dirty,
+                LegacyCleanliness::Clean,
+            ))
+            .await
+            .expect("dirty must succeed")
+            .writeback_enqueued,
+            "iHOTEL showed the room clean — the tap MUST reach its grid"
+        );
+        assert_eq!(job_count(&pool, agg, "mark_room_dirty").await, 1);
+        assert_eq!(room_clean(&pool, room_id).await, Some(false));
+
+        assert!(
+            !svc.report_cleaning_progress(cleaning_cmd_with_legacy(
+                room_id,
+                CleaningProgressStatus::Dirty,
+                LegacyCleanliness::Clean,
+            ))
+            .await
+            .expect("repeat dirty must succeed")
+            .writeback_enqueued,
+            "the second tap is deduplicated against our own queued job"
+        );
+        assert_eq!(
+            job_count(&pool, agg, "mark_room_dirty").await,
+            1,
+            "exactly one writeback across the double-tap"
+        );
+
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(agg)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&pool)
+            .await;
+    }
+
     /// Validation fires before any I/O. A blank `by` would land as a blank
     /// `HT_Housewife.h_name`; a blank badge would produce an unattributable
     /// audit row that no maid can be identified from.
@@ -1136,6 +1611,7 @@ mod tests {
                 .report_cleaning_progress(ReportCleaningCommand {
                     room_id: 1,
                     status: CleaningProgressStatus::Done,
+                    legacy_room_clean: LegacyCleanliness::Unknown,
                     badge: badge.into(),
                     name: None,
                     by: by.into(),
@@ -1147,6 +1623,127 @@ mod tests {
                 .expect_err("blank identity must be rejected");
             assert!(matches!(err, ServiceError::Validation(_)), "got {err:?}");
         }
+    }
+
+    // ---- D1: which truth the guard judges (pure, no DB) -----------------
+
+    /// THE DEFECT, as a unit test. The CT mirror lags: canonical still says
+    /// CLEAN while iHOTEL — the value the maid's screen showed her — says
+    /// DIRTY. Before D1 this was `IS DISTINCT FROM true` ⇒ 0 rows ⇒ silent
+    /// no-op ⇒ nothing ever reached iHOTEL. It must now be a repair.
+    #[test]
+    fn mirror_lagging_dirty_makes_a_done_tap_a_repair_not_a_no_op() {
+        assert_eq!(
+            decide_cleanliness(true, Some(true), LegacyCleanliness::Dirty),
+            CleanlinessDecision::MirrorRepair
+        );
+    }
+
+    /// The symmetric pole: the display is iHOTEL-wins in BOTH directions, so a
+    /// `dirty` tap on a room canonical already calls dirty, while iHOTEL still
+    /// shows it clean, must reach iHOTEL too. Covering only `done` would mean
+    /// "we trust the maid's screen, but only sometimes".
+    #[test]
+    fn mirror_lagging_clean_makes_a_dirty_tap_a_repair() {
+        assert_eq!(
+            decide_cleanliness(false, Some(false), LegacyCleanliness::Clean),
+            CleanlinessDecision::MirrorRepair
+        );
+    }
+
+    /// Legacy unreachable / unmapped / not consulted ⇒ EXACTLY the pre-D1
+    /// behaviour: canonical alone decides. This is the fallback the whole
+    /// design rests on — same failure surface as before, never worse, and a
+    /// maid's tap is never gated on a legacy server being up.
+    #[test]
+    fn unknown_legacy_falls_back_to_canonical_only_judgement() {
+        // Canonical already at the target ⇒ the old silent no-op, unchanged.
+        assert_eq!(
+            decide_cleanliness(true, Some(true), LegacyCleanliness::Unknown),
+            CleanlinessDecision::NoOp
+        );
+        assert_eq!(
+            decide_cleanliness(false, Some(false), LegacyCleanliness::Unknown),
+            CleanlinessDecision::NoOp
+        );
+        // Canonical NOT at the target ⇒ the ordinary transition, unchanged.
+        assert_eq!(
+            decide_cleanliness(true, Some(false), LegacyCleanliness::Unknown),
+            CleanlinessDecision::Transition
+        );
+        assert_eq!(
+            decide_cleanliness(false, Some(true), LegacyCleanliness::Unknown),
+            CleanlinessDecision::Transition
+        );
+    }
+
+    /// A real canonical transition outranks whatever iHOTEL says — including
+    /// iHOTEL AGREEING with the target. The tap still flips canonical and still
+    /// mirrors: suppressing it would leave the two databases disagreeing with
+    /// no event to reconcile them, and it is the path 55/55 production jobs
+    /// have taken.
+    #[test]
+    fn a_real_transition_is_never_suppressed_by_legacy_agreement() {
+        for legacy in [
+            LegacyCleanliness::Clean,
+            LegacyCleanliness::Dirty,
+            LegacyCleanliness::Unknown,
+        ] {
+            assert_eq!(
+                decide_cleanliness(true, Some(false), legacy),
+                CleanlinessDecision::Transition,
+                "canonical dirty + done must transition regardless of {legacy:?}"
+            );
+        }
+    }
+
+    /// Both truths already agree with the tap ⇒ nothing to do. The honest
+    /// no-op, and the one D1 must NOT turn into a write (that is Candidate B,
+    /// always-enqueue, which would spam `HT_Housewife` and break the
+    /// double-tap story).
+    #[test]
+    fn agreement_is_still_a_no_op() {
+        assert_eq!(
+            decide_cleanliness(true, Some(true), LegacyCleanliness::Clean),
+            CleanlinessDecision::NoOp
+        );
+        assert_eq!(
+            decide_cleanliness(false, Some(false), LegacyCleanliness::Dirty),
+            CleanlinessDecision::NoOp
+        );
+    }
+
+    /// NULL canonical keeps the old `IS DISTINCT FROM` semantics in both
+    /// directions: unknown cleanliness is "not at the target", so it flips and
+    /// mirrors explicitly instead of being swallowed as "already there".
+    #[test]
+    fn null_canonical_is_still_a_transition_in_both_directions() {
+        for legacy in [
+            LegacyCleanliness::Clean,
+            LegacyCleanliness::Dirty,
+            LegacyCleanliness::Unknown,
+        ] {
+            assert_eq!(
+                decide_cleanliness(true, None, legacy),
+                CleanlinessDecision::Transition
+            );
+            assert_eq!(
+                decide_cleanliness(false, None, legacy),
+                CleanlinessDecision::Transition
+            );
+        }
+    }
+
+    /// The polarity of the hint itself — inverted relative to legacy's
+    /// `Room_Clean` NEEDS-CLEANING flag, and the single most breakable fact in
+    /// the chain. `Unknown` must be the Default so an un-set field can only
+    /// ever mean "canonical-only", never "iHOTEL said clean".
+    #[test]
+    fn legacy_cleanliness_polarity_and_default() {
+        assert_eq!(LegacyCleanliness::Clean.is_clean(), Some(true));
+        assert_eq!(LegacyCleanliness::Dirty.is_clean(), Some(false));
+        assert_eq!(LegacyCleanliness::Unknown.is_clean(), None);
+        assert_eq!(LegacyCleanliness::default(), LegacyCleanliness::Unknown);
     }
 
     /// The status literals this service writes MUST be exactly what the
