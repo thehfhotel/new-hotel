@@ -142,12 +142,27 @@ const ADMIN_WITH_NULL_LOCATION: &str = r#"{"found":true,"badge":"421","display_n
     "apps":["hotel","housekeeping","housekeeping_admin"],"active":true,"pending":false,
     "location":null}"#;
 
-/// TODAY'S LIVE SHAPE for badge 421 — the grant absent from `apps`. This is
-/// the darkness proof in test form: the payload the live lookup actually
-/// returns right now must behave exactly as it did before this feature
-/// existed (⇒ 403, no location on file).
+/// A non-holder with NO location on file — the shape badge 421 had while it
+/// was the estate's one un-placed employee, and the shape any newly-onboarded
+/// employee has until the owner places them. Must still refuse.
 const NON_ADMIN_NULL_LOCATION: &str = r#"{"found":true,"badge":"421","display_name":"นก",
     "apps":["hotel","housekeeping"],"active":true,"pending":false,"location":null}"#;
+
+/// **THE LIVE PAYLOAD, VERBATIM** — probed from production at 2026-08-17
+/// 08:4xZ against `http://192.168.100.228:5000/api/private/reader/resolve-badge`
+/// for badge 421, on the fingerprint build (`6cfdbc32`) that already exposes
+/// `housekeeping_admin` in its catalog. Note `apps` does NOT contain it: the
+/// grant exists but nobody holds it, which is exactly the state this change
+/// ships into.
+///
+/// This is the darkness proof in its strongest form — not a shape resembling
+/// production, but the bytes production actually returns. `row17b` asserts it
+/// yields precisely what it yielded before this feature existed: one branch,
+/// her own. Note too that 421 now HAS a location (`"HF"`); the doc line
+/// calling it "the only NULL today" is stale, which is why the null case is
+/// carried by its own constant above rather than by this badge.
+const LIVE_BADGE_421: &str = r#"{"found":true,"badge":"421","display_name":"วิณัฐ",
+    "apps":["housekeeping"],"active":true,"pending":false,"location":"HF"}"#;
 
 /// A plain HF Hotel maid, grant absent. The byte-unchanged control.
 const NON_ADMIN_WITH_LOCATION: &str = r#"{"found":true,"badge":"HOTEL-MAID","display_name":null,
@@ -180,6 +195,7 @@ impl LocationLookup for PayloadLookup {
             "ADMIN-NULL" => ADMIN_WITH_NULL_LOCATION,
             "NON-ADMIN-NULL" => NON_ADMIN_NULL_LOCATION,
             "NON-ADMIN-LOCATED" => NON_ADMIN_WITH_LOCATION,
+            "LIVE-421" => LIVE_BADGE_421,
             _ => r#"{"found":false,"active":false,"location":null}"#,
         };
         outcome_for_resolve_badge_body(body)
@@ -909,6 +925,61 @@ async fn row17_the_same_badge_without_the_grant_is_byte_unchanged() {
                 &format!("non-holder null location → {method} {uri}?branch={branch}"),
             );
         }
+    }
+}
+
+/// Row 17b. **The darkness proof against the LIVE bytes.** The payload
+/// production returns for badge 421 today — probed from the deployed
+/// fingerprint build that already offers `housekeeping_admin`, with `apps`
+/// not containing it — must yield exactly one branch, her own, and refuse the
+/// other. Byte-for-byte what it did before this feature existed.
+///
+/// If someone ever ticks the box for her, THIS test is the one that starts
+/// failing, and its failure means "the capability is live", not "the code
+/// broke".
+#[tokio::test]
+async fn row17b_the_live_production_payload_is_unchanged() {
+    let (status, body) = call(
+        enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], PayloadLookup::new()),
+        maid("LIVE-421"),
+        "GET",
+        "/api/hk/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+    assert_eq!(
+        me_branch_ids(&json),
+        vec!["hfhotel".to_string()],
+        "the live payload must still offer ONE branch — no grant, no widening: {body}"
+    );
+    assert!(
+        json["branchesUnavailableReason"].is_null(),
+        "she has a location, so nothing is missing: {body}"
+    );
+
+    // Her own branch works; the other is still the mismatch 403.
+    for (method, uri, req_body) in ROOM_ENDPOINTS {
+        let (status, resp) = call(
+            enforcing_payloads(vec![Branch::Hfhotel, Branch::Hfville], PayloadLookup::new()),
+            maid("LIVE-421"),
+            method,
+            &with_branch(uri, "hfville"),
+            req_body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the live non-holder must still be refused the other property: \
+             {method} {uri} → {resp}"
+        );
+        assert_envelope(
+            &resp,
+            LOCATION_MISMATCH_ERROR,
+            &format!("live 421 → {method} {uri}?branch=hfville"),
+        );
     }
 }
 
