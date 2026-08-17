@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation'
 import Script from 'next/script'
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
 import { BranchProvider } from '@/contexts/BranchContext'
+import type { ShellProperty } from '@/lib/server/shell-property'
 
 // Pages that should render WITHOUT the sidebar / branch context — the only
 // public route today is /login (the auth landing). Kept as a Set so additional
@@ -32,7 +33,22 @@ const CHROMELESS_PATHS = new Set<string>(['/login'])
  * overlap the classic Sidebar had, and isn't wired up to
  * `--hf-band-offset` — and on /login, matching the existing chromeless set.
  */
-export default function AppShell({ children }: { children: React.ReactNode }) {
+export default function AppShell({
+  children,
+  shellProperty,
+}: {
+  children: React.ReactNode
+  /**
+   * The property this viewer is standing at, resolved per request from the
+   * server-verified Cloudflare Access identity in `app/layout.tsx`
+   * (`lib/server/shell-property.ts`). `undefined` for every identity that does
+   * not name a place — HF's reception account (which also runs as a second
+   * Chrome profile on the HF Ville PC), the office kiosk, managers, phones,
+   * anonymous callers, and any failure — and then the attribute is omitted and
+   * the band lists every tool.
+   */
+  shellProperty?: ShellProperty
+}) {
   const pathname = usePathname()
   // The new "/v2" front-desk experience ships its own shell (rail + bottom nav
   // + its own BranchProvider) and must render WITHOUT the classic sidebar.
@@ -59,6 +75,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         src="https://erp.thehfhotel.org/shell/hf-bar.js"
         data-app="Hotel PMS"
         data-module="front-desk"
+        // Spread, not `data-property={shellProperty}`: React renders an
+        // `undefined` value by omitting the attribute, but being explicit keeps
+        // "omit entirely" — the fail-open default the band relies on — from
+        // depending on that behaviour.
+        {...(shellProperty ? { 'data-property': shellProperty } : {})}
         strategy="afterInteractive"
       />
       <ChromedShell>{children}</ChromedShell>
