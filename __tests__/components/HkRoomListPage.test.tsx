@@ -17,7 +17,7 @@
  * owns the pure helpers and the URL construction.
  */
 
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 
 const mockHkFetch = jest.fn()
 const mockHkFetchMe = jest.fn()
@@ -33,6 +33,7 @@ jest.mock('@/app/hk/hk-lib', () => {
 
 import HkRoomListPage from '@/app/hk/page'
 import { LEGACY_STATUS_STALE_NOTE } from '@/app/hk/hk-lib'
+import { HK_STATUS_LABELS } from '@/lib/v2/status'
 
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body }
@@ -92,4 +93,66 @@ it('marks only the rooms the server reported unclean', async () => {
   await renderList({ legacyStatusStale: false })
   const dirty = screen.getAllByTitle('ห้องยังไม่สะอาด')
   expect(dirty).toHaveLength(1)
+})
+
+// ---------------------------------------------------------------------------
+// Explicit clean/dirty chip (owner feedback, wave-5): "I don't see status
+// from iHOTEL at แม่บ้าน" — a clean room used to show NOTHING and a dirty one
+// only the small dot above. Every room now carries a labelled chip, in the
+// SAME words reception reads at /v2/housekeeping (lib/v2/status.ts).
+// ---------------------------------------------------------------------------
+
+it('gives a CLEAN room an explicit สะอาด chip, not just the absence of a marker', async () => {
+  await renderList({ legacyStatusStale: false })
+  const cleanCard = screen.getByText('203').closest('li') as HTMLElement
+  expect(within(cleanCard).getByText(HK_STATUS_LABELS.clean)).toBeInTheDocument()
+  // The clean room must NOT also carry the dirty dot marker.
+  expect(within(cleanCard).queryByTitle('ห้องยังไม่สะอาด')).not.toBeInTheDocument()
+})
+
+it('gives a DIRTY room the explicit รอทำความสะอาด chip, alongside the existing dot marker', async () => {
+  await renderList({ legacyStatusStale: false })
+  const dirtyCard = screen.getByText('104').closest('li') as HTMLElement
+  expect(within(dirtyCard).getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+  expect(within(dirtyCard).getByTitle('ห้องยังไม่สะอาด')).toBeInTheDocument()
+})
+
+it('keeps the progress chip visible as a secondary label next to the clean/dirty chip', async () => {
+  await renderList({ legacyStatusStale: false })
+  // ROOMS fixture: room 104 has cleaning: null → progressLabel default,
+  // "ยังไม่เริ่ม" — the classic morning state alongside รอทำความสะอาด.
+  const dirtyCard = screen.getByText('104').closest('li') as HTMLElement
+  expect(within(dirtyCard).getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+  expect(within(dirtyCard).getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+})
+
+it('renders clean/dirty chips using the exact same words as reception (lib/v2/status.ts HK labels)', async () => {
+  await renderList({ legacyStatusStale: false })
+  expect(screen.getAllByText(HK_STATUS_LABELS.clean).length).toBeGreaterThan(0)
+  expect(screen.getAllByText(HK_STATUS_LABELS.dirty).length).toBeGreaterThan(0)
+})
+
+// When the backend fell back to the PMS mirror, the chips still render — the
+// canonical fallback value is a real value, not an unknown one.
+it('still renders the clean/dirty chip while legacyStatusStale is true', async () => {
+  await renderList({ legacyStatusStale: true })
+  const dirtyCard = screen.getByText('104').closest('li') as HTMLElement
+  expect(within(dirtyCard).getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+})
+
+// ---------------------------------------------------------------------------
+// Summary bar (owner feedback, wave-5): รอทำความสะอาด N — the number a maid
+// actually plans her round by, alongside เสร็จแล้ว/กำลังทำ/ทั้งหมด.
+// ---------------------------------------------------------------------------
+
+it('shows the count of merged-dirty rooms in the summary bar', async () => {
+  await renderList({ legacyStatusStale: false })
+  // ROOMS fixture: room 104 dirty, room 203 clean → 1 room needs cleaning.
+  const summary = screen.getByTestId('hk-summary')
+  expect(within(summary).getByText('รอทำความสะอาด')).toBeInTheDocument()
+  expect(within(summary).getByText('1')).toBeInTheDocument()
+  // The pre-existing counters must stay put.
+  expect(within(summary).getByText('เสร็จแล้ว')).toBeInTheDocument()
+  expect(within(summary).getByText('กำลังทำ')).toBeInTheDocument()
+  expect(within(summary).getByText('ทั้งหมด')).toBeInTheDocument()
 })

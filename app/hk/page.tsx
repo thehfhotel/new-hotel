@@ -22,6 +22,7 @@ import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import { AlertCircle, Info, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import {
+  countRoomsNeedingClean,
   groupRoomsByFloor,
   hkFetch,
   hkFetchMe,
@@ -29,6 +30,7 @@ import {
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
+  roomCleanChip,
   storeBranch,
   timeLabel,
   type Branch,
@@ -133,6 +135,9 @@ export default function HkRoomListPage() {
 
   const doneCount = rooms.filter((r) => r.cleaning?.status === 'done').length
   const startedCount = rooms.filter((r) => r.cleaning?.status === 'started').length
+  // The number a maid actually plans her round by — merged iHOTEL-wins
+  // roomClean, not today's progress. See countRoomsNeedingClean in hk-lib.
+  const dirtyCount = countRoomsNeedingClean(rooms)
 
   // The EMPTY case (§C): location enforcement resolved this maid to no branch
   // at all. Blocks like the picker does, but offers nothing to tap — there is
@@ -204,8 +209,16 @@ export default function HkRoomListPage() {
 
           {/* Progress summary + refresh */}
           {!error && (
-            <div className="mb-4 flex items-center justify-between rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm">
-              <div className="flex gap-4">
+            <div
+              data-testid="hk-summary"
+              className="mb-4 flex items-center justify-between rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm"
+            >
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                {/* The number a maid actually plans by — merged-dirty rooms,
+                    listed first because it is the one that drives her round. */}
+                <span className="text-red-700">
+                  รอทำความสะอาด <strong>{dirtyCount}</strong>
+                </span>
                 <span className="text-emerald-700">
                   เสร็จแล้ว <strong>{doneCount}</strong>
                 </span>
@@ -243,6 +256,7 @@ export default function HkRoomListPage() {
                 <ul className="grid grid-cols-2 gap-2">
                   {floorRooms.map((room) => {
                     const badge = progressLabel(room.cleaning?.status)
+                    const cleanChip = roomCleanChip(room.roomClean)
                     return (
                       <li key={room.roomId}>
                         <Link
@@ -260,11 +274,22 @@ export default function HkRoomListPage() {
                               )}
                             </span>
                           </div>
-                          <span
-                            className={`mt-2 inline-block rounded-full border px-2 py-0.5 text-xs ${badge.className}`}
-                          >
-                            {badge.label}
-                          </span>
+                          {/* Primary: explicit clean/dirty (merged iHOTEL-wins
+                              roomClean). Secondary: today's maid-reported
+                              progress — dirty + ยังไม่เริ่ม is the ordinary
+                              morning state, both chips stay visible together. */}
+                          <div className="mt-2 flex flex-wrap items-center gap-1">
+                            <span
+                              className={`inline-block rounded-full border px-2 py-0.5 text-xs ${cleanChip.className}`}
+                            >
+                              {cleanChip.label}
+                            </span>
+                            <span
+                              className={`inline-block rounded-full border px-2 py-0.5 text-xs ${badge.className}`}
+                            >
+                              {badge.label}
+                            </span>
+                          </div>
                           {room.cleaning && (
                             <p className="mt-1 text-[11px] text-gray-400">
                               {timeLabel(room.cleaning.at)}

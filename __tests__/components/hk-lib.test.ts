@@ -11,6 +11,7 @@
 
 import {
   branchesUnavailableMessage,
+  countRoomsNeedingClean,
   groupRoomsByFloor,
   HK_API_BASE,
   hkFetch,
@@ -22,12 +23,14 @@ import {
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
+  roomCleanChip,
   storeBranch,
   timeLabel,
   type Branch,
   type HkBranchOption,
   type HkRoom,
 } from '@/app/hk/hk-lib'
+import { HK_STATUS_LABELS } from '@/lib/v2/status'
 
 function room(overrides: Partial<HkRoom>): HkRoom {
   return {
@@ -74,6 +77,48 @@ describe('progressLabel', () => {
       progressLabel(null).className,
     ])
     expect(classes.size).toBe(4)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// roomCleanChip / countRoomsNeedingClean — owner feedback (wave-5):
+// "I don't see status from iHOTEL at แม่บ้าน". Every room now gets an
+// explicit clean/dirty chip, using the SAME Thai words reception reads off
+// lib/v2/status.ts, so the two audiences never disagree about the vocabulary.
+// ---------------------------------------------------------------------------
+
+describe('roomCleanChip', () => {
+  it('labels a clean room with the exact reception vocabulary (lib/v2/status.ts)', () => {
+    expect(roomCleanChip(true).label).toBe(HK_STATUS_LABELS.clean)
+    expect(roomCleanChip(true).label).toBe('สะอาด')
+  })
+
+  it('labels a dirty room with the exact reception vocabulary (lib/v2/status.ts)', () => {
+    expect(roomCleanChip(false).label).toBe(HK_STATUS_LABELS.dirty)
+    expect(roomCleanChip(false).label).toBe('รอทำความสะอาด')
+  })
+
+  it('assigns visually distinct styles for clean vs dirty', () => {
+    expect(roomCleanChip(true).className).not.toBe(roomCleanChip(false).className)
+  })
+})
+
+describe('countRoomsNeedingClean', () => {
+  it('counts only rooms whose merged roomClean is false', () => {
+    const rooms = [
+      room({ roomId: 1, roomClean: false }),
+      room({ roomId: 2, roomClean: true }),
+      room({ roomId: 3, roomClean: false }),
+    ]
+    expect(countRoomsNeedingClean(rooms)).toBe(2)
+  })
+
+  it('returns 0 when every room is clean', () => {
+    expect(countRoomsNeedingClean([room({ roomClean: true })])).toBe(0)
+  })
+
+  it('returns 0 for an empty list', () => {
+    expect(countRoomsNeedingClean([])).toBe(0)
   })
 })
 

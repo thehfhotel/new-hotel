@@ -6,6 +6,8 @@
 // rewrite comment in next.config.js. Everything here is plain TypeScript so
 // the pure helpers are unit-testable without a DOM.
 
+import { HK_STATUS_LABELS } from '@/lib/v2/status'
+
 // ---------------------------------------------------------------------------
 // API types (mirror hotel-backend/src/routes/hk.rs)
 // ---------------------------------------------------------------------------
@@ -306,6 +308,33 @@ export function progressLabel(status: CleaningStatus | null | undefined): {
         className: 'bg-gray-100 text-gray-600 border-gray-300',
       }
   }
+}
+
+/**
+ * Explicit clean/dirty chip for a room, from the merged (iHOTEL-wins)
+ * `HkRoom.roomClean` — owner feedback (wave-5): "I don't see status from
+ * iHOTEL at แม่บ้าน". Before this, a clean room showed NOTHING and a dirty
+ * one only a small dot; every room now gets a labelled chip.
+ *
+ * Uses the EXACT Thai words `lib/v2/status.ts`'s `HK_STATUS_LABELS` gives
+ * reception (`.clean` / `.dirty`) — same fact, same word, for both audiences.
+ * This is the PRIMARY chip; `progressLabel` (today's maid-reported progress,
+ * e.g. "ยังไม่เริ่ม") stays a SECONDARY chip alongside it — dirty +
+ * ยังไม่เริ่ม is the ordinary morning state, not a contradiction to resolve.
+ */
+export function roomCleanChip(roomClean: boolean): { label: string; className: string } {
+  return roomClean
+    ? { label: HK_STATUS_LABELS.clean, className: 'bg-green-100 text-green-800 border-green-300' }
+    : { label: HK_STATUS_LABELS.dirty, className: 'bg-red-100 text-red-800 border-red-300' }
+}
+
+/**
+ * Count of rooms whose merged `roomClean` is false — the number a maid
+ * actually plans her round by. Surfaced in the list's summary bar alongside
+ * เสร็จแล้ว/กำลังทำ/ทั้งหมด. PURE — unit-tested.
+ */
+export function countRoomsNeedingClean(rooms: HkRoom[]): number {
+  return rooms.filter((r) => !r.roomClean).length
 }
 
 /**

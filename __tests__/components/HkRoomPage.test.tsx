@@ -41,6 +41,7 @@ jest.mock('@/app/hk/hk-lib', () => {
 
 import HkRoomPage from '@/app/hk/rooms/[roomId]/page'
 import { LEGACY_STATUS_STALE_NOTE } from '@/app/hk/hk-lib'
+import { HK_STATUS_LABELS } from '@/lib/v2/status'
 
 const ROOM = {
   roomId: 7,
@@ -173,6 +174,45 @@ describe('mark-dirty confirm step (R2b)', () => {
 
     expect(screen.queryByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'ยืนยัน' })).not.toBeInTheDocument()
+  })
+})
+
+describe('clean/dirty chip on the detail header (owner feedback, wave-5)', () => {
+  // ROOM fixture is roomClean: false — the merged-dirty state.
+  it('shows the explicit รอทำความสะอาด chip for a merged-dirty room', async () => {
+    await renderRoom({})
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+  })
+
+  it('shows the explicit สะอาด chip for a merged-clean room, not just silence', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({ success: true, room: { ...ROOM, roomClean: true }, events: [] })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.getByText(HK_STATUS_LABELS.clean)).toBeInTheDocument()
+    expect(screen.queryByText(HK_STATUS_LABELS.dirty)).not.toBeInTheDocument()
+  })
+
+  it('keeps the progress chip visible as a secondary label alongside the clean/dirty chip', async () => {
+    await renderRoom({})
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+    // ROOM.cleaning is null → progressLabel default, "ยังไม่เริ่ม".
+    expect(screen.getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+  })
+
+  // When the backend fell back to the PMS mirror, the chip still renders the
+  // canonical fallback value — the stale note explains provenance, not
+  // whether there is a chip at all.
+  it('still renders the chip while legacyStatusStale is true', async () => {
+    await renderRoom({ legacyStatusStale: true })
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+  })
+
+  it('uses the exact same words as reception (lib/v2/status.ts HK labels)', async () => {
+    await renderRoom({})
+    expect(screen.getByText(HK_STATUS_LABELS.dirty).textContent).toBe(HK_STATUS_LABELS.dirty)
   })
 })
 

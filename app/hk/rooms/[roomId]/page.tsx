@@ -36,6 +36,7 @@ import {
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
+  roomCleanChip,
   timeLabel,
   type Branch,
   type CleaningStatus,
@@ -228,20 +229,27 @@ export default function HkRoomPage() {
       {room && (
         <>
           <header className="mb-4 rounded-xl border border-gray-200 bg-white p-4">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <h1 className="text-2xl font-bold">ห้อง {room.roomNo}</h1>
-              <span
-                className={`inline-block rounded-full border px-2.5 py-1 text-xs ${badge.className}`}
-              >
-                {badge.label}
+              {/* Primary: explicit clean/dirty (merged iHOTEL-wins roomClean),
+                  same words reception reads at /v2/housekeeping. Secondary:
+                  today's maid-reported progress — both stay visible. */}
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={`inline-block rounded-full border px-2.5 py-1 text-xs ${roomCleanChip(room.roomClean).className}`}
+                >
+                  {roomCleanChip(room.roomClean).label}
+                </span>
+                <span
+                  className={`inline-block rounded-full border px-2.5 py-1 text-xs ${badge.className}`}
+                >
+                  {badge.label}
+                </span>
               </span>
             </div>
             <p className="mt-1 text-sm text-gray-500">
               {room.floor !== null ? `ชั้น ${room.floor}` : ''}
               {room.building ? ` · ${room.building}` : ''}
-              {!room.roomClean && (
-                <span className="ml-1 text-red-600">· ห้องยังไม่สะอาด</span>
-              )}
             </p>
           </header>
 
