@@ -153,7 +153,7 @@
 //!
 //! The read itself is [`crate::legacy_room_status`] (read-only, `Room_no`-keyed,
 //! 3s budget); the POLICY is here, in three rules that are unit-tested as pure
-//! functions ([`merge_legacy_room_clean`]):
+//! functions ([`merge_legacy_room_flags`]):
 //!
 //! 1. **iHOTEL wins** for every room it has an answer for. A room absent from
 //!    the legacy answer (unmatched `Room_no`, unrecognised literal) keeps its
@@ -173,6 +173,34 @@
 //! from a surface with a handful of users. The write path (below) reads the
 //! same way and for the same reason — caching the answer there would put the
 //! defect it fixes back, one layer down.
+//!
+//! ## Occupancy rides the SAME read (display-only)
+//!
+//! [`HkRoom::occupancy`] is iHOTEL's `HT_Rooms.Room_Use` under the identical
+//! three rules, merged PER FACT: the same row of the same single `SELECT`
+//! carries both `Room_Clean` and `Room_Use`, so occupancy costs no extra
+//! round-trip and cannot be stale in a way cleanliness is not. `legacy_status_stale`
+//! therefore covers both facts, and a SECOND flag would be a second name for
+//! the same outage.
+//!
+//! The canonical FALLBACK for occupancy is DERIVED per fetch from active
+//! checkins ([`rooms_list_sql`]), never the stored `ht_rooms_new.room_status`
+//! column — that column is bypassed by check-in/check-out and is months behind
+//! reality (issue #200).
+//!
+//! Nothing writes, gates or decides on occupancy. It exists so a maid can see
+//! whether the door she is about to open has a guest behind it.
+//!
+//! ## Arrivals / departures today (canonical-only)
+//!
+//! [`HkRoom::expected_arrival`] and [`HkRoom::expected_departure`] are the
+//! maid's planning tags: a booking whose stay starts today and has not become
+//! a check-in yet, and an active checkin due out today or earlier. Both are
+//! derived per fetch from canonical PG with NO legacy counterpart in the CR-1
+//! read — iHOTEL has no equivalent per-room flag — so they are deliberately
+//! NOT covered by `legacy_status_stale` and stay live through a legacy outage.
+//!
+//! Both use the Bangkok civil day ([`TODAY_BKK_DATE`]), never `CURRENT_DATE`.
 //!
 //! ## The WRITE judges the same truth (defect D1, wave-5)
 //!
@@ -214,7 +242,7 @@
 //!
 //! Branch-aware via `?branch=` resolved through the unified
 //! [`AppState::write_pool`] chokepoint (Ship-B gate). The legacy reader is
-//! resolved by the SAME branch through [`HkPolicy::legacy_room_clean`], so a
+//! resolved by the SAME branch through [`HkPolicy::legacy_room_flags`], so a
 //! Ville maid's list can only ever be reconciled against Ville's legacy server.
 //!
 //! ## HF Ville admission
@@ -255,7 +283,7 @@ use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::hfid_location::{EmployeeLocation, HfidLocationClient, LocationOutcome};
-use crate::legacy_room_status::{RoomCleanOutcome, RoomCleanSource};
+use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::housekeeping::{
@@ -365,7 +393,7 @@ pub struct HkPolicy {
     /// Contrast [`Self::location`], which fails CLOSED — answering wrongly
     /// there sends a maid to the wrong hotel; answering nothing here would
     /// only blank a screen she needs.
-    pub legacy_room_clean: BTreeMap<&'static str, Arc<dyn RoomCleanSource>>,
+    pub legacy_room_flags: BTreeMap<&'static str, Arc<dyn RoomFlagsSource>>,
 }
 
 impl HkPolicy {
@@ -392,30 +420,30 @@ impl HkPolicy {
             mark_dirty_enabled,
             location_enforcement_enabled,
             location,
-            // Populated by `main.rs` via `with_legacy_room_clean` — it owns
+            // Populated by `main.rs` via `with_legacy_room_flags` — it owns
             // the legacy pools (and is the ONE place that already has HF
             // Hotel's). Empty here means the fallback path, which is a
             // correct, shippable state.
-            legacy_room_clean: BTreeMap::new(),
+            legacy_room_flags: BTreeMap::new(),
         }
     }
 
     /// Attach a branch's iHOTEL room-status reader. Called by `main.rs` once
     /// per branch that has one; branches without a reader use the fallback.
-    pub fn with_legacy_room_clean(
+    pub fn with_legacy_room_flags(
         mut self,
         branch: Branch,
-        source: Arc<dyn RoomCleanSource>,
+        source: Arc<dyn RoomFlagsSource>,
     ) -> Self {
-        self.legacy_room_clean.insert(branch_id(branch), source);
+        self.legacy_room_flags.insert(branch_id(branch), source);
         self
     }
 
     /// Branch ids that have a live iHOTEL reader — for the startup log, so an
     /// operator can see at a glance whether `/hk` is serving iHOTEL truth or
     /// the canonical mirror.
-    pub fn legacy_room_clean_branches(&self) -> Vec<&'static str> {
-        self.legacy_room_clean.keys().copied().collect()
+    pub fn legacy_room_flags_branches(&self) -> Vec<&'static str> {
+        self.legacy_room_flags.keys().copied().collect()
     }
 
     /// Stable ids of the configured branches, for logging + `GET /api/hk/me`.
@@ -439,7 +467,7 @@ impl Default for HkPolicy {
             mark_dirty_enabled: false,
             location_enforcement_enabled: false,
             location: None,
-            legacy_room_clean: BTreeMap::new(),
+            legacy_room_flags: BTreeMap::new(),
         }
     }
 }
@@ -862,6 +890,33 @@ pub struct CleaningProgress {
     pub at: DateTime<Utc>,
 }
 
+/// Whether a guest is in the room right now. Display-only — nothing on this
+/// surface writes, gates or decides on it.
+///
+/// A two-variant enum rather than a bare `bool` because the wire value is read
+/// by a human-facing card: `"occupied"` / `"vacant"` cannot be misread the way
+/// `occupied: false` can be, and a future third state (iHOTEL has none today)
+/// would be additive rather than a breaking type change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Occupancy {
+    Occupied,
+    Vacant,
+}
+
+impl Occupancy {
+    /// `true` ⇒ [`Occupancy::Occupied`]. The one place the bool→enum mapping
+    /// lives, so the SQL column, the legacy flag and the tests cannot drift
+    /// into three spellings of it.
+    fn from_occupied(occupied: bool) -> Self {
+        if occupied {
+            Self::Occupied
+        } else {
+            Self::Vacant
+        }
+    }
+}
+
 /// One room on the maid's list.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -876,8 +931,45 @@ pub struct HkRoom {
     /// whenever iHOTEL answers for this `room_no`. Falls back to canonical
     /// `ht_rooms_new.room_clean` when the legacy read is unavailable (see the
     /// response's `legacy_status_stale`) or when iHOTEL has no usable value for
-    /// this particular room. See [`merge_legacy_room_clean`].
+    /// this particular room. See [`merge_legacy_room_flags`].
     pub room_clean: bool,
+    /// Whether a guest is in the room, as **iHOTEL** reports it (CR-1).
+    ///
+    /// Sourced from legacy `HT_Rooms.Room_Use` (NOT inverted: `'yes'` =
+    /// occupied) whenever iHOTEL answers for this `room_no`. Falls back to the
+    /// canonical DERIVED occupancy — `occupied_pms`, computed from ACTIVE
+    /// CHECKINS in [`fetch_rooms`] / [`fetch_room`] — when the legacy read is
+    /// unavailable (see the response's `legacy_status_stale`) or when iHOTEL
+    /// has no usable `Room_Use` for this particular room.
+    ///
+    /// NEVER the stored `ht_rooms_new.room_status` column: that column is
+    /// bypassed by check-in/check-out and is not kept in sync (issue #200,
+    /// same defect `routes::new_rooms::LIVE_ROOM_FLAGS_SQL` was introduced to
+    /// route around). Reading it here would put a room's occupancy months
+    /// behind the guest standing in it.
+    ///
+    /// Display-only: no writeback, no guard, no decision reads this.
+    pub occupancy: Occupancy,
+    /// A canonical booking (CT mirror of `HT_Book_H`/`HT_Book_Date` via
+    /// `ht_bookings`/`ht_booking_rooms`) assigned to this room, stay starting
+    /// TODAY (Bangkok civil day), still `'confirmed'`/`'pending'`.
+    ///
+    /// Dies when the CT mirror flips the booking to `'checked_in'` /
+    /// `'cancelled'`, or at Bangkok midnight — pure per-fetch derivation, no
+    /// stored state and nothing to clean up.
+    ///
+    /// Canonical-side fact: it never consults iHOTEL, so it is NOT covered by
+    /// `legacy_status_stale` and stays truthful during a legacy outage.
+    pub expected_arrival: bool,
+    /// Active checkin on this room due out TODAY **or earlier** — Bangkok
+    /// civil day, no morning hour-gate.
+    ///
+    /// Dies with the active folio / room line: after a real checkout the card
+    /// shows vacant + dirty, which is the existing "just left" reading.
+    ///
+    /// Canonical-side fact, exactly like [`Self::expected_arrival`]: NOT
+    /// covered by `legacy_status_stale`.
+    pub expected_departure: bool,
     /// Today's latest maid-reported progress; `None` = nothing reported yet.
     pub cleaning: Option<CleaningProgress>,
 }
@@ -887,10 +979,20 @@ pub struct HkRoom {
 pub struct RoomsResponse {
     pub success: bool,
     pub data: Vec<HkRoom>,
-    /// `true` when the iHOTEL read could not answer and every `roomClean`
-    /// above is therefore the canonical PG MIRROR rather than iHOTEL truth
-    /// (CR-1 rule 2). The client renders a visible Thai note; it must never
-    /// render an error page — a stale list is usable, a blank one is not.
+    /// `true` when the iHOTEL read could not answer and every `roomClean` AND
+    /// `occupancy` above is therefore the canonical fallback rather than
+    /// iHOTEL truth (CR-1 rule 2). The client renders a visible Thai note; it
+    /// must never render an error page — a stale list is usable, a blank one
+    /// is not.
+    ///
+    /// ONE flag for BOTH facts, deliberately: they come from the same row of
+    /// the same single `SELECT` ([`crate::legacy_room_status::ROOM_STATUS_SQL`]),
+    /// so a second flag could never disagree with this one — it would only be
+    /// a second name for the same outage.
+    ///
+    /// Note what it does NOT cover: `expectedArrival` / `expectedDeparture`
+    /// are canonical-side derivations that never consult iHOTEL, so they stay
+    /// live and truthful while this flag is `true`.
     ///
     /// ADDITIVE and always serialized, so a client can branch on the VALUE
     /// rather than on whether the key exists. A machine-readable flag rather
@@ -983,87 +1085,124 @@ fn parse_cleaning_status(raw: &str) -> Result<CleaningProgressStatus, ApiError> 
 // iHOTEL-wins merge (CR-1) — pure, unit-tested below
 // ============================================================================
 
-/// Overwrite each room's `room_clean` with iHOTEL's answer, and report whether
-/// the maid is looking at a fallback.
+/// Overwrite each room's `room_clean` AND `occupancy` with iHOTEL's answer,
+/// and report whether the maid is looking at a fallback.
 ///
 /// Returns `true` when the caller must set `legacy_status_stale` — i.e. the
 /// legacy read did not answer at all and every value left in `rooms` is the
-/// canonical PG mirror.
+/// canonical fallback (the PG `room_clean` mirror, and occupancy DERIVED from
+/// active checkins).
 ///
-/// The three CR-1 rules, in one place (see the module docs):
+/// The three CR-1 rules, in one place (see the module docs), applied **PER
+/// FACT**:
 ///
-/// * iHOTEL wins per room it has a usable value for;
-/// * a room iHOTEL has no usable value for keeps its canonical value SILENTLY
+/// * iHOTEL wins per room per fact it has a usable value for;
+/// * a fact iHOTEL has no usable value for keeps its canonical value SILENTLY
 ///   — that is a mapping gap, not a staleness event, and flagging the whole
-///   list for one unmatched room would train the maid to ignore the note;
+///   list for one unmatched room would train the maid to ignore the note. A
+///   room with a readable `Room_Use` but a junk `Room_Clean` therefore takes
+///   iHOTEL's occupancy and keeps canonical cleanliness;
 /// * every disagreement is logged at `warn` with `room_no` and BOTH values,
 ///   and NONE of it reaches the response.
 ///
+/// `expected_arrival` / `expected_departure` are NOT touched: they are
+/// canonical-side derivations with no legacy counterpart in this read, and
+/// they stay live even when everything else here falls back.
+///
 /// PURE apart from the log line, which is exactly why the divergence rule is
 /// testable without a database or a legacy server.
-pub(crate) fn merge_legacy_room_clean(
+pub(crate) fn merge_legacy_room_flags(
     rooms: &mut [HkRoom],
-    outcome: &RoomCleanOutcome,
+    outcome: &RoomFlagsOutcome,
     branch: Branch,
 ) -> bool {
     let legacy = match outcome {
-        RoomCleanOutcome::Available(map) => map,
+        RoomFlagsOutcome::Available(map) => map,
         // Rule 2. Values stay as fetched from PG; the caller tells the client.
-        RoomCleanOutcome::Unavailable => return true,
+        RoomFlagsOutcome::Unavailable => return true,
     };
 
-    let mut divergences = 0usize;
+    // Counted SEPARATELY: the two facts drift for different reasons (a lagging
+    // `Room_Clean` mirror vs. a check-in one side has not seen), and one
+    // summary number would hide which engine is behind.
+    let mut clean_divergences = 0usize;
+    let mut occupancy_divergences = 0usize;
+
     for room in rooms.iter_mut() {
-        let Some(&legacy_clean) = legacy.get(room.room_no.trim()) else {
+        let Some(flags) = legacy.get(room.room_no.trim()) else {
             continue;
         };
-        if legacy_clean != room.room_clean {
-            divergences += 1;
-            // Rule 3 — operator-facing ONLY. `room_no` plus both values is
-            // everything needed to chase it into the CT watcher or the
-            // legacy-key repair (`bin/repair_room_legacy_keys`), which is the
-            // known cause of this class at HF Ville.
-            tracing::warn!(
-                branch = branch_id(branch),
-                room_no = %room.room_no,
-                ihotel_clean = legacy_clean,
-                pms_clean = room.room_clean,
-                "/hk room-clean divergence: iHOTEL and canonical PG disagree — \
-                 showing iHOTEL (CR-1); canonical is the mirror"
-            );
+
+        if let Some(legacy_clean) = flags.is_clean {
+            if legacy_clean != room.room_clean {
+                clean_divergences += 1;
+                // Rule 3 — operator-facing ONLY. `room_no` plus both values is
+                // everything needed to chase it into the CT watcher or the
+                // legacy-key repair (`bin/repair_room_legacy_keys`), which is
+                // the known cause of this class at HF Ville.
+                tracing::warn!(
+                    branch = branch_id(branch),
+                    room_no = %room.room_no,
+                    ihotel_clean = legacy_clean,
+                    pms_clean = room.room_clean,
+                    "/hk room-clean divergence: iHOTEL and canonical PG disagree — \
+                     showing iHOTEL (CR-1); canonical is the mirror"
+                );
+            }
+            // Rule 1.
+            room.room_clean = legacy_clean;
         }
-        // Rule 1.
-        room.room_clean = legacy_clean;
+
+        if let Some(legacy_occupied) = flags.occupied {
+            let legacy_occupancy = Occupancy::from_occupied(legacy_occupied);
+            if legacy_occupancy != room.occupancy {
+                occupancy_divergences += 1;
+                // Same operator signal, different engine: an occupancy
+                // disagreement means one side has a check-in or check-out the
+                // other has not applied yet.
+                tracing::warn!(
+                    branch = branch_id(branch),
+                    room_no = %room.room_no,
+                    ihotel_occupied = legacy_occupied,
+                    pms_occupied = room.occupancy == Occupancy::Occupied,
+                    "/hk occupancy divergence: iHOTEL Room_Use and the canonical \
+                     derived occupancy disagree — showing iHOTEL (CR-1)"
+                );
+            }
+            // Rule 1.
+            room.occupancy = legacy_occupancy;
+        }
     }
 
-    if divergences > 0 {
+    if clean_divergences > 0 || occupancy_divergences > 0 {
         tracing::warn!(
             branch = branch_id(branch),
-            divergences,
+            clean_divergences,
+            occupancy_divergences,
             rooms = rooms.len(),
-            "/hk served iHOTEL room-clean status over a diverging canonical mirror"
+            "/hk served iHOTEL room status over a diverging canonical fallback"
         );
     }
     false
 }
 
-/// Ask this branch's iHOTEL reader, or report [`RoomCleanOutcome::Unavailable`]
+/// Ask this branch's iHOTEL reader, or report [`RoomFlagsOutcome::Unavailable`]
 /// when the branch has none configured.
 ///
 /// "No reader" and "reader failed" are the SAME answer on purpose: both mean
 /// the maid is about to see the canonical mirror, and she must be told so
 /// either way. Collapsing them keeps the fallback path single — the one that
 /// ships today, and the one an operator can reason about at 6am.
-async fn resolve_legacy_room_clean(policy: &HkPolicy, branch: Branch) -> RoomCleanOutcome {
-    match policy.legacy_room_clean.get(branch_id(branch)) {
-        Some(source) => source.room_clean().await,
+async fn resolve_legacy_room_flags(policy: &HkPolicy, branch: Branch) -> RoomFlagsOutcome {
+    match policy.legacy_room_flags.get(branch_id(branch)) {
+        Some(source) => source.room_flags().await,
         None => {
             tracing::debug!(
                 branch = branch_id(branch),
                 "/hk has no iHOTEL room-status reader for this branch — \
                  serving the canonical PG mirror with the stale note"
             );
-            RoomCleanOutcome::Unavailable
+            RoomFlagsOutcome::Unavailable
         }
     }
 }
@@ -1084,21 +1223,25 @@ pub(crate) fn target_clean_for(status: CleaningProgressStatus) -> Option<bool> {
 
 /// Pick ONE room's answer out of a legacy read outcome.
 ///
-/// The same three-way answer [`merge_legacy_room_clean`] applies to the display,
+/// The same three-way answer [`merge_legacy_room_flags`] applies to the display,
 /// reduced to the single room a tap is about: a room ABSENT from the legacy
 /// answer (unmatched `Room_no`, unrecognised `Room_Clean` literal) is
 /// [`LegacyCleanliness::Unknown`], never guessed — exactly as the display keeps
 /// such a room's canonical value rather than inventing one. `Unavailable` is
 /// Unknown too, which is what makes a legacy outage degrade the write path to
 /// its pre-D1 behaviour instead of blocking or failing a maid's tap.
-pub(crate) fn legacy_hint_for_room(outcome: &RoomCleanOutcome, room_no: &str) -> LegacyCleanliness {
+pub(crate) fn legacy_hint_for_room(outcome: &RoomFlagsOutcome, room_no: &str) -> LegacyCleanliness {
     match outcome {
-        RoomCleanOutcome::Available(map) => match map.get(room_no.trim()) {
+        // Only the CLEANLINESS fact. Occupancy is display-only and has no say
+        // in whether a maid's tap earns a writeback — an unrecognised
+        // `Room_Clean` under a perfectly readable `Room_Use` is still Unknown
+        // here, exactly as it was before the read widened.
+        RoomFlagsOutcome::Available(map) => match map.get(room_no.trim()).and_then(|f| f.is_clean) {
             Some(true) => LegacyCleanliness::Clean,
             Some(false) => LegacyCleanliness::Dirty,
             None => LegacyCleanliness::Unknown,
         },
-        RoomCleanOutcome::Unavailable => LegacyCleanliness::Unknown,
+        RoomFlagsOutcome::Unavailable => LegacyCleanliness::Unknown,
     }
 }
 
@@ -1140,16 +1283,94 @@ pub(crate) fn needs_legacy_opinion(target_clean: Option<bool>, canonical: Option
 pub(crate) const TODAY_BKK: &str =
     "(hkev_created_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date";
 
-/// Fetch the active-room list with today's latest cleaning progress.
-async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
-    let sql = format!(
+/// Today's civil DATE in Bangkok — the right-hand side of [`TODAY_BKK`], reused
+/// on its own by the arrival / departure predicates.
+///
+/// `CURRENT_DATE` is BANNED in these predicates: it is the SERVER's date, and
+/// the server is not guaranteed to run on Thai wall-clock. Between 17:00 and
+/// 24:00 UTC the two answers differ by a day, which would flip every arrival
+/// and departure tag on the maid's list for seven hours a night.
+/// `routes::new_rooms::LIVE_ROOM_FLAGS_SQL`'s `booked` predicate does use
+/// `CURRENT_DATE` — that is the wrong idiom and must not be copied here.
+pub(crate) const TODAY_BKK_DATE: &str = "(NOW() AT TIME ZONE 'Asia/Bangkok')::date";
+
+/// The per-room resolution shared by the occupancy and departure predicates:
+/// which ACTIVE folio, if any, holds this room right now.
+///
+/// `cr` rows are AUTHORITATIVE when the folio has any: `NOT IN` the checkout
+/// spellings rather than `= 'เข้าพัก'`, because `cr_room_status` mixes
+/// CT-mirrored legacy literals with our own `'active'` (production 2026-08-19:
+/// `'Check-Out'` + `'เข้าพัก'` only, but the column is ours to write too, and
+/// an allowlist would silently drop a spelling we add later). BOTH checkout
+/// spellings are tolerated — `'Check-Out'` (ClickUSE.cs:1116) and `'Check Out'`
+/// without the hyphen (FrmCheckOut.cs:6246, the known iHOTEL inconsistency in
+/// COMPAT_CHEATSHEET) — plus the cancel literal `'ยกเลิก'`.
+///
+/// The bias is deliberate: junk under an active folio reads as OCCUPIED. A maid
+/// walking in on a guest is the failure to avoid; a room shown occupied that is
+/// actually empty costs her one door knock.
+///
+/// `cin_room_id` counts ONLY for folios with no `cr` rows at all — the pre-B5
+/// single-room shape. Without that guard a multi-room folio would keep tagging
+/// its `cin_room_id` room after that room's own line checked out.
+///
+/// This DELIBERATELY differs from `routes::new_rooms::LIVE_ROOM_FLAGS_SQL`,
+/// which ORs `cin_room_id` in unconditionally and ignores `cr_room_status`
+/// entirely. Do NOT unify them: that one feeds reception's grid, this one is
+/// the maid's fallback and must not show a checked-out room as occupied.
+const ACTIVE_FOLIO_HOLDS_ROOM: &str = r#"                   EXISTS (SELECT 1 FROM ht_checkin_rooms cr
+                            WHERE cr.cr_cin_id = c.cin_id AND cr.cr_room_id = r.room_id
+                              AND cr.cr_room_status NOT IN ('Check-Out', 'Check Out', 'ยกเลิก'))
+                   OR (c.cin_room_id = r.room_id
+                       AND NOT EXISTS (SELECT 1 FROM ht_checkin_rooms cr2 WHERE cr2.cr_cin_id = c.cin_id))"#;
+
+/// The three derived per-room facts, as a SELECT-list fragment shared VERBATIM
+/// by [`rooms_list_sql`] and [`room_detail_sql`] — one definition, so the list
+/// and the detail card can never tell the maid different stories about the same
+/// room.
+fn derived_room_facts_sql() -> String {
+    format!(
+        r#"
+            EXISTS (
+              SELECT 1 FROM ht_checkins c
+               WHERE c.cin_status = 'active' AND c.cin_checkout_time IS NULL
+                 AND (
+{ACTIVE_FOLIO_HOLDS_ROOM}
+                 )
+            ) AS occupied_pms,
+            EXISTS (
+              SELECT 1 FROM ht_booking_rooms br
+                JOIN ht_bookings b ON b.book_id = br.br_book_id
+               WHERE br.br_room_id = r.room_id
+                 AND b.book_status IN ('confirmed', 'pending')
+                 AND b.book_checkin = {TODAY_BKK_DATE}
+            ) AS expected_arrival,
+            EXISTS (
+              SELECT 1 FROM ht_checkins c
+               WHERE c.cin_status = 'active' AND c.cin_checkout_time IS NULL
+                 AND c.cin_expected_checkout <= {TODAY_BKK_DATE}
+                 AND (
+{ACTIVE_FOLIO_HOLDS_ROOM}
+                 )
+            ) AS expected_departure"#
+    )
+}
+
+/// `GET /api/hk/rooms` — the active-room list with today's latest cleaning
+/// progress and the three derived facts.
+///
+/// A function rather than a `const` because [`derived_room_facts_sql`] is
+/// interpolated; extracted from [`fetch_rooms`] so the SQL can be pinned by a
+/// unit test without a database.
+pub(crate) fn rooms_list_sql() -> String {
+    format!(
         r#"
         SELECT
             r.room_id,
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,
+            COALESCE(r.room_clean, true) AS room_clean,{facts},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1164,24 +1385,22 @@ async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
         ) ev ON TRUE
         WHERE COALESCE(r.room_active, true) = true
         ORDER BY r.room_no
-        "#
-    );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
-        .fetch_all(pool)
-        .await?;
-    Ok(rows.iter().map(room_from_row).collect())
+        "#,
+        facts = derived_room_facts_sql()
+    )
 }
 
-/// Fetch one active room (today's progress + open-report count included).
-async fn fetch_room(pool: &PgPool, room_id: i32) -> Result<Option<HkRoom>, sqlx::Error> {
-    let sql = format!(
+/// `GET /api/hk/rooms/{id}` — the same row shape as [`rooms_list_sql`] for one
+/// room. `$1` is `room_id`.
+pub(crate) fn room_detail_sql() -> String {
+    format!(
         r#"
         SELECT
             r.room_id,
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,
+            COALESCE(r.room_clean, true) AS room_clean,{facts},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1195,8 +1414,23 @@ async fn fetch_room(pool: &PgPool, room_id: i32) -> Result<Option<HkRoom>, sqlx:
             LIMIT 1
         ) ev ON TRUE
         WHERE r.room_id = $1 AND COALESCE(r.room_active, true) = true
-        "#
-    );
+        "#,
+        facts = derived_room_facts_sql()
+    )
+}
+
+/// Fetch the active-room list with today's latest cleaning progress.
+async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
+    let sql = rooms_list_sql();
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(room_from_row).collect())
+}
+
+/// Fetch one active room (today's progress + open-report count included).
+async fn fetch_room(pool: &PgPool, room_id: i32) -> Result<Option<HkRoom>, sqlx::Error> {
+    let sql = room_detail_sql();
     let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(room_id)
         .fetch_optional(pool)
@@ -1222,6 +1456,17 @@ fn room_from_row(row: &sqlx::postgres::PgRow) -> HkRoom {
         floor: row.try_get::<i32, _>("room_floor").ok(),
         building: row.try_get::<String, _>("room_building").ok(),
         room_clean: row.try_get::<bool, _>("room_clean").unwrap_or(true),
+        // `false` on a read failure for all three: the derived columns are
+        // plain `EXISTS`, so a miss means the column is not there — and the
+        // safe display for a fact we could not compute is "no tag", not an
+        // invented one.
+        occupancy: Occupancy::from_occupied(
+            row.try_get::<bool, _>("occupied_pms").unwrap_or(false),
+        ),
+        expected_arrival: row.try_get::<bool, _>("expected_arrival").unwrap_or(false),
+        expected_departure: row
+            .try_get::<bool, _>("expected_departure")
+            .unwrap_or(false),
         cleaning,
     }
 }
@@ -1409,8 +1654,8 @@ pub async fn list_rooms(
     let mut data = fetch_rooms(pool).await?;
     // CR-1: iHOTEL wins. A legacy failure NEVER fails the request — it
     // degrades to the canonical mirror plus the client-rendered Thai note.
-    let outcome = resolve_legacy_room_clean(&policy, branch).await;
-    let legacy_status_stale = merge_legacy_room_clean(&mut data, &outcome, branch);
+    let outcome = resolve_legacy_room_flags(&policy, branch).await;
+    let legacy_status_stale = merge_legacy_room_flags(&mut data, &outcome, branch);
     Ok(Json(RoomsResponse {
         success: true,
         data,
@@ -1436,8 +1681,8 @@ pub async fn room_detail(
     // CR-1: the SAME merge as the list, so a maid who taps into a room never
     // sees a different answer than the tile she tapped.
     let mut rooms = [room];
-    let outcome = resolve_legacy_room_clean(&policy, branch).await;
-    let legacy_status_stale = merge_legacy_room_clean(&mut rooms, &outcome, branch);
+    let outcome = resolve_legacy_room_flags(&policy, branch).await;
+    let legacy_status_stale = merge_legacy_room_flags(&mut rooms, &outcome, branch);
     let [room] = rooms;
     Ok(Json(RoomDetailResponse {
         success: true,
@@ -1496,7 +1741,7 @@ pub async fn report_cleaning(
     // is NEVER failed or gated on legacy availability.
     let target_clean = target_clean_for(status);
     let legacy_room_clean = if needs_legacy_opinion(target_clean, room.room_clean) {
-        let outcome = resolve_legacy_room_clean(&policy, branch).await;
+        let outcome = resolve_legacy_room_flags(&policy, branch).await;
         legacy_hint_for_room(&outcome, &room.room_no)
     } else {
         LegacyCleanliness::Unknown
@@ -1589,6 +1834,7 @@ pub async fn broken_item_photo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_room_status::LegacyRoomFlags;
 
     // ---- pure validation ----------------------------------------------
 
@@ -2149,7 +2395,8 @@ mod tests {
     // ---- CR-1: iHOTEL-wins room status ---------------------------------
 
     /// A room as PG would hand it to us — `clean` is the CANONICAL value the
-    /// merge is allowed to overwrite.
+    /// merge is allowed to overwrite. Occupancy defaults to the canonical
+    /// DERIVED `Vacant`; use [`pg_room_occupied`] for the other pole.
     fn pg_room(room_no: &str, clean: bool) -> HkRoom {
         HkRoom {
             room_id: 1,
@@ -2157,17 +2404,58 @@ mod tests {
             floor: Some(1),
             building: None,
             room_clean: clean,
+            occupancy: Occupancy::Vacant,
+            expected_arrival: false,
+            expected_departure: false,
             cleaning: None,
         }
     }
 
-    /// iHOTEL's answer, in CANONICAL polarity (the inversion already applied
-    /// by `legacy_room_status::legacy_clean_to_is_clean`).
-    fn ihotel(entries: &[(&str, bool)]) -> RoomCleanOutcome {
-        RoomCleanOutcome::Available(
+    /// A room PG derived as OCCUPIED, so an iHOTEL `Room_Use='no'` has
+    /// something to overrule.
+    fn pg_room_occupied(room_no: &str, clean: bool) -> HkRoom {
+        HkRoom {
+            occupancy: Occupancy::Occupied,
+            ..pg_room(room_no, clean)
+        }
+    }
+
+    /// iHOTEL's answer for the CLEANLINESS fact only, in CANONICAL polarity
+    /// (the inversion already applied by
+    /// `legacy_room_status::legacy_clean_to_is_clean`). `occupied` is UNKNOWN,
+    /// which is what keeps the pre-existing merge tests honest about the
+    /// cleanliness rules alone.
+    fn ihotel(entries: &[(&str, bool)]) -> RoomFlagsOutcome {
+        RoomFlagsOutcome::Available(
             entries
                 .iter()
-                .map(|(no, clean)| ((*no).to_string(), *clean))
+                .map(|(no, clean)| {
+                    (
+                        (*no).to_string(),
+                        LegacyRoomFlags {
+                            is_clean: Some(*clean),
+                            occupied: None,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// iHOTEL's answer for BOTH facts.
+    fn ihotel_flags(entries: &[(&str, Option<bool>, Option<bool>)]) -> RoomFlagsOutcome {
+        RoomFlagsOutcome::Available(
+            entries
+                .iter()
+                .map(|(no, is_clean, occupied)| {
+                    (
+                        (*no).to_string(),
+                        LegacyRoomFlags {
+                            is_clean: *is_clean,
+                            occupied: *occupied,
+                        },
+                    )
+                })
                 .collect(),
         )
     }
@@ -2184,7 +2472,7 @@ mod tests {
             // cleaned it in iHOTEL).
             pg_room("203", false),
         ];
-        let stale = merge_legacy_room_clean(
+        let stale = merge_legacy_room_flags(
             &mut rooms,
             &ihotel(&[("104", false), ("203", true)]),
             Branch::Hfhotel,
@@ -2200,7 +2488,7 @@ mod tests {
     #[test]
     fn agreement_leaves_every_room_untouched() {
         let mut rooms = vec![pg_room("104", true), pg_room("203", false)];
-        let stale = merge_legacy_room_clean(
+        let stale = merge_legacy_room_flags(
             &mut rooms,
             &ihotel(&[("104", true), ("203", false)]),
             Branch::Hfhotel,
@@ -2218,7 +2506,7 @@ mod tests {
     fn unavailable_legacy_falls_back_to_pms_and_flags_stale() {
         let mut rooms = vec![pg_room("104", true), pg_room("203", false)];
         let stale =
-            merge_legacy_room_clean(&mut rooms, &RoomCleanOutcome::Unavailable, Branch::Hfhotel);
+            merge_legacy_room_flags(&mut rooms, &RoomFlagsOutcome::Unavailable, Branch::Hfhotel);
         assert!(stale, "the client MUST be told it is showing the mirror");
         assert!(rooms[0].room_clean, "canonical value is preserved verbatim");
         assert!(!rooms[1].room_clean, "canonical value is preserved verbatim");
@@ -2230,10 +2518,10 @@ mod tests {
     #[tokio::test]
     async fn a_branch_without_a_reader_reports_unavailable() {
         let p = policy(vec![Branch::Hfhotel, Branch::Hfville]);
-        assert!(p.legacy_room_clean_branches().is_empty());
+        assert!(p.legacy_room_flags_branches().is_empty());
         assert_eq!(
-            resolve_legacy_room_clean(&p, Branch::Hfville).await,
-            RoomCleanOutcome::Unavailable
+            resolve_legacy_room_flags(&p, Branch::Hfville).await,
+            RoomFlagsOutcome::Unavailable
         );
     }
 
@@ -2243,27 +2531,27 @@ mod tests {
     #[tokio::test]
     async fn readers_are_resolved_per_branch() {
         #[derive(Debug)]
-        struct Fixed(RoomCleanOutcome);
+        struct Fixed(RoomFlagsOutcome);
         #[async_trait::async_trait]
-        impl RoomCleanSource for Fixed {
-            async fn room_clean(&self) -> RoomCleanOutcome {
+        impl RoomFlagsSource for Fixed {
+            async fn room_flags(&self) -> RoomFlagsOutcome {
                 self.0.clone()
             }
         }
 
-        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]).with_legacy_room_clean(
+        let p = policy(vec![Branch::Hfhotel, Branch::Hfville]).with_legacy_room_flags(
             Branch::Hfhotel,
             Arc::new(Fixed(ihotel(&[("104", false)]))),
         );
-        assert_eq!(p.legacy_room_clean_branches(), vec!["hfhotel"]);
+        assert_eq!(p.legacy_room_flags_branches(), vec!["hfhotel"]);
         assert_eq!(
-            resolve_legacy_room_clean(&p, Branch::Hfhotel).await,
+            resolve_legacy_room_flags(&p, Branch::Hfhotel).await,
             ihotel(&[("104", false)])
         );
         // Ville has no reader — fallback, NOT HF Hotel's answer.
         assert_eq!(
-            resolve_legacy_room_clean(&p, Branch::Hfville).await,
-            RoomCleanOutcome::Unavailable
+            resolve_legacy_room_flags(&p, Branch::Hfville).await,
+            RoomFlagsOutcome::Unavailable
         );
     }
 
@@ -2275,7 +2563,7 @@ mod tests {
     fn a_room_missing_from_ihotel_keeps_its_canonical_value_without_flagging() {
         let mut rooms = vec![pg_room("104", true), pg_room("999", false)];
         let stale =
-            merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+            merge_legacy_room_flags(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
         assert!(!stale, "one unmatched room is not a staleness event");
         assert!(!rooms[0].room_clean, "104 follows iHOTEL");
         assert!(!rooms[1].room_clean, "999 keeps its canonical value");
@@ -2286,7 +2574,7 @@ mod tests {
     #[test]
     fn room_numbers_are_matched_trimmed() {
         let mut rooms = vec![pg_room(" 104 ", true)];
-        merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+        merge_legacy_room_flags(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
         assert!(!rooms[0].room_clean);
     }
 
@@ -2297,7 +2585,7 @@ mod tests {
     #[test]
     fn an_empty_ihotel_answer_is_not_stale() {
         let mut rooms = vec![pg_room("104", true)];
-        let stale = merge_legacy_room_clean(&mut rooms, &ihotel(&[]), Branch::Hfhotel);
+        let stale = merge_legacy_room_flags(&mut rooms, &ihotel(&[]), Branch::Hfhotel);
         assert!(!stale);
         assert!(rooms[0].room_clean);
     }
@@ -2310,7 +2598,7 @@ mod tests {
     fn divergence_is_never_serialized_to_the_maid() {
         let mut rooms = vec![pg_room("104", true)];
         let stale =
-            merge_legacy_room_clean(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
+            merge_legacy_room_flags(&mut rooms, &ihotel(&[("104", false)]), Branch::Hfhotel);
         let body = serde_json::to_string(&RoomsResponse {
             success: true,
             data: rooms,
@@ -2325,6 +2613,251 @@ mod tests {
                 "response must not surface divergence ({leaked}): {body}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Occupancy — the SECOND fact, merged per-fact under the same rules
+    // ------------------------------------------------------------------
+
+    /// The wire spelling. A maid's card renders these strings; changing them
+    /// is a frontend break, so pin them here rather than in a snapshot.
+    #[test]
+    fn occupancy_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Occupancy::Occupied).expect("serializes"),
+            "\"occupied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Occupancy::Vacant).expect("serializes"),
+            "\"vacant\""
+        );
+    }
+
+    /// Rule 1 for occupancy, both directions — iHOTEL's `Room_Use` replaces
+    /// the canonical DERIVED value whichever way they disagree.
+    ///
+    /// The `Room_Use='no'` over a PG-derived OCCUPIED room is the live case:
+    /// Ville room 106 on 2026-08-19 (PG derived occupied from an active folio,
+    /// iHOTEL said vacant). The maid must see iHOTEL.
+    #[test]
+    fn ihotel_occupancy_wins_over_the_derived_value_in_both_directions() {
+        let mut rooms = vec![pg_room_occupied("106", true), pg_room("203", true)];
+        let stale = merge_legacy_room_flags(
+            &mut rooms,
+            &ihotel_flags(&[
+                ("106", None, Some(false)),
+                ("203", None, Some(true)),
+            ]),
+            Branch::Hfhotel,
+        );
+        assert!(!stale, "iHOTEL answered — nothing is stale");
+        assert_eq!(rooms[0].occupancy, Occupancy::Vacant, "106 follows iHOTEL");
+        assert_eq!(rooms[1].occupancy, Occupancy::Occupied, "203 follows iHOTEL");
+    }
+
+    /// PER-FACT, the whole point of [`LegacyRoomFlags`]: a room whose
+    /// `Room_Clean` parsed but whose `Room_Use` did not takes iHOTEL's
+    /// cleanliness and KEEPS its canonical occupancy — silently, and without
+    /// flagging the list stale.
+    #[test]
+    fn an_unknown_fact_keeps_its_canonical_value_while_the_other_still_wins() {
+        let mut rooms = vec![pg_room_occupied("104", true)];
+        let stale = merge_legacy_room_flags(
+            &mut rooms,
+            &ihotel_flags(&[("104", Some(false), None)]),
+            Branch::Hfhotel,
+        );
+        assert!(!stale, "one unknown FACT is not a staleness event");
+        assert!(!rooms[0].room_clean, "cleanliness follows iHOTEL");
+        assert_eq!(
+            rooms[0].occupancy,
+            Occupancy::Occupied,
+            "occupancy keeps the canonical derived value"
+        );
+    }
+
+    /// The mirror image — `Room_Use` parsed, `Room_Clean` did not.
+    #[test]
+    fn an_occupancy_only_answer_leaves_cleanliness_canonical() {
+        let mut rooms = vec![pg_room("104", true)];
+        let stale = merge_legacy_room_flags(
+            &mut rooms,
+            &ihotel_flags(&[("104", None, Some(true))]),
+            Branch::Hfhotel,
+        );
+        assert!(!stale);
+        assert!(rooms[0].room_clean, "cleanliness keeps its canonical value");
+        assert_eq!(rooms[0].occupancy, Occupancy::Occupied);
+    }
+
+    /// Rule 2 covers BOTH facts with the ONE flag: an unreachable iHOTEL
+    /// leaves cleanliness AND occupancy exactly as PG derived them.
+    #[test]
+    fn unavailable_legacy_leaves_both_facts_canonical_and_flags_stale() {
+        let mut rooms = vec![pg_room_occupied("104", true), pg_room("203", false)];
+        let stale =
+            merge_legacy_room_flags(&mut rooms, &RoomFlagsOutcome::Unavailable, Branch::Hfhotel);
+        assert!(stale, "the client MUST be told it is showing the fallback");
+        assert_eq!(rooms[0].occupancy, Occupancy::Occupied);
+        assert!(rooms[0].room_clean);
+        assert_eq!(rooms[1].occupancy, Occupancy::Vacant);
+        assert!(!rooms[1].room_clean);
+    }
+
+    /// The write guard reads the CLEANLINESS fact only. A room with a junk
+    /// `Room_Clean` under a perfectly readable `Room_Use` must be Unknown to
+    /// the D1 decision — occupancy has no say in whether a tap enqueues.
+    #[test]
+    fn the_write_hint_ignores_the_occupancy_fact() {
+        let outcome = ihotel_flags(&[("104", None, Some(true))]);
+        assert_eq!(
+            legacy_hint_for_room(&outcome, "104"),
+            LegacyCleanliness::Unknown
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Arrival / departure tags — canonical-only, untouched by the merge
+    // ------------------------------------------------------------------
+
+    /// The two planning tags are canonical derivations with no legacy
+    /// counterpart. Whatever the merge does to cleanliness and occupancy, it
+    /// must leave these EXACTLY as fetched — including on the `Unavailable`
+    /// path, which is what keeps them truthful during a legacy outage.
+    #[test]
+    fn the_merge_never_touches_the_arrival_and_departure_tags() {
+        for outcome in [
+            ihotel_flags(&[("104", Some(false), Some(false))]),
+            RoomFlagsOutcome::Unavailable,
+        ] {
+            let mut rooms = vec![HkRoom {
+                expected_arrival: true,
+                expected_departure: true,
+                ..pg_room_occupied("104", true)
+            }];
+            merge_legacy_room_flags(&mut rooms, &outcome, Branch::Hfhotel);
+            assert!(
+                rooms[0].expected_arrival,
+                "arrival is canonical-only and must survive the merge: {outcome:?}"
+            );
+            assert!(
+                rooms[0].expected_departure,
+                "departure is canonical-only and must survive the merge: {outcome:?}"
+            );
+        }
+    }
+
+    /// A stale response still carries LIVE tags. Serialized, because this is a
+    /// wire-contract claim: `legacyStatusStale` scopes the two iHOTEL facts,
+    /// never these two.
+    #[test]
+    fn a_stale_response_still_carries_live_arrival_and_departure_tags() {
+        let mut rooms = vec![HkRoom {
+            expected_arrival: true,
+            expected_departure: true,
+            ..pg_room("104", false)
+        }];
+        let stale =
+            merge_legacy_room_flags(&mut rooms, &RoomFlagsOutcome::Unavailable, Branch::Hfhotel);
+        let body = serde_json::to_string(&RoomsResponse {
+            success: true,
+            data: rooms,
+            legacy_status_stale: stale,
+        })
+        .expect("serializes");
+        assert!(body.contains("\"legacyStatusStale\":true"), "{body}");
+        assert!(body.contains("\"expectedArrival\":true"), "{body}");
+        assert!(body.contains("\"expectedDeparture\":true"), "{body}");
+    }
+
+    // ------------------------------------------------------------------
+    // SQL pins — the derived columns, without a database
+    // ------------------------------------------------------------------
+
+    /// Both statements carry all three derived columns, from the ONE shared
+    /// fragment. A list and a detail card that derived a room's facts
+    /// differently would be the same "two screens, two answers" defect CR-1
+    /// exists to close.
+    #[test]
+    fn both_fetch_statements_derive_the_same_three_facts() {
+        let facts = derived_room_facts_sql();
+        for sql in [rooms_list_sql(), room_detail_sql()] {
+            assert!(sql.contains(&facts), "shared fragment missing: {sql}");
+            for column in ["AS occupied_pms", "AS expected_arrival", "AS expected_departure"] {
+                assert!(sql.contains(column), "{column} missing: {sql}");
+            }
+        }
+    }
+
+    /// The bypassed column must never come back. `ht_rooms_new.room_status` is
+    /// not maintained by check-in/check-out (issue #200); reading it would put
+    /// a room's occupancy months behind the guest standing in it.
+    ///
+    /// Checked as `r.room_status` — the folio-line column `cr.cr_room_status`
+    /// is a DIFFERENT column and is read on purpose.
+    #[test]
+    fn the_derived_facts_never_read_the_stored_room_status_column() {
+        for sql in [rooms_list_sql(), room_detail_sql()] {
+            assert!(
+                !sql.contains("r.room_status"),
+                "occupancy must be DERIVED, never read from ht_rooms_new.room_status: {sql}"
+            );
+            assert!(
+                sql.contains("cr.cr_room_status"),
+                "…but the folio LINE status is exactly what resolves the room: {sql}"
+            );
+        }
+    }
+
+    /// Every date predicate is on the Bangkok civil day. `CURRENT_DATE` is the
+    /// SERVER's date and disagrees with Bangkok for seven hours every night —
+    /// long enough to blank every arrival and departure tag on a night shift.
+    #[test]
+    fn the_date_predicates_are_bangkok_never_current_date() {
+        for sql in [rooms_list_sql(), room_detail_sql()] {
+            assert!(
+                !sql.contains("CURRENT_DATE"),
+                "CURRENT_DATE is banned in these predicates: {sql}"
+            );
+            assert!(
+                sql.contains("b.book_checkin = (NOW() AT TIME ZONE 'Asia/Bangkok')::date"),
+                "arrival must key on the Bangkok civil day: {sql}"
+            );
+            assert!(
+                sql.contains(
+                    "c.cin_expected_checkout <= (NOW() AT TIME ZONE 'Asia/Bangkok')::date"
+                ),
+                "departure must key on the Bangkok civil day: {sql}"
+            );
+        }
+    }
+
+    /// The checkout literals both spellings must be tolerated in, plus the
+    /// cancel literal — and the NOT-IN shape itself, which is what biases a
+    /// junk `cr_room_status` under an active folio towards OCCUPIED.
+    #[test]
+    fn the_room_resolution_excludes_both_checkout_spellings() {
+        assert!(ACTIVE_FOLIO_HOLDS_ROOM.contains("NOT IN ('Check-Out', 'Check Out', 'ยกเลิก')"));
+        assert!(
+            !ACTIVE_FOLIO_HOLDS_ROOM.contains("= 'เข้าพัก'"),
+            "an allowlist would silently drop a spelling we add later"
+        );
+        // `cin_room_id` counts ONLY for folios with no `cr` rows at all.
+        assert!(ACTIVE_FOLIO_HOLDS_ROOM
+            .contains("NOT EXISTS (SELECT 1 FROM ht_checkin_rooms cr2 WHERE cr2.cr_cin_id = c.cin_id)"));
+    }
+
+    /// Occupancy and departure resolve "which folio holds this room" through
+    /// the SAME text. Keeping them textually identical is what stops a room
+    /// from being tagged "leaving today" while shown vacant.
+    #[test]
+    fn occupancy_and_departure_share_one_room_resolution() {
+        let facts = derived_room_facts_sql();
+        assert_eq!(
+            facts.matches(ACTIVE_FOLIO_HOLDS_ROOM).count(),
+            2,
+            "occupancy and departure must use the same resolution verbatim: {facts}"
+        );
     }
 
     /// The maid label stamped into `HT_Housewife.h_name` prefers the verified
@@ -2437,7 +2970,7 @@ mod tests {
     #[test]
     fn no_usable_legacy_answer_is_unknown_not_a_guess() {
         assert_eq!(
-            legacy_hint_for_room(&RoomCleanOutcome::Unavailable, "104"),
+            legacy_hint_for_room(&RoomFlagsOutcome::Unavailable, "104"),
             LegacyCleanliness::Unknown
         );
         assert_eq!(

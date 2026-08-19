@@ -50,7 +50,7 @@ use uuid::Uuid;
 use super::mode::{AppState, Branch};
 use crate::domain::user::User;
 use crate::error::ApiResult;
-use crate::legacy_room_status::{RoomCleanOutcome, RoomCleanReaders};
+use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsReaders};
 use crate::outbox::event::EventSource;
 use crate::service::{
     HousekeepingService, MarkCleanCommand, MarkDirtyCommand, MarkMaintenanceCommand,
@@ -347,7 +347,7 @@ pub struct RoomCleanRow {
 ///
 /// Returns `(legacy_status_stale, legacy_clean, housekeeping)`.
 ///
-/// Same three CR-1 rules as `routes::hk::merge_legacy_room_clean` — iHOTEL
+/// Same three CR-1 rules as `routes::hk::merge_legacy_room_flags` — iHOTEL
 /// wins per room it has a usable value for; a room it has no usable value for
 /// keeps its canonical value SILENTLY (a mapping gap is not a staleness
 /// event); an unanswerable read is stale, not an error — with ONE deliberate
@@ -356,12 +356,12 @@ pub struct RoomCleanRow {
 /// PURE apart from the summary log line.
 pub fn build_housekeeping_axes(
     rooms: &[RoomCleanRow],
-    outcome: &RoomCleanOutcome,
+    outcome: &RoomFlagsOutcome,
     branch_id: &str,
 ) -> (bool, Vec<LegacyRoomClean>, Vec<RoomHousekeeping>) {
     let legacy = match outcome {
-        RoomCleanOutcome::Available(map) => Some(map),
-        RoomCleanOutcome::Unavailable => None,
+        RoomFlagsOutcome::Available(map) => Some(map),
+        RoomFlagsOutcome::Unavailable => None,
     };
 
     let mut legacy_clean = Vec::new();
@@ -369,7 +369,12 @@ pub fn build_housekeeping_axes(
     let mut divergences = 0usize;
 
     for room in rooms {
-        let ihotel = legacy.and_then(|m| m.get(room.room_no.trim()).copied());
+        // `.is_clean` ONLY. The CR-1 read also carries `Room_Use` occupancy
+        // now, but reception's board derives occupancy from its own
+        // availability axis (`/api/rooms`) — pulling a second opinion in here
+        // would change this surface's contract, which this change deliberately
+        // does not do.
+        let ihotel = legacy.and_then(|m| m.get(room.room_no.trim()).and_then(|f| f.is_clean));
         if let Some(clean) = ihotel {
             legacy_clean.push(LegacyRoomClean {
                 room_no: room.room_no.clone(),
@@ -452,7 +457,7 @@ pub fn build_housekeeping_axes(
 pub async fn list_cleaning_progress(
     State(state): State<AppState>,
     Query(query): Query<HousekeepingQuery>,
-    readers: Option<Extension<RoomCleanReaders>>,
+    readers: Option<Extension<RoomFlagsReaders>>,
 ) -> ApiResult<Json<CleaningProgressResponse>> {
     // Same per-site chokepoint as the mutating siblings, so this read can never
     // disagree with the writes it renders.
@@ -545,7 +550,7 @@ pub async fn list_cleaning_progress(
         // No Extension layered (direct-call tests, or a router built without
         // it): identical to an unreachable legacy — serve the canonical mirror
         // and say so.
-        None => RoomCleanOutcome::Unavailable,
+        None => RoomFlagsOutcome::Unavailable,
     };
 
     let (legacy_status_stale, legacy_clean, housekeeping) =
@@ -563,6 +568,7 @@ pub async fn list_cleaning_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_room_status::LegacyRoomFlags;
 
     // ---------------------------------------------------------------
     // Housekeeping axis (wave-5 IF-1) — pure, no DB, no legacy server
@@ -576,13 +582,53 @@ mod tests {
         }
     }
 
-    fn ihotel(pairs: &[(&str, bool)]) -> RoomCleanOutcome {
-        RoomCleanOutcome::Available(
+    /// iHOTEL's answer for this surface. `occupied` is left UNKNOWN on
+    /// purpose: reception's board must behave identically whether or not the
+    /// widened read has an occupancy opinion.
+    fn ihotel(pairs: &[(&str, bool)]) -> RoomFlagsOutcome {
+        RoomFlagsOutcome::Available(
             pairs
                 .iter()
-                .map(|(no, clean)| ((*no).to_string(), *clean))
+                .map(|(no, clean)| {
+                    (
+                        (*no).to_string(),
+                        LegacyRoomFlags {
+                            is_clean: Some(*clean),
+                            occupied: None,
+                        },
+                    )
+                })
                 .collect(),
         )
+    }
+
+    /// A room whose `Room_Clean` was junk but whose `Room_Use` read fine must
+    /// be treated here exactly as a room iHOTEL never mentioned: the reception
+    /// board keeps its canonical cleanliness and reports no legacy opinion.
+    /// Pins that the widened read cannot leak occupancy into this surface.
+    #[test]
+    fn an_occupancy_only_answer_is_no_opinion_for_reception() {
+        let rooms = vec![pg_room("104", true, None)];
+        let outcome = RoomFlagsOutcome::Available(
+            [(
+                "104".to_string(),
+                LegacyRoomFlags {
+                    is_clean: None,
+                    occupied: Some(true),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let (stale, legacy_clean, housekeeping) =
+            build_housekeeping_axes(&rooms, &outcome, "hfhotel");
+        assert!(!stale, "iHOTEL answered — nothing is stale");
+        assert!(
+            legacy_clean.is_empty(),
+            "no cleanliness opinion ⇒ nothing on the legacy axis: {legacy_clean:?}"
+        );
+        assert!(!housekeeping[0].divergent);
+        assert_eq!(housekeeping[0].hk_status, "clean", "canonical stands");
     }
 
     /// The three-way derivation, exactly as the locked design's table.
@@ -682,7 +728,7 @@ mod tests {
     fn unavailable_legacy_is_stale_and_proves_no_divergence() {
         let rooms = vec![pg_room("301", false, None), pg_room("302", true, None)];
         let (stale, legacy, hk) =
-            build_housekeeping_axes(&rooms, &RoomCleanOutcome::Unavailable, "hfhotel");
+            build_housekeeping_axes(&rooms, &RoomFlagsOutcome::Unavailable, "hfhotel");
 
         assert!(stale);
         assert!(legacy.is_empty());

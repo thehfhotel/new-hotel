@@ -26,7 +26,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use hotel_backend::legacy_room_status::RoomCleanReaders;
+use hotel_backend::legacy_room_status::RoomFlagsReaders;
 
 use crate::config::{auth_enabled_from_env, AppConfig};
 use crate::db::{create_pg_pool, create_pool, pg_pool_options};
@@ -203,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hk_policy.mark_dirty_enabled,
         hk_policy.location_enforcement_enabled,
         hk_policy.location_lookup_configured(),
-        hk_policy.legacy_room_clean_branches()
+        hk_policy.legacy_room_flags_branches()
     );
     if hk_policy.location_enforcement_enabled && !hk_policy.location_lookup_configured() {
         tracing::error!(
@@ -367,14 +367,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reads (wave-5 IF-1) — one truth, so the two screens cannot disagree about
     // a room. `hk_policy` owns them; clone the map (Arc bumps only, no new
     // legacy connection) before it is moved into the `/hk` router below.
-    let room_clean_readers = RoomCleanReaders::new(hk_policy.legacy_room_clean.clone());
+    let room_flags_readers = RoomFlagsReaders::new(hk_policy.legacy_room_flags.clone());
     tracing::info!(
         "reception housekeeping board: iHOTEL readers for {:?}",
-        room_clean_readers.branches()
+        room_flags_readers.branches()
     );
 
     let new_routes = if let Some(ref app_state) = final_app_state {
-        build_new_routes(app_state.clone(), room_clean_readers)
+        build_new_routes(app_state.clone(), room_flags_readers)
     } else {
         Router::new()
     };
@@ -632,7 +632,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// No reader for a branch means the maid sees the canonical PG mirror plus a
 /// visible Thai note — a supported, tested state
-/// (`routes::hk::merge_legacy_room_clean`). A legacy server that is down at
+/// (`routes::hk::merge_legacy_room_flags`). A legacy server that is down at
 /// boot must never stop the API from serving, so an unconfigured or
 /// unreachable target is a WARN and nothing more.
 async fn attach_hk_legacy_readers(
@@ -640,7 +640,7 @@ async fn attach_hk_legacy_readers(
     legacy_pool: &Option<db::DbPool>,
 ) -> routes::hk::HkPolicy {
     use crate::routes::mode::Branch;
-    use hotel_backend::legacy_room_status::MssqlRoomCleanSource;
+    use hotel_backend::legacy_room_status::MssqlRoomFlagsSource;
     use std::sync::Arc;
 
     let mut policy = policy;
@@ -649,9 +649,9 @@ async fn attach_hk_legacy_readers(
     if policy.branches.contains(&Branch::Hfhotel) {
         match legacy_pool {
             Some(pool) => {
-                policy = policy.with_legacy_room_clean(
+                policy = policy.with_legacy_room_flags(
                     Branch::Hfhotel,
-                    Arc::new(MssqlRoomCleanSource::new(pool.clone(), "hfhotel")),
+                    Arc::new(MssqlRoomFlagsSource::new(pool.clone(), "hfhotel")),
                 );
                 tracing::info!(
                     "/hk iHOTEL room-status reader attached for hfhotel (reusing the \
@@ -678,9 +678,9 @@ async fn attach_hk_legacy_readers(
                 );
                 match create_pool(&cfg).await {
                     Ok(pool) => {
-                        policy = policy.with_legacy_room_clean(
+                        policy = policy.with_legacy_room_flags(
                             Branch::Hfville,
-                            Arc::new(MssqlRoomCleanSource::new(pool, "hfville")),
+                            Arc::new(MssqlRoomFlagsSource::new(pool, "hfville")),
                         );
                         tracing::info!("/hk iHOTEL room-status reader attached for hfville");
                     }
@@ -810,7 +810,7 @@ fn parse_allowed_origins() -> AllowOrigin {
 /// operator opts in. The middleware is applied to THIS subrouter only
 /// — `/api/auth/*` and `/health` are mounted separately in `main()`
 /// and stay public.
-fn build_new_routes(app_state: AppState, room_clean_readers: RoomCleanReaders) -> Router {
+fn build_new_routes(app_state: AppState, room_flags_readers: RoomFlagsReaders) -> Router {
     let auth_layer =
         axum_middleware::from_fn_with_state(app_state.clone(), app_middleware::require_auth);
 
@@ -1404,7 +1404,7 @@ fn build_new_routes(app_state: AppState, room_clean_readers: RoomCleanReaders) -
         // rebuilt, so the maid and reception merge the same answer. Absent =
         // the supported fallback (canonical mirror + stale flag), which is why
         // the handler extracts it as `Option<Extension<_>>`.
-        .layer(Extension(room_clean_readers))
+        .layer(Extension(room_flags_readers))
         // Phase 4 PR2: gate every route above behind the cookie-session
         // auth middleware. The middleware itself is a no-op when
         // `AUTH_ENABLED=false` (the production default), so this is

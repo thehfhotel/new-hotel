@@ -1,5 +1,20 @@
-//! iHOTEL room-cleanliness READ for the maid surface (CR-1, owner decision
+//! iHOTEL room-status READ for the maid surface (CR-1, owner decision
 //! locked 2026-08-15).
+//!
+//! ## Two facts, one read
+//!
+//! One `SELECT` answers BOTH questions the maid's list asks about a room:
+//!
+//! | legacy column | fact                              | polarity          |
+//! |---------------|-----------------------------------|-------------------|
+//! | `Room_Clean`  | [`LegacyRoomFlags::is_clean`]     | INVERTED (see below) |
+//! | `Room_Use`    | [`LegacyRoomFlags::occupied`]     | NOT inverted (`'yes'` = occupied) |
+//!
+//! They are carried per-fact-optional ([`LegacyRoomFlags`]) rather than as one
+//! all-or-nothing answer: a room whose `Room_Clean` is junk but whose
+//! `Room_Use` reads cleanly must still get iHOTEL's OCCUPANCY, and vice versa.
+//! Widening the read costs nothing — same row, same round-trip, same 34-58 row
+//! scan.
 //!
 //! ## Why this exists
 //!
@@ -27,6 +42,15 @@
 //! `NULL`, `''`, `'Yes'`, junk — is `None`: UNKNOWN, never a guess. An unknown
 //! room keeps its PG value rather than being flipped by a literal we do not
 //! recognise.
+//!
+//! `Room_Use` is the OCCUPANCY flag and is **not** inverted: `'yes'` = a guest
+//! is in the room, `'no'` = vacant. Same two-literal alphabet, same
+//! `None`-is-unknown rule ([`legacy_use_to_occupied`] mirrors
+//! [`legacy_clean_to_is_clean`] exactly apart from the inversion). Verified
+//! against BOTH production sites 2026-08-19: `SELECT Room_Use, COUNT(*) FROM
+//! HT_Rooms GROUP BY Room_Use` returns only `'no'` / `'yes'`, untrimmed-clean
+//! and lowercase, at HF Hotel (47/11 of 58) and HF Ville (18/16 of 34). There
+//! is no third literal to widen the match for.
 //!
 //! ## Keyed on `Room_no`, NOT on `legacy_room_id_int`
 //!
@@ -65,7 +89,7 @@
 //! should see.
 //!
 //! `docs/architecture.md`'s "Routes never know about MSSQL" still holds
-//! literally: `routes::hk` depends on the [`RoomCleanSource`] TRAIT, never on
+//! literally: `routes::hk` depends on the [`RoomFlagsSource`] TRAIT, never on
 //! tiberius, and the decommission story is unchanged — drop the reader, the
 //! surface falls back to canonical PG on its own.
 //!
@@ -73,7 +97,7 @@
 //!
 //! [`hfid_location`](crate::hfid_location) fails CLOSED because answering
 //! wrongly there sends a maid to the wrong hotel. This one fails SOFT
-//! ([`RoomCleanOutcome::Unavailable`] ⇒ show the PG mirror plus a visible Thai
+//! ([`RoomFlagsOutcome::Unavailable`] ⇒ show the PG mirror plus a visible Thai
 //! note) because answering nothing here means a maid on a stairwell stares at
 //! an error page instead of her room list. Stale-but-shown beats dead screen —
 //! the owner's call, and the reason the timeout is short.
@@ -100,23 +124,38 @@ pub const ROOM_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Budget handed to the inner query, leaving headroom inside
 /// [`ROOM_STATUS_TIMEOUT`] for the bb8 acquire that precedes it. The OUTER
-/// bound is still authoritative — see [`MssqlRoomCleanSource::room_clean`].
+/// bound is still authoritative — see [`MssqlRoomFlagsSource::room_flags`].
 const QUERY_TIMEOUT: Duration = Duration::from_millis(2_500);
 
 /// The one statement this module issues. READ-ONLY.
-pub const ROOM_STATUS_SQL: &str = "SELECT Room_no, Room_Clean FROM HT_Rooms";
+pub const ROOM_STATUS_SQL: &str = "SELECT Room_no, Room_Clean, Room_Use FROM HT_Rooms";
 
-/// What iHOTEL says about room cleanliness right now.
+/// Per-room iHOTEL flags. Per-fact `None` = unrecognised literal — that FACT
+/// keeps its canonical value; the other fact still wins per CR-1.
+///
+/// Per-fact rather than per-room on purpose: the two columns are independent
+/// literals written by different iHOTEL code paths, and one of them being junk
+/// is no reason to hand the maid a stale answer for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyRoomFlags {
+    /// From `Room_Clean`, INVERTED (`'no'` = clean). Unchanged semantics.
+    pub is_clean: Option<bool>,
+    /// From `Room_Use`, NOT inverted (`'yes'` = occupied).
+    pub occupied: Option<bool>,
+}
+
+/// What iHOTEL says about a room's cleanliness AND occupancy right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RoomCleanOutcome {
-    /// iHOTEL answered. Map is `Room_no` (trimmed) → `is_clean` in CANONICAL
-    /// polarity (already inverted; `true` = IS clean). Rooms whose
-    /// `Room_Clean` literal was NULL / blank / unrecognised are ABSENT from the
-    /// map rather than guessed — an absent room keeps its PG value.
-    Available(HashMap<String, bool>),
+pub enum RoomFlagsOutcome {
+    /// iHOTEL answered. Map is `Room_no` (trimmed) → [`LegacyRoomFlags`], with
+    /// `is_clean` already in CANONICAL polarity (inverted; `true` = IS clean).
+    /// A room enters the map when AT LEAST ONE fact parsed; a room whose
+    /// `Room_Clean` AND `Room_Use` were both NULL / blank / unrecognised is
+    /// ABSENT rather than guessed — and an absent room keeps its PG values.
+    Available(HashMap<String, LegacyRoomFlags>),
     /// No answer was obtained: no reader configured for this branch, pool
     /// acquire failed, the query errored, or the budget elapsed. The caller
-    /// MUST fall back to the canonical PG value and say so on screen.
+    /// MUST fall back to the canonical PG values and say so on screen.
     Unavailable,
 }
 
@@ -125,11 +164,11 @@ pub enum RoomCleanOutcome {
 ///
 /// `Debug` is required so [`crate::routes::hk::HkPolicy`] keeps its derive.
 #[async_trait]
-pub trait RoomCleanSource: Send + Sync + fmt::Debug {
-    /// Read every room's current legacy cleanliness. Never errors — an
-    /// unreachable legacy is [`RoomCleanOutcome::Unavailable`], which is a
+pub trait RoomFlagsSource: Send + Sync + fmt::Debug {
+    /// Read every room's current legacy cleanliness + occupancy. Never errors
+    /// — an unreachable legacy is [`RoomFlagsOutcome::Unavailable`], which is a
     /// first-class, displayable state rather than an exception.
-    async fn room_clean(&self) -> RoomCleanOutcome;
+    async fn room_flags(&self) -> RoomFlagsOutcome;
 }
 
 /// Legacy `Room_Clean` literal → canonical `is_clean`. PURE — unit-tested.
@@ -143,6 +182,25 @@ pub fn legacy_clean_to_is_clean(raw: Option<&str>) -> Option<bool> {
     match raw.map(str::trim) {
         Some("no") => Some(true),   // no cleaning needed ⇒ IS clean
         Some("yes") => Some(false), // needs cleaning ⇒ dirty
+        _ => None,
+    }
+}
+
+/// Legacy `Room_Use` literal → `occupied`. PURE — unit-tested.
+///
+/// NOT inverted (contrast [`legacy_clean_to_is_clean`]): `'yes'` means a guest
+/// is in the room. Otherwise this mirrors `legacy_clean_to_is_clean` /
+/// `sync::mappers::room::legacy_yesno_to_bool` exactly — trimmed, matched
+/// against the two LOWERCASE literals only, everything else `None` = unknown.
+///
+/// Case-sensitive on purpose, for the same reason as its sibling: the sync
+/// mapper refuses `'Yes'`, and a surface that interpreted a literal the mapper
+/// would refuse would disagree with the mirror about the very row the
+/// divergence log is meant to flag.
+pub fn legacy_use_to_occupied(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim) {
+        Some("yes") => Some(true), // in use ⇒ occupied
+        Some("no") => Some(false), // not in use ⇒ vacant
         _ => None,
     }
 }
@@ -165,10 +223,10 @@ pub fn legacy_clean_to_is_clean(raw: Option<&str>) -> Option<bool> {
 /// Keys are the wire branch ids (`hfhotel` / `hfville`) — the `?branch=`
 /// spelling, so the reader and the PG pool are chosen off the same token.
 #[derive(Clone, Debug, Default)]
-pub struct RoomCleanReaders(BTreeMap<&'static str, Arc<dyn RoomCleanSource>>);
+pub struct RoomFlagsReaders(BTreeMap<&'static str, Arc<dyn RoomFlagsSource>>);
 
-impl RoomCleanReaders {
-    pub fn new(readers: BTreeMap<&'static str, Arc<dyn RoomCleanSource>>) -> Self {
+impl RoomFlagsReaders {
+    pub fn new(readers: BTreeMap<&'static str, Arc<dyn RoomFlagsSource>>) -> Self {
         Self(readers)
     }
 
@@ -177,25 +235,25 @@ impl RoomCleanReaders {
         self.0.keys().copied().collect()
     }
 
-    /// Ask a branch's reader, or report [`RoomCleanOutcome::Unavailable`] when
+    /// Ask a branch's reader, or report [`RoomFlagsOutcome::Unavailable`] when
     /// that branch has none.
     ///
     /// "No reader configured" and "reader failed" collapse to the SAME answer,
     /// deliberately and identically to `routes::hk`'s
-    /// `resolve_legacy_room_clean`: both mean the caller is about to render the
+    /// `resolve_legacy_room_flags`: both mean the caller is about to render the
     /// canonical PG mirror, and the screen must say so either way. Two surfaces
     /// disagreeing about what "stale" means would be worse than either being
     /// wrong.
-    pub async fn read(&self, branch_id: &str) -> RoomCleanOutcome {
+    pub async fn read(&self, branch_id: &str) -> RoomFlagsOutcome {
         match self.0.get(branch_id) {
-            Some(source) => source.room_clean().await,
+            Some(source) => source.room_flags().await,
             None => {
                 tracing::debug!(
                     branch = branch_id,
                     "no iHOTEL room-status reader for this branch — serving the \
                      canonical PG mirror with the stale flag"
                 );
-                RoomCleanOutcome::Unavailable
+                RoomFlagsOutcome::Unavailable
             }
         }
     }
@@ -208,32 +266,32 @@ impl RoomCleanReaders {
 /// shipping branch adds NO new connection plumbing (reuse over new plumbing).
 /// The pool's `PoisonAwareManager` means a timed-out read marks its connection
 /// broken instead of returning a desynced stream to the shared pool.
-pub struct MssqlRoomCleanSource {
+pub struct MssqlRoomFlagsSource {
     pool: DbPool,
     /// `hfhotel` / `hfville` — log field only, so an operator can tell the two
     /// readers apart in one grep.
     site: &'static str,
 }
 
-impl fmt::Debug for MssqlRoomCleanSource {
+impl fmt::Debug for MssqlRoomFlagsSource {
     /// Hand-written: `bb8::Pool`'s own `Debug` is not part of our contract and
     /// nothing about a connection pool belongs in a startup log line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MssqlRoomCleanSource")
+        f.debug_struct("MssqlRoomFlagsSource")
             .field("site", &self.site)
             .finish()
     }
 }
 
-impl MssqlRoomCleanSource {
+impl MssqlRoomFlagsSource {
     pub fn new(pool: DbPool, site: &'static str) -> Self {
         Self { pool, site }
     }
 }
 
 #[async_trait]
-impl RoomCleanSource for MssqlRoomCleanSource {
-    async fn room_clean(&self) -> RoomCleanOutcome {
+impl RoomFlagsSource for MssqlRoomFlagsSource {
+    async fn room_flags(&self) -> RoomFlagsOutcome {
         // ONE outer bound over acquire + query. The pool's own
         // `connection_timeout` is 5s — longer than this whole call is allowed
         // to take — so bounding only the query would let a wedged legacy hold
@@ -248,7 +306,7 @@ impl RoomCleanSource for MssqlRoomCleanSource {
                         "iHOTEL room-status read: pool acquire failed — \
                          falling back to the canonical PG value"
                     );
-                    return RoomCleanOutcome::Unavailable;
+                    return RoomFlagsOutcome::Unavailable;
                 }
             };
             let rows = match simple_query_with_explicit_timeout(
@@ -266,12 +324,13 @@ impl RoomCleanSource for MssqlRoomCleanSource {
                         "iHOTEL room-status read failed — falling back to the \
                          canonical PG value"
                     );
-                    return RoomCleanOutcome::Unavailable;
+                    return RoomFlagsOutcome::Unavailable;
                 }
             };
 
             let mut map = HashMap::with_capacity(rows.len());
-            let mut unknown = 0usize;
+            let mut unknown_clean = 0usize;
+            let mut unknown_use = 0usize;
             for row in &rows {
                 let Some(room_no) = row
                     .get::<&str, _>("Room_no")
@@ -280,25 +339,36 @@ impl RoomCleanSource for MssqlRoomCleanSource {
                 else {
                     continue;
                 };
-                match legacy_clean_to_is_clean(row.get::<&str, _>("Room_Clean")) {
-                    Some(is_clean) => {
-                        map.insert(room_no.to_string(), is_clean);
-                    }
-                    // Unrecognised literal: leave the room OUT of the map so
-                    // the merge keeps its PG value. Counted, not per-row
-                    // logged — a schema drift would otherwise emit 58 lines.
-                    None => unknown += 1,
+                let is_clean = legacy_clean_to_is_clean(row.get::<&str, _>("Room_Clean"));
+                let occupied = legacy_use_to_occupied(row.get::<&str, _>("Room_Use"));
+                if is_clean.is_none() {
+                    unknown_clean += 1;
+                }
+                if occupied.is_none() {
+                    unknown_use += 1;
+                }
+                // A room enters the map when AT LEAST ONE fact parsed — a junk
+                // `Room_Clean` must not cost the maid iHOTEL's occupancy, nor
+                // the reverse. Both unrecognised ⇒ absent, so the merge keeps
+                // BOTH canonical values.
+                if is_clean.is_some() || occupied.is_some() {
+                    map.insert(room_no.to_string(), LegacyRoomFlags { is_clean, occupied });
                 }
             }
-            if unknown > 0 {
+            if unknown_clean > 0 || unknown_use > 0 {
+                // ONE line, two counters. Counted rather than per-row logged —
+                // a schema drift would otherwise emit 58 lines per room-list
+                // load, and the two facts drift independently.
                 tracing::warn!(
                     site = self.site,
-                    unknown,
+                    unknown_clean,
+                    unknown_use,
                     "iHOTEL room-status read: rooms with an unrecognised \
-                     Room_Clean literal kept their canonical PG value"
+                     Room_Clean / Room_Use literal kept their canonical PG value \
+                     for that fact"
                 );
             }
-            RoomCleanOutcome::Available(map)
+            RoomFlagsOutcome::Available(map)
         };
 
         match tokio::time::timeout(ROOM_STATUS_TIMEOUT, work).await {
@@ -310,7 +380,7 @@ impl RoomCleanSource for MssqlRoomCleanSource {
                     "iHOTEL room-status read exceeded its budget — falling back \
                      to the canonical PG value"
                 );
-                RoomCleanOutcome::Unavailable
+                RoomFlagsOutcome::Unavailable
             }
         }
     }
@@ -347,6 +417,65 @@ mod tests {
                 "{raw:?} must be UNKNOWN — an unknown room keeps its PG value"
             );
         }
+    }
+
+    /// `Room_Use` is NOT inverted, both poles. The mirror image of
+    /// `legacy_no_is_clean_and_yes_is_dirty`, and pinned separately BECAUSE
+    /// the two columns disagree about what `'yes'` means: `Room_Clean='yes'`
+    /// is dirty, `Room_Use='yes'` is occupied. Copy-pasting the inversion into
+    /// this one shows every occupied room as vacant — a maid walking in on a
+    /// guest.
+    #[test]
+    fn legacy_use_yes_is_occupied_and_no_is_vacant() {
+        assert_eq!(legacy_use_to_occupied(Some("yes")), Some(true));
+        assert_eq!(legacy_use_to_occupied(Some("no")), Some(false));
+    }
+
+    /// Trimmed, exactly like its sibling.
+    #[test]
+    fn use_literals_are_trimmed() {
+        assert_eq!(legacy_use_to_occupied(Some("  yes  ")), Some(true));
+        assert_eq!(legacy_use_to_occupied(Some("no ")), Some(false));
+    }
+
+    /// Same unknown set as `legacy_clean_to_is_clean`, matched literal for
+    /// literal. `'Yes'` / `'YES'` are UNKNOWN, not occupied: this function is
+    /// specified as a mirror of `legacy_yesno_to_bool`, which is case-SENSITIVE
+    /// — and a surface that read a literal the sync mapper refuses would
+    /// disagree with the mirror about the very row it is meant to reconcile.
+    ///
+    /// Production says there is nothing to widen for: `Room_Use` holds only
+    /// `'no'` / `'yes'` at both sites (verified 2026-08-19).
+    #[test]
+    fn unrecognised_use_literals_are_unknown_not_guessed() {
+        for raw in [None, Some(""), Some("Yes"), Some("YES"), Some("y"), Some("1")] {
+            assert_eq!(
+                legacy_use_to_occupied(raw),
+                None,
+                "{raw:?} must be UNKNOWN — occupancy then keeps its canonical value"
+            );
+        }
+    }
+
+    /// The two mappings share an alphabet but NOT a polarity. Pinned as one
+    /// assertion so a refactor that "unifies" them fails here rather than in
+    /// production.
+    #[test]
+    fn the_two_facts_read_the_same_literal_oppositely() {
+        assert_eq!(legacy_clean_to_is_clean(Some("yes")), Some(false));
+        assert_eq!(legacy_use_to_occupied(Some("yes")), Some(true));
+    }
+
+    /// The exact statement, byte for byte. The widening from one column to two
+    /// is the change this module shipped; pinning the literal means a future
+    /// edit that drops `Room_Use` (silently reverting every maid's occupancy to
+    /// the canonical fallback) fails a test instead of shipping quiet.
+    #[test]
+    fn the_statement_reads_both_facts() {
+        assert_eq!(
+            ROOM_STATUS_SQL,
+            "SELECT Room_no, Room_Clean, Room_Use FROM HT_Rooms"
+        );
     }
 
     /// The SQL is a bare SELECT. Pinned so a future edit cannot quietly turn

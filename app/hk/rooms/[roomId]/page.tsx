@@ -33,6 +33,8 @@ import {
   hkFetchMe,
   legacyStatusNote,
   markDirtyConfirmMessage,
+  movementTags,
+  occupancyIndicator,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -191,6 +193,8 @@ export default function HkRoomPage() {
 
   const room = detail?.room
   const badge = progressLabel(room?.cleaning?.status)
+  const occupancy = occupancyIndicator(room?.occupancy)
+  const tags = room ? movementTags(room) : []
 
   return (
     <main>
@@ -230,7 +234,21 @@ export default function HkRoomPage() {
         <>
           <header className="mb-4 rounded-xl border border-gray-200 bg-white p-4">
             <div className="flex items-center justify-between gap-2">
-              <h1 className="text-2xl font-bold">ห้อง {room.roomNo}</h1>
+              <span className="flex items-center gap-2">
+                <h1 className="text-2xl font-bold">ห้อง {room.roomNo}</h1>
+                {/* Answers "can I enter" — guest occupancy, distinct from the
+                    clean/dirty chips ("what work") on the right. */}
+                {occupancy && (
+                  <span
+                    className={`flex items-center gap-1 text-xs font-medium ${occupancy.className}`}
+                  >
+                    {room.occupancy === 'occupied' && (
+                      <span className="inline-block h-2 w-2 rounded-full bg-sky-500" />
+                    )}
+                    {occupancy.label}
+                  </span>
+                )}
+              </span>
               {/* Primary: explicit clean/dirty (merged iHOTEL-wins roomClean),
                   same words reception reads at /v2/housekeeping. Secondary:
                   today's maid-reported progress — both stay visible. */}
@@ -247,6 +265,22 @@ export default function HkRoomPage() {
                 </span>
               </span>
             </div>
+            {/* Day-scoped movement (arrivals/departures today) — a different
+                axis from occupancy (right now) and the chips (what work).
+                Departure first. Nothing rendered, no placeholder, when there
+                is nothing to say today. */}
+            {tags.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {tags.map((tag) => (
+                  <span
+                    key={tag.key}
+                    className={`inline-block rounded-full border px-1.5 py-0.5 text-[11px] ${tag.className}`}
+                  >
+                    {tag.label}
+                  </span>
+                ))}
+              </div>
+            )}
             <p className="mt-1 text-sm text-gray-500">
               {room.floor !== null ? `ชั้น ${room.floor}` : ''}
               {room.building ? ` · ${room.building}` : ''}

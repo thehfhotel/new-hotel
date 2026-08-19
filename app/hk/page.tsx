@@ -27,6 +27,8 @@ import {
   hkFetch,
   hkFetchMe,
   legacyStatusNote,
+  movementTags,
+  occupancyIndicator,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -257,23 +259,48 @@ export default function HkRoomListPage() {
                   {floorRooms.map((room) => {
                     const badge = progressLabel(room.cleaning?.status)
                     const cleanChip = roomCleanChip(room.roomClean)
+                    const occupancy = occupancyIndicator(room.occupancy)
+                    const tags = movementTags(room)
                     return (
                       <li key={room.roomId}>
                         <Link
                           href={`/hk/rooms/${room.roomId}`}
                           className="block rounded-xl border border-gray-200 bg-white p-3 active:bg-gray-50"
                         >
+                          {/* Room number answers "where"; this top-right slot
+                              answers "can I enter" (guest occupancy) — a
+                              different question from the chips below, which
+                              answer "what work". */}
                           <div className="flex items-center justify-between">
                             <span className="text-lg font-bold">{room.roomNo}</span>
-                            <span className="flex items-center gap-1">
-                              {!room.roomClean && (
-                                <span
-                                  title="ห้องยังไม่สะอาด"
-                                  className="inline-block h-2.5 w-2.5 rounded-full bg-red-500"
-                                />
-                              )}
-                            </span>
+                            {occupancy && (
+                              <span
+                                className={`flex items-center gap-1 text-xs font-medium ${occupancy.className}`}
+                              >
+                                {room.occupancy === 'occupied' && (
+                                  <span className="inline-block h-2 w-2 rounded-full bg-sky-500" />
+                                )}
+                                {occupancy.label}
+                              </span>
+                            )}
                           </div>
+                          {/* Day-scoped movement (arrivals/departures today) —
+                              a different axis from occupancy (right now) and
+                              the chips (what work). Departure first. Renders
+                              nothing at all, no placeholder, when there is
+                              nothing to say today. */}
+                          {tags.length > 0 && (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {tags.map((tag) => (
+                                <span
+                                  key={tag.key}
+                                  className={`inline-block rounded-full border px-1.5 py-0.5 text-[11px] ${tag.className}`}
+                                >
+                                  {tag.label}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                           {/* Primary: explicit clean/dirty (merged iHOTEL-wins
                               roomClean). Secondary: today's maid-reported
                               progress — dirty + ยังไม่เริ่ม is the ordinary

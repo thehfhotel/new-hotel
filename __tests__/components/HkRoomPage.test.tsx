@@ -50,6 +50,7 @@ const ROOM = {
   building: null,
   roomClean: false,
   cleaning: null,
+  occupancy: 'occupied',
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -213,6 +214,92 @@ describe('clean/dirty chip on the detail header (owner feedback, wave-5)', () =>
   it('uses the exact same words as reception (lib/v2/status.ts HK labels)', async () => {
     await renderRoom({})
     expect(screen.getByText(HK_STATUS_LABELS.dirty).textContent).toBe(HK_STATUS_LABELS.dirty)
+  })
+})
+
+describe('guest occupancy indicator (header, next to the roomNo heading)', () => {
+  // ROOM fixture is occupancy: 'occupied'.
+  it('shows มีแขกพัก for an occupied room', async () => {
+    await renderRoom({})
+    expect(screen.getByText('มีแขกพัก')).toBeInTheDocument()
+  })
+
+  it('shows ว่าง for a vacant room', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({ success: true, room: { ...ROOM, occupancy: 'vacant' }, events: [] })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.getByText('ว่าง')).toBeInTheDocument()
+    expect(screen.queryByText('มีแขกพัก')).not.toBeInTheDocument()
+  })
+
+  // Deploy skew: an older backend has not shipped `occupancy` yet.
+  it('shows nothing when the backend omits occupancy entirely', async () => {
+    const { occupancy: _occupancy, ...roomWithoutOccupancy } = ROOM
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({ success: true, room: roomWithoutOccupancy, events: [] })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.queryByText('มีแขกพัก')).not.toBeInTheDocument()
+    expect(screen.queryByText('ว่าง')).not.toBeInTheDocument()
+  })
+})
+
+describe('movement tags (phase 2 delta: arrivals/departures today)', () => {
+  it('renders both tags, departure first, for a back-to-back room', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({
+        success: true,
+        room: { ...ROOM, expectedArrival: true, expectedDeparture: true },
+        events: [],
+      })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+
+    const departure = screen.getByText('แขกออกวันนี้')
+    const arrival = screen.getByText('แขกเข้าวันนี้')
+    expect(departure).toBeInTheDocument()
+    expect(arrival).toBeInTheDocument()
+    expect(
+      departure.compareDocumentPosition(arrival) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
+  it('renders only the departure tag for a departure-only room', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({ success: true, room: { ...ROOM, expectedDeparture: true }, events: [] })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.getByText('แขกออกวันนี้')).toBeInTheDocument()
+    expect(screen.queryByText('แขกเข้าวันนี้')).not.toBeInTheDocument()
+  })
+
+  it('renders only the arrival tag for an arrival-only room', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(
+      jsonResponse({ success: true, room: { ...ROOM, expectedArrival: true }, events: [] })
+    )
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.getByText('แขกเข้าวันนี้')).toBeInTheDocument()
+    expect(screen.queryByText('แขกออกวันนี้')).not.toBeInTheDocument()
+  })
+
+  // ROOM fixture carries no expectedArrival/expectedDeparture — skew case.
+  it('renders no tag row when the fields are absent, chip row still exactly two chips', async () => {
+    await renderRoom({})
+    expect(screen.queryByText('แขกออกวันนี้')).not.toBeInTheDocument()
+    expect(screen.queryByText('แขกเข้าวันนี้')).not.toBeInTheDocument()
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+    expect(screen.getByText('ยังไม่เริ่ม')).toBeInTheDocument()
   })
 })
 

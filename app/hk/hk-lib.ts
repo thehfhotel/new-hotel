@@ -20,6 +20,11 @@ export type Branch = 'hfhotel' | 'hfville'
 
 export type CleaningStatus = 'started' | 'done' | 'dirty'
 
+/** Whether a guest currently occupies the room, independent of cleanliness —
+ * "ว่าง + ไม่สะอาด" (guest just left) is a normal, expected combination, not a
+ * contradiction to resolve. */
+export type Occupancy = 'occupied' | 'vacant'
+
 /** One selectable property on the branch picker, served by `GET /api/hk/me`
  * so `HK_BRANCHES` has ONE source of truth (no `NEXT_PUBLIC_*` coupling). */
 export interface HkBranchOption {
@@ -85,6 +90,24 @@ export interface HkRoom {
    */
   roomClean: boolean
   cleaning: HkCleaningProgress | null
+  /**
+   * Guest occupancy, independent of cleanliness. Always sent by a new backend;
+   * optional here (TS only, not on the wire) so an older bundle talking to a
+   * newer backend — or a newer bundle mid-deploy against an older backend —
+   * degrades to `undefined`, which `occupancyIndicator` renders as nothing
+   * rather than a guess.
+   */
+  occupancy?: Occupancy
+  /**
+   * Canonical-side day-scoped movement facts — NOT part of the iHOTEL merge
+   * (CR-1) and NOT covered by `legacyStatusStale`: these describe today's
+   * bookings, not room cleanliness/occupancy. `expectedArrival` is a booking
+   * starting today not yet checked in; `expectedDeparture` is a guest due out
+   * today, overstays included. A room can be BOTH (back-to-back). Optional
+   * here for the same bundle/backend-skew reason as `occupancy`.
+   */
+  expectedArrival?: boolean
+  expectedDeparture?: boolean
 }
 
 /** `GET /hk/api/rooms`. */
@@ -329,6 +352,50 @@ export function roomCleanChip(roomClean: boolean): { label: string; className: s
 }
 
 /**
+ * Header-slot occupancy indicator (มีแขกพัก / ว่าง) — answers "can I enter this
+ * room", which is a DIFFERENT question from the clean/dirty chips ("what work
+ * is left"). `undefined` (an older backend during deploy skew, before this
+ * field existed) renders as `null` — nothing shown, never a guessed value.
+ */
+export function occupancyIndicator(
+  occupancy: Occupancy | null | undefined
+): { label: string; className: string } | null {
+  if (occupancy === 'occupied') return { label: 'มีแขกพัก', className: 'text-sky-700' }
+  if (occupancy === 'vacant') return { label: 'ว่าง', className: 'text-gray-400' }
+  return null
+}
+
+/**
+ * Day-scoped movement tags (แขกออกวันนี้ / แขกเข้าวันนี้) for the tag row
+ * between the header and the chip row. Canonical-side booking facts — a
+ * DIFFERENT axis from occupancy (right-now) and the clean/dirty chips (what
+ * work). Departure is listed first (the day's chronology: someone must leave
+ * before the back-to-back arrival can occupy the room). `[]` when both flags
+ * are absent or false — old-backend skew and an ordinary room both render
+ * nothing, on purpose: there is no third "unknown" tag to show.
+ */
+export function movementTags(
+  room: Pick<HkRoom, 'expectedArrival' | 'expectedDeparture'>
+): Array<{ key: 'departure' | 'arrival'; label: string; className: string }> {
+  const tags: Array<{ key: 'departure' | 'arrival'; label: string; className: string }> = []
+  if (room.expectedDeparture === true) {
+    tags.push({
+      key: 'departure',
+      label: 'แขกออกวันนี้',
+      className: 'bg-orange-50 text-orange-700 border-orange-300',
+    })
+  }
+  if (room.expectedArrival === true) {
+    tags.push({
+      key: 'arrival',
+      label: 'แขกเข้าวันนี้',
+      className: 'bg-violet-50 text-violet-700 border-violet-300',
+    })
+  }
+  return tags
+}
+
+/**
  * Count of rooms whose merged `roomClean` is false — the number a maid
  * actually plans her round by. Surfaced in the list's summary bar alongside
  * เสร็จแล้ว/กำลังทำ/ทั้งหมด. PURE — unit-tested.
@@ -338,8 +405,9 @@ export function countRoomsNeedingClean(rooms: HkRoom[]): number {
 }
 
 /**
- * Shown when `legacyStatusStale` is true (CR-1 rule 2): the room-clean column
- * on screen is the PMS mirror because iHOTEL could not be reached.
+ * Shown when `legacyStatusStale` is true (CR-1 rule 2): both room-status
+ * columns on screen — cleanliness AND occupancy — are the PMS mirror because
+ * iHOTEL could not be reached.
  *
  * Deliberately says three things, in the order a maid needs them: WHAT she is
  * looking at (PMS's own status), WHY (iHOTEL unreachable), and the ONE
@@ -351,7 +419,7 @@ export function countRoomsNeedingClean(rooms: HkRoom[]): number {
  * does: the server sends a machine-readable flag and the client owns the Thai.
  */
 export const LEGACY_STATUS_STALE_NOTE =
-  'ขณะนี้เชื่อมต่อระบบ iHOTEL ไม่ได้ สถานะความสะอาดที่แสดงมาจากระบบ PMS ซึ่งอาจไม่ตรงกับหน้าจอแผนกต้อนรับ'
+  'ขณะนี้เชื่อมต่อระบบ iHOTEL ไม่ได้ สถานะห้อง (ความสะอาดและการเข้าพัก) ที่แสดงมาจากระบบ PMS ซึ่งอาจไม่ตรงกับหน้าจอแผนกต้อนรับ'
 
 /**
  * The Thai note for a room list / room detail response, or `null` when there

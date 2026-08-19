@@ -30,7 +30,7 @@
 //!
 //! ## No MSSQL, ever
 //!
-//! The legacy read is injected as a scripted [`RoomCleanSource`], exactly as
+//! The legacy read is injected as a scripted [`RoomFlagsSource`], exactly as
 //! `tests/test_hk_ihotel_status.rs` does for the read path — CI needs no SQL
 //! Server and cannot flake on one. The recipes are untouched by this change, so
 //! there is no new byte-parity surface to verify live.
@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Extension;
-use hotel_backend::legacy_room_status::{RoomCleanOutcome, RoomCleanSource};
+use hotel_backend::legacy_room_status::{LegacyRoomFlags, RoomFlagsOutcome, RoomFlagsSource};
 use hotel_backend::middleware::hk_access::HkIdentity;
 use hotel_backend::routes::hk::HkPolicy;
 use hotel_backend::routes::mode::{AppState, Branch};
@@ -58,19 +58,28 @@ use tower::ServiceExt; // for `oneshot`
 const ROOM_NO: &str = "ZT-D1W";
 
 #[derive(Debug)]
-struct ScriptedIhotel(RoomCleanOutcome);
+struct ScriptedIhotel(RoomFlagsOutcome);
 
 #[async_trait]
-impl RoomCleanSource for ScriptedIhotel {
-    async fn room_clean(&self) -> RoomCleanOutcome {
+impl RoomFlagsSource for ScriptedIhotel {
+    async fn room_flags(&self) -> RoomFlagsOutcome {
         self.0.clone()
     }
 }
 
-fn ihotel_says(is_clean: bool) -> RoomCleanOutcome {
+/// The CLEANLINESS fact only — `Room_Use` is left UNKNOWN, so this suite
+/// keeps proving that the D1 write guard decides on cleanliness alone and the
+/// widened CR-1 read gave it no new input.
+fn ihotel_says(is_clean: bool) -> RoomFlagsOutcome {
     let mut map = HashMap::new();
-    map.insert(ROOM_NO.to_string(), is_clean);
-    RoomCleanOutcome::Available(map)
+    map.insert(
+        ROOM_NO.to_string(),
+        LegacyRoomFlags {
+            is_clean: Some(is_clean),
+            occupied: None,
+        },
+    );
+    RoomFlagsOutcome::Available(map)
 }
 
 async fn try_pool() -> Option<PgPool> {
@@ -91,13 +100,13 @@ fn maid() -> HkIdentity {
 ///
 /// `mark_dirty_enabled` is passed explicitly: the `dirty` pole stays behind
 /// `HK_MARK_DIRTY_ENABLED` (invariant #6) and D1 does not widen that gate.
-fn app(state: AppState, outcome: RoomCleanOutcome, mark_dirty_enabled: bool) -> axum::Router {
+fn app(state: AppState, outcome: RoomFlagsOutcome, mark_dirty_enabled: bool) -> axum::Router {
     let policy = HkPolicy {
         branches: vec![Branch::Hfhotel],
         mark_dirty_enabled,
         ..HkPolicy::default()
     }
-    .with_legacy_room_clean(Branch::Hfhotel, Arc::new(ScriptedIhotel(outcome)));
+    .with_legacy_room_flags(Branch::Hfhotel, Arc::new(ScriptedIhotel(outcome)));
     hotel_backend::routes::hk::routes_inside_access(state, policy).layer(Extension(maid()))
 }
 
@@ -229,7 +238,7 @@ async fn an_unreachable_ihotel_degrades_to_todays_behaviour_and_never_fails_the_
     let state = AppState::new(pool.clone());
 
     let (status, body) = post_cleaning(
-        app(state, RoomCleanOutcome::Unavailable, false),
+        app(state, RoomFlagsOutcome::Unavailable, false),
         room_id,
         "done",
     )

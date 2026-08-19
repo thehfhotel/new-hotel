@@ -20,6 +20,8 @@ import {
   LEGACY_STATUS_STALE_NOTE,
   legacyStatusNote,
   markDirtyConfirmMessage,
+  movementTags,
+  occupancyIndicator,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
@@ -100,6 +102,71 @@ describe('roomCleanChip', () => {
 
   it('assigns visually distinct styles for clean vs dirty', () => {
     expect(roomCleanChip(true).className).not.toBe(roomCleanChip(false).className)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// occupancyIndicator — header-slot "can I enter" answer, distinct from the
+// clean/dirty chips ("what work"). undefined = an older backend during
+// deploy skew, which must render as nothing, never a guess.
+// ---------------------------------------------------------------------------
+
+describe('occupancyIndicator', () => {
+  it('labels an occupied room มีแขกพัก in sky', () => {
+    expect(occupancyIndicator('occupied')).toEqual({
+      label: 'มีแขกพัก',
+      className: 'text-sky-700',
+    })
+  })
+
+  it('labels a vacant room ว่าง in gray', () => {
+    expect(occupancyIndicator('vacant')).toEqual({
+      label: 'ว่าง',
+      className: 'text-gray-400',
+    })
+  })
+
+  it('renders nothing for undefined (older backend, deploy skew) or null', () => {
+    expect(occupancyIndicator(undefined)).toBeNull()
+    expect(occupancyIndicator(null)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// movementTags — day-scoped arrival/departure tags (phase 2 delta). A
+// different axis from occupancy (right now) and the clean/dirty chips (what
+// work): this answers "what changes today". Canonical-side, NOT covered by
+// legacyStatusStale.
+// ---------------------------------------------------------------------------
+
+describe('movementTags', () => {
+  it('returns both tags, departure first, for a back-to-back room', () => {
+    const tags = movementTags({ expectedArrival: true, expectedDeparture: true })
+    expect(tags.map((t) => t.key)).toEqual(['departure', 'arrival'])
+    expect(tags[0].label).toBe('แขกออกวันนี้')
+    expect(tags[1].label).toBe('แขกเข้าวันนี้')
+  })
+
+  it('returns only the departure tag when just expectedDeparture is true', () => {
+    const tags = movementTags({ expectedArrival: false, expectedDeparture: true })
+    expect(tags).toHaveLength(1)
+    expect(tags[0].key).toBe('departure')
+  })
+
+  it('returns only the arrival tag when just expectedArrival is true', () => {
+    const tags = movementTags({ expectedArrival: true, expectedDeparture: false })
+    expect(tags).toHaveLength(1)
+    expect(tags[0].key).toBe('arrival')
+  })
+
+  it('returns an empty list when both flags are false', () => {
+    expect(movementTags({ expectedArrival: false, expectedDeparture: false })).toEqual([])
+  })
+
+  // Old-backend skew: the fields do not exist on the wire at all yet.
+  it('returns an empty list when both flags are undefined (deploy skew)', () => {
+    expect(movementTags({})).toEqual([])
+    expect(movementTags({ expectedArrival: undefined, expectedDeparture: undefined })).toEqual([])
   })
 })
 
@@ -448,6 +515,14 @@ describe('legacyStatusNote', () => {
     expect(LEGACY_STATUS_STALE_NOTE).toContain('PMS')
     expect(LEGACY_STATUS_STALE_NOTE).toContain('iHOTEL')
     expect(LEGACY_STATUS_STALE_NOTE).toContain('แผนกต้อนรับ')
+  })
+
+  // The note now covers BOTH room-status columns the maid sees — cleanliness
+  // AND occupancy — not cleanliness alone, since the merged PMS-mirror
+  // fallback applies to both.
+  it('names both cleanliness and occupancy as the affected room status', () => {
+    expect(LEGACY_STATUS_STALE_NOTE).toContain('ความสะอาด')
+    expect(LEGACY_STATUS_STALE_NOTE).toContain('การเข้าพัก')
   })
 })
 
