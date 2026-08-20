@@ -192,11 +192,12 @@ pub struct RefundDepositOutcome {
 #[derive(Debug, Clone)]
 pub struct ExtendStayCommand {
     pub check_in_id: i32,
-    /// New (later) departure boundary. Must be strictly after the current
-    /// expected checkout — the service enforces this via the repository's
-    /// `apply_checkout` semantics is NOT used here; this is a separate flow
-    /// the repository will own in a later wave. Today we only emit the
-    /// writeback intent + event so the worker can apply the legacy diff.
+    /// New departure boundary. The service enforces exactly one rule on it:
+    /// it must DIFFER from the folio's current `cin_expected_checkout` (see
+    /// [`reject_noop_extend`] — a no-change extend would bump iHOTEL's folio
+    /// lock for nothing). Direction is not the service's business: later =
+    /// extend, earlier = shorten / re-date, and the route layer decides which
+    /// of those its endpoint allows.
     pub new_end: DateTime<Utc>,
     /// Original `Cin_Room_In` from the canonical PG state. The recipe enumerates
     /// calendar nights in `[stay_start, new_end)` so the legacy `HT_Room_Status`
@@ -591,6 +592,14 @@ impl CheckInService {
     /// dates for the "one more night" button; `change_dates` allows both).
     /// UI refreshes via the next poll.
     ///
+    /// It DOES enforce that the date actually changes: a `new_end` equal to
+    /// the current `cin_expected_checkout` is rejected by
+    /// [`reject_noop_extend`] before anything is written or enqueued, because
+    /// the resulting ExtendStay would bump iHOTEL's per-folio lock token and
+    /// evict a receptionist mid-edit for a change that changes nothing. The
+    /// check reads the current date under a row lock inside this same tx, so
+    /// it holds even when the folio moved after the route validated it.
+    ///
     /// TODO(hourly): the iHOTEL hourly path (`Cin_type=1`; pricing rules in
     /// `HT_ContinueTime`) is NOT mirrored here — there is no continue-time
     /// writeback recipe (`writeback::recipes` ships only the day-based
@@ -621,6 +630,28 @@ impl CheckInService {
         // midnight of the new checkout date); calendar nights span
         // `[stay_start, new_end)`, matching the recipe's enumeration.
         let new_checkout_date = cmd.new_end.date_naive();
+
+        // No-op guard. A submit that re-sends the CURRENT checkout date must
+        // not reach the outbox: `extend_stay` is the one recipe that writes
+        // `HT_CheckIn_H.Cin_Work_number` (iHOTEL's per-folio optimistic-lock
+        // token — see `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4), so a
+        // no-change ExtendStay still bumps the token, and the next save from
+        // whichever reception form has that folio open dies with
+        // `มีการแก้ไข … จากเครื่องอื่น` and discards her typed work. Both HTTP
+        // callers already reject this shape up front, so reaching the guard
+        // means the folio moved between the route's read and this tx — hence
+        // the row lock: it closes that window instead of merely narrowing it.
+        let current_checkout: NaiveDate = sqlx::query_scalar(
+            "SELECT cin_expected_checkout FROM ht_checkins WHERE cin_id = $1 FOR UPDATE",
+        )
+        .bind(cmd.check_in_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::not_found(format!("check-in {} does not exist", cmd.check_in_id))
+        })?;
+        reject_noop_extend(cmd.check_in_id, current_checkout, new_checkout_date)?;
+
         let new_nights = (new_checkout_date - cmd.stay_start.date_naive())
             .num_days()
             .max(1) as i32;
@@ -1520,6 +1551,43 @@ fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
     Ok(())
 }
 
+/// Guard: an "extension" whose new departure date EQUALS the folio's current
+/// `cin_expected_checkout` changes nothing, so it must not reach the outbox.
+///
+/// Why an equal date is not harmless. `extend_stay` is the ONE writeback
+/// recipe permitted to write `HT_CheckIn_H.Cin_Work_number` — iHOTEL's
+/// per-folio optimistic-lock token, taken on folio LOAD by five reception
+/// forms and re-checked on save (`docs/legacy-app/COMPAT_CHEATSHEET.md`
+/// §7.4). Enqueuing a no-change ExtendStay still bumps that token, so the
+/// receptionist who has the folio open is told
+/// `มีการแก้ไข … จากเครื่องอื่น`, her form closes, and her in-progress edit
+/// is discarded — a real, user-visible loss in exchange for nothing.
+///
+/// The guard is EQUALITY-only, deliberately. An earlier date is a legitimate
+/// shorten / re-date (Task #54 / Track G2) that the recipe handles by
+/// rewriting `[stay_start, new_end)` in either direction; direction policy
+/// lives in the route layer, not here (see [`CheckInService::extend`]).
+///
+/// `Validation` rather than `Conflict` is deliberate too: the extend and
+/// change-dates routes funnel every `ServiceError::Conflict` through
+/// `map_extend_error`, which replaces the message with the fixed string
+/// "Check-in is not active" — accurate for the status guard, actively
+/// misleading here. `Validation` reaches the receptionist as a 400 carrying
+/// THIS message, which names the date her folio already ends on and so tells
+/// her what to do next (pick a different date, or accept that it is done).
+fn reject_noop_extend(
+    check_in_id: i32,
+    current_checkout: NaiveDate,
+    new_checkout: NaiveDate,
+) -> ServiceResult<()> {
+    if new_checkout == current_checkout {
+        return Err(ServiceError::validation(format!(
+            "check-in {check_in_id} already ends on {current_checkout} — nothing to change"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_party_size(adults: i32, children: i32) -> ServiceResult<()> {
     if adults < 0 || children < 0 {
         return Err(ServiceError::validation(format!(
@@ -2286,5 +2354,320 @@ mod change_room_tests {
         let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no LIKE 'G4%'")
             .execute(pool)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod extend_tests {
+    //! Tests for `CheckInService::extend`'s no-op guard.
+    //!
+    //! The behaviour under test is narrow but expensive to get wrong:
+    //! `extend_stay` is the ONE writeback recipe allowed to touch
+    //! `HT_CheckIn_H.Cin_Work_number`, iHOTEL's per-folio optimistic-lock
+    //! token. An ExtendStay that changes no date still bumps that token, and
+    //! the next save from a reception form holding the folio open is refused
+    //! with `มีการแก้ไข … จากเครื่องอื่น` — the form closes and the
+    //! receptionist's typed work is discarded. So a no-change submit must
+    //! enqueue NOTHING.
+    //!
+    //! Same layout as `change_room_tests`: integration-style against the PG
+    //! test database, skipped at runtime when PG is unreachable so the suite
+    //! still passes without a DB.
+
+    use super::*;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::{EventBus, OutboxRepository};
+    use crate::repository::checkin::PgCheckInRepository;
+    use chrono::{NaiveTime, TimeZone};
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    fn build_service(pool: PgPool) -> CheckInService {
+        let repo: Arc<dyn crate::repository::checkin::CheckInRepository> =
+            Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        CheckInService::new(repo, outbox, events, pool)
+    }
+
+    // ---------- pure guard tests (no DB) ----------
+
+    #[test]
+    fn reject_noop_extend_blocks_the_unchanged_checkout_date() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let err = reject_noop_extend(42, day, day).expect_err("same date must reject");
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(msg.contains("nothing to change"), "got: {msg}");
+                assert!(msg.contains("2026-08-21"), "message must name the date: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_noop_extend_allows_later_and_earlier_dates() {
+        let current = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        // Later = the "one more night" extend.
+        assert!(reject_noop_extend(42, current, current + chrono::Duration::days(1)).is_ok());
+        // Earlier = the deliberate shorten / re-date path (Task #54 / Track
+        // G2). The recipe rewrites `[stay_start, new_end)` in EITHER
+        // direction, so direction is NOT this guard's business — only
+        // equality is.
+        assert!(reject_noop_extend(42, current, current - chrono::Duration::days(1)).is_ok());
+    }
+
+    // ---------- DB-backed tests ----------
+
+    /// The load-bearing case: a submit whose new checkout equals the folio's
+    /// current one must (1) return an error the receptionist can read,
+    /// (2) enqueue NO writeback job, and (3) leave `ht_checkins` untouched.
+    #[tokio::test]
+    async fn extend_rejects_no_op_same_date_and_enqueues_nothing() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping extend_rejects_no_op_same_date_and_enqueues_nothing — PG not reachable");
+            return;
+        };
+        let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "noop").await else {
+            eprintln!("skipping extend_rejects_no_op_same_date_and_enqueues_nothing — seed failed");
+            return;
+        };
+
+        let svc = build_service(pool.clone());
+        // Hold the result instead of unwrapping it: when this test FAILS the
+        // call succeeds, and an `expect_err` panic here would skip `cleanup`
+        // and leave `CIN-XT-noop` behind — which makes the next run's seed
+        // collide and the test silently SKIP instead of staying red. Assert
+        // only after the teardown.
+        let result = svc
+            .extend(sample_extend(cin_id, checkin_date, expected_checkout))
+            .await;
+
+        let jobs = writeback_job_count(&pool, cin_id).await;
+        let (landed_checkout, landed_updated_at) = checkout_and_updated_at(&pool, cin_id).await;
+        cleanup(&pool, cin_id).await;
+
+        let err = result.expect_err("a same-date extend must not succeed silently");
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(msg.contains("nothing to change"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            jobs, 0,
+            "a no-change extend must enqueue no ExtendStay — it would bump \
+             iHOTEL's folio lock token and evict the receptionist"
+        );
+        assert_eq!(
+            landed_checkout, expected_checkout,
+            "canonical checkout date must be untouched"
+        );
+        assert_eq!(
+            landed_updated_at, SEED_UPDATED_AT,
+            "no PG write may happen at all (updated_at must still be the seeded value)"
+        );
+    }
+
+    /// Control: the guard is equality-only. A genuine LATER date still
+    /// extends, and a genuine EARLIER one still shortens — the shorten path
+    /// is deliberately supported here (Task #54 / Track G2; the route layer
+    /// owns the direction policy, not the service).
+    #[tokio::test]
+    async fn extend_still_lands_real_changes_in_both_directions() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping extend_still_lands_real_changes_in_both_directions — PG not reachable");
+            return;
+        };
+        let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "real").await else {
+            eprintln!("skipping extend_still_lands_real_changes_in_both_directions — seed failed");
+            return;
+        };
+        let svc = build_service(pool.clone());
+
+        // Later: the "one more night" button.
+        let later = expected_checkout + chrono::Duration::days(1);
+        let extend_result = svc.extend(sample_extend(cin_id, checkin_date, later)).await;
+        let after_extend = checkout_and_updated_at(&pool, cin_id).await.0;
+        let jobs_after_extend = writeback_job_count(&pool, cin_id).await;
+
+        // Earlier: the shorten / re-date edit.
+        let earlier = expected_checkout;
+        let shorten_result = svc.extend(sample_extend(cin_id, checkin_date, earlier)).await;
+        let after_shorten = checkout_and_updated_at(&pool, cin_id).await.0;
+        let jobs_after_shorten = writeback_job_count(&pool, cin_id).await;
+
+        cleanup(&pool, cin_id).await;
+
+        extend_result.expect("a genuine later date must still extend");
+        assert_eq!(after_extend, later, "extend must land the later date");
+        assert_eq!(jobs_after_extend, 1, "extend must enqueue exactly one job");
+
+        shorten_result.expect("a genuine earlier date must still shorten");
+        assert_eq!(after_shorten, earlier, "shorten must land the earlier date");
+        assert_eq!(
+            jobs_after_shorten, 2,
+            "shorten must enqueue its own job (per-event v4 discriminator, \
+             so no idempotency-key collision with the extend above)"
+        );
+    }
+
+    // -------------------- test helpers --------------------
+
+    /// Sentinel `updated_at` planted by [`seed_stay`]. The no-op test asserts
+    /// it survives, which proves `extend` wrote nothing at all — not merely
+    /// that it wrote the same date back.
+    const SEED_UPDATED_AT: &str = "2000-01-01 00:00:00";
+
+    fn utc_midnight(day: NaiveDate) -> DateTime<Utc> {
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+        Utc.from_utc_datetime(&day.and_time(midnight))
+    }
+
+    /// Same shape `routes::new_checkins::build_extend_stay_command` produces:
+    /// UTC-midnight boundaries, one-room folio, totals that the recipe
+    /// re-aggregates anyway.
+    fn sample_extend(cin_id: i32, checkin_date: NaiveDate, new_checkout: NaiveDate) -> ExtendStayCommand {
+        ExtendStayCommand {
+            check_in_id: cin_id,
+            new_end: utc_midnight(new_checkout),
+            stay_start: utc_midnight(checkin_date),
+            guest_label: "Extend Tester".to_string(),
+            new_room_price_total: Money::from_baht(1200),
+            new_net_total: Money::from_baht(1200),
+            new_pay_total: Money::ZERO,
+            new_balance_total: Money::from_baht(1200),
+            source: EventSource::System {
+                reason: "extend_noop_test".into(),
+            },
+        }
+    }
+
+    /// Seed `(customer, room, active check-in, junction row)`. Returns
+    /// `(cin_id, checkin_date, expected_checkout)`, or `None` if any step
+    /// fails. `updated_at` is planted with [`SEED_UPDATED_AT`] so the no-op
+    /// test can prove nothing was written.
+    async fn seed_stay(pool: &PgPool, marker: &str) -> Option<(i32, NaiveDate, NaiveDate)> {
+        // Clear anything a previous crashed run left behind. Without this a
+        // single aborted run poisons every later one: the `cin_no` UNIQUE
+        // collides, `seed_stay` returns `None`, and the test SKIPS — a test
+        // that quietly stops testing is worse than one that fails.
+        if let Ok(Some(stale)) =
+            sqlx::query_scalar::<_, i32>("SELECT cin_id FROM ht_checkins WHERE cin_no = $1")
+                .bind(format!("CIN-XT-{marker}"))
+                .fetch_optional(pool)
+                .await
+        {
+            cleanup(pool, stale).await;
+        }
+
+        let cust_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_customers (cust_firstname, cust_lastname) \
+             VALUES ($1, 'TestExtend') RETURNING cust_id",
+        )
+        .bind(format!("Guest_{marker}"))
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'occupied') RETURNING room_id",
+        )
+        .bind(format!("XT{marker}"))
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        let row: (i32, NaiveDate, NaiveDate) = sqlx::query_as(
+            "INSERT INTO ht_checkins (\
+                cin_no, cin_cust_id, cin_room_id, cin_checkin_time, \
+                cin_expected_checkout, cin_status, cin_rate_per_night, updated_at\
+             ) VALUES ($1, $2, $3, CURRENT_DATE, CURRENT_DATE + 2, 'active', 1200, $4::timestamp) \
+             RETURNING cin_id, cin_checkin_time::date, cin_expected_checkout",
+        )
+        .bind(format!("CIN-XT-{marker}"))
+        .bind(cust_id)
+        .bind(room_id)
+        .bind(SEED_UPDATED_AT)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        sqlx::query(
+            "INSERT INTO ht_checkin_rooms (\
+                cr_cin_id, cr_room_id, cr_room_status, cr_rate_per_night, cr_nights\
+             ) VALUES ($1, $2, 'active', 1200, 2)",
+        )
+        .bind(row.0)
+        .bind(room_id)
+        .execute(pool)
+        .await
+        .ok()?;
+
+        Some(row)
+    }
+
+    async fn writeback_job_count(pool: &PgPool, cin_id: i32) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(aggregate_uuid(AggregateKind::CheckIn, cin_id))
+            .fetch_one(pool)
+            .await
+            .expect("writeback_jobs count must be readable")
+    }
+
+    async fn checkout_and_updated_at(pool: &PgPool, cin_id: i32) -> (NaiveDate, String) {
+        let row: (NaiveDate, String) = sqlx::query_as(
+            "SELECT cin_expected_checkout, \
+                    to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') \
+               FROM ht_checkins WHERE cin_id = $1",
+        )
+        .bind(cin_id)
+        .fetch_one(pool)
+        .await
+        .expect("seeded check-in must be readable");
+        row
+    }
+
+    /// Best-effort teardown of everything [`seed_stay`] planted.
+    async fn cleanup(pool: &PgPool, cin_id: i32) {
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(aggregate_uuid(AggregateKind::CheckIn, cin_id))
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        // Parent rows have FKs pointing at them, so read the ids, drop the
+        // check-in, THEN drop customer + room (change_room_tests' cleanup
+        // relies on best-effort tolerance for this; here we just order it
+        // correctly so no rows leak between runs).
+        let ids: Option<(i32, i32)> =
+            sqlx::query_as("SELECT cin_cust_id, cin_room_id FROM ht_checkins WHERE cin_id = $1")
+                .bind(cin_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        if let Some((cust_id, room_id)) = ids {
+            let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+                .bind(room_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
+                .bind(cust_id)
+                .execute(pool)
+                .await;
+        }
     }
 }

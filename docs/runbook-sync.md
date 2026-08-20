@@ -70,7 +70,7 @@ Every variable consumed by `bin/sync`. Defaults are what
 | `LEGACY_SYNC_ALLOW_OVERFLOW` | `true` = start even when the watermark is already past CT retention on one or more tables (incremental rows since the watermark are silently skipped — DATA LOSS). | `false` | NEVER in production. Bootstrap is the supported path. See Section 4b for the shadow-mode trap that makes overflow a foreseeable scenario. |
 | `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP` | `true` = allow `--bootstrap` to run while `LEGACY_SYNC_ENABLED=true` (i.e. against a live deployment). The bootstrap snapshot's `DELETE FROM legacy_mirror.<table>` races the watcher's `mirror_source='ct'` UPSERTs and can clobber real-time CT writes that landed during the snapshot window. | `false` | NEVER in production. Supported procedure: stop the watcher first (`LEGACY_SYNC_ENABLED=false` + redeploy), bootstrap, re-enable. |
 | `LEGACY_SYNC_RECONCILE_MODE` | Mode for the demoted `scheduler::sync::run_sync` job. `diff_only` = log drift to `ht_reconcile_log`; `upsert` = legacy 5-min-style UPSERT into `ht_*_legacy`. | `diff_only` | Flip to `upsert` ONLY if the CT watcher is operationally disabled and you need the legacy safety net to keep canonical state in sync. |
-| `SYNC_PER_TABLE_WATERMARK` | `false` = one shared `legacy_ct_state` row for all CT tables; `true` = one `legacy_ct_state_per_table` row each (R3). Per-table stops a wedge on one hot table gating every other table's advance. | `false` both sites | **Safe since #259** (the global row is now written as a min-of-per-table floor) but deliberately OFF — the wedge it prevents is loud, bounded (~2 days) and rare. Migration 078's reseed is done. Enable only if a wedge actually occurs: `docs/coexistence/RUNBOOK-reconcile-flag-flips.md` §2. |
+| `SYNC_PER_TABLE_WATERMARK` | `false` = one shared `legacy_ct_state` row for all CT tables; `true` = one `legacy_ct_state_per_table` row each (R3). Per-table stops a wedge on one hot table gating every other table's advance. | `false` both sites | **Safe since #259** (the global row is now written as a min-of-per-table floor) but deliberately OFF — the wedge it prevents is loud, bounded (~2 days) and rare. Migration 078's reseed is done. Enable only if a wedge actually occurs: `docs/coexistence/RUNBOOK-reconcile-flag-flips.md` §"2. Flip B". |
 | `WORKER_RECONCILE_ENABLED` | Runs the reconcile sweep inside the `sync` worker instead of the backend cron. This is how HF Ville gets a reconcile backstop at all (the backend cron only ever covered HF Hotel). | `false` (HF Hotel, uses backend cron) / `true` (HF Ville) | Leave as-is. HF Ville's is load-bearing — turning it off leaves that site with no backstop, which is exactly the 2026-06-28 gap. |
 | `RECONCILE_FORCE_CONVERGE_ENABLED` | Auto-repairs **value** drift by re-running the mapper. **`customers` and `rooms` only** — bookings/checkins are multi-row aggregates and fall through untouched. | **`true` both sites** | Live. State lives in `docker-compose.yml` defaults, NOT GitHub variables (ADR 0004) — the GH vars were deleted. Read compose, and flip by editing the default there. |
 | `RECONCILE_REINGEST_MISSING_PG_ENABLED` | Auto-repairs **`missing_pg`** rows (legacy row exists, canonical PG has none) by re-running the mapper for that key. PG-write-only; never writes legacy. Customers are processed before bookings so FK-defer ordering holds. Rows whose legacy row has *vanished* are left open for operator review. | **`true` both sites** (Ville 2026-07-27, HF Hotel 2026-07-28) | Live — this is the self-heal for a dropped legacy change whose CT delta aged past retention. State is a `docker-compose.yml` default (ADR 0004). See Section 9b. |
@@ -125,7 +125,8 @@ operators tuning pool/alerting behaviour need them in one place. Root cause: eve
 /v2 tab's SSE stream held 1-2 real PG pool slots for its lifetime
 (`PgListener::connect_with(pool)`), so tab churn exhausted the 10/5-slot pools and
 sqlx's un-overridden 30s acquire timeout turned that into 500s + a Cloudflare 524.
-Full writeup: `docs/coexistence/sync-incident-log.md` § 2026-07-29.
+Full writeup: `docs/coexistence/sync-incident-log.md` §"2026-07-29 — /v2 slow tabs"
+(there are two `## 2026-07-29` headings; the other one is the mark_dirty polarity fix).
 
 | Var | Meaning | Default | When to flip |
 |---|---|---|---|
@@ -134,7 +135,9 @@ Full writeup: `docs/coexistence/sync-incident-log.md` § 2026-07-29.
 | `PG_ACQUIRE_TIMEOUT` (compiled-in constant, **not** an env var) | How long a caller waits for a free pool connection before failing, for BOTH canonical pools — set via the shared `db::pg_pool_options()` builder (`hotel-backend/src/db/pg_pool.rs`) so it can't be applied to one pool and forgotten on the other. sqlx's default is 30s and was never overridden before this fix, which is what let the 2026-07-29 saturation hang requests into Cloudflare's own timeout window instead of failing fast. | `5s` (hardcoded `PG_ACQUIRE_TIMEOUT` constant) | Code change + redeploy only — deliberately not env-tunable; a pool-acquire ceiling is a safety property, not a per-environment tuning knob. |
 | `access_log` middleware (no env toggle) | Request-level INFO log line per `/api/*` request — method, path, status, `latency_ms` ONLY. Excludes `/api/events` (an hour-long SSE stream's "latency" is a disconnect timestamp, not a service time) and any non-`/api` path. Deliberately omits query strings, headers, and body: query strings carry guest-identifying params (`?q=`, `book_no`, customer ids), which is why the existing `TraceLayer` (which does log full URIs) stays at DEBUG rather than being reconfigured. Added because the 2026-07-29T04:23Z 500-burst was undiagnosable — the backend logged nothing per-request, so the incident had to be reconstructed from `pg_stat_activity` and the browser console. | Always on (outermost layer in `main.rs`, wraps `TraceLayer`) | N/A — unconditional, no flag. Would need a code change to disable. |
 
+---
 
+## 3. Slack alert meanings
 
 The watcher surfaces three categories of alerts to Slack. All are
 prefixed so they're triagable in one glance.
@@ -602,7 +605,7 @@ The drift-reconcile job recorded more than 50 unresolved
 ht_reconcile_log rows for the following table(s) in the last hour:
 • `customers`: 73 unresolved rows in last hour
 • `bookings`: 412 unresolved rows in last hour
-_Investigate via docs/runbook-sync.md §9 (Phase 6 drift alert)._
+_Investigate via `docs/runbook-sync.md` §"9. Phase 6 — drift-reconcile safety net"._
 ```
 
 Logs always carry the same data even when Slack isn't configured —
@@ -751,7 +754,8 @@ worth stating explicitly so an operator doesn't assume they're covered.
 * **Coupons (`HT_Cupon`).** Verified unused in both live legacy DBs — dormant
   since 2025-07 (`docs/adr/0003-ihotel-anchored-ux.md`, CONTEXT.md's "Verified
   unused" list). No dedicated Phase 6 arm exists for it, but it isn't a blind
-  spot: `HT_Cupon` is one of the 8 `legacy_mirror.*` tables in the §2b Phase
+  spot: `HT_Cupon` is one of the 8 `legacy_mirror.*` tables in
+  `docs/runbook-sync.md` §"2b. Phase 6-A..D reconcile-arm flags" — the Phase
   6-C mirror probe's set, so if the dormant feature ever came back to life, a
   coupon batch would still be caught by that probe with no code change.
 * **Rate tiers and the other `legacy_mirror` dimension tables**

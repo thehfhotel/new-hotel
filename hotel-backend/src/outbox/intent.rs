@@ -206,7 +206,7 @@ pub enum WritebackIntent {
         /// of issuing a no-detail receipt rather than failing the payment).
         receipt: RecordPaymentReceipt,
         /// Specific `HT_CheckIn_Ds.id` the payment is being apportioned to —
-        /// per spike §3h capture line 3, the legacy app fires
+        /// per `raw/invoice-20260424-100827/writes.txt:3` (spike §3h), the legacy app fires
         /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
         /// just before inserting the `HT_CheckIn_Pay` row. `None` when the
         /// route hasn't resolved a specific room (multi-room check-ins where
@@ -292,7 +292,7 @@ pub enum WritebackIntent {
     ///
     /// The payload is the full [`CustomerResave`] field set — the same
     /// 31-column `UPDATE HT_Customers ... where Cust_no=...` an iHOTEL
-    /// re-save fires (spike §3c capture line 28) — hydrated by
+    /// re-save fires (`raw/booking-checkin-20260424-101838/writes.txt:28`, spike §3d) — hydrated by
     /// `service::customer::update` from the canonical `ht_customers` row
     /// AFTER the PG UPDATE commits its values. Columns the new-app edit
     /// doesn't touch are hydrated from the CT-mirrored columns
@@ -369,9 +369,9 @@ pub enum WritebackIntent {
 
     /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
     /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
-    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:550`
-    /// — "Cin_Pay_Cash/Credit ... can be negative (refunds use
-    /// negation)") and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
+    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md`
+    /// §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)")
+    /// and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
     /// / `Total_Price_Balance` / `Total_Price_vat` from `HT_CheckIn_Pay`
     /// rows under UPDLOCK+HOLDLOCK (Track C pattern — never additive).
     ///
@@ -447,7 +447,8 @@ pub enum WritebackIntent {
     },
 
     /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:574-578`).
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Product`" "Stock change cascade"
+    /// — was: cheatsheet 574-578, a section boundary, not the invariant).
     ///
     /// `UPDATE HT_Products SET Pro_Amt = Pro_Amt + <delta> WHERE Pro_no=<no>`
     /// — closes the stock invariant from our app's writes. The legacy
@@ -543,8 +544,9 @@ pub enum WritebackIntent {
     ///
     /// Stock-adjust is bundled into the SAME recipe rather than
     /// emitting a separate `AdjustProductStock` intent: the legacy
-    /// app's POS form fires both writes inside one transaction
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:574-578`); splitting the
+    /// app's POS form fires both writes as an unconditional pair
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Product`" "The new app MUST replicate this pairing"
+    /// — was: cheatsheet 574-578); splitting the
     /// pair into two jobs would let one succeed while the other
     /// failed, breaking the stock invariant the legacy app expects.
     RecordPosSale {
@@ -613,7 +615,8 @@ pub enum WritebackIntent {
 
     /// Track J6 (round-bill coexistence step 2) — our app **opens** a
     /// cashier round, mirroring iHOTEL's `FrmDueBill.cs:1653`
-    /// (`COMPAT_CHEATSHEET.md` §960 / §3.20):
+    /// (`COMPAT_CHEATSHEET.md` §`HT_Round_Bill` "INSERT (id, round_start, round_price, round_by)",
+    /// §3.20 — was: cheatsheet 960, which sits in the `HT_Log` section):
     /// `INSERT HT_Round_Bill (id, round_start, round_price, round_by)`
     /// with `round_end` NULL. The legacy `id` is **explicit** in the
     /// payload (allocated by `ShiftService::open_shift` as
@@ -645,7 +648,7 @@ pub enum WritebackIntent {
 
     /// Task #49 — deposit refund (คืนเงินมัดจำ). Mirrors iHOTEL
     /// `FormShowDEPBack.cs:536` (`docs/legacy-app/COMPAT_CHEATSHEET.md`
-    /// §`HT_CheckIn_Ds` "Refund deposit", lines 466-467):
+    /// §`HT_CheckIn_Ds` "Refund deposit"):
     ///
     /// ```text
     /// update HT_CheckIn_Ds
@@ -1901,7 +1904,8 @@ pub struct RecordPaymentReceipt {
 /// retained as `None` are left untouched. The writeback recipe applies these
 /// as targeted UPDATEs (not the legacy app's DELETE-then-REINSERT).
 ///
-/// `customer_resave` mirrors spike §3c lines 5/16/28: the .NET app re-saves
+/// `customer_resave` mirrors `raw/booking-checkin-20260424-101838/writes.txt:5,16,28`
+/// (spike §3c for 5/16, §3d for 28): the .NET app re-saves
 /// the customer record on every booking modify. Phone/address edits never
 /// propagate to the customer master without it. When `Some(_)` the recipe
 /// emits an `UPDATE HT_Customers SET …` with the full field set.
@@ -1931,7 +1935,8 @@ pub struct BookingChanges {
 
 /// Full customer-record re-save payload for [`BookingChanges::customer_resave`].
 ///
-/// Fields mirror the .NET app's UPDATE in spike §3c capture line 28 — the
+/// Fields mirror the .NET app's UPDATE in
+/// `raw/booking-checkin-20260424-101838/writes.txt:28` (spike §3d) — the
 /// recipe writes them all so the legacy customer record reflects the latest
 /// values from PG. Empty strings are preferred over NULL (NULL crashes the
 /// .NET WinForms downstream — see `booking_create` recipe).

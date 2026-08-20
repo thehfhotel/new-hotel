@@ -33,8 +33,9 @@
 //!
 //! ## Foreign-guest filter
 //!
-//! Per `docs/legacy-app/COMPAT_CHEATSHEET.md` line 99, the legacy
-//! boolean `Cin_foreign` is `'True'` / `'False'` (capital). The
+//! Per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.5 Boolean conventions"
+//! "`Cin_foreign` (HT_CheckIn_H)", the legacy boolean `Cin_foreign` is
+//! `'True'` / `'False'` (capital). The
 //! canonical mirror does not carry a boolean foreign flag — we derive
 //! it from `nationality`: any non-empty value other than `'TH'` or
 //! `'Thailand'` (case-insensitive) qualifies as foreign. This matches

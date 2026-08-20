@@ -654,7 +654,7 @@ impl HousekeepingService {
     /// publish the event — all in one transaction.
     ///
     /// Audit 2026-06-11 P2 gap-close: this used to be PG-only ("the legacy
-    /// app derives dirty from checkout §3e"), but iHOTEL's grid reads the
+    /// app derives dirty from checkout" — spike §3e), but iHOTEL's grid reads the
     /// `HT_Rooms.Room_Clean` flag directly — a standalone mark-dirty in
     /// the new app left the room rendered clean in iHOTEL.
     pub async fn mark_dirty(

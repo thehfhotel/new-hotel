@@ -5,7 +5,7 @@ Schema changes that we apply to the **legacy MSSQL database**
 WireGuard mesh) to support the event-driven sync architecture.
 
 The legacy DB is **shared with the legacy .NET app** (per `CLAUDE.md`
-and `docs/architecture.md` §11) — every change here is reviewed for
+and `docs/architecture.md` §"11. Legacy-only features") — every change here is reviewed for
 .NET-app compatibility before applying.
 
 ## Convention

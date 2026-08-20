@@ -10,7 +10,8 @@
 -- Today `service::payment::record_payment` rejects `amount_satang <= 0`,
 -- so a guest complaint forces the receptionist back into iHOTEL just to
 -- record a refund (negative `Cin_Pay_Cash` / `Cin_Pay_Credit` per
--- `docs/legacy-app/COMPAT_CHEATSHEET.md:527`). Track G2 adds a separate
+-- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)").
+-- Track G2 adds a separate
 -- `refund_payment` service method that inserts a negative `ht_payments`
 -- row plus a `WritebackIntent::RefundPayment` outbox enqueue. To keep
 -- refunds queryable / auditable on the canonical side, the new row

@@ -1618,38 +1618,46 @@ impl MssqlChangeMapper for RoomsCancelMirrorMapper {
 // ## What `HT_Book_Pro` rows mean in iHOTEL
 //
 // Pre-booked products (food / drinks pre-ordered) attached to a
-// booking. `COMPAT_CHEATSHEET.md` lines 725-730 ("Table: `HT_Book_Pro`
-// (A) — pre-booked products"):
+// booking. `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Book_Pro`" "B_NO (Book_ID)"
+// (was: cheatsheet 725-730 — the `HT_Book_Date` section):
 //
 //   * PK `id int IDENTITY` — inserts omit `[id]` (FrmAddBook2.cs:3638).
 //   * 9 columns: `id, B_NO (Book_ID), B_ROOM, B_NAME, B_UNIT, B_NUM,
 //     B_PRICE, B_PRICE_TOTAL, B_PRO_ID`.
-//   * Insert in a loop on FrmAddBook2 save (§3.4 step 3.5, cheatsheet
-//     line 1222: `INSERT HT_Book_Pro (B_NO=Book_ID, B_ROOM, B_NAME,
-//     B_UNIT, B_NUM, B_PRICE, B_PRICE_TOTAL, B_PRO_ID)`).
+//   * Insert in a loop on FrmAddBook2 save
+//     (cheatsheet §3.4 "INSERT HT_Book_Pro (B_NO=Book_ID"; was: cheatsheet 1222):
+//     `INSERT HT_Book_Pro (B_NO=Book_ID, B_ROOM, B_NAME,
+//     B_UNIT, B_NUM, B_PRICE, B_PRICE_TOTAL, B_PRO_ID)`.
 //   * Delete-on-edit `delete from HT_Book_Pro where [B_NO]='<id>'` —
 //     part of FrmAddBook2.SAVE_EDIT's delete-then-reinsert rewrite
-//     (§3.7 step 5, cheatsheet line 1260; same pattern as HT_Book_Date
-//     / HT_Book_Ds per line 650). Expect D-rows followed by fresh
-//     I-rows with NEW ids on every booking edit.
+//     (cheatsheet §3.7 "DELETE FROM HT_Book_Pro WHERE [B_NO]=<id>";
+//     same pattern as HT_Book_Date / HT_Book_Ds — was: cheatsheet 1260
+//     and 650, neither of which carries either claim). Expect D-rows
+//     followed by fresh I-rows with NEW ids on every booking edit.
 //   * `B_NO` joins to `HT_Book_H.Book_ID` (manual cascade, cheatsheet
-//     line 1536). Read by FrmCheckIn (booking→check-in conversion) and
-//     FormBookingInvoice (FEATURE_MAP lines 247, 507, 543).
+//     §"5. Denormalization Map" "`HT_Book_Pro.B_NO`"; was: cheatsheet 1536).
+//     Read by FrmCheckIn (booking→check-in conversion) and
+//     FormBookingInvoice (`docs/legacy-app/FEATURE_MAP.md`
+//     §"5. Per-Form Table Touches" "HT_Book_Pro(R)"; was: FEATURE_MAP 247/507/543).
 //
 // ## TODO — booking→check-in conversion writeback gap (do NOT fix here)
 //
 // iHOTEL's FrmCheckIn, when converting a booking ("เปลี่ยนเป็น
-// Check-In", FEATURE_MAP §J3 lines 676-682), READS the booking's
-// `HT_Book_Pro` lines into its product grid (FEATURE_MAP line 543:
-// FrmCheckIn touches `HT_Book_Pro(R)` + `HT_CheckIn_Product(RW)`) and
-// on save runs §3.1 Step 3 (cheatsheet lines 1124-1127) for each
-// product row:
+// Check-In", `docs/legacy-app/FEATURE_MAP.md` §J3), READS the booking's
+// `HT_Book_Pro` lines into its product grid (FEATURE_MAP
+// §"5. Per-Form Table Touches" "HT_Book_Pro(R), HT_CheckIn_Ds(RW)";
+// was: FEATURE_MAP 543) and on save runs Step 3 of the walk-in cascade
+// (cheatsheet §"3.1 Walk-in Check-in" "Step 3: For each product row in Grid2:";
+// was: cheatsheet 1124-1127) for each product row:
 //
 //   1. `INSERT HT_CheckIn_Product (Cin_No, Cin_Room_no, Cin_Pro_id,
-//      …)` — omitting `[id]` (IDENTITY, cheatsheet lines 539-547);
+//      …)` — omitting `[id]` (IDENTITY, cheatsheet
+//      §"Table: `HT_CheckIn_Product`" "implies `id` IS IDENTITY despite schema";
+//      was: cheatsheet 539-547);
 //   2. the MANDATORY stock pairing `UPDATE HT_Products SET
-//      Pro_Amt=Pro_Amt-<num> WHERE Pro_no='<p>'` (cheatsheet lines
-//      560-566, "The new app MUST replicate this pairing");
+//      Pro_Amt=Pro_Amt-<num> WHERE Pro_no='<p>'` (cheatsheet
+//      §"Table: `HT_CheckIn_Product`" "The new app MUST replicate this pairing";
+//      was: cheatsheet 560-566);
 //   3. `Insert_Pay(...)` when a payment amount accompanies the line.
 //
 // Our `writeback/recipes/checkin_to_booking.rs` emits NO
@@ -1664,8 +1672,9 @@ impl MssqlChangeMapper for RoomsCancelMirrorMapper {
 //     `legacy_mirror.ht_book_pro WHERE b_no = <Book_ID>` — this
 //     mapper's output — or directly from `HT_Book_Pro` inside the
 //     recipe's MSSQL TX);
-//   * Per line, emit the `HT_CheckIn_Product` INSERT (cheatsheet §3.1
-//     Step 3 shape) + the paired `HT_Products.Pro_Amt` decrement;
+//   * Per line, emit the `HT_CheckIn_Product` INSERT (cheatsheet
+//     §"3.1 Walk-in Check-in" "Step 3: For each product row in Grid2:" shape)
+//     + the paired `HT_Products.Pro_Amt` decrement;
 //   * VERIFY FIRST against the FrmCheckIn decompile / a fresh capture
 //     how `B_PRO_ID` (int) maps onto `HT_CheckIn_Product.Cin_Pro_id`
 //     (varchar(250)) and `HT_Products.Pro_no` (varchar(50)) — the
@@ -1680,7 +1689,7 @@ pub struct BookProMirrorMapper;
 /// CT JOIN projection for `HT_Book_Pro`. Held as a module-private
 /// const so Track J1's projection-lock test can pin every column
 /// against the authoritative HF Hotel schema dump
-/// (`schema-baseline.txt` lines 179-187).
+/// (`schema-baseline.txt:179-187`).
 const BOOK_PRO_SELECT_COLS: &str =
     "t.id, t.B_NO, t.B_ROOM, t.B_NAME, t.B_UNIT, t.B_NUM, \
      t.B_PRICE, t.B_PRICE_TOTAL, t.B_PRO_ID";

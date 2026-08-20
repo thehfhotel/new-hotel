@@ -3,7 +3,8 @@
 -- Date: 2026-06-27
 --
 -- Cash in/out petty-cash ledger (รายรับ-รายจ่าย) — net-new feature parity with
--- iHOTEL's FrmPayMain / FrmAddPay (docs/legacy-app/FEATURE_MAP.md:296,535,560;
+-- iHOTEL's FrmPayMain / FrmAddPay (`docs/legacy-app/FEATURE_MAP.md` §"3.9 Payments / Folio / Debt" "`FrmPayMain.cs` | Cash in/out (rayrap-rayjai) main. Writes `tb_pay_history`.";
+-- `docs/legacy-app/FEATURE_MAP.md` §"5. Per-Form Table Touches" "`FrmAddPay` | TB_Pay_History(W)";
 -- docs/adoption/feature-gap-audit.md "Cash In/Out Ledger"). Two canonical
 -- tables:
 --
@@ -22,7 +23,9 @@
 -- — same model as `ht_shifts` / `ht_payment_ledger` (docs/architecture.md
 -- canonical PG split). No site column.
 --
--- Legacy shape (docs/legacy-app/SCHEMA.sql:777, COMPAT_CHEATSHEET.md §1051):
+-- Legacy shape (`docs/legacy-app/SCHEMA.sql` §"Table: dbo.TB_Pay_History" "[Pay_Date] float";
+-- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `TB_Pay_History`" "stored as OADate (float)"
+-- — the cheatsheet half was a bare line-1051 citation, which had drifted onto a blank line):
 -- `TB_Pay_History` is a 10-col table — `id int` (NOT IDENTITY; allocated
 -- app-side via get_id MAX+1), `Pay_Date float` (an OLE-Automation date serial,
 -- NOT datetime — `DateTime.ToOADate()`), `Pay_Bill`, `Pay_Cust`, `Pay_Type`

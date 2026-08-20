@@ -441,9 +441,10 @@ async fn header_only_booking_creates_canonical_row_with_zero_booking_rooms() {
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
 }
 
-/// Regression: an edit that drops every room from a booking (the legacy
-/// app's §3.7 delete-then-reinsert pattern can transiently surface this
-/// state) MUST remove the stale `ht_booking_rooms` rows. Without the
+/// Regression: an edit that drops every room from a booking (the legacy app's
+/// `docs/legacy-app/COMPAT_CHEATSHEET.md` §3.7 delete-then-reinsert pattern can
+/// transiently surface this state) MUST remove the stale `ht_booking_rooms`
+/// rows. Without the
 /// unconditional `replace_rooms` call the junction would keep pointing
 /// at rooms that no longer exist in the legacy aggregate.
 #[tokio::test]

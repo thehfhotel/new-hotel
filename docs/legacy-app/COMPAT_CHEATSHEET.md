@@ -515,7 +515,7 @@ either never reads them, or reads them only from one DEAD form):
   Used as the source for cash-drawer / shift reports and customer debt balance changes.
 - **PK convention**: `id` is `int NOT NULL` BUT there's a wrinkle — schema says NOT IDENTITY,
   but live data shows it's **actually IDENTITY** (column type `id int IDENTITY NOT NULL`
-  per `_SCHEMA.sql` line 16, but `INFORMATION_SCHEMA.COLUMNS` says `is_identity=1` for
+  per `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_CheckIn_Pay" "[id] int IDENTITY NOT NULL", but `INFORMATION_SCHEMA.COLUMNS` says `is_identity=1` for
   `HT_CheckIn_Pay.id`). **VERIFY**: confirmed `HT_CheckIn_Pay.id IS IDENTITY` in live DB.
   → The old app's `Insert_Pay` does NOT include `[id]` in the column list (Module1.cs:1781) —
   uses identity. So this column IS DB-managed.
@@ -897,7 +897,8 @@ either never reads them, or reads them only from one DEAD form):
   dirty flip (corrected 2026-07-31, #276/`ccf88c3`): findings.md §3e
   (check-out) and §3i (cancel-check-in) both raise `Room_Clean='yes'` with
   zero `HT_Housewife` touches, and the only two housewife-writing decompile
-  handlers, `ClickClean`/`ClickCleanOK` (§3.13/§3.14 below), are clean-side.
+  handlers, `ClickClean`/`ClickCleanOK` (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.13 Mark Room CLEAN"
+  and §"3.14 Mark Room Clean Done", below), are clean-side.
   A live scan of all ~31,922 rows found only two non-empty `h_note` patterns
   (system auto-close, send-to-maintenance) — neither for dirtying.
 - **PK**: `id int IDENTITY`. INSERTs omit [id].
@@ -1778,6 +1779,19 @@ is not recoverable.
 > mutates an existing folio's totals and dates and a stale open form would otherwise
 > overwrite them on save. **No other recipe may write it without its own decision record.**
 
+**That decision record exists — read it before widening the write.**
+
+- `docs/adr/0007-folio-lock-participation.md` §"1. `extend_stay` bumps the token deliberately"
+  — the boundary: which recipe bumps the token, which six folio-mutating recipes knowingly do
+  not, and why that gap is a recorded decision rather than an oversight.
+- `docs/adr/0007-folio-lock-participation.md` §"4. The lock is ADVISORY" — the caveats below,
+  turned into a standing prohibition: this lock may never be cited as the reason some other
+  invariant holds.
+
+The one recipe that does bump it is guarded upstream as well: `service/checkin.rs` refuses an
+"extend" whose new checkout date equals the folio's current one, so a no-op edit never reaches
+the outbox and never evicts a receptionist for a change that changes nothing.
+
 **Caveats — the lock is advisory, not sound. Do NOT rely on it for mutual exclusion:**
 
 - The check-read and the subsequent save writes are not in a transaction. There is **no**
@@ -1798,7 +1812,8 @@ HF Ville: 2,352 folios — 2,329 hold an active token, 23 are `0`, none above `9
 
 **In-repo disproof of "never read"**, if you want it without the decompile:
 `docs/legacy-spike/raw/checkout2-20260424-101023/07-events.txt` line 9 is the
-`update HT_CheckIn_H set Cin_Work_number=361383 …` at folio open, and line 14 is
+`update HT_CheckIn_H set Cin_Work_number=361383 …` at folio open, and the same
+`07-events.txt` line 14 is
 `select Cin_Work_number from HT_CheckIn_H where Cin_no='CH26-005227'` 2.4 s later at save.
 
 **Scope of this verification**: decompile `Hotel-2018- V.1.45` only. If either site ever

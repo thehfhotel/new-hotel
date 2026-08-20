@@ -2,7 +2,8 @@
 //!
 //! The legacy iHOTEL app records refunds as a `HT_CheckIn_Pay` row with a
 //! NEGATIVE `Cin_Pay_Cash` (or `Credit`/`Tran`/`web`) amount per
-//! `docs/legacy-app/COMPAT_CHEATSHEET.md:550`:
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay` (A)"
+//! "can be negative (refunds use negation)":
 //!
 //! > Cin_Pay_Cash/Cin_Pay_Credit: split tender amounts, can be negative
 //! > (refunds use negation).
@@ -114,8 +115,9 @@ pub fn build_statements(
     // the matched column carries `-amount` instead of `+amount`. The
     // legacy invariant
     // `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web` therefore
-    // sums to the negative refund amount (matches
-    // COMPAT_CHEATSHEET.md:557 + 550).
+    // sums to the negative refund amount (matches `COMPAT_CHEATSHEET.md`
+    // §"Table: `HT_CheckIn_Pay` (A)"
+    // "Cin_Pay_Cash+Cin_Pay_Credit+Cin_Pay_Free+Cin_Pay_Tran+Cin_Pay_web").
     let (cash_2dp, credit_2dp, transfer_2dp, web_2dp) = match inputs.method {
         PaymentMethod::Cash => (
             money_2dp(neg_amount)?,
@@ -373,7 +375,8 @@ mod tests {
 
     #[test]
     fn refund_emits_negative_ds_price_for_invariant() {
-        // Legacy invariant (COMPAT_CHEATSHEET.md:557):
+        // Legacy invariant (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay` (A)"
+        // "Cin_Pay_Cash+Cin_Pay_Credit+Cin_Pay_Free+Cin_Pay_Tran+Cin_Pay_web"):
         //   Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web
         // For a -500 cash refund: -500 = -500 + 0 + 0 + 0 + 0 ✓
         let s = build_statements(&sample_inputs()).unwrap();

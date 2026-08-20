@@ -2,7 +2,8 @@
 //!
 //! Mirrors the iHOTEL standalone-receipt write path (`FrmAddSale` /
 //! `FrmReceiptMain`, captured in `docs/legacy-spike/findings.md` §3h "print
-//! invoice" + `docs/legacy-app/COMPAT_CHEATSHEET.md` §3.8 / §720-753). A
+//! invoice" + `docs/legacy-app/COMPAT_CHEATSHEET.md` §3.8,
+//! §"Table: `HT_Receipt_H` (A)" and §"Table: `HT_Receipt_Ds` (A)"). A
 //! walk-up sale (customer NOT staying — no folio) is recorded as:
 //!
 //! ```text

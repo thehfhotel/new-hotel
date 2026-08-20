@@ -2,8 +2,14 @@
 
 Captured 2026-04-24 from the live HF Hotel legacy DB (`<legacy-mssql-host> / db`)
 while the receptionist drove the 3rd-party Windows app through controlled
-actions. All quotes/identifiers below are direct from the captured event
-stream — see `raw/<capture>/writes.txt` for the unedited record.
+actions. Every quote, identifier, statement count and timing in §3 is direct
+from the captured event stream — see `raw/<capture>/writes.txt` for the
+unedited record.
+
+**Two parts of this document are not from the captures** and say so at the
+point of use: §1's server fingerprint (ad-hoc queries) and §5-§6's race tests
+(interactive live tests run outside every capture window). Nothing in `raw/**`
+records either, so neither can be re-derived from this repo.
 
 ---
 
@@ -19,6 +25,13 @@ stream — see `raw/<capture>/writes.txt` for the unedited record.
 | Triggers / sprocs / functions in `db` | **Zero** |
 
 No hidden side-effects — every state change is in the captured INSERT/UPDATE statements.
+
+**Provenance**: unlike the rest of this document, the table above is *not* recoverable from
+`raw/**`. It came from ad-hoc `@@VERSION` / catalog queries typed in the same session; no
+capture directory holds that output (the capture dirs contain only the row-count snapshots,
+the session scripts, `07-events.txt` and `writes.txt`). Treat it as a one-time observation of
+2026-04-24 — re-run the queries rather than assuming it still holds, especially the version
+number and the zero-triggers claim.
 
 ---
 
@@ -43,7 +56,9 @@ to avoid duplicate-key collisions when two writers race.
 **Race-safety: PROVEN with `TABLOCKX, HOLDLOCK`**. See §6 for the verified
 locking pattern. We tested it against live receptionist activity — both our
 writeback and the .NET app got distinct sequential IDs with zero errors.
-The receptionist's UI experienced ~10s blocking but no error dialog.
+The receptionist's UI blocked for the length of the lock hold we deliberately
+set (10 seconds, Test 2) but showed no error dialog. That was an interactive
+live test, not one of the XEvent captures — see the provenance note in §6.
 
 **Note on `HT_Book_Ds.id`**: this is the ONE exception — it's actually a
 SQL Server `IDENTITY` column. The app INSERTs WITHOUT specifying `id` and
@@ -61,6 +76,19 @@ Each section lists the SQL the legacy app fires for that user action.
 **All `:param`-style placeholders are interpolated values**, not parameters
 — the app sends literal SQL text every time. INSERT statements use bracketed
 identifiers (typical .NET SqlClient style).
+
+**Timing convention for every `Nms` figure below** — stated once, applies to all of §3.
+Each capture is a `sql_batch_completed` XEvent stream, so `event_time_utc` is the moment a
+statement *finished*; its start is `event_time_utc − duration_ms` (the `duration_ms` column).
+A burst's elapsed time here is measured **from the start of its first statement to the
+completion of its last**. This matters: the two plausible conventions differ by up to 27% on
+these short bursts — §3f's Phase A is 33ms completion-to-completion but 42ms
+start-to-completion.
+
+**Clock convention**: the capture clock is UTC, the legacy server's local clock is UTC+7.
+Timestamps quoted from `07-events.txt` / `writes.txt` are therefore UTC, while date literals
+*inside* those same statements (`'4/24/2026 5:05:04 PM'`) are Thai local time. The two must
+not be conflated — `10:05:04` UTC and `5:05:04 PM` local are the same instant.
 
 ### 3a. Walk-in check-in (9 statements, 61ms)
 
@@ -138,9 +166,9 @@ identical shape: 9 statements at `10:01:11`, token write at `10:01:16`.
   - **Why the capture alone couldn't tell**: an XEvent stream of `sql_batch_completed` shows the UPDATE but not the caller, and a form-open side effect and an async post-save job look identical in it — both are a lone UPDATE a few seconds off the save burst. What resolved it was (a) the decompile, which puts the write inside `LoadBill()` and the matching read early in `SAVE_EDIT()`, and (b) a read we already had on tape: `raw/checkout2-20260424-101023/07-events.txt:9` is the UPDATE at folio open and `:14` is `select Cin_Work_number …` 2.4 s later at save. An "assigned async, never read" column does not get SELECTed.
 - ID-card photo storage table `Tb_Save_Image` (9,688 rows) is non-trivial — likely binary blobs.
 
-### 3b. Create future booking (4 INSERTs, ~20ms)
+### 3b. Create future booking (3 INSERTs + 1 per night — 4 for a 1-night stay, 19ms)
 
-Source: `booking-checkin-20260424-101838/writes.txt` first 4 lines.
+Source: `booking-checkin-20260424-101838/writes.txt` first 4 lines (the 1-night `R014810`).
 
 ```sql
 INSERT INTO [HT_Customers] (...)             -- new customer (skipped if existing)
@@ -162,12 +190,20 @@ INSERT INTO [HT_Book_Date] ([id=47285], [Book_no='R014810'], [Book_type='402'],
 **Findings:**
 - `HT_Book_Ds.Book_Room_Type` stores the room **number** (`'402'`), not a type code. The column name is misleading.
 - `HT_Book_Date` has **one row per calendar night** of the booking. A 2-night stay = 2 rows.
+  **The statement count is therefore night-dependent**, and "4 INSERTs" is only the 1-night
+  case: 3 fixed INSERTs (`HT_Customers`, `HT_Book_H`, `HT_Book_Ds`) plus one `HT_Book_Date`
+  INSERT per night. The 2-night `R014811` in
+  `booking-cancel-20260424-103158/writes.txt` (lines 1-5) is 5 INSERTs, 21ms.
 - `Book_USE=0` distinguishes a booking-only date from a checked-in one (later set to 1 on check-in).
 - Departure time is hardcoded `'11:59:59 AM'` (1 second before noon) — convenient for date-range BETWEEN queries.
 
 ### 3c. Modify booking (destructive — DELETE + RE-INSERT)
 
-Source: `booking-checkin-20260424-101838/writes.txt` second 13 lines (10:20:13 onwards).
+Source: `booking-checkin-20260424-101838/writes.txt:5-13` — the 9-statement modify burst at
+`10:20:13` (44ms) — plus `writes.txt:26-27`, the display-caption pair at
+`10:22:24`. Those last two are **not** in the same burst; they
+follow a second modify at `10:22:19` (`writes.txt:16-25`, same shape but 2 nights, so two
+`HT_Book_Date` INSERTs).
 
 The legacy app does NOT update individual fields. It does:
 ```sql
@@ -179,7 +215,7 @@ DELETE FROM HT_Book_H    WHERE Book_ID='R014810'
 DELETE FROM HT_Book_Pro  WHERE [B_NO]='R014810'           -- (HT_Book_Pro is empty in our DB)
 DELETE FROM HT_Book_Ds   WHERE Book_no='R014810'
 
--- Then RE-INSERT all 4 tables with the new dates
+-- Then RE-INSERT 3 of the 4 with the new dates (nothing goes back into the empty HT_Book_Pro)
 INSERT INTO [HT_Book_H] (...) -- new dates
 INSERT INTO [HT_Book_Ds] (...)
 INSERT INTO [HT_Book_Date] (...) -- one row per night of the new range
@@ -196,9 +232,10 @@ UPDATE HT_Book_Date SET Book_ok=Book_ok+1 WHERE id=47285
 
 ### 3d. Check-in TO existing booking (vs walk-in)
 
-Source: `booking-checkin-20260424-101838/writes.txt` last block (10:23:02).
+Source: `booking-checkin-20260424-101838/writes.txt` last block (10:23:02) — 12 statements
+(5 INSERTs + 7 UPDATEs), 108ms, against the walk-in's 9 statements / 61ms.
 
-**5 differences from walk-in:**
+**6 differences from walk-in:**
 1. ❌ **No** `INSERT INTO HT_Customers` — customer already exists from booking step.
 2. ✅ `UPDATE HT_Customers` instead (re-save profile).
 3. ✅ `UPDATE HT_Book_H SET Book_Status='เข้าพัก' WHERE Book_ID='R014810'` — booking marked as occupying.
@@ -261,8 +298,13 @@ from the SELECTs it issues just before the write (`07-events.txt`):
 
 None of the four is check-out data. Do not replay any of them.
 
-**Phase 2 (the actual check-out, 5 UPDATEs):**
+**Phase 2 (the actual check-out, 6 statements — 1 DELETE + 5 UPDATEs):** 49ms in
+`checkout-20260424-100323` (`writes.txt:18-23`), 47ms in `checkout2-20260424-101023`
+(`writes.txt:19-24`).
 ```sql
+DELETE FROM HT_CheckIn_Product WHERE Cin_no='CH26-005228'  -- opens the burst in BOTH
+                                                           -- check-out captures
+
 UPDATE HT_POWER_LOG
    SET ROOM_POWER_END=GETDATE(),
        ROOM_POWER_END_BY='Admin',
@@ -334,7 +376,7 @@ capture alone could not separate "form-open side effect" from "async batch job",
 `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4 for the mechanism and the one recipe that
 takes the lock deliberately.
 
-**Phase A (the actual extend, 7 statements, ~30ms):**
+**Phase A (the actual extend, 7 statements, 42ms):**
 ```sql
 UPDATE HT_Rooms SET room_use='no' WHERE room_no IN (...)  -- temp clear (will revert)
 DELETE FROM HT_Room_Status WHERE room_CheckIn_No='CH26-005230'  -- nuke all date rows
@@ -390,11 +432,19 @@ UPDATE HT_Book_H  SET book_status='ยกเลิก' WHERE book_id='R014811'  
 - The two `UPDATE HT_Book_H ... book_status='ยกเลิก'` statements at 10:34:02.099 and 10:34:02.124 are duplicates — set the same value twice. Likely a bug in the legacy app's UI handler.
 - No destructive Phase B runs. **This is the cleanest flow we've captured.** 🎉
 
-### 3h. Take payment + print invoice (4 statements, ~26s gap for print dialog)
+### 3h. Take payment + print invoice (7 statements, ~26s gap for print dialog)
 
-Source: `invoice-20260424-100827/writes.txt`
+Source: `invoice-20260424-100827/writes.txt:2-8` (`:1` is a folio-open token write, not part of
+this flow — see §3a). Two bursts: payment is 4 statements at `10:08:51` (29ms), receipt is
+3 statements at `10:09:17` (17ms). The measured gap between them is 25.94s.
 
 ```sql
+-- Payment burst. The first two statements clear and restate the folio's product/note state
+-- before the payment row is written.
+DELETE FROM HT_CheckIn_Product WHERE Cin_no='CH26-005227'
+
+UPDATE [HT_CheckIn_Ds] SET [Cin_Room_Pay_Total]=711, [Cin_note]='' WHERE id=25006
+
 INSERT INTO [HT_CheckIn_Pay] ([Cin_No='CH26-005227'], [Cin_Pay_Cash], [Cin_Pay_Credit],
     [Cin_Pay_Date], [Cin_Pay_Ds_Name], [Cin_Pay_Ds_Price], [Cin_Pay_Ds_unit],
     [Pay_No], [Cin_Cust_no], [Cin_Pay_Ds_ID], [Cin_Pay_Ds_Num],
@@ -405,7 +455,9 @@ UPDATE [HT_CheckIn_H]
        [Total_Price_Pay]=711, [Total_Price_Balance]=0
  WHERE [Cin_no]='CH26-005227'
 
--- ~26 seconds later (after print dialog interaction)
+-- ~26 seconds later (after print dialog interaction): the receipt burst
+UPDATE HT_CheckIn_H SET Total_Price_vat=Total_Price_vat+711.00 WHERE Cin_no='CH26-005227'
+
 INSERT INTO [HT_Receipt_H] ([id], [Receipt_no], [Receipt_Date], [Receipt_Name],
     [Receipt_Address], [Receipt_Tel], [Receipt_Total=711], [Receipt_Vat=0],
     [Receipt_VatPer=0], [status_name], [Receipt_Discount=0], ...)
@@ -419,11 +471,15 @@ INSERT INTO [HT_Receipt_Ds] ([S_Sale_id=20653], [S_Product_no='SEV-001'],
 - `S_Product_no='SEV-001'` is the **service code** for room charge. Likely a constants table somewhere; we should look it up.
 - `S_Product_name='ค่าห้องพัก [414]'` (Thai: "room charge") with the room number in brackets.
 - `S_Unit=1, S_UnitName='คืน'` (Thai: "night").
-- This hotel uses **no VAT** (all 0). Need a setting check in `TB_SETTINGS` if other branches use VAT.
+- This hotel uses **no VAT** on the receipt itself (`Receipt_Vat=0`, `Receipt_VatPer=0`). Need a setting check in `TB_SETTINGS` if other branches use VAT.
+- **Unexplained**: the same flow still increments `HT_CheckIn_H.Total_Price_vat` by the full
+  gross (`+711.00`) while the receipt's VAT fields are `0`. So that column is not "VAT
+  collected" in the sense the receipt uses. What it *is* has not been established — do not
+  guess at it in a writeback recipe without tracing the decompile first.
 - Receipts are 1 receipt per print event — multiple charge lines (`HT_Receipt_Ds`) can group under one `HT_Receipt_H` (we only saw 1 line, but the structure supports many).
 - Receipts are **never deleted** on check-out — historical receipts persist.
 
-### 3i. Cancel a check-in (7 statements, ~70ms — clean, no destructive phase)
+### 3i. Cancel a check-in (7 statements, 76ms — clean, no destructive phase)
 
 Source: `cancel-checkin-20260424-114805/writes.txt`
 
@@ -522,7 +578,7 @@ in the booking list, but they appeared in the room availability view.
 **Required for booking-list visibility:**
 | Field | Must be | Notes |
 |---|---|---|
-| `HT_Book_H.book_room_type` | `2` (NOT `1`) | `2` = book by room number; `1` = book by room type. Of 1178 real bookings, 1176 use `2` (only 2 anomalies use `1`). |
+| `HT_Book_H.book_room_type` | `2` (NOT `1`) | `2` = book by room number; `1` = book by room type. A one-off count during the spike found only 2 rows using `1`; the query and its filter were not recorded, so the population it counted is unknown (`HT_Book_H` held 14,809 rows at capture time). Re-run it before quoting a ratio — the safe reading is just "`1` is rare". |
 | `HT_Book_Ds.Book_status` | `1` (active) | `0` = draft / non-standard; `1` = active; `3` = cancelled. The list filters to `=1`. |
 | `HT_Book_H.Book_Date_in/out` | midnight (00:00:00) | The `HT_Book_H` date fields render as DATE-only in the form's top header. Actual stay times come from `HT_Book_Ds.Book_Room_Start/End`. |
 | `HT_Book_H.Book_room_all` | `''` (empty) | Rooms live in `HT_Book_Ds` rows; this header field is unused by the .NET app. Setting it to `'402'` made the booking unfindable in some search paths. |
@@ -639,12 +695,15 @@ queries (which run at default `READ COMMITTED` isolation, no `NOLOCK`
 hints — verified in captures). The .NET app waits for our COMMIT, then
 reads the new MAX, allocates `our+1`, and INSERTs. No collisions.
 
-**Verified under live load (Test 2):**
-- We held `TABLOCKX` for 10 seconds while receptionist clicked "save" on a booking.
-- Allocations: ours `R014815` (committed at 18:13:05.633), receptionist's `R014816` (got blocked, waited, then committed with our+1).
+**Verified under live load (Test 2 — a live interactive test, not one of the captures; see §6):**
+- We held `TABLOCKX` for 10 seconds while receptionist clicked "save" on a booking. Ten
+  seconds is what *we chose to hold*, not something measured.
+- Allocations: ours `R014815` (committed at 18:13:05.633 server-local), receptionist's `R014816` (got blocked, waited, then committed with our+1).
 - Zero PK collisions, zero error dialogs in the .NET app — only a one-time UI hitch.
 
-In production, the lock hold time per allocation is ~5-10ms (network round-trip + INSERT), well under any UI threshold. Receptionist will not perceive it.
+**Not measured**: the real per-allocation hold time in production. It is a round trip plus one
+INSERT, so it should be small enough that no receptionist perceives it, but we never timed it —
+don't quote a figure until someone does.
 
 ### Safety rails
 
@@ -661,6 +720,16 @@ In production, the lock hold time per allocation is ~5-10ms (network round-trip 
 Race-safe MAX+1 allocation works against the live .NET app at default
 `READ COMMITTED` isolation. **No cooperation from the .NET app required**
 — SQL Server enforces the lock server-side.
+
+**Provenance for all of §6**: Tests 1-4 were driven interactively with the receptionist, on a
+day and in time windows that **no XEvent capture covers**. Nothing in `raw/**` records them —
+not the `TABLOCKX` sessions, not the `R014815`/`R014816` allocations, not the block durations.
+The numbers below are what was observed and written down at the time; they are single
+observations, not repeated measurements, and they cannot be re-derived from this repo. The
+*outcomes* (sequential IDs, no collisions, no error dialogs) are corroborated indirectly by the
+row-count snapshots either side of the test window — `HT_Customers` 21611→21617 and
+`HT_Book_H` 14811→14816 between `booking-cancel-20260424-103158/06-after.txt` and
+`checkin-cancel-20260424-114532/02-before.txt`. The *timings* are not corroborated by anything.
 
 ### Test 1 — lock blocks reads (no UI impact)
 

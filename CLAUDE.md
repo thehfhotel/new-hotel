@@ -226,7 +226,11 @@ exist, one accepted gap sits between them, and one column is a live lock:
    makes the next save show `มีการแก้ไข … จากเครื่องอื่น`, close the form, and
    **discard the receptionist's in-progress edit**. Exactly one recipe writes it on
    purpose (`extend_stay`); no other may without its own decision record. Detail,
-   call sites and caveats: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4.
+   call sites and caveats: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4. That decision
+   record — why the one write stays, why the other six recipes deliberately do not bump
+   the token, and why the lock must never be treated as a mutex — is
+   `docs/adr/0007-folio-lock-participation.md` §"Decision". Read it before widening the
+   write; do not infer permission from this bullet.
 
 ### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 

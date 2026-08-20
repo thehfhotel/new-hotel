@@ -47,8 +47,8 @@ pub struct BookingAggregate {
     pub rooms: Vec<HashMapRow>,
     /// `HT_Book_Date` rows (one per calendar night). Empty when the
     /// booking is older than 60 days — frmMain1 startup prunes these
-    /// (cheatsheet §3.7 "Startup prune"). Mappers must not infer
-    /// "cancelled" from an empty `nights` vector.
+    /// (cheatsheet §"Table: `HT_Book_Date` (A)" "Startup prune"). Mappers must
+    /// not infer "cancelled" from an empty `nights` vector.
     pub nights: Vec<HashMapRow>,
 }
 
@@ -280,7 +280,7 @@ const CHECKIN_PAY_PROJECTION: &[&str] = &[
     // Track J7a — line-detail columns for the canonical `ht_payment_ledger`
     // mirror (income-by-tender reconciliation + iHOTEL-equivalent shift
     // report). All exist on the legacy `HT_CheckIn_Pay` schema
-    // (COMPAT_CHEATSHEET §`HT_CheckIn_Pay` lines 485-497). Pulled on the same
+    // (COMPAT_CHEATSHEET §"Table: `HT_CheckIn_Pay` (A)" "Cin_Pay_Ds_Name varchar(500), Cin_Pay_Ds_ID varchar(50)"). Pulled on the same
     // read `apply_payment_aggregate` already issues — no extra query. The
     // check-in aggregate sweep ignores them; only the ledger mirror reads them.
     "Cin_Pay_Ds_Price", // line total (= sum of the 5 tenders)
@@ -323,17 +323,18 @@ pub async fn load_checkin_aggregate(
     let rooms = fetch_rows(
         mssql,
         "HT_CheckIn_Ds",
-        // Legacy schema uses capital N here (cheatsheet §3.4 schema
-        // dump: `Cin_No varchar(50)`). Locked test in
+        // Legacy schema uses capital N here (cheatsheet
+        // §`HT_CheckIn_Ds` "Cin_No varchar(50), Cin_Room_No varchar(50)"
+        // — was: cheatsheet §3.4, which is the FrmAddBook2 booking cascade
+        // and carries no schema dump). Locked test in
         // sync/mappers/checkin.rs guards against accidental rename.
         "Cin_No",
         cin_no,
         // Track B2 / T2 CRIT-1 — deposit columns mirrored into
         // `ht_checkin_rooms.cr_dep_*` by `sync::mappers::checkin::
         // project_rooms`. Legacy column names per the authoritative
-        // schema dump (`docs/legacy-spike/schema/01-baseline-schema.txt`
-        // lines 215, 222, 225, 226) and `writeback::fingerprint`
-        // SCHEMA_COLUMNS lines 192/199/202/203:
+        // schema dump (`01-baseline-schema.txt:215,222,225,226`) and the
+        // `HT_CheckIn_Ds` rows of `writeback::fingerprint::EXPECTED_SCHEMA_BASELINE`:
         //   `Cin_Room_Dep`        (float,    col 8)
         //   `Cin_Dep_Status`      (varchar,  col 15)
         //   `Cin_Dep_return_date` (datetime, col 18)

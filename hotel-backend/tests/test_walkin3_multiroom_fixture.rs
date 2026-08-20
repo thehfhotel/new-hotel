@@ -145,9 +145,9 @@ fn single_room_walkin_emits_exactly_one_checkin_ds_row() {
     );
 }
 
-/// **Track B4 closes T2 CRIT-1.** The COMPAT_CHEATSHEET says
-/// `HT_CheckIn_Ds` is "one row per room (a single check-in can cover
-/// multiple rooms)" (lines 427-430). Track B4 wires
+/// **Track B4 closes T2 CRIT-1.** Per `docs/legacy-app/COMPAT_CHEATSHEET.md`
+/// §"Table: `HT_CheckIn_Ds` (A)" "single check-in can cover multiple rooms",
+/// `HT_CheckIn_Ds` carries one row per room. Track B4 wires
 /// `WalkInInputs.room_lines` into `build_statements` so a 2-room walk-in
 /// emits TWO `HT_CheckIn_Ds` INSERTs (one per room) plus a single
 /// `HT_CheckIn_H` header carrying both room numbers in `Cin_Room_ALL`.
