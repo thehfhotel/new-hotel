@@ -291,7 +291,7 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     // Wave 3 followup: each night must be an UPSERT, not a plain INSERT
     // (booking_create pre-inserts night rows). The
     // `IF EXISTS … UPDATE … ELSE INSERT` form matches the legacy app's
-    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:347-348`) and
+    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:371-372`) and
     // makes the recipe safe for both pre-existing and net-new nights.
     //
     // Multi-room id-base layout: `room_status_id_base + (room_idx *
@@ -341,8 +341,13 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     // 10. HT_CheckIn_H — 19-col canonical legacy order (verified from
     //     /tmp/legacy-events-full.log captures of CH26-005236, line
     //     3988). Cin_Book_no carries the linked booking. Drops the
-    //     obsolete `[Total_Price_vat]`, `[Cin_note]`, and
-    //     `[Cin_Work_number]` columns; uses the lowercase
+    //     obsolete `[Total_Price_vat]` and `[Cin_note]` columns, and —
+    //     separately — `[Cin_Work_number]`, which is NOT obsolete: it is
+    //     iHOTEL's live per-folio optimistic-lock token
+    //     (COMPAT_CHEATSHEET §7.4). It is omitted because the capture's
+    //     INSERT column list omits it, so the row lands on `DEFAULT ((0))`
+    //     and iHOTEL takes the real token the next time the folio is
+    //     opened. Uses the lowercase
     //     `[Cin_cust_price]`, mixed-case `[Cin_Date_Out]` and
     //     `[Cin_Type]` casing the legacy app emits. `[Cin_Type]=0`
     //     (integer); `[Cin_foreign]='False'` (literal string).
@@ -876,6 +881,11 @@ mod tests {
         let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
         assert!(!cin_h.contains("[Total_Price_vat]"));
         assert!(!cin_h.contains("[Cin_note]"));
+        // Pins the HT_CheckIn_H INSERT column list to the capture. This is NOT
+        // a global prohibition on writing `Cin_Work_number`: that column is
+        // iHOTEL's per-folio optimistic-lock token and `extend_stay` writes it
+        // deliberately (COMPAT_CHEATSHEET §7.4). Booking→check-in creates the
+        // folio, so there is no open iHOTEL form to invalidate — hence not here.
         assert!(!cin_h.contains("[Cin_Work_number]"));
     }
 
@@ -970,7 +980,7 @@ mod tests {
     /// already exist (multi-night booking conversion). Instead it emits a
     /// single-statement `IF EXISTS … UPDATE … ELSE INSERT` upsert that
     /// matches the legacy app's "upsert per night" semantics
-    /// (`COMPAT_CHEATSHEET.md:347-348`).
+    /// (`COMPAT_CHEATSHEET.md:371-372`).
     #[test]
     fn additional_nights_are_upserts_not_plain_inserts() {
         let s = build_statements(&sample_inputs());

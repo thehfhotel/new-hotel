@@ -6,7 +6,7 @@
 //!
 //! ## Background
 //!
-//! `docs/legacy-app/COMPAT_CHEATSHEET.md:560-564` documents the stock
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md:574-578` documents the stock
 //! invariant — every `HT_CheckIn_Product` INSERT/UPDATE/DELETE on the
 //! legacy side is paired with
 //! `UPDATE HT_Products SET Pro_Amt = Pro_Amt ± num WHERE Pro_no='<id>'`

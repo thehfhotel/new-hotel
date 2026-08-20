@@ -369,7 +369,7 @@ pub enum WritebackIntent {
 
     /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
     /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
-    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:513`
+    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:550`
     /// — "Cin_Pay_Cash/Credit ... can be negative (refunds use
     /// negation)") and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
     /// / `Total_Price_Balance` / `Total_Price_vat` from `HT_CheckIn_Pay`
@@ -447,7 +447,7 @@ pub enum WritebackIntent {
     },
 
     /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`).
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:574-578`).
     ///
     /// `UPDATE HT_Products SET Pro_Amt = Pro_Amt + <delta> WHERE Pro_no=<no>`
     /// — closes the stock invariant from our app's writes. The legacy
@@ -544,7 +544,7 @@ pub enum WritebackIntent {
     /// Stock-adjust is bundled into the SAME recipe rather than
     /// emitting a separate `AdjustProductStock` intent: the legacy
     /// app's POS form fires both writes inside one transaction
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`); splitting the
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:574-578`); splitting the
     /// pair into two jobs would let one succeed while the other
     /// failed, breaking the stock invariant the legacy app expects.
     RecordPosSale {
@@ -613,7 +613,7 @@ pub enum WritebackIntent {
 
     /// Track J6 (round-bill coexistence step 2) — our app **opens** a
     /// cashier round, mirroring iHOTEL's `FrmDueBill.cs:1653`
-    /// (`COMPAT_CHEATSHEET.md` §946 / §3.20):
+    /// (`COMPAT_CHEATSHEET.md` §960 / §3.20):
     /// `INSERT HT_Round_Bill (id, round_start, round_price, round_by)`
     /// with `round_end` NULL. The legacy `id` is **explicit** in the
     /// payload (allocated by `ShiftService::open_shift` as

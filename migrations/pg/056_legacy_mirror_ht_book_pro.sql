@@ -4,7 +4,7 @@
 --
 -- Phase 5/E2 — iHOTEL coexistence audit 2026-06-11 (P2 gap closure):
 -- `HT_Book_Pro` (pre-booked products attached to a booking by
--- FrmAddBook2; COMPAT_CHEATSHEET line 711-716, §3.4 step 3.5) had no
+-- FrmAddBook2; COMPAT_CHEATSHEET line 725-730, §3.4 step 3.5) had no
 -- CT mapper, so iHOTEL-entered booking products were invisible to the
 -- new app and were silently dropped when such a booking was checked
 -- in via the new app.

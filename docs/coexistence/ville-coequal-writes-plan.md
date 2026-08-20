@@ -40,7 +40,7 @@ The API backend is one process holding `new_pool` + `Option<ville_pool>`. Each s
 
 **Live `HT_Round_Bill` investigation (read-only, via evergreen):** both sites run **active, disciplined rounds** — HF Hotel 4,777 rounds since 2021-12 (3 `round_by`), HF Ville 813 since 2024-12 (1 `round_by`); **~3 rounds/day** (~06:00/12:00/22:00 shift boundaries), durations ~6–10h, and **exactly one open round per site at all times** (`open_now=1` both). So: mimic iHOTEL strictly — **no gate leniency**; one-open-per-site matches `ht_shifts`. `round_no` is unused (NULL) → key on legacy `id`; `round_by` is a shared "Admin" account (coarse attribution).
 
-**Captured write shapes** (`COMPAT_CHEATSHEET.md` §946-956, §3.20-3.21, from `FrmDueBill.cs:1653/1670`):
+**Captured write shapes** (`COMPAT_CHEATSHEET.md` §960-970, §3.20-3.21, from `FrmDueBill.cs:1653/1670`):
 - Open: `INSERT HT_Round_Bill (id=get_id [MAX+1], round_start=now, round_price=<float>, round_by=loginName)` (round_end NULL)
 - Close: `UPDATE HT_Round_Bill SET round_end=now, round_by=<emp> WHERE round_end IS NULL`
 - Gate: `SELECT id FROM HT_Round_Bill WHERE round_end IS NULL`; `get_id` collision risk rated **Low** (only one open at a time).

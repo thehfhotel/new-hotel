@@ -481,7 +481,7 @@ without spending the riskiest kind of engineering effort on a hypothetical.
   `room_clean`/`room_maintenance` COALESCE fix this pattern generalises from.
 - `hotel-backend/src/sync/gate_guard.rs` — the pinned invariant this design must not break
   outside a dedicated implementation session.
-- `docs/legacy-app/COMPAT_CHEATSHEET.md` lines 420, 438, 611-640, 674, 1482-1486 — the
+- `docs/legacy-app/COMPAT_CHEATSHEET.md` lines 420, 448, 625-654, 688, 1496-1500 — the
   `'C0000'` sentinel convention that narrows §3a's real-world risk.
 - ADR 0004 — the compose-committed-flag pattern this design's rollout mechanism reuses.
 - `docs/coexistence/sync-incident-log.md` — prior incidents in the same gate/hash class

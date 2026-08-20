@@ -46,7 +46,7 @@ impl PaymentMethod {
     /// Legacy column on `HT_CheckIn_Pay` that receives the amount for this method.
     ///
     /// Mirrors the recipe in `writeback::recipes::payment::build_statements`
-    /// and `COMPAT_CHEATSHEET.md:515` — bank transfers (PromptPay / wire) land
+    /// and `COMPAT_CHEATSHEET.md:552` — bank transfers (PromptPay / wire) land
     /// in `Cin_Pay_Tran`, not `Cin_Pay_Credit`. QR / online payments land in
     /// `Cin_Pay_web` per `audit-2026-05-13.md` Wave 5c.
     pub fn legacy_column(self) -> &'static str {
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn transfer_method_routes_to_tran_column() {
         // Fix for audit H5: Transfer must route to Cin_Pay_Tran per
-        // COMPAT_CHEATSHEET.md:515 — bank transfers are the third tender
+        // COMPAT_CHEATSHEET.md:552 — bank transfers are the third tender
         // column, distinct from credit cards.
         assert_eq!(PaymentMethod::Transfer.legacy_column(), "Cin_Pay_Tran");
     }

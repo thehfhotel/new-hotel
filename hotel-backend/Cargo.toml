@@ -144,9 +144,11 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Hashing (SHA256 for sync change detection)
 sha2 = "0.10"
 
-# Randomness (used by writeback recipes for TM.30 batch numbers per spike §3a —
-# `HT_CheckIn_H.Cin_Work_number` is a non-sequential random i32 the legacy app
-# assigns ~5s after each save). Minimal feature set: only need `rand::random`.
+# Randomness — `rand::random` for `extend_stay`'s folio lock token
+# (`HT_CheckIn_H.Cin_Work_number`, iHOTEL's per-folio optimistic-lock token,
+# COMPAT_CHEATSHEET §7.4), and `thread_rng().fill_bytes` for token/secret
+# generation in `service::auth` and `service::reader` — the latter is why
+# `std_rng` is in the feature list.
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 # Config

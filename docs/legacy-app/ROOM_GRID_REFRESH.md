@@ -102,10 +102,10 @@ That is the entire body. It checks whether the SQL connection object is closed a
 pops the reconnect dialog. **It does not re-query anything, and it has nothing to do with
 the room grid.** Any assumption that iHOTEL "polls every 10 seconds" for room-state changes
 is wrong and should be retired — flag it explicitly when it comes up, don't just quietly
-work around it. Note `docs/legacy-spike/findings.md:46,567,611,613` also mentions "10s",
-but in a completely unrelated context — the observed UI hitch while our writeback holds a
-`TABLOCKX` lock during ID allocation. Don't conflate the two "10s" facts; they share a
-number and nothing else.
+work around it. Note `docs/legacy-spike/findings.md` §2, §5 "Allocation strategy" and §6
+"Test 2" also mention "10s", but in a completely unrelated context — the observed UI hitch
+while our writeback holds a `TABLOCKX` lock during ID allocation. Don't conflate the two
+"10s" facts; they share a number and nothing else.
 
 ## 4. What a refresh actually costs
 
@@ -324,12 +324,13 @@ in this repo, not because it wasn't thought of:
   already-exhausted Change Tracking prerequisite carve-out in `migrations/legacy-mssql/`.
   A trigger or a notification mechanism added to the shared MSSQL is not that carve-out.
 - **The legacy DB has zero triggers, stored procedures, or functions today**
-  (`docs/legacy-spike/findings.md:19` — verified via `SELECT name FROM sys.triggers`
-  returning 0 rows). iHOTEL's entire app assumes this — "no hidden side-effects; every
-  state change is in the captured INSERT/UPDATE statements." Introducing one trigger to
-  page reception would be the first hidden side-effect the shared DB has ever had, breaking
-  an assumption every other part of this coexistence effort (byte-parity writeback, the
-  spike's captured-statement methodology) depends on.
+  (`docs/legacy-spike/findings.md` §1 "Server & app fingerprint" — verified via
+  `SELECT name FROM sys.triggers` returning 0 rows). iHOTEL's entire app assumes this —
+  "no hidden side-effects; every state change is in the captured INSERT/UPDATE
+  statements." Introducing one trigger to page reception would be the first hidden
+  side-effect the shared DB has ever had, breaking an assumption every other part of this
+  coexistence effort (byte-parity writeback, the spike's captured-statement methodology)
+  depends on.
 
 ## See also
 

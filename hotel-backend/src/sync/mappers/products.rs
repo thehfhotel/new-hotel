@@ -65,7 +65,7 @@
 //!    whole reload transaction on an FK violation, every tick, forever.
 //! 2. **Absence from legacy is not deletion.** iHOTEL's
 //!    `FrmManageProduct` edits master data by DELETE-then-REINSERT
-//!    (`COMPAT_CHEATSHEET.md:1471`, hard-delete list). A poll that read
+//!    (`COMPAT_CHEATSHEET.md:1524`, hard-delete list). A poll that read
 //!    between those two statements would prune a live SKU — and pruning
 //!    a live SKU re-creates exactly the FK-miss jam this module exists
 //!    to prevent.
@@ -449,7 +449,7 @@ mod tests {
     }
 
     /// The sentinel "room rent line" Pro_no per
-    /// `COMPAT_CHEATSHEET.md:964` — projection must round-trip the
+    /// `COMPAT_CHEATSHEET.md:1008` — projection must round-trip the
     /// literal `'P001'` unchanged so the writeback recipe can target
     /// it by name.
     #[test]

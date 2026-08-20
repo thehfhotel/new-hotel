@@ -19,7 +19,7 @@
 --   * No existing PRIMARY KEY on `HT_CheckIn_Other_People`
 --   * No existing per-table CT
 --   * `id` is the IDENTITY column (live-verified IDENTITY per
---     COMPAT_CHEATSHEET line 571: "schema says NOT IDENTITY but live
+--     COMPAT_CHEATSHEET line 585: "schema says NOT IDENTITY but live
 --     verified IDENTITY per INFORMATION_SCHEMA.COLUMNS.is_identity=1"),
 --     so an existing IDENTITY column is already NOT NULL on every
 --     row but the column nullability may still be marked NULL in

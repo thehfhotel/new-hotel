@@ -6,7 +6,7 @@
 -- ## Background
 --
 -- iHOTEL keeps two "sticky note" tables with an identical shape and a simple
--- read-flag flow (`docs/legacy-app/COMPAT_CHEATSHEET.md` §932-942, §3.22;
+-- read-flag flow (`docs/legacy-app/COMPAT_CHEATSHEET.md` §946-956, §3.22;
 -- `docs/legacy-app/SCHEMA.sql:385,596`; `docs/legacy-app/FEATURE_MAP.md:233`):
 --
 --   * `HT_Room_SMS`  — a sticky note pinned to a ROOM (keyed `SMS_Room` = room_no).

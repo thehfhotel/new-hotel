@@ -62,7 +62,7 @@ Each section lists the SQL the legacy app fires for that user action.
 — the app sends literal SQL text every time. INSERT statements use bracketed
 identifiers (typical .NET SqlClient style).
 
-### 3a. Walk-in check-in (8 statements, ~30ms)
+### 3a. Walk-in check-in (9 statements, 61ms)
 
 Source captures: `walkin-20260424-095304/writes.txt`, `walkin3-20260424-100000/writes.txt`
 
@@ -103,11 +103,16 @@ INSERT INTO [HT_CheckIn_H] ([Cin_no], [Cin_Date], [Cin_Book_no=NULL for walk-ins
 -- 9. Coupon flag (cupons are pre-allocated; this marks the new check-in's coupon as printed)
 UPDATE HT_Cupon SET cupon_print=1 WHERE cupon_cin_no='CH26-005228'
 
--- ~5 seconds later (TM.30 batch number assigned async)
+-- ~5 s later, and NOT part of the check-in write set: the folio was re-opened, and the
+-- form-open took iHOTEL's per-folio lock token. Mechanism traced in the note below.
 UPDATE HT_CheckIn_H SET Cin_Work_number=269357 WHERE Cin_No='CH26-005228'
 ```
 
-**Tables touched**: 7 INSERTs + 3 UPDATEs.
+**Tables touched**: 6 INSERTs + 3 UPDATEs — the nine statements above, all stamped
+`09:56:20` in `raw/walkin-20260424-095304/writes.txt` (lines 1-9). The trailing
+`Cin_Work_number` UPDATE at `09:56:25` is a tenth statement and is **not** part of the
+write set — see the finding note below. `raw/walkin3-20260424-100000/writes.txt` has the
+identical shape: 9 statements at `10:01:11`, token write at `10:01:16`.
 
 **Findings:**
 - `Cin_Room_Status` initial value is `'เข้าพัก'` (Thai: "occupying") for walk-ins.
@@ -115,7 +120,22 @@ UPDATE HT_CheckIn_H SET Cin_Work_number=269357 WHERE Cin_No='CH26-005228'
 - `Cin_by='Admin'` is the legacy app's logged-in employee. Always `Admin` in our captures.
 - The person prefix varies: `Mr.` or `นาย` (Thai for Mr.) depending on which input form was used. Inconsistent — both observed in our 2 walk-ins.
 - `Tb_Save_Image` UPDATE always fires; matches 0 rows if no photo.
-- `Cin_Work_number` (TM.30 batch number) is **random**, assigned ~5s after check-in completes. Multiple updates may fire (we saw 3 in one session). It's NOT sequential.
+- `Cin_Work_number` is iHOTEL's per-folio **optimistic-lock token** — *not* a TM.30 batch number, and nothing about it is asynchronous. `Module1.GET_WORK_NUMBER` (`Module1.cs:1662`) writes a fresh `Random.Next(100000, 999999)` — .NET's upper bound is exclusive, so `100000..999998` — on every folio **load** in five reception forms, and each re-checks the value in `SAVE_EDIT()`; a mismatch discards the receptionist's edit and closes her form. The "3 updates in one session" we saw are three folio *opens*, not three batch assignments. It is random and non-sequential — that means "lock token", not "document number". Full mechanism and call sites: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4.
+  - **What writes the trailing one on the walk-in path** — traced statement-by-statement through `raw/walkin-20260424-095304/07-events.txt`, and reproduced in `raw/walkin3-20260424-100000/07-events.txt`. The walk-in save is `FrmCheckIn.SAVE_ADD()` (`FrmCheckIn.cs:9245`; `Button7_Click` picks it over `SAVE_EDIT()` because `EDIT_ID` is empty for a new folio, `:9233-9239`). SAVE_ADD contains **no** `GET_WORK_NUMBER`, `LoadBill()` or `WORK_ID` reference at all — it ends at `:9681-9684` by assigning `EDIT_ID`, showing "Check-In เสร็จเรียบร้อย" and closing the form. The token write comes from a **second, operator-driven folio open** a few seconds later:
+
+    | `walkin` | `walkin3` | Event | Code |
+    |---|---|---|---|
+    | `09:56:23` | `10:01:14` | `View_CheckIn_Ds` → `HT_ContinueTime` → `total_price_balance` → `cupon_no` — the occupied-room popup loading | `FormRoomMain.cs:4101-4103` opens `ClickUSE`; its Load is `ClickUSE.cs:1064` (body `:1094-1101`) |
+    | `09:56:24.665` | `10:01:15.394` | `select * from View_CheckIn_Ds where Cin_Room_no='<room>' …` | `ClickUSE.ButtonX10_Click:1633` — the popup's `เพิ่ม/แก้ไข ห้องพัก` button |
+    | `09:56:24.666` | `10:01:15.395` | `select id from HT_Round_Bill where round_end is null` | `frmMain1.ButtonItem10_Click:7421` → `Module1.check_round_bill:1554` |
+    | `09:56:25.113` | `10:01:15.848` | `HT_SET_CusType_Main` / `HT_Order_Up` / `HT_SET_CusType` | `FrmCheckIn_Load:8105` → `LoadTypeM()`/`LoadType()` at `:8116-8117` |
+    | `09:56:25.126` | `10:01:15.861` | `HT_CheckIn_H` / `_Ds` / `_Product` / `_Other_People` | `LoadBill:8208` first four SELECTs (`:8210-8213`) |
+    | `09:56:25.281` | `10:01:16.016` | **the `Cin_Work_number` UPDATE** | `GET_WORK_NUMBER` at `LoadBill:8228` |
+    | `09:56:25.285` | `10:01:16.020` | `select * from HT_Customers where Cust_no='<cust>'` | `LoadBill:8229` |
+
+    `frmMain1.ButtonItem10_Click` sets `frmCheckIn.EDIT_ID = c_no` (`:7433`) before `ShowDialog()`, which is why this second `FrmCheckIn_Load` takes its `EDIT_ID <> ""` branch into `LoadBill()` (`:8151-8154`) while the original walk-in open did not. `ButtonX10_Click` is wired only as a `Click` handler (`ClickUSE.cs:320`) with no `PerformClick` anywhere, so this is a receptionist action, not something the app does to itself.
+  - **Not the same mechanism as on check-out.** There, `FrmCheckIn.SAVE_EDIT()` re-takes the token itself at its tail (`LoadBill()` at `FrmCheckIn.cs:10172`) — see §3e. `:10172` sits inside `SAVE_EDIT()` (declared `:9693`), which a walk-in never runs.
+  - **Why the capture alone couldn't tell**: an XEvent stream of `sql_batch_completed` shows the UPDATE but not the caller, and a form-open side effect and an async post-save job look identical in it — both are a lone UPDATE a few seconds off the save burst. What resolved it was (a) the decompile, which puts the write inside `LoadBill()` and the matching read early in `SAVE_EDIT()`, and (b) a read we already had on tape: `raw/checkout2-20260424-101023/07-events.txt:9` is the UPDATE at folio open and `:14` is `select Cin_Work_number …` 2.4 s later at save. An "assigned async, never read" column does not get SELECTed.
 - ID-card photo storage table `Tb_Save_Image` (9,688 rows) is non-trivial — likely binary blobs.
 
 ### 3b. Create future booking (4 INSERTs, ~20ms)
@@ -199,7 +219,7 @@ INSERTs that **still happen** for additional nights: if booking is N nights and 
 
 Source: `checkout-20260424-100323/writes.txt`, `checkout2-20260424-101023/writes.txt`
 
-**Phase 1 (always fires first, ~12 statements):** opens the check-in, deletes all child rows, re-inserts them. We confirmed this fires whether the receptionist clicks Save first or just clicks Check-out — it's hardcoded.
+**Phase 1 (always fires first, 14 statements):** opens the check-in, deletes all child rows, re-inserts them. We confirmed this fires whether the receptionist clicks Save first or just clicks Check-out — it's hardcoded.
 
 ```sql
 UPDATE HT_Customers SET ... WHERE Cust_no='C21607'             -- re-save customer
@@ -217,8 +237,29 @@ INSERT INTO [HT_Room_Status] (...)
 DELETE FROM HT_CheckIn_Other_People WHERE Cin_no='CH26-005228'
 INSERT INTO [HT_CheckIn_Other_People] (...)
 INSERT INTO [HT_CheckIn_H] (...)
-UPDATE HT_CheckIn_H SET Cin_Work_number=712095 WHERE Cin_No='CH26-005228'  -- new TM.30 batch
+UPDATE HT_CheckIn_H SET Cin_Work_number=712095 WHERE Cin_No='CH26-005228'
+   -- FrmCheckIn.SAVE_EDIT() re-takes the lock token itself: its tail calls LoadBill()
+   -- (FrmCheckIn.cs:10172), and LoadBill() runs GET_WORK_NUMBER (:8228). Concurrency
+   -- control, not check-out data — do not replay it.
 ```
+
+Unlike the walk-in's trailing token write (§3a), this one is the *same form's* own doing,
+which is why it lands in the same second as the burst (`10:04:08` in
+`checkout-20260424-100323/writes.txt:16`) rather than seconds after it.
+
+`GET_WORK_NUMBER` is the only code in the decompile that writes this column, and it is
+reachable only from the five `LoadBill()`s — so **every** `Cin_Work_number` write in any
+capture is a folio open. `checkout-20260424-100323` has four, and each form is identifiable
+from the SELECTs it issues just before the write (`07-events.txt`):
+
+| Write | Preceding SELECTs | Form |
+|---|---|---|
+| `10:03:50` (`writes.txt:1`) | `HT_SET_CusType order by id`, then `HT_CheckIn_H`/`_Ds`/`_Product` (no `_Other_People`), then `View_Pay_Ds` + `HT_Log_Debt` after | `FrmCheckOut` (`FrmCheckOut.cs`: `LoadType:5334` → `LoadBill:5154`, take at `:5167`) |
+| `10:04:03` (`writes.txt:2`) | `HT_SET_CusType_Main` / `HT_Order_Up` / `HT_SET_CusType order by name`, then all four folio tables | `FrmCheckIn` re-opened from the room-tile popup — same path as §3a |
+| `10:04:08` (`writes.txt:16`) | the four folio tables with **no** combo-box preamble | `FrmCheckIn.SAVE_EDIT()`'s own tail `LoadBill()` (`FrmCheckIn.cs:10172`) |
+| `10:05:02` (`writes.txt:17`) | `HT_SET_CusType order by id` + three folio tables again | `FrmCheckOut` re-opened, immediately before Phase 2 |
+
+None of the four is check-out data. Do not replay any of them.
 
 **Phase 2 (the actual check-out, 5 UPDATEs):**
 ```sql
@@ -271,14 +312,37 @@ INSERT INTO HT_Housewife (h_name='Admin', h_room='402', h_date='4/24/2026 5:11:5
 
 Source: `extend-20260424-101350/writes.txt`
 
+**Before Phase A — the form-open lock take (not part of the save).** Four seconds before
+the save burst, at `10:15:22`, `FrmEditDate` opened and `GET_WORK_NUMBER` took iHOTEL's
+folio lock:
+
+```sql
+update HT_CheckIn_H set Cin_Work_number=539215 where Cin_No='CH26-005230'
+```
+
+`raw/extend-20260424-101350/writes.txt` holds *four* such writes — `10:14:12`, `10:15:22`,
+`10:16:30`, `10:16:36` — one per folio open, and the `10:15:26` save burst contains **none**
+of them. The `10:15:22` one is `FrmEditDate`: `07-events.txt` shows
+`ClickUSE.ButtonX11_Click` (`ClickUSE.cs:1639`, the popup's `เพิ่ม/ลด วันเข้าพัก` button)
+firing at `10:15:22.219`, then `FrmEditDate.LoadBill()` — called explicitly at
+`ClickUSE.cs:1647` — issuing `HT_CheckIn_H` / `_Ds` / `_Product` (`FrmEditDate.cs:4175-4177`)
+and taking the token at `FrmEditDate.cs:4187`. The matching check is visible too: `select Cin_Work_number …` at
+`10:15:26.158` (`FrmEditDate.cs:4867`), immediately before the Phase A writes.
+
+None of these belong in a writeback recipe as *data*. See §3a's finding note for why the
+capture alone could not separate "form-open side effect" from "async batch job", and
+`docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4 for the mechanism and the one recipe that
+takes the lock deliberately.
+
 **Phase A (the actual extend, 7 statements, ~30ms):**
 ```sql
-UPDATE HT_CheckIn_H SET Cin_Work_number=539215 WHERE Cin_No='CH26-005230'  -- TM.30 touch
 UPDATE HT_Rooms SET room_use='no' WHERE room_no IN (...)  -- temp clear (will revert)
 DELETE FROM HT_Room_Status WHERE room_CheckIn_No='CH26-005230'  -- nuke all date rows
 UPDATE [HT_CheckIn_H]
-   SET [Total_Price_Room]=1780, [Total_Price_Net]=1780, [Total_Price_Balance]=1780
- WHERE [Cin_no]='CH26-005230'  -- recalc totals
+   SET [Total_Price_Room]=1780.00, [Total_Price_Product]=0.00, [Total_Price_Net]=1780.00,
+       [Total_Price_Pay]=0.00, [Total_Price_Balance]=1780.00
+ WHERE [Cin_no]='CH26-005230'  -- recalc totals: iHOTEL writes ALL FIVE as absolute
+                               -- literals from its in-form labels (writes.txt:5)
 UPDATE [HT_CheckIn_Ds]
    SET [Cin_Room_night]=2, [Cin_Room_PriceTotal]=1780,
        [Cin_Room_Out]='4/26/2026 12:00:00 PM'
@@ -291,6 +355,18 @@ INSERT INTO [HT_Room_Status] (id=50236, room_date='4/25/2026', ...)  -- new nigh
 Then Phase B (destructive save) fires too — same pattern as on check-out.
 
 **Implication for writeback**: extend = recompute totals + replace `HT_Room_Status` rows for the changed date range. Targeted, no destructive Phase B needed.
+
+**Two deliberate departures in `writeback/recipes/extend_stay.rs`** (both are departures,
+not parity — don't "restore parity" by reverting either):
+
+- We write only `Total_Price_Room` / `_Net` / `_Balance`, **not** all five. iHOTEL writes
+  Product and Pay too (above); we skip them because our `product_total` would be a
+  hardcoded `0.0` (which would zero iHOTEL-entered product revenue) and a
+  `Total_Price_Pay` literal would race concurrent payment writebacks.
+- We *do* emit the `Cin_Work_number` lock take, even though it is not in the capture's save
+  burst, because we are "another machine" editing that folio: any iHOTEL form loaded
+  before our extend would otherwise save its stale in-form totals straight over ours. See
+  COMPAT_CHEATSHEET §7.4.
 
 ### 3g-bis. Cancel booking (4 UPDATEs + 1 DELETE — clean, no destructive phase!)
 
@@ -526,7 +602,7 @@ Map of "our app's intent" → "legacy SQL we must emit":
 | New customer (standalone) | `INSERT HT_Customers` | Allocate `Cust_no = MAX+1`. Address fields all default to `''`. |
 | New booking (advance) | `INSERT HT_Book_H` + `INSERT HT_Book_Ds` (1) + `INSERT HT_Book_Date` (×nights) | Allocate `Book_ID = MAX+1`. Departure time = `'11:59:59 AM'`. |
 | Modify booking dates | UPDATE HT_Book_H, HT_Book_Ds; ADD/REMOVE HT_Book_Date rows; UPDATE HT_Rooms display | **Skip** the legacy's destructive DELETE-all pattern. |
-| Walk-in check-in | All 8 statements from §3a, plus the 5s-later `Cin_Work_number` UPDATE | Allocate `Cin_no = MAX+1`. `Cin_by` = our app user (or `'Admin'`). |
+| Walk-in check-in | All 9 statements from §3a. **Do NOT replay the trailing `Cin_Work_number` UPDATE** — that is a later folio *open* taking iHOTEL's lock token (COMPAT_CHEATSHEET §7.4), not part of the check-in write set. Walk-in *creates* the folio, so there is no pre-existing open form to invalidate. | Allocate `Cin_no = MAX+1`. `Cin_by` = our app user (or `'Admin'`). |
 | Check-in to a booking | Same as walk-in BUT: skip `INSERT HT_Customers` (UPDATE instead), set `Cin_Book_no`, UPDATE `HT_Book_H.Book_Status='เข้าพัก'`, UPDATE existing `HT_Room_Status` rows | Linkage via `Cin_Book_no`. |
 | Add / extend night | UPDATE `HT_CheckIn_Ds` (night count, Cin_Room_Out, prices), UPDATE `HT_CheckIn_H` totals, INSERT new `HT_Room_Status` for added nights | Skip destructive Phase. |
 | Take payment | INSERT `HT_CheckIn_Pay`, UPDATE `HT_CheckIn_H` totals | One-shot. |
@@ -646,7 +722,12 @@ Applied the §3g-bis cancel SQL to `R014812`. Receptionist confirmed:
 | What the empty-table columns (`HT_Bank_*`, `HT_Bill_Debt_*`, `HT_Order_*`, `HT_Deposit`, `HT_Register`) are for | Unused features — confirm with hotel staff. |
 | What `Tb_Save_Image` actually stores (binary blobs?) | Sample one row's column shapes. |
 | Whether multi-room check-ins use the same flow | Capture a 2-room walk-in; confirm two `HT_CheckIn_Ds` rows + power log entries. |
-| `Cin_Work_number` — TM.30 batch number meaning | Random number assigned async ~5s after check-in. May relate to government registry export. |
 
 These are all minor — the writeback worker can ship without them. Add as
 needed when the corresponding feature is implemented in our app.
+
+`Cin_Work_number` was on this list as an open question about a TM.30 batch number. It is
+not one: it is iHOTEL's per-folio **optimistic-lock token** — `Module1.GET_WORK_NUMBER`,
+taken on folio load by five reception forms and re-checked in each form's `SAVE_EDIT()`.
+There is no registry export and no async job. Mechanism, call sites and the "never write
+this casually" rule: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4.

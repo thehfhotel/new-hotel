@@ -6,7 +6,7 @@
 -- ## Background
 --
 -- iHOTEL lets a receptionist attach pre-booked products to a booking via
--- FrmAddBook2 (COMPAT_CHEATSHEET line 711-716, §3.4 step 3.5). Those rows
+-- FrmAddBook2 (COMPAT_CHEATSHEET line 725-730, §3.4 step 3.5). Those rows
 -- live in legacy `HT_Book_Pro` and are mirrored READ-ONLY into
 -- `legacy_mirror.ht_book_pro` (migration 056). Until this migration our app
 -- had no CANONICAL place to record a product a guest pre-orders at the moment

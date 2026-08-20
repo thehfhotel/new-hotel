@@ -29,9 +29,31 @@
 //! - Person prefix is `'Mr. '` or `'นาย '` — both observed; we use `'Mr. '` as default.
 //! - `Tb_Save_Image` UPDATE is a no-op when no photo was uploaded — we skip
 //!   it (matches the legacy app's behavior on photo-less check-ins).
-//! - `Cin_Work_number` (TM.30 batch) is assigned ~5s later by the legacy app's
-//!   async batch job. Our writeback doesn't allocate it — the .NET app will
-//!   set it when it next opens the check-in (or it stays 0 until then).
+//! - `Cin_Work_number` is iHOTEL's per-folio OPTIMISTIC-LOCK TOKEN — **not** a
+//!   TM.30 batch number and **not** an async job (the 2026-04 spike inferred
+//!   both; the inference is disproven). `Module1.GET_WORK_NUMBER`
+//!   (Module1.cs:1662) writes a fresh `Random.Next(100000,999999)` on FOLIO
+//!   LOAD in five reception forms — `FrmEditDate`, `FrmPayAdd`,
+//!   `FrmPayAddPro`, `FrmCheckIn`, `FrmCheckOut` — and each re-reads it in
+//!   `SAVE_EDIT()`; on mismatch the form shows
+//!   `มีการแก้ไข … จากเครื่องอื่น`, calls `Close()`, and the receptionist's
+//!   typed work is DISCARDED. The UPDATE the capture shows ~5 s after the save
+//!   burst is NOT part of the walk-in save: `SAVE_ADD()` (the walk-in path,
+//!   FrmCheckIn.cs:9245) contains no `GET_WORK_NUMBER`, `LoadBill` or
+//!   `WORK_ID` at all. It is a later, operator-driven re-open of the folio —
+//!   `ClickUSE.ButtonX10_Click` → `frmMain1.ButtonItem10_Click` (sets
+//!   `EDIT_ID`, `ShowDialog`) → `FrmCheckIn_Load` → `LoadBill()` →
+//!   `GET_WORK_NUMBER` — i.e. a folio-open side effect, not a batch job.
+//!   (Check-OUT captures show a superficially similar trailing write from a
+//!   different mechanism: `SAVE_EDIT()`'s own tail `LoadBill()`.)
+//!   We deliberately do not write it here: walk-in CREATES the folio, so no
+//!   iHOTEL form can already be open on it and there is nothing to protect —
+//!   the write would be pure risk with no benefit. The assertion in
+//!   `checkin_h_drops_obsolete_columns_per_audit` pins that choice.
+//!   The .NET app takes the token the next time it opens the check-in (until
+//!   then the column sits at its `DEFAULT ((0))`). Contrast `extend_stay`,
+//!   which mutates an EXISTING folio and therefore bumps the token on purpose.
+//!   See `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4.
 
 use chrono::{DateTime, NaiveDate, Utc};
 
@@ -304,9 +326,13 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
 
     // N+2. HT_CheckIn_H — 19-col canonical legacy order (verified from
     //     16 captures in /tmp/legacy-events-full.log; `Cin_by` precedes
-    //     `Cin_Date_in`). Drops the obsolete `[Total_Price_vat]`,
-    //     `[Cin_note]`, and `[Cin_Work_number]` columns the audit
-    //     identified, and uses the lowercase `[Cin_cust_price]`,
+    //     `Cin_Date_in`). Drops the obsolete `[Total_Price_vat]` and
+    //     `[Cin_note]` columns the audit identified, and — separately —
+    //     `[Cin_Work_number]`, which is NOT obsolete: it is iHOTEL's live
+    //     per-folio optimistic-lock token (COMPAT_CHEATSHEET §7.4). It is
+    //     omitted because the capture's INSERT column list omits it, so the
+    //     row lands on `DEFAULT ((0))` and iHOTEL takes the real token the
+    //     next time the folio is opened. Uses the lowercase `[Cin_cust_price]`,
     //     mixed-case `[Cin_Date_Out]`, `[Cin_Type]` casing the legacy
     //     app emits. `[Cin_Type]` is the integer 0; `[Cin_foreign]` is
     //     the string `'False'`. For walk-ins `[Cin_Book_no]` is empty.
@@ -632,6 +658,11 @@ mod tests {
         let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
         assert!(!cin_h.contains("[Total_Price_vat]"));
         assert!(!cin_h.contains("[Cin_note]"));
+        // Pins the HT_CheckIn_H INSERT column list to the capture. This is NOT
+        // a global prohibition on writing `Cin_Work_number`: that column is
+        // iHOTEL's per-folio optimistic-lock token and `extend_stay` writes it
+        // deliberately (COMPAT_CHEATSHEET §7.4). Walk-in creates the folio, so
+        // there is no open iHOTEL form to invalidate — hence not here.
         assert!(!cin_h.contains("[Cin_Work_number]"));
     }
 

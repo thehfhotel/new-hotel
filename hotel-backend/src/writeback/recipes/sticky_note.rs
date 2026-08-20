@@ -1,7 +1,7 @@
 //! Sticky-note recipes — Task #47 (room & staff notes / โน้ตห้อง / โน้ตพนักงาน).
 //!
 //! Mirrors iHOTEL's `Room_Note.cs` / `EMP_Note.cs` against the two legacy SMS
-//! tables (`docs/legacy-app/COMPAT_CHEATSHEET.md` §932-942 / §3.22;
+//! tables (`docs/legacy-app/COMPAT_CHEATSHEET.md` §946-956 / §3.22;
 //! `docs/legacy-app/SCHEMA.sql:385,596`). Both tables share one shape —
 //! `SMS_ID int IDENTITY, <key> varchar(50), SMS_Details text, SMS_By
 //! varchar(250), SMS_Readed varchar(50)` — differing only in the target key

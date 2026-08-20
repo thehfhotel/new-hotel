@@ -1618,7 +1618,7 @@ impl MssqlChangeMapper for RoomsCancelMirrorMapper {
 // ## What `HT_Book_Pro` rows mean in iHOTEL
 //
 // Pre-booked products (food / drinks pre-ordered) attached to a
-// booking. `COMPAT_CHEATSHEET.md` lines 711-716 ("Table: `HT_Book_Pro`
+// booking. `COMPAT_CHEATSHEET.md` lines 725-730 ("Table: `HT_Book_Pro`
 // (A) — pre-booked products"):
 //
 //   * PK `id int IDENTITY` — inserts omit `[id]` (FrmAddBook2.cs:3638).

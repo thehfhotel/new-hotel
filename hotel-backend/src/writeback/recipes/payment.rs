@@ -234,7 +234,7 @@ pub fn build_statements(
     //
     //    Audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal` are the
     //    actual tender amount (not the nightly total). The legacy invariant
-    //    (COMPAT_CHEATSHEET.md:534) requires
+    //    (COMPAT_CHEATSHEET.md:557) requires
     //    `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`. The unit
     //    price (`Cin_Pay_Ds_PriceOne`) and quantity (`Cin_Pay_Ds_Num`)
     //    remain verbatim so the printed receipt line still shows the
@@ -805,7 +805,7 @@ mod tests {
     /// Fix for audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal`
     /// must equal the actual tender amount, satisfying the legacy invariant
     /// `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`
-    /// (COMPAT_CHEATSHEET.md:534). With the prior (nightly_total) wiring a
+    /// (COMPAT_CHEATSHEET.md:557). With the prior (nightly_total) wiring a
     /// partial payment broke the invariant: a 400-baht prepayment against a
     /// 711-baht nightly stay would write Ds_Price=711 but Cash+...=400.
     #[test]

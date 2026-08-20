@@ -75,16 +75,16 @@ threaded through the intent. Fix: extend `WritebackIntent::CheckOut`
 payload with the 5 totals; propagate.
 
 **H2 — `checkout.rs:106` Room_Use_Count += 1 regardless of nights.**
-Should be `Room_Use_Count + {nights}` per `COMPAT_CHEATSHEET.md:289,1164`.
+Should be `Room_Use_Count + {nights}` per `COMPAT_CHEATSHEET.md:309,1208`.
 Spike captures were 1-night stays so the bug was hidden. Multi-night
 stays under-count by `nights-1`. Fix: parameterize from `inputs.nights`
 (already in the payload after H1 fix).
 
 **H3 — `payment.rs:213-217` violates legacy sum invariant.**
 Sets `Cin_Pay_Ds_Price = nightly_total_2dp` but legacy invariant
-(`COMPAT_CHEATSHEET.md:534`) is
+(`COMPAT_CHEATSHEET.md:557`) is
 `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`. Partial payments
-break the invariant; shift report (`COMPAT:534`) becomes inconsistent.
+break the invariant; shift report (`COMPAT:557`) becomes inconsistent.
 Fix: `Cin_Pay_Ds_Price = Cin_Pay_Ds_PriceTotal = amount_2dp` (the actual
 tender). Keep `Cin_Pay_Ds_PriceOne` and `Cin_Pay_Ds_Num` verbatim. Add a
 `debug_assert!` on the sum.
@@ -97,7 +97,7 @@ Live capture (`invoice-20260424-100827/writes.txt:8`) is `1.00, 711.00,
 
 **H5 — `domain/payment.rs:46` Transfer routed to wrong column.**
 `PaymentMethod::Transfer.legacy_column()` returns `"Cin_Pay_Credit"` —
-should be `"Cin_Pay_Tran"` per `COMPAT_CHEATSHEET.md:515`. The recipe
+should be `"Cin_Pay_Tran"` per `COMPAT_CHEATSHEET.md:552`. The recipe
 at `payment.rs:146` is correct; the helper contradicts it. No current
 caller uses the helper, so latent — but `pub`.
 
@@ -116,7 +116,7 @@ Night-0 does `UPDATE HT_Room_Status WHERE room_date=… AND room_no=…`. Our
 HT_Customers, HT_Book_H, HT_Book_Ds, HT_Book_Date). UPDATE silently
 matches 0 rows; iHOTEL's calendar shows night-0 as empty.
 Fix: `booking_create.rs` should also insert `HT_Room_Status` per night
-with `status='จอง'` (matches `COMPAT_CHEATSHEET.md:347` "insert booking
+with `status='จอง'` (matches `COMPAT_CHEATSHEET.md:370` "insert booking
 day"). This is the cleanest fix — keeps checkin_to_booking unchanged.
 
 **H8 — `booking_modify.rs:202-234` caption rewrite skipped on date-only edit.**

@@ -38,10 +38,11 @@
 //!
 //! Both `walkin3-20260424-100000/writes.txt` and
 //! `booking-checkin-20260424-101838/writes.txt` show one `HT_CheckIn_Ds`
-//! INSERT per check-in. `findings.md:648` records the open question
-//! ("Whether multi-room check-ins use the same flow"); the
-//! `COMPAT_CHEATSHEET` (landed 2026-05-11) answered it — `HT_CheckIn_Ds`
-//! is one row per room — and Track B4 finally closes the writeback gap.
+//! INSERT per check-in. `findings.md` §7 "What we still don't know"
+//! records the open question ("Whether multi-room check-ins use the same
+//! flow"); the `COMPAT_CHEATSHEET` (landed 2026-05-11) answered it —
+//! `HT_CheckIn_Ds` is one row per room — and Track B4 finally closes the
+//! writeback gap.
 
 #![allow(clippy::needless_collect)]
 

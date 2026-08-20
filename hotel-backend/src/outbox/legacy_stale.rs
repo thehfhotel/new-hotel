@@ -307,7 +307,7 @@ pub async fn publish(pg: &PgPool, signal: &LegacyStaleSignal) -> Result<(), sqlx
 /// `MarkRoomClean`'s label ("ทำความสะอาดเรียบร้อย") is NOT that file's
 /// vacant-clean tile text (which is "ว่าง") — it's the phrase iHOTEL itself
 /// logs in its cleaning-done button handler, `docs/legacy-app/
-/// COMPAT_CHEATSHEET.md:1391`. `SetRoomMaintenance`'s two labels
+/// COMPAT_CHEATSHEET.md:1405`. `SetRoomMaintenance`'s two labels
 /// ("แจ้งซ่อม" / "ยกเลิกแจ้งซ่อม") have no `docs/legacy-app/` hit at all
 /// (iHOTEL's maintenance tile just says "ซ่อม") — those are our own wording,
 /// not a decompile citation.
@@ -348,7 +348,7 @@ pub fn stale_label(intent: &WritebackIntent, room_no: Option<&str>) -> String {
         // --- Housekeeping / room master data ---
         // MarkRoomDirty reuses iHOTEL's own tile text (ROOM_STATUS_PALETTE.md:12)
         // so the toast matches the board reception looks at next. MarkRoomClean
-        // is iHOTEL's cleaning-done button-log phrase (COMPAT_CHEATSHEET.md:1391),
+        // is iHOTEL's cleaning-done button-log phrase (COMPAT_CHEATSHEET.md:1405),
         // not the palette's vacant-clean tile text (which is "ว่าง").
         MarkRoomClean { .. } => room_prefixed(room_no, "ทำความสะอาดเรียบร้อย"),
         MarkRoomDirty { .. } => room_prefixed(room_no, "รอ ทำความสะอาด"),
@@ -783,7 +783,7 @@ mod tests {
         // iHOTEL's own tile text — see ROOM_STATUS_PALETTE.md:12.
         assert_eq!(by_name("mark_room_dirty", Some("302")), "ห้อง 302 รอ ทำความสะอาด");
         // iHOTEL's cleaning-done button-log phrase, not the palette's
-        // vacant-clean tile text ("ว่าง") — see COMPAT_CHEATSHEET.md:1391.
+        // vacant-clean tile text ("ว่าง") — see COMPAT_CHEATSHEET.md:1405.
         assert_eq!(
             by_name("mark_room_clean", Some("302")),
             "ห้อง 302 ทำความสะอาดเรียบร้อย"

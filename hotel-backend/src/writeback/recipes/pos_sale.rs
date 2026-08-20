@@ -1,7 +1,7 @@
 //! `RecordPosSale` recipe — Track G6 / POS module (MVP).
 //!
 //! Mirrors the iHOTEL POS write path captured in
-//! `docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`. When the receptionist
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md:574-578`. When the receptionist
 //! posts a F&B / laundry / amenity line to a guest's folio, the legacy
 //! app fires two statements inside one transaction:
 //!

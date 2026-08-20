@@ -147,7 +147,7 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         // The matching `HT_Book_Ds.[Book_Room_Note]` (capital R) is pushed
         // into `ds_sets` below — iHOTEL's edit-booking form binds the visible
         // note column to the Ds row (`SCHEMA.sql:6` for HT_Book_Ds,
-        // `COMPAT_CHEATSHEET.md:671` for the column name), so without that
+        // `COMPAT_CHEATSHEET.md:708` for the column name), so without that
         // write a note edit stayed invisible in iHOTEL until the user
         // re-saved.
         header_sets.push(format!("[Book_room_note]={q}"));
@@ -202,7 +202,7 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         // — distinct column from the header-level `Book_room_note`). iHOTEL's
         // edit-booking form binds the visible note input to the Ds row, so
         // without this write a note edit was invisible in iHOTEL until the
-        // user re-saved. `SCHEMA.sql` line 6 / `COMPAT_CHEATSHEET.md:671`
+        // user re-saved. `SCHEMA.sql` line 6 / `COMPAT_CHEATSHEET.md:708`
         // confirm the column name + casing.
         let q = sql_quote(notes);
         ds_sets.push(format!("[Book_Room_Note]={q}"));

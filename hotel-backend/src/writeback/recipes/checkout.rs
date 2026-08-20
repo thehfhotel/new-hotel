@@ -696,7 +696,7 @@ mod tests {
     }
 
     /// Fix for audit H2: Room_Use_Count is bumped by the real nights count
-    /// (per COMPAT_CHEATSHEET.md:289), not always +1. Spike captures were
+    /// (per COMPAT_CHEATSHEET.md:309), not always +1. Spike captures were
     /// 1-night stays so the bug was hidden.
     #[test]
     fn room_use_count_increments_by_nights_not_one() {
