@@ -202,6 +202,11 @@ the race is real; `HT_CheckIn_Pay.id` is `is_identity = 1`, so SQL Server alloca
 iHOTEL's INSERT omits the column, and no duplicate-id race is possible there at all
 (verified against HF Ville, 2026-08-19).
 
+Relatedly, **"has this intent ever run?" is answered from canonical `writeback_jobs`,
+never from `dbo.ht_writeback_ledger`** — the ledger only records create-writebacks, so
+non-ledgered intents (ExtendStay, MarkRoomClean/Dirty) never appear there and an empty
+ledger lookup proves nothing.
+
 **Before hand-editing ANY legacy value (not just schema) — read this.** Two guards
 exist, one accepted gap sits between them, and one column is a live lock:
 
