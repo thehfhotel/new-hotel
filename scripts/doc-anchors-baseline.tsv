@@ -1,0 +1,68 @@
+# doc-anchors baseline — citations this guard KNOWS are broken and tolerates.
+#
+# WHY THIS FILE EXISTS. `scripts/check-doc-anchors.sh` is a NEW lint landing on
+# an existing codebase. A new lint lands with a recorded baseline and burns down;
+# it does not hold a focused branch hostage to a tree-wide sweep. Everything
+# listed here is pre-existing debt in an area the doc-anchor-hardening branch
+# never claimed. Nothing here is a citation this branch wrote.
+#
+# CONTRACT — enforced by the guard, not by convention:
+#   * The guard exits 0 when every remaining failure is listed here.
+#   * A failure NOT listed here still fails the build. This is a ledger, not a mute.
+#   * A listed failure occurring MORE times than its count FAILS the build, so the
+#     debt cannot grow by copy-paste. The fix is to remove the new occurrence,
+#     never to raise the count.
+#   * EVERY ROW MUST BE CLASSIFIED AND JUSTIFIED. `scope` must be `in-scope` or
+#     `out-of-scope`, and `reason` must be a real sentence (>= 20 chars, and a
+#     TODO/FIXME/XXX placeholder is refused outright). A row that fails either
+#     test makes the guard EXIT 2: an untriaged row is not a ledger entry, it is
+#     a mute button, and a ledger that mutes silently is worse than no ledger.
+#     This is why `--update-baseline` writes `unclassified` + a TODO reason for
+#     any row it has not seen before — the regenerated file does not pass until a
+#     human has decided each new row is tolerable and written down why.
+#   * RAISING A COUNT IS AN ERROR, not an edit. The guard compares this file
+#     against its version at the merge base; a row whose count went up fails the
+#     build, quoting the before and after. (When no merge base is available — a
+#     shallow CI checkout, or a run outside a git tree — the run says so out loud
+#     rather than pretending the comparison happened.)
+#   * ADDING a row is allowed and never quiet: every row that is new since the
+#     merge base is printed with its scope and reason on every run.
+#   * A listed failure that is FIXED (or occurs fewer times) prints a WARNING
+#     asking for the row to be deleted, so the file shrinks toward zero instead of
+#     rotting. Warning and not error, deliberately: paying down debt must never
+#     turn someone's build red, and this branch landed while a sibling package was
+#     still converting citations in the same tree — a hard failure there would
+#     have made every partial fix look like a regression.
+#
+# HOW TO REGENERATE:  ./scripts/check-doc-anchors.sh --update-baseline
+#   (preserves the scope and reason of every row it already knows; new rows get
+#   `unclassified` and a TODO reason, both of which the guard REFUSES, so a new
+#   row cannot be added silently — triage it or delete it.)
+#
+# COLUMNS, tab-separated:
+#   1 path      the citing file
+#   2 count     how many times this exact failure occurs in that file
+#   3 class     stable diagnostic code — never contains a line number
+#   4 citation  the resolved target + the citation text: the identity that
+#               survives the file being edited
+#   5 scope     out-of-scope | in-scope   (`unclassified` is REJECTED)
+#   6 reason    why it is tolerated, and what would fix it
+#   7 lines=    INFORMATIONAL ONLY, for humans navigating to the site. Never
+#               matched against; stale numbers here are harmless by construction.
+#
+# THE KEY IS (path, class, citation) AND DELIBERATELY CONTAINS NO LINE NUMBER.
+# Keying a baseline on line numbers would reproduce exactly the rot this guard
+# was built to delete: edit the file, and every entry either points at the wrong
+# citation or stops matching. Keyed on the citation TEXT, an entry follows its
+# citation around the file and cannot be inherited by a different one.
+#
+app/reports/rr4/page.tsx	1	ambiguous-literal	docs/coexistence/audit-2026-05-13.md §T4	out-of-scope	Correct target UNKNOWN, not merely unconverted. audit-2026-05-13.md is organised as Themes 1-10 and Tracks A-H and has no §T4 heading; "T4" occurs 14x as body text. Which document owns a "T4 CRIT-2" section was not determined. Fixing it needs a decision, not a rename.	lines=9
+docs/architecture.md	1	self-anchor-not-found	docs/architecture.md §3a	out-of-scope	Surfaced by closing the self-validation hole: this is a real citation into ANOTHER document written without its doc-ref, and it passed before only because the anchor text sits on the citation's own line. The source-tree map's walkin.rs line reads "§3a recipe from spike findings", i.e. `docs/legacy-spike/findings.md` §"3a. Walk-in check-in" (line 93 there). Cure: name findings.md before the § on that line. architecture.md is not this package's file.	lines=1112
+docs/audits/2026-06-11-ihotel-coexistence-audit.md	1	self-anchor-not-found	docs/audits/2026-06-11-ihotel-coexistence-audit.md §3.13	out-of-scope	Same class: `MarkRoomDirty (§3.13 + HT_Housewife start row)` is a recipe-section reference into `docs/legacy-app/COMPAT_CHEATSHEET.md` (which has a §3.13, `Mark Room CLEAN (housewife cleaning action)`), not a heading of this audit. It passed before only by matching its own line. Cure: name the cheatsheet before the §, after its owner confirms 3.13 is the intended section. Audit records are out of this package's scope.	lines=134
+docs/legacy-spike/tables.md	1	self-anchor-not-found	docs/legacy-spike/tables.md §3j	out-of-scope	Same class: `App-INSERTed when room marked CLEAN (§3j)` means `docs/legacy-spike/findings.md` §"3j. Mark room clean" - the same table row cites `findings.md §3e/§3i` explicitly a few words later, so the doc-ref is simply missing from this one. Cure: write `findings.md §3j` like its neighbours. tables.md belongs to the legacy-spike set, not to this package.	lines=28
+docs/legacy-spike/writeback-audit-2026-05-12.md	1	self-anchor-not-found	docs/legacy-spike/writeback-audit-2026-05-12.md §3k	out-of-scope	Same class: the sentence "Update `§3k` table in both file headers" is a cross-document section reference (findings.md has §"3k. Booking-list visibility requirements"); it names no heading of the audit itself and passed only on its own line. WHICH document the sentence means must be confirmed by the audit's owner before a doc-ref is added, so it is recorded rather than guessed at here.	lines=144
+docs/sessions/2026-06-11-coexistence-audit-session.md	1	self-anchor-not-found	docs/sessions/2026-06-11-coexistence-audit-session.md §3.17	out-of-scope	Surfaced by narrowing the docs/sessions allowlist to Rule B. Both §s in this record are cheatsheet sections written without a doc-ref (`COMPAT_CHEATSHEET.md` §6.3 `On every product-line insert/delete...` and §3.17 `Change Room Mid-Stay`), not headings of the session record, so they were resolving against the wrong file. Cure: name the cheatsheet on each line. Session records are history and out of this package's scope.	lines=52
+docs/sessions/2026-06-11-coexistence-audit-session.md	1	self-anchor-not-found	docs/sessions/2026-06-11-coexistence-audit-session.md §6.3	out-of-scope	Surfaced by narrowing the docs/sessions allowlist to Rule B. Both §s in this record are cheatsheet sections written without a doc-ref (`COMPAT_CHEATSHEET.md` §6.3 `On every product-line insert/delete...` and §3.17 `Change Room Mid-Stay`), not headings of the session record, so they were resolving against the wrong file. Cure: name the cheatsheet on each line. Session records are history and out of this package's scope.	lines=50
+thai-id-middleware-tauri/README.md	1	anchor-not-found	docs/legacy-app/ROOM_GRID_REFRESH.md §4-5	out-of-scope	Heading RANGE the anchor grammar cannot express: §4-5 parses as the literal "4-5", which labels no heading. Both endpoints exist ("## 4. What a refresh actually costs", "## 5. The only external lever, and its hazards"), so the cure is two anchors. thai-id-middleware-tauri/** is the Tauri sidecar, outside this branch scope.	lines=56
+thai-id-middleware-tauri/src-tauri/src/ihotel/mod.rs	1	anchor-not-found	docs/legacy-app/ROOM_GRID_REFRESH.md §4-5	out-of-scope	Same heading-range spelling as the README row above; same sidecar, same out-of-scope reason.	lines=49
+thai-id-middleware-tauri/src-tauri/src/stale.rs	1	anchor-not-found	docs/legacy-app/ROOM_GRID_REFRESH.md §1-2	out-of-scope	Same class again: §1-2 is a heading range ("## 1. The refresh timer", "## 2. The focus gate — the headline finding"). Cure is two anchors; sidecar is out of scope.	lines=8

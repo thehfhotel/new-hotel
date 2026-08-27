@@ -998,13 +998,15 @@ pub(crate) fn project_aggregate(
     // Migration 079 — the ROOM-ONLY half of the folio, kept as its own
     // canonical column. `total_amount` above is `Total_Price_Net`, which
     // iHOTEL defines as Room + Product and rewrites on EVERY payment/sale
-    // change (COMPAT_CHEATSHEET §359-362), so it is not a usable room
-    // basis once a POS line exists. `routes::new_checkins::folio_breakdown`
+    // change (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "aggregated totals; old app updates these on every payment/sale change"
+    // — was: cheatsheet 359-362, the `HT_Room_Status` section), so it is not
+    // a usable room basis once a POS line exists. `routes::new_checkins::folio_breakdown`
     // needs the split to compute `net = room + product` without
     // double-counting a line iHOTEL already folded in.
     // Read straight through with no `Total_Price_Net` fallback: legacy
     // `Total_Price_Room` is `float NOT NULL DEFAULT 0`
-    // (COMPAT_CHEATSHEET §375), so a `None` here means the column was
+    // (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "Total_Price_Room float NOT NULL DEFAULT 0"
+    // — was: cheatsheet 375, the `HT_Room_Status` section), so a `None` here means the column was
     // genuinely absent from the row, not "unset" — and a product-only
     // folio legitimately carries 0.00.
     let room_amount = header.try_get_decimal("Total_Price_Room")?;

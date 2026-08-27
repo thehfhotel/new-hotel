@@ -427,8 +427,9 @@ impl MssqlChangeMapper for GuestRegistryMapper {
     }
 
     fn primary_key_cols(&self) -> &'static [&'static str] {
-        // IDENTITY column per COMPAT_CHEATSHEET line 585 (schema says
-        // NOT IDENTITY but live INFORMATION_SCHEMA.COLUMNS.is_identity=1).
+        // IDENTITY column per `COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Other_People`" "`id` IS IDENTITY"
+        // (schema says NOT IDENTITY but live INFORMATION_SCHEMA.COLUMNS.is_identity=1;
+        // was: cheatsheet 585, which is the `HT_CheckIn_Product` schema fence).
         // Track E1 migration 022 enforces the PK at the CT level.
         &["id"]
     }

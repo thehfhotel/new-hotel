@@ -175,7 +175,8 @@ jobs:
   # - test-frontend / test-backend — cheap, keep the green-CI signal honest
   #   even on a release-merge commit.
   # - lint-cardinality-map, lint-bin-hydrate, lint-no-changelog-version-edits,
-  #   init-db-migrations-drift-check — same rationale (lints are seconds).
+  #   lint-doc-anchors, init-db-migrations-drift-check — same rationale (lints
+  #   are seconds).
   # - The `should-deploy` check itself.
   #
   # Only the docker build + push and the evergreen SSH deploy step are
@@ -353,6 +354,54 @@ jobs:
 
       - name: Enforce per-site write-pool routing for mutating handlers
         run: ./scripts/check-write-pool-routing.sh
+
+  # Documentation-citation guard (chore/doc-anchor-hardening).
+  #
+  # This repo cites its own living documents constantly, and it used to do so by
+  # LINE NUMBER. Editing either document silently invalidated every citation
+  # pointing into it — PR #291's doc growth broke ~40 citations across 25 files,
+  # several of which had already been wrong for months because nothing checked
+  # them. `scripts/check-doc-anchors.sh` makes a citation resolve or fail: the
+  # target file must exist, the `§` anchor must match exactly one heading, and
+  # the optional quoted phrase must actually appear inside that section.
+  #
+  # NEW LINT ON AN EXISTING CODEBASE, so it ships with a recorded baseline of
+  # pre-existing debt (`scripts/doc-anchors-baseline.tsv`) rather than holding a
+  # focused branch hostage to a tree-wide sweep. The baseline is a ledger, not a
+  # mute — an unlisted failure still fails; a listed one occurring more times
+  # than recorded fails too; every row must carry a real scope and a real reason
+  # (an `unclassified` scope or a TODO reason exits 2); and raising a row's count
+  # against the merge-base version of the ledger is itself an error. `--self-test`
+  # covers every one of those directions, so a refactor of the script cannot
+  # quietly turn the baseline into a blanket suppression.
+  #
+  # `fetch-depth: 0` IS LOAD-BEARING HERE. The ledger-growth check compares this
+  # file against its version at the merge base, and the default shallow checkout
+  # has no merge base to compare against — the guard would print "growth NOT
+  # compared" and carry on. History for this repo is ~450 commits / ~50 MB, a
+  # second or two, which is cheap for turning "do not raise the count" from a
+  # sentence in a header into a rule CI enforces.
+  #
+  # Same shape and tier as lint-bin-hydrate: pure text over `git ls-files` — no
+  # network, no database, no cargo, no docker — so it is cheap enough to always
+  # run and is deliberately NOT in test-backend/build-backend `needs:` or the
+  # deploy gate. A stale doc citation should turn the PR check red; it should not
+  # serialise the backend build or block a production deploy.
+  lint-doc-anchors:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        with:
+          fetch-depth: 0   # merge base needed by the ledger-growth check
+
+      - name: Self-test the check script
+        run: ./scripts/check-doc-anchors.sh --self-test
+
+      - name: Enforce document-citation anchors (Rule A resolve / Rule B no line numbers)
+        run: ./scripts/check-doc-anchors.sh
 
   # Track J2 guard (audit-2026-05-14 follow-on to PR #99).
   #

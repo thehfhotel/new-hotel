@@ -92,7 +92,7 @@ pub struct RefundInsert<'a> {
     /// writing to the canonical `pay_amount` column so consumers reading
     /// `ht_payments` see a negative `pay_amount` (matches legacy
     /// `Cin_Pay_Cash/Credit` convention per
-    /// `docs/legacy-app/COMPAT_CHEATSHEET.md:550`).
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)").
     pub amount: f64,
     pub method: &'a str,
     pub original_payment_id: i32,
@@ -387,7 +387,8 @@ impl PaymentRepository for PgPaymentRepository {
         // Negate the caller-supplied positive `amount` so canonical
         // `pay_amount` carries a negative value (matches legacy
         // `Cin_Pay_Cash/Credit` negation convention per
-        // COMPAT_CHEATSHEET.md:550). The check that `amount` is
+        // `COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)").
+        // The check that `amount` is
         // positive is the service-layer's responsibility — the
         // repository writes whatever it's given.
         let neg_amount = -insert.amount.abs();

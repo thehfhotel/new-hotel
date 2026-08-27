@@ -24,7 +24,7 @@
 ```
 SOURCE: evergreen:"/home/nut/new-hotel/legacy/Hotel-2018- V.1.45/_decompiled_clean/iHOTEL2025/FormRoomMain.cs" (decompiled VB.NET WinForms, DevComponents DotNetBar). Line refs are into that file.
 
-RENDERING MODEL — each tile is a PanelEx with a vertical two-stop gradient (Style.GradientAngle=90): BackColor1 = top stop, BackColor2 = bottom stop. In the states[] list, color = BackColor1 (the dominant hue); the gradient partner (BackColor2) is given in the glyph-free note per state below. The color switch matches on the Thai R_STATUS string prefix and exists twice, byte-identical: method_0 (lines 3116–3169) and SETButton_Notclear (lines 3469–3523).
+RENDERING MODEL — each tile is a PanelEx with a vertical two-stop gradient (Style.GradientAngle=90): BackColor1 = top stop, BackColor2 = bottom stop. In the states[] list, color = BackColor1 (the dominant hue); the gradient partner (BackColor2) is given in the glyph-free note per state below. The color switch matches on the Thai R_STATUS string prefix and exists twice, byte-identical: method_0 (FormRoomMain.cs:3116-3169) and SETButton_Notclear (FormRoomMain.cs:3469-3523).
 
 GRADIENT PAIRS (BackColor1 → BackColor2):
 - reserved "จอง": Yellow #FFFF00 → LightYellow #FFFFE0

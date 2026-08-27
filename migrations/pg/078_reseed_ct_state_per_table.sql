@@ -15,8 +15,8 @@
 -- Both existing seeds of `legacy_ct_state_per_table` use
 -- `ON CONFLICT (table_name) DO NOTHING`:
 --
---   * migrations/pg/050_legacy_ct_state_per_table.sql:61-86  (18 tables)
---   * migrations/pg/056_legacy_mirror_ht_book_pro.sql:69-73  (HT_Book_Pro)
+--   * `migrations/pg/050_legacy_ct_state_per_table.sql` §"INSERT INTO legacy_ct_state_per_table (table_name, last_seen_version)" "ON CONFLICT (table_name) DO NOTHING"  (18 tables)
+--   * `migrations/pg/056_legacy_mirror_ht_book_pro.sql` §"SELECT 'HT_Book_Pro'," "ON CONFLICT (table_name) DO NOTHING"  (HT_Book_Pro)
 --
 -- `DO NOTHING` was the CORRECT choice there and remains correct for those
 -- files: both are one-shot seeds whose job is "create a row if one does not

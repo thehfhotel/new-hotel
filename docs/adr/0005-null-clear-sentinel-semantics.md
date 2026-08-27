@@ -185,7 +185,7 @@ On a genuine legacy clear:
 authoritative for iHOTEL's actual write paths) turns up **no documented code path that
 ever writes SQL NULL** to `Book_Cust_ID` or `Cin_cust_no`. Every clear-like mutation of
 either column is the customer-delete cascade, and it always writes the reserved sentinel
-`'C0000'` (cheatsheet lines 420, 438, 611-640, 674, 1482-1486) — which is **Some→Some**,
+`'C0000'` — which is **Some→Some**,
 already correctly caught by the guarded term (`booking.rs:1997-2000`: "Some→Some,
 mirroring iHOTEL's customer-delete cascade... The gate term is guarded, so a Some→None
 mutation would NOT defeat it — and must not"). New bookings/check-ins always populate a
@@ -193,6 +193,14 @@ real customer at creation. So the theoretical trigger for this gap — iHOTEL ge
 writing NULL — has **no known live path** on either side. It is a correct, provable gap in
 the type system, with (as far as current evidence shows) zero observed or reachable
 production occurrence. §6 returns to why that matters for prioritisation.
+
+The cascade sites in the cheatsheet, in full (same set as the References section — kept
+deliberately identical so the two copies cannot drift apart again):
+
+- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "update HT_CheckIn_H set Cin_cust_no='C0000' where Cin_cust_no='<delcust>'"
+- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Book_H`" "update HT_Book_H set Book_Cust_ID='C0000' where Book_Cust_ID='<delcust>'"
+- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Customers`" "`'C0000'` is reserved for"
+- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.24 Delete Customer" "UPDATE HT_CheckIn_H SET Cin_cust_no='C0000' WHERE Cin_cust_no=<delcust_no>"
 
 ### 3b. `book_notes` (bookings only) — silent, but common and reception-facing
 
@@ -313,7 +321,7 @@ v2 segment:  match tri_state {
 ```
 
 A `Cust_no` is always `C\d{4,5}` or the reserved `'C0000'` (cheatsheet); a NUL-delimited
-literal can never collide with one. Given a pre-flight audit (§ below) confirms zero rows
+literal can never collide with one. Given the pre-flight audit below confirms zero rows
 are currently in the `Cleared` state, **v2 produces byte-identical output to v1 for every
 row that exists in production right now** — the "re-diff storm" is provably a no-op on
 cutover day for the data that exists, and only becomes live the day a genuine clear first
@@ -481,8 +489,12 @@ without spending the riskiest kind of engineering effort on a hypothetical.
   `room_clean`/`room_maintenance` COALESCE fix this pattern generalises from.
 - `hotel-backend/src/sync/gate_guard.rs` — the pinned invariant this design must not break
   outside a dedicated implementation session.
-- `docs/legacy-app/COMPAT_CHEATSHEET.md` lines 420, 448, 625-654, 688, 1496-1500 — the
-  `'C0000'` sentinel convention that narrows §3a's real-world risk.
+- The `'C0000'` sentinel convention that narrows §3a's real-world risk (same set as §3a's
+  own list — kept deliberately identical so the two copies cannot drift apart again):
+  - `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "update HT_CheckIn_H set Cin_cust_no='C0000' where Cin_cust_no='<delcust>'"
+  - `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Book_H`" "update HT_Book_H set Book_Cust_ID='C0000' where Book_Cust_ID='<delcust>'"
+  - `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Customers`" "`'C0000'` is reserved for"
+  - `docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.24 Delete Customer" "UPDATE HT_CheckIn_H SET Cin_cust_no='C0000' WHERE Cin_cust_no=<delcust_no>"
 - ADR 0004 — the compose-committed-flag pattern this design's rollout mechanism reuses.
 - `docs/coexistence/sync-incident-log.md` — prior incidents in the same gate/hash class
   (d09e756, the 2026-07-28 booking/customer gate gaps) that motivated `gate_guard.rs`

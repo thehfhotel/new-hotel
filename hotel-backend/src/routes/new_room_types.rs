@@ -29,7 +29,8 @@ use crate::models::Pagination;
 /// Room-type master edits are **canonical-only** for now. The nearest legacy
 /// table is `HT_SET_RoomType` (`id, id_full, name, Room_PriceA/B/C` — cheatsheet
 /// §`HT_SET_RoomType`), but (a) iHOTEL edits it with a destructive
-/// delete-then-reinsert (cheatsheet §1471 "master-data edit"), (b) our
+/// delete-then-reinsert (cheatsheet §3.25 "On master-data edit: HT_Rooms, HT_Products"
+/// — was: cheatsheet 1471, which is the §3.21 Close Round-Bill heading), (b) our
 /// `ht_room_types` shape (type_code / name_en / max_guests / bed_type / size)
 /// does not map 1:1 onto it, and (c) nothing in `sync/mappers/` mirrors it
 /// inbound, so there is no back-population anchor. Wiring a writeback would

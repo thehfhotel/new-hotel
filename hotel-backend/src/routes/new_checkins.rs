@@ -491,9 +491,11 @@ struct RoomBasis {
 ///
 /// `cin_total_amount` mirrors legacy `HT_CheckIn_H.Total_Price_Net`
 /// (`sync/mappers/checkin.rs::project_aggregate`), and iHOTEL defines
-/// `Total_Price_Net = Total_Price_Room + Total_Price_Product`, rewriting the
-/// whole family on EVERY payment/sale change
-/// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §359-362). Using it as the room
+/// `Total_Price_Net = Total_Price_Room + Total_Price_Product`
+/// (`docs/coexistence/checkout-folio-comparison.md` §"1. Field mapping" "`Room + Product`"),
+/// rewriting the whole family on EVERY payment/sale change
+/// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "aggregated totals; old app updates these on every payment/sale change"
+/// — was: cheatsheet 359-362, which is the `HT_Room_Status` section). Using it as the room
 /// basis and then adding `product_total` on top DOUBLE-COUNTS every POS line
 /// iHOTEL has already folded in — and, via `CheckOutCommand.room_price_total`
 /// → `writeback/recipes/checkout.rs`, stamps the inflated figure into the

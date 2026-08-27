@@ -6,8 +6,15 @@
 -- ## Background
 --
 -- iHOTEL keeps two "sticky note" tables with an identical shape and a simple
--- read-flag flow (`docs/legacy-app/COMPAT_CHEATSHEET.md` §946-956, §3.22;
--- `docs/legacy-app/SCHEMA.sql:385,596`; `docs/legacy-app/FEATURE_MAP.md:233`):
+-- read-flag flow — was a bare cheatsheet line-range citation (946-956), which
+-- had drifted onto the `HT_Log` section:
+--   `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_EMP_SMS`" "`SMS_Readed`: `'no'` (default on insert) / `'yes'` (read)"
+--   `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Room_SMS`" "Same shape as HT_EMP_SMS but keyed on `SMS_Room`"
+--   `docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.22 Add Sticky Note to Room / Employee" "INSERT HT_Room_SMS (SMS_Room=<r>"
+--   `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_EMP_SMS" "[SMS_Readed]"
+--   `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Room_SMS" "[SMS_Room]"
+--   `docs/legacy-app/FEATURE_MAP.md` §"3.3 Room Cell Click Handlers" "Per-room sticky notes (`HT_Room_SMS`)"
+--   `docs/legacy-app/FEATURE_MAP.md` §"3.3 Room Cell Click Handlers" "Inter-employee sticky notes (`HT_EMP_SMS`)"
 --
 --   * `HT_Room_SMS`  — a sticky note pinned to a ROOM (keyed `SMS_Room` = room_no).
 --   * `HT_EMP_SMS`   — an inter-employee note (keyed `SMS_TO` = staff username).

@@ -52,9 +52,9 @@ task MUST be filed within the same PR. The audit's job is to diff the
 new reference against the current schema/mappers/queries and surface
 gaps.
 
-The lesson: `COMPAT_CHEATSHEET.md:466-467` says explicitly that
-`HT_CheckIn_Ds` is "one row per room (a single check-in can cover
-multiple rooms)". This landed on 2026-05-11 and triggered no schema
+The lesson: `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Ds`" "one row per **room** in the check-in"
+says explicitly that `HT_CheckIn_Ds` is one row per room (a single check-in
+can cover multiple rooms). This landed on 2026-05-11 and triggered no schema
 re-audit. The gap was caught only when the dashboard migration
 2026-05-11/12 surfaced the symptom.
 
@@ -115,7 +115,7 @@ The lesson: `walkin3-20260424-100000/07-events.txt` contained a 2-room
 walk-in capture. `booking-checkin-20260424-101838/07-events.txt`
 contained a 2-room booking-linked check-in. Both went un-promoted to
 tests for three weeks. The Apr 24 open question in
-`findings.md` §7 "What we still don't know" ("Whether multi-room
+`docs/legacy-spike/findings.md` §"7. What we still don't know" ("Whether multi-room
 check-ins use the same flow") was already answered by the captures
 themselves — the answer just never made it to writing or testing.
 

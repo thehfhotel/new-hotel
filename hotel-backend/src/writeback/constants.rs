@@ -73,8 +73,8 @@ pub const ROOM_STATUS_OCCUPYING: &str = "เข้าพัก";
 /// per-room-per-day occupancy ledger. The legacy app's calendar grid
 /// queries `where (room_status='จอง' or room_status='เข้าพัก')` to render
 /// reserved + occupied nights — so without this row the booking is
-/// invisible in the grid. Per `COMPAT_CHEATSHEET.md` line 347:
-/// "Insert booking day: id from get_id, status='จอง', room_Book_No=Book_ID".
+/// invisible in the grid. Per `COMPAT_CHEATSHEET.md` §`HT_Room_Status` "status='จอง', room_Book_No=Book_ID"
+/// (was: cheatsheet 347, the schema fence header of that same section).
 pub const ROOM_STATUS_RESERVED: &str = "จอง";
 
 /// `HT_Room_Status.room_status` value after check-out — **English with a

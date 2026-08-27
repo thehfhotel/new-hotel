@@ -25,7 +25,10 @@ current test surface.
 **File:** `hotel-backend/src/writeback/allocate.rs:188-200`
 
 Emits `P{yyMM}-{6digit}` (e.g. `P2604-000001`). Legacy convention per
-`findings.md` §2 line 129 and live capture
+`docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.6 ID generation patterns" "R{yyMM}-{4digit}"
+(was: a line-number citation into section 2 of `findings.md` — wrong document; that
+format is documented nowhere in `findings.md` at any revision), primary source
+`Module1.GetSIR_PAY` (decompile `Module1.cs:1756`), and live capture
 `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154` is
 `R{yyMM}-{4digit}` (e.g. `R2604-0241`).
 
@@ -43,8 +46,12 @@ Add a unit test asserting `allocate_pay_no` emits `^R\d{4}-\d{4}$`.
 
 Emits `RC{yyMM}-{6digit}`. Legacy is `B{yyMM}-{4digit}` (with `SB`/`CB`
 variants for SmallBill/CreditBill — single `B` is the default).
-References: `findings.md` §2 line 130, `COMPAT_CHEATSHEET.md` line 130,
-live capture `walkin-20260424-095304/07-events.txt:120`.
+References: `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.6 ID generation patterns" "B{yyMM}-{4digit}"
+(was: one line number pointed at two documents at once — the same number read as
+a `findings.md` section-2 line AND as a cheatsheet line; only the cheatsheet
+reading resolved), primary source
+`FrmAddSale.GetSIR` (decompile `FrmAddSale.cs:3818`), live capture
+`docs/legacy-spike/raw/walkin-20260424-095304/07-events.txt:120`.
 
 **Fix:** `format!("B{:02}{:02}-", year%100, month)` and `{next:04}`.
 Derive `SUBSTRING` offset from `prefix.len()+1` rather than hardcoded `8`.
@@ -75,16 +82,17 @@ threaded through the intent. Fix: extend `WritebackIntent::CheckOut`
 payload with the 5 totals; propagate.
 
 **H2 — `checkout.rs:106` Room_Use_Count += 1 regardless of nights.**
-Should be `Room_Use_Count + {nights}` per `COMPAT_CHEATSHEET.md:309,1208`.
+Should be `Room_Use_Count + {nights}` per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Rooms`" "Room_Use_Count=Room_Use_Count+<nights>"
+and `docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.2 Check-out & Settle" "Room_Use_Count=Room_Use_Count+<nights>".
 Spike captures were 1-night stays so the bug was hidden. Multi-night
 stays under-count by `nights-1`. Fix: parameterize from `inputs.nights`
 (already in the payload after H1 fix).
 
 **H3 — `payment.rs:213-217` violates legacy sum invariant.**
 Sets `Cin_Pay_Ds_Price = nightly_total_2dp` but legacy invariant
-(`COMPAT_CHEATSHEET.md:557`) is
+(`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cin_Pay_Cash+Cin_Pay_Credit+Cin_Pay_Free+Cin_Pay_Tran+Cin_Pay_web") is
 `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`. Partial payments
-break the invariant; shift report (`COMPAT:557`) becomes inconsistent.
+break the invariant; the shift report reading that sum becomes inconsistent.
 Fix: `Cin_Pay_Ds_Price = Cin_Pay_Ds_PriceTotal = amount_2dp` (the actual
 tender). Keep `Cin_Pay_Ds_PriceOne` and `Cin_Pay_Ds_Num` verbatim. Add a
 `debug_assert!` on the sum.
@@ -97,7 +105,7 @@ Live capture (`invoice-20260424-100827/writes.txt:8`) is `1.00, 711.00,
 
 **H5 — `domain/payment.rs:46` Transfer routed to wrong column.**
 `PaymentMethod::Transfer.legacy_column()` returns `"Cin_Pay_Credit"` —
-should be `"Cin_Pay_Tran"` per `COMPAT_CHEATSHEET.md:552`. The recipe
+should be `"Cin_Pay_Tran"` per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "`Cin_Pay_Tran`: bank-transfer amount". The recipe
 at `payment.rs:146` is correct; the helper contradicts it. No current
 caller uses the helper, so latent — but `pub`.
 
@@ -116,8 +124,8 @@ Night-0 does `UPDATE HT_Room_Status WHERE room_date=… AND room_no=…`. Our
 HT_Customers, HT_Book_H, HT_Book_Ds, HT_Book_Date). UPDATE silently
 matches 0 rows; iHOTEL's calendar shows night-0 as empty.
 Fix: `booking_create.rs` should also insert `HT_Room_Status` per night
-with `status='จอง'` (matches `COMPAT_CHEATSHEET.md:370` "insert booking
-day"). This is the cleanest fix — keeps checkin_to_booking unchanged.
+with `status='จอง'` (matches `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Room_Status`" "**Insert booking day**: id from get_id, status='จอง'").
+This is the cleanest fix — keeps checkin_to_booking unchanged.
 
 **H8 — `booking_modify.rs:202-234` caption rewrite skipped on date-only edit.**
 Caption rewrite (`UPDATE HT_Rooms SET room_book_ds=…`) only runs when
@@ -144,12 +152,15 @@ Fix: when `new_stay` is None and `new_price` is Some, look up existing
 
 ### Robustness / injection / scope
 
-**H11 — `bin/writeback.rs:617-643` pool can leak open-tran connections.**
-If `ROLLBACK TRAN` fails (line 634), the bb8 conn returns to pool with
+**H11 — `bin/writeback.rs` `run_in_transaction` pool can leak open-tran connections.**
+If its best-effort `ROLLBACK TRAN` fails, the bb8 conn returns to pool with
 open transaction; bb8-tiberius has no `is_valid` per-checkout. Next
 checkout reuses; next TABLOCKX hangs or commits to wrong tran.
 Fix: defensive `IF @@TRANCOUNT > 0 ROLLBACK` at acquisition, or
 `on_release` hook that drops the connection.
+(Fixed since: `bin/writeback.rs` `RESET_TRANCOUNT_SQL`, run on every checkout.
+Symbol anchors replace the original `:617-643` / `:634` line citations, which
+now land in an unrelated Slack-alert formatter.)
 
 **H12 — `recipes/mod.rs:111-136` SCOPE_IDENTITY across batch boundary.**
 `execute_capturing_identity_at` runs the INSERT in one `simple_query`,

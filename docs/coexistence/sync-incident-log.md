@@ -415,7 +415,7 @@ per day had no paging path at all — `[Sync] CT watcher lag detected` alone fir
 mute, not because the system was clean.
 
 **Evidence / cause.** Per-detector shipped behaviour and knobs are in
-`docs/runbook-sync.md` §2a/§3. Highlights: the unconverged-rows digest had one voice
+`docs/runbook-sync.md` §"2a. Alert-tuning knobs". Highlights: the unconverged-rows digest had one voice
 regardless of age (day-1 == day-16 text, which trains dismissal fastest); cooldowns
 burned on ATTEMPT rather than confirmed delivery, so a failed POST on the all-clear
 path could permanently lose the closure record; the CT-lag observation had no

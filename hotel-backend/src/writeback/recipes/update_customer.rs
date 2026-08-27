@@ -3,7 +3,7 @@
 //!
 //! One statement: the same 31-field `UPDATE [HT_Customers] SET ... where
 //! Cust_no=...` the legacy .NET app fires on every customer re-save
-//! (spike §3c capture line 28 — built by
+//! (spike §3c "re-save customer" — built by
 //! [`super::helpers::build_customer_resave_update`], shared byte-for-byte
 //! with the `booking_modify` recipe's embedded re-save).
 //!

@@ -12,8 +12,9 @@
 //!    nights still get INSERTed. Per spike §3d this is "current-state" behavior.
 //! 6. `Cin_Book_no='R…'` set in `HT_CheckIn_H` — the linkage.
 //!
-//! Reference SQL (verbatim from `booking-checkin-20260424-101838/writes.txt`
-//! lines 25-37 — the 10:23:02 block):
+//! Reference SQL (verbatim from
+//! `booking-checkin-20260424-101838/writes.txt` lines 25-37 — the 10:23:02
+//! block):
 //!
 //! ```text
 //! UPDATE [HT_Customers] SET [Cust_name]='SPIKE TEST WALKIN', … WHERE Cust_no='C21610'
@@ -291,7 +292,8 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     // Wave 3 followup: each night must be an UPSERT, not a plain INSERT
     // (booking_create pre-inserts night rows). The
     // `IF EXISTS … UPDATE … ELSE INSERT` form matches the legacy app's
-    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:371-372`) and
+    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md`
+    // §"Table: `HT_Room_Status` (A)" "Insert checkin day") and
     // makes the recipe safe for both pre-existing and net-new nights.
     //
     // Multi-room id-base layout: `room_status_id_base + (room_idx *
@@ -980,7 +982,8 @@ mod tests {
     /// already exist (multi-night booking conversion). Instead it emits a
     /// single-statement `IF EXISTS … UPDATE … ELSE INSERT` upsert that
     /// matches the legacy app's "upsert per night" semantics
-    /// (`COMPAT_CHEATSHEET.md:371-372`).
+    /// (`COMPAT_CHEATSHEET.md` §"Table: `HT_Room_Status` (A)"
+    /// "Insert checkin day").
     #[test]
     fn additional_nights_are_upserts_not_plain_inserts() {
         let s = build_statements(&sample_inputs());

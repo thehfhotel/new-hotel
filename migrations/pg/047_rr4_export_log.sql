@@ -9,7 +9,7 @@
 -- The legacy iHOTEL app produces the report via `FrmReportRR4`
 -- (Crystal Reports), bound to `Datalocal.ReportRR4` and built from
 -- `HT_CheckIn_H` + `HT_CheckIn_Other_People` + `HT_Customers` +
--- `TB_SETTINGS` — see `docs/legacy-app/REPORTS_INVENTORY.md` §3.9.
+-- `TB_SETTINGS` — see `docs/legacy-app/REPORTS_INVENTORY.md` §"3.9 Government".
 --
 -- Track G8 closes the standalone-readiness gap (audit T4 CRIT-2): we
 -- emit the report from the canonical `ht_guest_registry` +
