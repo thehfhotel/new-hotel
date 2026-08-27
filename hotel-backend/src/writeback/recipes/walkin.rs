@@ -262,7 +262,7 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
         };
         // Deposit capture: the folio-level deposit lands on the FIRST room's
         // `Cin_Room_Dep`; when `> 0`, `Cin_dep_status` flips to "collected"
-        // (`'ยังไม่คืนค่ามัดจำ'`) per iHOTEL (COMPAT_CHEATSHEET §HT_CheckIn_Ds).
+        // (`'ยังไม่คืนค่ามัดจำ'`) per iHOTEL (COMPAT_CHEATSHEET §`HT_CheckIn_Ds`).
         // Zero keeps the legacy byte-shape (`0` literal + `'ไม่เก็บค่ามัดจำ'`)
         // so existing capture/byte-parity tests are unaffected.
         // TODO(multi-room): apportion the deposit per-room once `room_lines`

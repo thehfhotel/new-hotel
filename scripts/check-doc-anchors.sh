@@ -236,6 +236,14 @@
 #      still FAILS Rule A.
 #  28. EXIT 2 on a malformed allowlist entry — a typo must never widen an
 #      exemption to both rules.
+#  29. FAIL when a heading's bare numeric label is renamed by PREPENDING a
+#      digit (`9k.` -> `19k.`) — the old label is still a SUBSTRING of the new
+#      one, which is exactly how `### 3e.` -> `### 13e.` stayed green in the
+#      real tree until this case was added (PR #292 peer review).
+#  30. PASS when a bare anchor is not an exact heading label but the heading
+#      text STARTS with it as a whole token (`7g` against `7g-note. …`) — the
+#      cure is a whole-token PREFIX match, not a bare exact-label match with
+#      the substring fallback deleted outright.
 # CI invokes the same script with no arguments.
 
 set -euo pipefail
@@ -703,10 +711,20 @@ sub resolve_anchor {
             # A bare anchor is a heading NUMBER: match the heading's own label
             # exactly, so §3 cannot swallow §3a/§3.6d.
             @hit = grep { defined $H->[$_][3] && $H->[$_][3] eq $anchor } @cand;
-            # No label match: fall back to substring, which is what turns
-            # architecture.md's `§4d` (4d-bis + 4d-tris) into "ambiguous"
-            # rather than a bare "not found".
-            @hit = grep { index($H->[$_][2], $anchor) >= 0 } @cand unless @hit;
+            # No label match: fall back to a WHOLE-TOKEN prefix match — the
+            # heading text must START with the anchor, immediately followed by
+            # a token boundary (`.`, whitespace, `)`, `-`, or end-of-string).
+            # That is still enough to turn architecture.md's `§4d` (headings
+            # "4d-bis. …" and "4d-tris. …", labels "4d-bis"/"4d-tris", neither
+            # an exact match) into "ambiguous" rather than a bare "not found" —
+            # both headings' text literally starts with "4d-". It is NOT a bare
+            # substring match: a heading renamed from `3e.` to `13e.` no longer
+            # STARTS with "3e" (it starts with "13e"), so §3e citations into it
+            # correctly fail instead of matching "3e" wherever it happens to
+            # occur inside "13e". A prior substring-anywhere fallback let a
+            # heading rename silently invalidate every citation pointing at it
+            # without CI noticing.
+            @hit = grep { $H->[$_][2] =~ /\A\Q$anchor\E(?:[.\s)-]|\z)/ } @cand unless @hit;
         } else {
             @hit = grep { index($H->[$_][2], $anchor) >= 0 } @cand;
             if (@hit > 1) {
@@ -724,6 +742,21 @@ sub resolve_anchor {
 
     return (undef, undef, 'section anchor matches no heading', 'anchor-not-found')
         if $no_literal;
+
+    # A bare anchor names a heading NUMBER and nothing else (see the `bare`
+    # branch above) — so once the target document has headings to check a bare
+    # anchor against and none matched, that is a genuine miss, not license to
+    # fall through to raw-text search below. Without this, the literal
+    # fallback re-opens the exact hole the whole-token prefix match above was
+    # written to close: a heading renamed from `3e.` to `13e.` still contains
+    # "3e" as a substring of its OWN raw source line ("### 13e. …"), so a
+    # naive whole-file search can re-validate a `§3e` citation against the
+    # renamed heading's own line whenever that happens to be the only
+    # occurrence of "3e" left in the file — silently reproducing the bug this
+    # fix exists to close. Quoted/backtick anchors (`kind ne 'bare'`) are
+    # unaffected: those legitimately mean "this literal text", headings or not.
+    return (undef, undef, 'section anchor matches no heading', 'anchor-not-found')
+        if $kind eq 'bare' && @cand;
 
     # No heading matched (or the target has no headings at all): fall back to a
     # whole-file UNIQUE literal, with a 40-line window as the section extent.
@@ -1877,6 +1910,58 @@ RESTORED
         return 1
     fi
     echo "[self-test] case 28 OK"
+
+    # ==================================================================
+    # BARE-ANCHOR WHOLE-TOKEN MATCH (PR #292 peer review). The bare-anchor
+    # fallback used to accept ANY substring of a heading's text, so renaming
+    # `### 3e.` to `### 13e.` in the real tree left every `§3e` citation into
+    # it silently green — CI never noticed dozens of citations had gone
+    # stale. Cases 29-30 pin the cure: a whole-TOKEN prefix match, not a
+    # substring match anywhere in the label.
+    # ==================================================================
+
+    # Case 29: renaming a heading by PREPENDING a digit must break every bare
+    # citation into it, not keep passing because the old label is still a
+    # substring of the new one ("9k" inside "19k").
+    cat >> "${root}/docs/target.md" <<'MD'
+
+## 9k. Token heading
+
+Distinguishing body text for the token-match fixture.
+MD
+    cat > "${root}/src/token.rs" <<'RS'
+// Cites `docs/target.md` §9k for the token-match fixture.
+RS
+    echo "[self-test] case 29a — bare anchor matches a heading's OWN label → expect PASS"
+    self_test_case "case 29a" pass "${root}" || return 1
+    sed 's/## 9k\. Token heading/## 19k. Token heading/' \
+        "${root}/docs/target.md" > "${root}/docs/target.md.new"
+    mv "${root}/docs/target.md.new" "${root}/docs/target.md"
+    echo "[self-test] case 29b — heading renamed by prepending a digit (9k → 19k) → expect FAIL, not a silent substring pass"
+    self_test_case "case 29b" fail "${root}" "section anchor matches no heading" || return 1
+    rm -f "${root}/src/token.rs"
+    write_fixture_doc
+
+    # Case 30: a bare anchor that is not an EXACT heading label still resolves
+    # when the heading text STARTS with the anchor as a whole token
+    # (immediately followed by `.`, whitespace, `)`, or `-`) — the same
+    # mechanism that turns architecture.md's real `§4d` into "ambiguous"
+    # rather than "not found" against its `4d-bis`/`4d-tris` headings. This
+    # proves the fix is a whole-token PREFIX match, not merely an exact-label
+    # match with the substring fallback deleted outright.
+    cat >> "${root}/docs/target.md" <<'MD'
+
+## 7g-note. Prefix token heading
+
+Distinguishing body text for the whole-token prefix fixture.
+MD
+    cat > "${root}/src/prefix.rs" <<'RS'
+// Cites `docs/target.md` §7g for the whole-token prefix fixture.
+RS
+    echo "[self-test] case 30 — bare anchor matches a heading's whole-token PREFIX (not its exact label) → expect PASS"
+    self_test_case "case 30" pass "${root}" || return 1
+    rm -f "${root}/src/prefix.rs"
+    write_fixture_doc
 
     echo "[self-test] all passed"
     return 0
