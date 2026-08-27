@@ -47,7 +47,7 @@ pub const CIN_DEP_STATUS_NONE: &str = "ไม่เก็บค่ามัด�
 
 /// `HT_CheckIn_Ds.Cin_dep_status` literal for "deposit collected, not yet
 /// returned" — the initial value iHOTEL sets when a deposit is taken at
-/// check-in (`docs/legacy-app/COMPAT_CHEATSHEET.md` §HT_CheckIn_Ds:
+/// check-in (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds`:
 /// "`'ยังไม่คืนค่ามัดจำ'` (deposit not yet returned) — initial when deposit
 /// collected", FrmCheckIn). The recipe writes this **only** when
 /// `Cin_Room_Dep > 0`; otherwise [`CIN_DEP_STATUS_NONE`] is emitted (iHOTEL's
