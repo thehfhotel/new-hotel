@@ -2,16 +2,19 @@
 -- enable Change Tracking on `HT_Book_Pro` (pre-booked products).
 --
 -- Why: FrmAddBook2 attaches product lines (food/drinks pre-ordered) to
--- a booking by INSERTing `HT_Book_Pro` rows (COMPAT_CHEATSHEET line
--- 711-716, §3.4 step 3.5). The table had no PK and no CT subscription,
+-- a booking by INSERTing `HT_Book_Pro` rows
+-- (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Book_Pro`" "insert in loop on FrmAddBook2 save",
+-- step 3.5 of `docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.4 Create Booking (with specific rooms, FrmAddBook2)" "INSERT HT_Book_Pro (B_NO=Book_ID"
+-- — was a bare cheatsheet line-range citation (711-716) that had drifted
+-- onto the `HT_Book_Ds` section). The table had no PK and no CT subscription,
 -- so iHOTEL-entered booking products were invisible to the new app —
 -- a booking with products checked in via the new app silently dropped
 -- those charges. The new `BookProMirrorMapper`
 -- (sync/mappers/mirror.rs) mirrors rows into
 -- `legacy_mirror.ht_book_pro` (migrations/pg/056).
 --
--- Pre-flight (verified against `hotel-backend/schema-baseline.txt`
--- lines 179-187 and the regenerated `docs/legacy-app/SCHEMA.sql`,
+-- Pre-flight (verified against `hotel-backend/schema-baseline.txt:179-187`
+-- and the regenerated `docs/legacy-app/SCHEMA.sql`,
 -- both from live prod 2026-06-11; re-verify at apply time):
 --   * No existing PRIMARY KEY on `HT_Book_Pro` (only HT_Booking_Notes
 --     has a PK in the baseline's "==== Primary keys ====" section)

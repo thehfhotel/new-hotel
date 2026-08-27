@@ -426,6 +426,16 @@ either never reads them, or reads them only from one DEAD form):
   - `Cin_Date_in`/`Cin_Date_out`: planned check-in / check-out times. `Cin_Date` is when
     the checkin record was *created* (DateTime.Now).
   - `Total_Price_*`: aggregated totals; old app updates these on every payment/sale change.
+  - `Cin_Work_number`: **NOT a data column — it is iHOTEL's per-folio optimistic-lock
+    token.** `Module1.GET_WORK_NUMBER` (`Module1.cs:1662`) stamps a fresh
+    `Random.Next(100000, 999999)` on every folio **load** in five reception forms
+    (`FrmEditDate`, `FrmPayAdd`, `FrmPayAddPro`, `FrmCheckIn`, `FrmCheckOut`) — .NET's
+    upper bound is exclusive, so the value is in `100000..999998` — and each
+    re-reads it in `SAVE_EDIT()`; on mismatch the form shows
+    `มีการแก้ไข … จากเครื่องอื่น`, calls `Close()`, and **discards the receptionist's
+    in-progress edit**. Anything that writes this column therefore kicks a receptionist
+    out of her form mid-edit. Full mechanism, call sites and caveats: **§7.4**.
+    Default `0` only means "never opened since insert" — not "unused".
 - **Operations**:
   - **Insert** (FrmCheckIn save): full row, status='ปกติ', defaults zero for totals if walk-in
     pre-payment. See `FrmCheckIn.cs:9508-9550`.
@@ -438,7 +448,11 @@ either never reads them, or reads them only from one DEAD form):
     `update HT_CheckIn_H set Cin_cust_no='C0000' where Cin_cust_no='<delcust>'`.
   - **Delete-then-reinsert pattern** (FrmCheckIn edit, see FrmCheckIn.cs:9750):
     `delete from HT_CheckIn_H where Cin_no='<cin>'`. Note: the related Ds/Pay/Product cleanup
-    is also done via DELETE.
+    is also done via DELETE. The re-INSERT column list (FrmCheckIn.cs:10004-10025) omits
+    `[Cin_Work_number]`, so the rebuilt row falls back to the schema default `0`.
+  - **Take folio lock** (every folio open, all five forms):
+    `update HT_CheckIn_H set Cin_Work_number=<rand 100000..999998> where Cin_No='<cin>'`.
+    This is concurrency control, not data — see §7.4 before writing it.
 - **Invariants**:
   - For every `HT_CheckIn_H` row with `cin_status='ปกติ'`, there should be ≥1
     `HT_CheckIn_Ds` row sharing `Cin_no` and ≥0 `HT_CheckIn_Pay` rows.
@@ -501,7 +515,7 @@ either never reads them, or reads them only from one DEAD form):
   Used as the source for cash-drawer / shift reports and customer debt balance changes.
 - **PK convention**: `id` is `int NOT NULL` BUT there's a wrinkle — schema says NOT IDENTITY,
   but live data shows it's **actually IDENTITY** (column type `id int IDENTITY NOT NULL`
-  per `_SCHEMA.sql` line 16, but `INFORMATION_SCHEMA.COLUMNS` says `is_identity=1` for
+  per `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_CheckIn_Pay" "[id] int IDENTITY NOT NULL", but `INFORMATION_SCHEMA.COLUMNS` says `is_identity=1` for
   `HT_CheckIn_Pay.id`). **VERIFY**: confirmed `HT_CheckIn_Pay.id IS IDENTITY` in live DB.
   → The old app's `Insert_Pay` does NOT include `[id]` in the column list (Module1.cs:1781) —
   uses identity. So this column IS DB-managed.
@@ -883,7 +897,8 @@ either never reads them, or reads them only from one DEAD form):
   dirty flip (corrected 2026-07-31, #276/`ccf88c3`): findings.md §3e
   (check-out) and §3i (cancel-check-in) both raise `Room_Clean='yes'` with
   zero `HT_Housewife` touches, and the only two housewife-writing decompile
-  handlers, `ClickClean`/`ClickCleanOK` (§3.13/§3.14 below), are clean-side.
+  handlers, `ClickClean`/`ClickCleanOK` (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.13 Mark Room CLEAN"
+  and §"3.14 Mark Room Clean Done", below), are clean-side.
   A live scan of all ~31,922 rows found only two non-empty `h_note` patterns
   (system auto-close, send-to-maintenance) — neither for dirtying.
 - **PK**: `id int IDENTITY`. INSERTs omit [id].
@@ -1650,16 +1665,41 @@ The DB has **zero triggers**. The new app must replicate the following "in-app t
   may read but must NOT issue DDL to recreate them (frmMain1.cs does this on version-bump
   startup; let the old app handle).
 
-### 7.2 Columns that are vestigial / unused
+### 7.2 Columns commonly assumed vestigial — and what they actually do
 
-- `HT_Book_H.Book_room_note` — written but rarely read.
-- `HT_Book_H.Book_room_all` — string-concat list; redundant with HT_Book_Ds.
-- `TB_SETTINGS.login_url` — always blank; experimental.
-- `HT_Rooms.Room_Polity` — set to int but never read (rumored "priority" feature).
-- `HT_CheckIn_H.Cin_Work_number` — written `0`, never read.
-- `HT_Invoice_Note.NOTE_STATUS` — never written.
-- `TB_FOLIO.F_STATUS` — never written.
-- `Tb_Version.V_NO` — managed by old app's startup migrations; do NOT touch.
+> Every entry below was re-verified against the decompile on 2026-08-19 (grep over
+> `_decompiled_clean/iHOTEL2025/`, plus one live `SELECT`). Several were wrong or
+> understated and have been corrected **in place**, with call sites so the next reader can
+> re-check rather than trust. **`HT_CheckIn_H.Cin_Work_number` has been removed from this
+> list entirely — it is a live optimistic-lock token, see §7.4.**
+
+- `HT_Book_H.Book_room_note` — written on every booking INSERT (`FrmAddBook.cs:3052`,
+  `FrmAddBook2.cs:3532`) and **read**: room-grid booking tooltip (`FormRoomMain.cs:4588`
+  and `:5325`, `FormRoomMainClean.cs:3594`, `FormRoomMainKichen.cs:3384`) and the booking
+  report (`Print_Report.cs:2381`). Not vestigial — write it, don't drop it.
+- `HT_Book_H.Book_room_all` — string-concat list, redundant with `HT_Book_Ds` **as a data
+  source**, but displayed verbatim in the same tooltip/report call sites as
+  `Book_room_note`. A booking we write without it shows a blank room list in the legacy
+  room-grid popup.
+- `TB_SETTINGS.login_url` — blank in live data (HF Ville 2026-08-19: `LEN()=0`), but **not
+  dead code**: `FrmSettings.cs:6673` persists whatever the operator types, `login.cs:780`
+  feeds it to `Module1.loginURLsplit` → `Module1.LOGIN_URL`, and `frmMain1.cs:7180-7183`
+  walks that list through a hidden WebBrowser (log line `"ทำ Login"`) — a captive-portal /
+  hotspot auto-login feature. Leave it alone; don't assume it stays inert if a site fills
+  it in.
+- `HT_Rooms.Room_Polity` — **not "never read"**. Bulk-rewritten across *every* `HT_Rooms`
+  row by `Module1.Set_room_pority` (`Module1.cs:1578-1612`), called from the room-grid
+  forms and `FrmSettings.cs:6902`. It is SELECTed (`select * from HT_Rooms`) and passed to
+  the room-tile renderer as `R_polity` (`FormRoomMain.cs:4794` → `:5098` → `method_0`,
+  declared at `:2838`) — but that parameter is never referenced in the method body, so it
+  is read-and-ignored. Behaviourally inert; the write storm across the whole table is
+  real, so expect Change-Tracking churn on `HT_Rooms` from it. Do not write it ourselves.
+- `HT_Invoice_Note.NOTE_STATUS` — never written **and never read**: zero references in the
+  entire decompile (verified 2026-08-19). Exists in `_SCHEMA.sql` only.
+- `TB_FOLIO.F_STATUS` — same: zero references in the entire decompile (verified
+  2026-08-19). Schema-only column.
+- `Tb_Version.V_NO` — managed by old app's startup migrations (`frmMain1.cs:6490` reads
+  it, `:6498`-`:6541` bump it once per applied step); do NOT touch.
 
 ### 7.3 Online endpoints / license to avoid
 
@@ -1673,6 +1713,112 @@ The DB has **zero triggers**. The new app must replicate the following "in-app t
 - MS Access password `foreverbu`.
 
 The new app should NOT replicate these unless explicitly required.
+
+### 7.4 Concurrency-control columns (never write casually)
+
+`HT_CheckIn_H.Cin_Work_number` is iHOTEL's **per-folio optimistic-lock token**. It is not
+vestigial, and it is not a TM.30 batch number — both of those readings appeared in our own
+docs and both were wrong.
+
+**Mechanism.** `Module1.GET_WORK_NUMBER` (`Module1.cs:1662-1669`) stamps a fresh
+`Random.Next(100000, 999999)` on **folio LOAD** and remembers it in the form's `WORK_ID`:
+
+```csharp
+public static int GET_WORK_NUMBER(string cin_no)
+{
+    int num = 0;
+    Random random = new Random();
+    num = random.Next(100000, 999999);
+    connect("update HT_CheckIn_H set Cin_Work_number=" + Conversions.ToString(num)
+            + " where Cin_No='" + cin_no + "'");
+    return num;
+}
+```
+
+`Random.Next(min, max)` excludes its upper bound, so the token iHOTEL can actually write is
+`100000..999998` — never `999999`. (A census bucketed as `BETWEEN 100000 AND 999999` is
+still correct; it just has an empty top value.)
+
+It is called from `LoadBill()` in **five** reception forms, and each one re-reads the
+column early in its `SAVE_EDIT()` — in four of the five as the very first statement, and
+in `FrmEditDate` after one save-confirm dialog:
+
+| Form | Take (in `LoadBill()`) | Check (in `SAVE_EDIT()`) | Anything before the check? |
+|---|---|---|---|
+| `FrmEditDate` (เพิ่ม/ลด วันเข้าพัก — extend/shorten stay) | `FrmEditDate.cs:4187` | `FrmEditDate.cs:4867` | Yes — a Yes/No `คุณต้องการบันทึกหรือไม่` box (`:4863-4866`); answering No returns without ever reading the token |
+| `FrmPayAdd` (add payment) | `FrmPayAdd.cs:4753` | `FrmPayAdd.cs:5380` | No — first statement of the method |
+| `FrmPayAddPro` (add product/charge) | `FrmPayAddPro.cs:4649` | `FrmPayAddPro.cs:5300` | No — first statement of the method |
+| `FrmCheckIn` (check-in / edit folio) | `FrmCheckIn.cs:8228` | `FrmCheckIn.cs:9695` | No — first statement of the method |
+| `FrmCheckOut` (check-out & settle) | `FrmCheckOut.cs:5167` | `FrmCheckOut.cs:6130` | No — first statement of the method |
+
+Practical consequence of the `FrmEditDate` exception: the operator can sit on that form
+with a stale token indefinitely and see no warning until she confirms the save. The check
+still fires before any write, so the *outcome* is the same — it is the timing of the
+warning that differs, not the protection.
+
+**`FrmCheckIn` takes the token only when it opens an *existing* folio.** `FrmCheckIn_Load`
+(`FrmCheckIn.cs:8105`) calls `LoadBill()` only under `if (EDIT_ID <> "")` (`:8151-8154`);
+a fresh walk-in leaves `EDIT_ID` empty, runs `Clear()` instead, and saves through
+`SAVE_ADD()` (`:9245`), which contains no `GET_WORK_NUMBER`, no `LoadBill()` and no
+`WORK_ID` reference at all. `SAVE_EDIT()` (`:9693`) is the one that both checks the token
+at its top and re-takes a new one at its tail, via `LoadBill()` at `:10172`.
+
+**What happens on mismatch.** The form shows
+
+```
+มีการแก้ไข เลขลงทะเบียน  <cin_no> จากเครื่องอื่น กรุณาปิดแล้วเข้ามาทำรายการใหม่อีกครั้ง
+```
+
+(`FrmCheckIn` / `FrmCheckOut` say `รายการใบลงทะเบียน` instead of `เลขลงทะเบียน`), calls
+`Close()`, and **issues no writes at all**. The receptionist's typed work is discarded and
+is not recoverable.
+
+> **RULE: writing this column invalidates every iHOTEL folio form currently open on that
+> `Cin_no`.** Treat it as taking a lock on someone else's screen, not as setting a field.
+> Exactly one of our writeback recipes does it deliberately — `extend_stay`, because it
+> mutates an existing folio's totals and dates and a stale open form would otherwise
+> overwrite them on save. **No other recipe may write it without its own decision record.**
+
+**That decision record exists — read it before widening the write.**
+
+- `docs/adr/0007-folio-lock-participation.md` §"1. `extend_stay` bumps the token deliberately"
+  — the boundary: which recipe bumps the token, which six folio-mutating recipes knowingly do
+  not, and why that gap is a recorded decision rather than an oversight.
+- `docs/adr/0007-folio-lock-participation.md` §"4. The lock is ADVISORY" — the caveats below,
+  turned into a standing prohibition: this lock may never be cited as the reason some other
+  invariant holds.
+
+The one recipe that does bump it is guarded upstream as well: `service/checkin.rs` refuses an
+"extend" whose new checkout date equals the folio's current one, so a no-op edit never reaches
+the outbox and never evicts a receptionist for a change that changes nothing.
+
+**Caveats — the lock is advisory, not sound. Do NOT rely on it for mutual exclusion:**
+
+- The check-read and the subsequent save writes are not in a transaction. There is **no**
+  `BeginTransaction` anywhere in the decompile (`grep` returns zero hits), so the window
+  between the compare and the first UPDATE is unguarded.
+- `new Random()` is clock-seeded, so two workstations loading the same folio within the
+  same tick can draw the same token.
+- `FrmCheckIn_EditOnly` (instantiated at `FrmPayDebt.cs:2168`) destructively
+  DELETE + re-INSERTs the header (`FrmCheckIn_EditOnly.cs:8006` and `:8111`) **without**
+  taking or checking the token — the file contains zero `WORK_ID` / `GET_WORK_NUMBER` /
+  `Cin_Work_number` references. iHOTEL can still invalidate its own open forms.
+
+**Where the `0`s come from.** `FrmCheckIn`'s INSERT column list (`FrmCheckIn.cs:10004-10025`)
+omits `[Cin_Work_number]`, so a freshly inserted (or DELETE+re-INSERTed) header falls back
+to the schema default `((0))` until the folio is next opened. That is the whole origin of
+the old "written `0`, never read" claim that used to sit in §7.2. Live census 2026-08-19,
+HF Ville: 2,352 folios — 2,329 hold an active token, 23 are `0`, none above `999999`.
+
+**In-repo disproof of "never read"**, if you want it without the decompile:
+`docs/legacy-spike/raw/checkout2-20260424-101023/07-events.txt` line 9 is the
+`update HT_CheckIn_H set Cin_Work_number=361383 …` at folio open, and the same
+`07-events.txt` line 14 is
+`select Cin_Work_number from HT_CheckIn_H where Cin_no='CH26-005227'` 2.4 s later at save.
+
+**Scope of this verification**: decompile `Hotel-2018- V.1.45` only. If either site ever
+runs a different iHOTEL build, re-verify the five-form list before treating this section as
+universal.
 
 ---
 

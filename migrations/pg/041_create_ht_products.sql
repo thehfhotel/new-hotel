@@ -10,7 +10,7 @@
 --
 -- `HT_Products` is the legacy product master (room-rent line `'P001'`,
 -- minibar SKUs, amenity charges) with `Pro_Amt` as the running stock
--- counter. Per `docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`, every
+-- counter. Per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Product`" "Stock change cascade", every
 -- `HT_CheckIn_Product` INSERT/UPDATE/DELETE is paired with
 -- `UPDATE HT_Products SET Pro_Amt = Pro_Amt ± num WHERE Pro_no='<id>'`
 -- so the stock counter stays consistent with consumption.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Regenerate the writeback worker's expected schema fingerprint.
 #
-# Per docs/architecture.md §4e + hotel-backend/src/writeback/fingerprint.rs:
+# Per `docs/architecture.md` §"4e. Schema fingerprint guard" "refuse to write and alert"
+# (this used to cite section 4e by number alone, which is ambiguous — architecture.md
+# has two headings numbered 4e) + hotel-backend/src/writeback/fingerprint.rs:
 # the writeback worker refuses to start if MSSQL's columns drift from the
 # captured baseline. When a vendor change legitimately alters the schema:
 #

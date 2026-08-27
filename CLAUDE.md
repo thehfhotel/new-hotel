@@ -195,8 +195,15 @@ allocates ids app-side (MAX+1, race-prone) — a duplicate-id race that used to 
 silently now hard-fails iHOTEL's INSERT on the PK. If a receptionist reports a save
 error in iHOTEL, check for a concurrent same-table save first.
 
+That hazard is **per-table, and only where the id is not an IDENTITY column** — check
+`sys.columns.is_identity` before assuming it applies. On the two busiest folio tables
+they differ: `HT_CheckIn_Ds.id` is `is_identity = 0`, so iHOTEL supplies the value and
+the race is real; `HT_CheckIn_Pay.id` is `is_identity = 1`, so SQL Server allocates it,
+iHOTEL's INSERT omits the column, and no duplicate-id race is possible there at all
+(verified against HF Ville, 2026-08-19).
+
 **Before hand-editing ANY legacy value (not just schema) — read this.** Two guards
-exist, and one accepted gap sits between them:
+exist, one accepted gap sits between them, and one column is a live lock:
 
 1. **Schema is guarded automatically.** `hotel-backend/src/writeback/fingerprint.rs`
    hashes the column shapes of every legacy table we touch on startup and **refuses to
@@ -213,6 +220,17 @@ exist, and one accepted gap sits between them:
    clear a customer link, **write `'C0000'`, never NULL.**
    Full analysis and the designed (deliberately unbuilt) fix:
    `docs/adr/0005-null-clear-sentinel-semantics.md`.
+3. **NEVER write `HT_CheckIn_H.Cin_Work_number` casually** — it is not vestigial and
+   not a TM.30 batch number. It is iHOTEL's per-folio **optimistic-lock token**,
+   taken on folio LOAD by five reception forms and re-checked on save; changing it
+   makes the next save show `มีการแก้ไข … จากเครื่องอื่น`, close the form, and
+   **discard the receptionist's in-progress edit**. Exactly one recipe writes it on
+   purpose (`extend_stay`); no other may without its own decision record. Detail,
+   call sites and caveats: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4. That decision
+   record — why the one write stays, why the other six recipes deliberately do not bump
+   the token, and why the lock must never be treated as a mutex — is
+   `docs/adr/0007-folio-lock-participation.md` §"Decision". Read it before widening the
+   write; do not infer permission from this bullet.
 
 ### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 

@@ -31,7 +31,7 @@
 //! §3.13 labels `ClickClean` ("`Room_Clean='no', Room_Clean_Time=''`" +
 //! `HT_Housewife` INSERT) as "housewife *starts* cleaning" — i.e. dirty.
 //! Under the real polarity that statement is the mark-CLEAN write (it is
-//! byte-identical to the §3j mark-clean capture, which should have been
+//! byte-identical to the spike §3j mark-clean capture, which should have been
 //! the tell). So "mark dirty" in our app wrote `Room_Clean='no'`, iHOTEL's
 //! board kept showing the room clean, and the CT echo of that row —
 //! inverted by the mapper — flipped canonical `room_clean` back to `true`
@@ -56,7 +56,7 @@
 //!   captures (§3e Phase 3, §3j) key by `id`, which is the PK and the key
 //!   the writeback resolver already carries
 //!   (`ht_rooms_new.legacy_room_id_int` — spike §3j critical finding,
-//!   §4e "different statements pick different lookup keys").
+//!   §4e "Pick the right one per statement").
 //!
 //! Further deliberate deviations from the decompile, with reasons:
 //!

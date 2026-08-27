@@ -19,8 +19,9 @@
 --   * No existing PRIMARY KEY on `HT_CheckIn_Other_People`
 --   * No existing per-table CT
 --   * `id` is the IDENTITY column (live-verified IDENTITY per
---     COMPAT_CHEATSHEET line 571: "schema says NOT IDENTITY but live
---     verified IDENTITY per INFORMATION_SCHEMA.COLUMNS.is_identity=1"),
+--     `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Other_People`" "schema says NOT IDENTITY but live verified IDENTITY"
+--     — was a bare cheatsheet line-585 citation, which had already drifted
+--     onto the `HT_CheckIn_Product` schema fence),
 --     so an existing IDENTITY column is already NOT NULL on every
 --     row but the column nullability may still be marked NULL in
 --     the system catalog; the ALTER COLUMN forces it loud.

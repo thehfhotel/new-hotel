@@ -97,7 +97,8 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     let book_id_q = sql_quote(inputs.book_id);
     let mut statements = Vec::new();
 
-    // 0a. Customer re-save — spike §3c capture lines 5,16,28. The .NET app
+    // 0a. Customer re-save — `raw/booking-checkin-20260424-101838/writes.txt:5,16,28`
+    //     (spike §3c for :5/:16; :28 is the §3d block). The .NET app
     //     re-saves the customer record on every booking modify. Without it,
     //     phone/address edits don't propagate to the customer master.
     if let Some(resave) = inputs.changes.customer_resave.as_ref() {
@@ -105,7 +106,8 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     }
 
     // 0b. Clear stale HT_Rooms display fields BEFORE the date diff —
-    //     spike §3c capture lines 6,14,17. Otherwise after a date change the
+    //     `raw/booking-checkin-20260424-101838/writes.txt:6,14,17` (spike §3c).
+    //     Otherwise after a date change the
     //     calendar grid keeps stale "booked" captions.
     statements.push(format!(
         "update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' \
@@ -146,8 +148,10 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         // header level, used by reports) for parity with the existing flow.
         // The matching `HT_Book_Ds.[Book_Room_Note]` (capital R) is pushed
         // into `ds_sets` below — iHOTEL's edit-booking form binds the visible
-        // note column to the Ds row (`SCHEMA.sql:6` for HT_Book_Ds,
-        // `COMPAT_CHEATSHEET.md:671` for the column name), so without that
+        // note column to the Ds row (`docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Book_Ds" "[Book_Room_Note] varchar(500)"
+        // — an earlier revision pointed at a file-header comment instead — and
+        // `COMPAT_CHEATSHEET.md` §"Table: `HT_Book_Ds` (A)" "Book_Room_PriceToTal float, Book_Room_Note varchar(500)"
+        // for the column name), so without that
         // write a note edit stayed invisible in iHOTEL until the user
         // re-saved.
         header_sets.push(format!("[Book_room_note]={q}"));
@@ -202,8 +206,10 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         // — distinct column from the header-level `Book_room_note`). iHOTEL's
         // edit-booking form binds the visible note input to the Ds row, so
         // without this write a note edit was invisible in iHOTEL until the
-        // user re-saved. `SCHEMA.sql` line 6 / `COMPAT_CHEATSHEET.md:671`
-        // confirm the column name + casing.
+        // user re-saved. `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Book_Ds" "[Book_Room_Note] varchar(500)"
+        // and `COMPAT_CHEATSHEET.md` §"Table: `HT_Book_Ds` (A)" "Book_Room_PriceToTal float, Book_Room_Note varchar(500)"
+        // confirm the column name + casing (an earlier revision pointed at a
+        // file-header comment instead).
         let q = sql_quote(notes);
         ds_sets.push(format!("[Book_Room_Note]={q}"));
     }
@@ -265,7 +271,8 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         }
     }
 
-    // Re-write the HT_Rooms display caption — spike §3c capture line 26.
+    // Re-write the HT_Rooms display caption —
+    // `raw/booking-checkin-20260424-101838/writes.txt:26` (spike §3c).
     // Mirrors `booking_create`'s caption format (commit 0179f81).
     //
     // 2026-06-11 audit P1-10a (extends H8): step 0b clears the caption on
@@ -576,7 +583,8 @@ mod tests {
 
     #[test]
     fn empty_changes_only_emits_room_book_clear() {
-        // Spike §3c capture lines 6/14/17: the .NET app fires the
+        // `raw/booking-checkin-20260424-101838/writes.txt:6,14,17` (spike §3c):
+        // the .NET app fires the
         // `update HT_Rooms set room_book_*=''` clear on EVERY save, even
         // when no fields change. Mirroring keeps the calendar grid in sync.
         let changes = BookingChanges {
@@ -919,7 +927,8 @@ mod tests {
 
     #[test]
     fn clear_room_book_display_fires_before_date_diff() {
-        // Spike §3c capture lines 6,14,17 — the clear must come BEFORE any
+        // `raw/booking-checkin-20260424-101838/writes.txt:6,14,17` (spike §3c)
+        // — the clear must come BEFORE any
         // HT_Book_Date INSERT, otherwise the .NET calendar grid keeps stale
         // captions briefly even after a date change.
         let changes = BookingChanges {
@@ -960,11 +969,17 @@ mod tests {
 
     #[test]
     fn customer_resave_emits_full_31_field_update() {
-        // Verified from /tmp/legacy-events-full.log capture for
-        // C21624 (line 3988): the .NET app's UPDATE includes the
-        // trailing 5 fields Cust_Work_tax, Cust_perfix, Cust_sex,
-        // Cust_IDcard, Cust_Contry — and the WHERE clause uses
-        // lowercase `where` (not `WHERE`).
+        // UNVERIFIED — the original evidence was `/tmp/legacy-events-full.log`
+        // (a C21624 capture), which was never committed and is gone from disk,
+        // so the claim below is no longer falsifiable from any source in this
+        // repo. What IS still evidenced: the statement SHAPE and its leading
+        // fields, by `raw/booking-checkin-20260424-101838/writes.txt:28`
+        // (spike §3d) — but that capture is TRUNCATED by the XEvent trace at
+        // `[Cust_Add_ampore]=`, so it does NOT show the trailing 5 fields
+        // (Cust_Work_tax, Cust_perfix, Cust_sex, Cust_IDcard, Cust_Contry),
+        // the total field count, or the lowercase `where`. Re-deriving those
+        // needs the decompile (the FrmCheckIn / FrmManageCustomers SAVE_CUST
+        // that builds the statement); nobody has chased it yet.
         let resave = CustomerResave {
             legacy_cust_no: "C21624".into(),
             cust_name: "Alberto Calvo Alvarez".into(),
@@ -1023,7 +1038,8 @@ mod tests {
 
     #[test]
     fn caption_rewrite_uses_new_dates_when_full_context_supplied() {
-        // Spike §3c capture line 26: re-write HT_Rooms display caption with
+        // `raw/booking-checkin-20260424-101838/writes.txt:26` (spike §3c):
+        // re-write HT_Rooms display caption with
         // the new dates after a modify. Mirrors `booking_create`'s format.
         let stay = DateRange::new(
             Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),

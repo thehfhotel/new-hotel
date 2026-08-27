@@ -146,8 +146,8 @@ impl MssqlChangeMapper for BookingRoomsMapper {
         // For D rows we cannot resolve `Book_No` from this row alone
         // (CT only carries the actual PK); the per-tick coalescing
         // layer picks the parent up via its own header / sibling CT
-        // row almost always present in the same TX (cheatsheet §3.3
-        // "Cancel cascade" + "Delete on edit").
+        // row almost always present in the same TX (cheatsheet
+        // §"Table: `HT_Book_Ds` (A)" "Cancel cascade" + "Delete on edit").
         &["id"]
     }
 
@@ -339,7 +339,7 @@ struct RoomLine {
 /// Unlike `legacy_cust_no` (ADR 0005 §4, "Unset vs. Cleared cannot be
 /// read off the raw column alone"), classification here needs no context
 /// from `fetch_existing` / INSERT-vs-UPDATE: `Book_room_note` is a plain
-/// nullable column (`docs/legacy-app/SCHEMA.sql:133`, `text`), so raw
+/// nullable column (`docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Book_H" "[Book_room_note] text"), so raw
 /// NULL vs. raw `""` vs. raw non-empty is a real, always-available
 /// distinction straight off the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]

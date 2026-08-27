@@ -21,7 +21,10 @@
 //! can verify from `docs/legacy-app/` is the column ORDER, types, the
 //! positional (no-column-list) INSERT form, the OADate `float` date encoding,
 //! and the app-side `get_id` (MAX+1) id allocation
-//! (`SCHEMA.sql:777`, `COMPAT_CHEATSHEET.md` §1051 / line 84-86 / line 1506).
+//! (`docs/legacy-app/SCHEMA.sql` §"Table: dbo.TB_Pay_History" "[id] int,",
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `TB_Pay_History` (A)"
+//! "`id int` (NOT IDENTITY) via `get_id`", §"1.4 Date/time handling"
+//! "`TB_Pay_History.Pay_Date` is `float`").
 //! What we CANNOT yet verify (the off-repo `FrmAddPay.cs` decompile is needed —
 //! `docs/legacy-app/EVERGREEN_ARTIFACTS.md`):
 //!

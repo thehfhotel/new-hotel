@@ -18,17 +18,21 @@ recorded in [`docs/legacy-app/ROOM_GRID_REFRESH.md`](../legacy-app/ROOM_GRID_REF
   is gated on `!MSSQL.CodeErr`, which goes `true` the instant the form loses focus
   (`FormRoomMain_Deactivate`) and only clears when it regains it. **While reception is
   working in our app instead of iHOTEL — which is exactly when a writeback fires — iHOTEL's
-  grid does not auto-refresh at all**, for any duration (`ROOM_GRID_REFRESH.md` §1-2).
+  grid does not auto-refresh at all**, for any duration
+  (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"1. The refresh timer" "FormRoomMain.Timer1.Interval = 60560"
+  and `docs/legacy-app/ROOM_GRID_REFRESH.md` §"2. The focus gate").
 - The only externally-reachable refresh is iHOTEL's own "Refresh" button, which also calls
   `ClearCheck()` and destroys any in-progress multi-room tap-selection
-  (`ROOM_GRID_REFRESH.md` §5).
+  (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"5. The only external lever").
 - A refresh is not read-only: `LoadRooms` can write `HT_Rooms`/`HT_Book_Date` and toggle
-  room power via a serial relay (`ROOM_GRID_REFRESH.md` §4).
+  room power via a serial relay (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"4. What a refresh actually costs").
 - Exhaustive search of the decompiled binary found no socket, named pipe, file watch, SQL
   notification, or window-message hook of any kind — **iHOTEL cannot be told to refresh by
-  anything outside its own process** (`ROOM_GRID_REFRESH.md` §6). This also forecloses a
+  anything outside its own process**
+  (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"6. The negative finding"). This also forecloses a
   DB-side fix (trigger, Service Broker): the legacy DB has zero triggers/sprocs today and
-  iHOTEL's whole app assumes that stays true (`ROOM_GRID_REFRESH.md` §11).
+  iHOTEL's whole app assumes that stays true
+  (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"11. Why not fix this DB-side").
 
 Given that, the practical options are: do nothing (status quo — reception occasionally
 looks at a stale grid and doesn't know it); make our app drive iHOTEL's refresh for her; or
@@ -46,10 +50,11 @@ button. **The refresh is never triggered automatically.**
 
 Not just a preference — automating the refresh would mean *our app* causes writes into
 legacy MSSQL at moments nobody chose (`Power_set2` room-power toggles,
-`AutoAddBookingRooms`'s `HT_Rooms`/`HT_Book_Date` UPDATEs — `ROOM_GRID_REFRESH.md` §4), and
+`AutoAddBookingRooms`'s `HT_Rooms`/`HT_Book_Date` UPDATEs —
+`docs/legacy-app/ROOM_GRID_REFRESH.md` §"4. What a refresh actually costs"), and
 those writes round-trip straight back through Change Tracking into canonical PostgreSQL.
 It would also blow away whatever multi-room selection reception has mid-flight
-(`ClearCheck()`, `ROOM_GRID_REFRESH.md` §5) — from her point of view, our app would be
+(`ClearCheck()`, `docs/legacy-app/ROOM_GRID_REFRESH.md` §"5. The only external lever") — from her point of view, our app would be
 silently clearing her in-progress work on a screen she isn't even looking at. Someone will
 propose full automation within a month of this shipping ("just click Refresh for her,
 what's the harm") — this ADR is the answer, and the reasoning above is why "it's just a
@@ -88,9 +93,8 @@ because it needs three things this project has already paid to avoid once:
 - **Per-PC branch identity** (which site's events this PC should get), a piece of config
   that doesn't exist today outside the browser session.
 - A **permanently-held connection from a Windows desktop process**, the exact shape
-  `docs/adr/0001-phase5-ville-multi-site.md:21` already rejected once for
-  `desktop-0be5led`'s own Tailscale daemon: "fragile (Windows userspace, sleeps with RDP
-  logout)."
+  `docs/adr/0001-phase5-ville-multi-site.md` §"Decision summary" "fragile (Windows userspace, sleeps with RDP logout)"
+  already rejected once for `desktop-0be5led`'s own Tailscale daemon (Q3 row of that table).
 
 **Honest cost, recorded rather than glossed over:** delivery requires BOTH the tray app
 running AND a browser tab open on the v2 UI on that PC. If either is missing, the failure
@@ -138,11 +142,12 @@ failures). Mitigation is a **latch**, not a counter:
   iHOTEL is unfocused/stale opens it and fires **one** toast; every subsequent writeback
   while the episode is still open just increments a counter — no new toast.
 - Suppressed entirely while iHOTEL is the foreground window (nothing to notify about if
-  she's already looking at it — and per `ROOM_GRID_REFRESH.md` §2, focus alone clears
+  she's already looking at it — and per `docs/legacy-app/ROOM_GRID_REFRESH.md` §"2. The focus gate", focus alone clears
   `MSSQL.CodeErr` and lets the normal 60.6 s timer resume).
 - Cleared either by the receptionist clicking "Refresh iHOTEL now," or by iHOTEL holding
   foreground continuously for ≥65 s (long enough for at least one natural timer tick to
-  have run — `ROOM_GRID_REFRESH.md` §1's ≈60.6 s interval plus slack).
+  have run — the ≈60.6 s interval in
+  `docs/legacy-app/ROOM_GRID_REFRESH.md` §"1. The refresh timer" "FormRoomMain.Timer1.Interval = 60560", plus slack).
 
 **Pilot acceptance gate:** ≤1 toast per 30 minutes sustained over a full shift, and a direct
 question to the receptionist afterward — did she use the button, or ignore it? A pilot that
@@ -171,12 +176,13 @@ was read-only diagnostics.
 - **DB-side notification** (a trigger or Service Broker on the shared legacy MSSQL).
   Rejected — legacy DDL beyond the CT prerequisite carve-out is prohibited, and the legacy
   DB's zero-trigger invariant is load-bearing for the rest of this project's byte-parity
-  methodology (`ROOM_GRID_REFRESH.md` §11).
+  methodology (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"11. Why not fix this DB-side").
 - **Tauri middleware subscribes to backend SSE directly**, skipping the browser hop.
   Rejected — see Decision §3.
 - **Poll `IsListroom`-style from outside the process.** Not viable at all:
   `Module1.IsListroom` is an in-process static field, never persisted anywhere external
-  (`ROOM_GRID_REFRESH.md` §7) — there is nothing to poll from outside `HOTEL.exe`.
+  (`docs/legacy-app/ROOM_GRID_REFRESH.md` §"7. The app's own refresh flag is unreachable")
+  — there is nothing to poll from outside `HOTEL.exe`.
 
 ## References
 
@@ -186,8 +192,9 @@ was read-only diagnostics.
   precedent this design's channel reuses the shape of.
 - `hotel-backend/src/routes/events.rs:133` — `RESYNC_EVENT = "refresh"`, the name this
   design deliberately does not reuse.
-- `docs/adr/0001-phase5-ville-multi-site.md` (Q3, line 21) — the prior rejection of a
-  permanently-held Windows-desktop connection this ADR's transport choice avoids repeating.
+- `docs/adr/0001-phase5-ville-multi-site.md` §"Decision summary" "fragile (Windows userspace, sleeps with RDP logout)"
+  (the Q3 row) — the prior rejection of a permanently-held Windows-desktop connection this
+  ADR's transport choice avoids repeating.
 - `thai-id-middleware-tauri/` — the existing local middleware this design extends; see its
   `README.md` for the current card-reader HTTP bridge it already runs.
 - Issue #277 — the bb8 pool-checkout timeout investigation that motivated the

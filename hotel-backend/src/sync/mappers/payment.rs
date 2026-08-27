@@ -61,10 +61,12 @@ pub struct PaymentMapper;
 // marker (`'ยกเลิก'`) down to the check-in aggregate sweep. The legacy
 // app cascades a folio cancel into `HT_CheckIn_Pay` via
 // `update HT_CheckIn_Pay set cin_status='ยกเลิก' where cin_no=…`
-// (COMPAT_CHEATSHEET line 531). Without the projection the sync layer
+// (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "update HT_CheckIn_Pay set cin_status='ยกเลิก'"
+// — was: cheatsheet 545). Without the projection the sync layer
 // silently treats the cancelled rows as active and over-counts
-// `cin_paid_amount`. Verified column shape per COMPAT_CHEATSHEET
-// line 492 (`Cin_Status varchar(50) NOT NULL DEFAULT '1'`).
+// `cin_paid_amount`. Verified column shape per `COMPAT_CHEATSHEET.md`
+// §"Table: `HT_CheckIn_Pay`" "Cin_Status varchar(50) NOT NULL DEFAULT '1'"
+// (was: cheatsheet 492, which is in the `HT_CheckIn_Ds` section).
 //
 // The two additional tender columns (`Cin_Pay_Free`, `Cin_Pay_web`)
 // round out the canonical sum so a future aggregate-by-tender
@@ -72,7 +74,8 @@ pub struct PaymentMapper;
 // pipeline change. Order matches the canonical writeback-recipe order
 // (Cash + Credit + Free + Tran + web) so downstream code reads
 // left-to-right in the same sequence as the legacy invariant
-// (COMPAT_CHEATSHEET line 534).
+// (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cin_Pay_Free + Cin_Pay_Tran + Cin_Pay_Web"
+// — was: cheatsheet 548).
 const PAYMENT_SELECT_COLS: &str = "t.id, t.Cin_No, t.Cin_Pay_Cash, t.Cin_Pay_Credit, \
     t.Cin_Pay_Free, t.Cin_Pay_Tran, t.Cin_Pay_web, t.Pay_No, t.Cin_Status";
 
@@ -332,8 +335,8 @@ pub async fn mirror_payment_ledger(
 // =============================================================================
 
 /// CT mapper for `HT_Receipt_H`. Receipts are append-only in the legacy
-/// app (cheatsheet §3.9 "Receipts are never deleted on check-out") so
-/// the I path dominates; U is the cancel path (status_name='ยกเลิก').
+/// app (spike §"5. Writeback design implications" "Receipts are append-only")
+/// so the I path dominates; U is the cancel path (status_name='ยกเลิก').
 pub struct ReceiptMapper;
 
 const RECEIPT_SELECT_COLS: &str =
@@ -837,7 +840,8 @@ mod tests {
     /// so the CT pipeline carries the cancellation marker
     /// (`'ยกเลิก'`) into the check-in aggregate sweep. Without it the
     /// cascade `update HT_CheckIn_Pay set cin_status='ยกเลิก' where
-    /// cin_no=…` (COMPAT_CHEATSHEET line 531) is silently dropped at
+    /// cin_no=…` (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cancel cascade"
+    /// — was: cheatsheet 545) is silently dropped at
     /// the sync layer and `ht_checkins.cin_paid_amount` over-counts.
     #[test]
     fn projects_cin_pay_status() {
@@ -853,7 +857,8 @@ mod tests {
     /// column so an aggregate-by-tender computation can be derived
     /// from CT-delivered rows without another pipeline change. The
     /// canonical writeback recipe sums Cash + Credit + Free + Tran +
-    /// web (COMPAT_CHEATSHEET line 534).
+    /// web (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cin_Pay_Free + Cin_Pay_Tran + Cin_Pay_Web"
+    /// — was: cheatsheet 548).
     #[test]
     fn projects_every_tender_column() {
         let m = PaymentMapper;
@@ -955,7 +960,9 @@ mod tests {
 
     #[test]
     fn project_payment_line_carries_negative_refund_tenders() {
-        // Refunds use tender negation (COMPAT_CHEATSHEET line 513).
+        // Refunds use tender negation (`COMPAT_CHEATSHEET.md`
+        // §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)"
+        // — was: cheatsheet 527, inside the schema fence).
         let row = pay_line_row(9)
             .with("Cin_Pay_Cash", MockValue::Decimal(-450.0))
             .with("Cin_Pay_Ds_Price", MockValue::Decimal(-450.0));

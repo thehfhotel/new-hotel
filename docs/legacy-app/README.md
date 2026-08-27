@@ -10,7 +10,7 @@ legacy app reads and writes, in what order, with what conventions.
 
 | File | What it is |
 |---|---|
-| [`COMPAT_CHEATSHEET.md`](COMPAT_CHEATSHEET.md) | **Coexistence contract** — every load-bearing literal, field, and convention. §1 global conventions (Thai_CI_AS varchar, date handling, ID generation). §2 per-table contract (every `HT_*` table). §3 multi-table cascade catalog (walk-in, check-out, booking, cancel, change-room mid-stay, mark dirty/clean, extension, etc.). §8 quirks (Branch column on payments, round-bill gate, etc.). **Read this first.** |
+| [`COMPAT_CHEATSHEET.md`](COMPAT_CHEATSHEET.md) | **Coexistence contract** — every load-bearing literal, field, and convention. §"1. Global Conventions" (Thai_CI_AS varchar, date handling, ID generation). §"2. Per-Table Contract" (every `HT_*` table). §"3. Multi-Table Cascade Catalog" (walk-in, check-out, booking, cancel, change-room mid-stay, mark dirty/clean, extension, etc.). §"8. Open Questions and Gotchas" (Branch column on payments, round-bill gate, etc.). **Read this first.** |
 | [`FEATURE_MAP.md`](FEATURE_MAP.md) | Feature inventory grouped by UI screen / `Form*.cs` file, mapped to the DB tables each one touches. Use when you need to know "what does the receptionist clicking X actually do?" |
 | [`REPORTS_INVENTORY.md`](REPORTS_INVENTORY.md) | Crystal Report inventory — each `.rpt` file, its purpose, the source query, and which legacy menu/button invokes it. |
 | [`SCHEMA.sql`](SCHEMA.sql) | Live schema dump captured from the legacy `db` database. Less complete than the canonical baseline at [`docs/legacy-spike/schema/01-baseline-schema.txt`](../legacy-spike/schema/01-baseline-schema.txt) — that file is authoritative; this one is included for self-contained reference. |

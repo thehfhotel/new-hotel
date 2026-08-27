@@ -5920,8 +5920,9 @@ mod tests {
     /// not insert a duplicate. This reproduces the exact `ON CONFLICT
     /// (cash_legacy_id)` target `sync_cash_history`'s
     /// `CASH_HISTORY_UPSERT_SQL` upserts on (`hotel-backend/src/bin/sync.rs`,
-    /// the `const` at line 6192 / `ON CONFLICT` at line 6197, consumed by
-    /// `sync_cash_history` at line 6547) against the real `ht_cash_ledger`
+    /// the `const CASH_HISTORY_UPSERT_SQL` and its `ON CONFLICT
+    /// (cash_legacy_id) DO UPDATE` clause, consumed by `fn sync_cash_history`)
+    /// against the real `ht_cash_ledger`
     /// UNIQUE constraint — it does NOT call or modify `bin/sync.rs` (out of
     /// this task's ownership; the dedup itself is proven correct there by
     /// `cash_sync_tests::reimport_without_backpopulation_still_duplicates`,

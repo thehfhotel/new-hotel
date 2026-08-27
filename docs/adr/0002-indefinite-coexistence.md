@@ -2,13 +2,15 @@
 
 **Status:** Accepted — 2026-06-26. Ratified by the project owner.
 **Supersedes:** the *decommission-as-goal* framing only — ADR 0001 "Phase 8 / 9
-(transition / decommission)" note, and `docs/architecture.md` §0 (State C as an
-end-state) and §8 (the "∞ Decommission" target). It does **not** change any
+(transition / decommission)" note, and `docs/architecture.md` §"State C — DECOMMISSIONED (only our app)"
+(State C as an end-state) and `docs/architecture.md` §"8. Migration roadmap" "**∞ (dormant)**"
+(the "∞ Decommission" target). It does **not** change any
 shipped code or the finished Phase 0–7 work.
 
 ## Context
 
-The original plan (ADR 0001, `architecture.md` §0/§8) framed the legacy MSSQL +
+The original plan (ADR 0001; `docs/architecture.md` §"State C — DECOMMISSIONED (only our app)"
+and `docs/architecture.md` §"8. Migration roadmap") framed the legacy MSSQL +
 iHOTEL .NET app as something we would eventually **decommission**: coexist
 during a transition (State B), then turn the legacy stack off (State C / "Phase
 8/9"). Every design choice was made "decommission-ready."
@@ -68,7 +70,7 @@ state on the path to co-equal Ville writes, not a permanent design.
 | Finished (Phases 0–7, ✅) | Status under this ADR |
 |---|---|
 | Layering, outbox/writeback, CT sync, multi-site, drift-reconcile | **Unchanged** — this IS the coexistence machinery; it now runs indefinitely rather than "until decommission." |
-| `architecture.md` §8 "∞ Decommission" row | **Reframed** to a dormant capability (decision 3), not a target. |
+| `docs/architecture.md` §"8. Migration roadmap" "**∞ (dormant)**" row | **Reframed** to a dormant capability (decision 3), not a target. |
 | ADR 0001 "Phase 8/9 transition→decommission" | **Superseded** — Phase 8 becomes "complete HF Ville co-equal writes"; there is no Phase 9 decommission. |
 | Decommission-readiness as a design driver | **Reframed** as a retained safety property, not a goal. |
 

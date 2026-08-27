@@ -83,7 +83,7 @@ pub fn guest_prefix_for_country(country: &str) -> &'static str {
 ///
 /// Fired from two flows — extracted here per this module's charter so the
 /// SQL literal stays byte-identical at both call sites:
-/// * `booking_modify` (spike §3c lines 5/16/28 — the .NET app re-saves the
+/// * `booking_modify` (spike §3c "re-save customer" — the .NET app re-saves the
 ///   customer on every booking modify);
 /// * `update_customer` (coexistence audit 2026-06-11 P2 — standalone
 ///   customer-edit writeback).

@@ -13,8 +13,10 @@
 -- iHOTEL has at least Admin / Cashier / Housekeeper / Receptionist roles
 -- with per-feature gating. The new app currently has binary auth (logged
 -- in vs. not). Phase 4 PR1 (migration 027) added an `admin`/`receptionist`
--- check constraint, but the audit (G HIGH-9, line 297 + 310) flagged
--- that as too coarse — refunds should be cashier-only, housekeeping
+-- check constraint, but the audit flagged that as too coarse
+-- (`docs/coexistence/audit-2026-05-13.md` §"Decisions needed from product owner" "**Permission granularity** (Track G HIGH-9)",
+-- and `docs/coexistence/audit-2026-05-13.md` §"Confidence" "T4 HIGH-9 (permission granularity)")
+-- — refunds should be cashier-only, housekeeping
 -- shouldn't see payment screens, etc.
 --
 -- This migration introduces three new tables (`ht_roles`,

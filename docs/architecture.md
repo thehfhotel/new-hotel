@@ -935,7 +935,7 @@ CREATE TABLE legacy_mirror.ht_book_h (
 );
 ```
 
-The sync worker maintains `legacy_mirror.*` AND **upserts new/changed rows into canonical `public.ht_*`** via the reconcile step (§4e below). The repository layer only ever reads `public.ht_*` — bidirectional flow is hidden from it.
+The sync worker maintains `legacy_mirror.*` AND **upserts new/changed rows into canonical `public.ht_*`** via the reconcile step (§"4e. Reconcile" below). The repository layer only ever reads `public.ht_*` — bidirectional flow is hidden from it.
 
 When legacy is decommissioned, drop the whole `legacy_mirror` schema.
 

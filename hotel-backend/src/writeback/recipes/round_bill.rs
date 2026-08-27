@@ -1,6 +1,7 @@
 //! `OpenRound` / `CloseRound` recipes — Track J6 (round-bill coexistence
 //! step 2). Faithful translation of iHOTEL's `FrmDueBill.cs` round handling,
-//! captured in `docs/legacy-app/COMPAT_CHEATSHEET.md` §946-956 / §3.20-3.21.
+//! captured in `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Round_Bill` (A)",
+//! §"3.20 Open Round-Bill" and §"3.21 Close Round-Bill".
 //!
 //! iHOTEL reference SQL (the only two statements it fires against
 //! `HT_Round_Bill`):

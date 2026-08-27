@@ -44,8 +44,8 @@ guest-registry, and mirror dual-write call sites never received it.
 |---|---------|-------|-----|
 | 1 | **Defer/watermark silent-drop class** (June 3 root cause). 7 `Ok(None)` defer paths consume CT rows while the watermark advances: booking→customer (`booking.rs:328-340`), receipt→checkin (`payment.rs:267-278`, receipts have NO re-fire source), guest-registry→checkin (`guest_registry.rs:148-155`, TM.30 undercount), checkin→room/booking (`checkin.rs:342-380`), mirror G4/G6 (`mirror.rs:285-287,593-599`) | sync mappers | (a) eager-mirror customers in `apply_booking_aggregate` like checkin does; (b) `errored=true` on FK-defer everywhere; (c) enable `SYNC_PER_TABLE_WATERMARK`; (d) fix the false `resolve.rs` contract doc |
 | 2 | **`payment.rs` blindly `DELETE HT_CheckIn_Product`** without the mandatory `Pro_Amt` stock-restore pairing (cheatsheet §6.3) and without re-insert — every writeback payment on a folio with iHOTEL minibar/product lines erases the charges AND corrupts stock | `recipes/payment.rs:209-211` | Drop the cart-clear statement (Phase-1 artifact) |
-| 3 | **`extend_stay.rs` clobbers totals**: sets `Total_Price_Product=0` (hardcoded) and `Total_Price_Pay` from stale intent snapshot — columns the §3f capture never touches; races concurrent payments | `recipes/extend_stay.rs:130-142,226` | Drop both columns from the UPDATE (match capture) |
-| 4 | **Room change leaves iHOTEL occupancy stale**: skips §3.17 caller duties (`Cin_Room_No`, `HT_Rooms` flags both rooms); code comment claims "sync mappers" converge it — wrong direction. iHOTEL shows guest in old room; double-assignment risk | `recipes/room_change.rs:25-43`, `service/checkin.rs:697-720` | Emit the companion statements in the same transaction |
+| 3 | **`extend_stay.rs` clobbers totals**: sets `Total_Price_Product=0` (hardcoded) and `Total_Price_Pay` from stale intent snapshot — columns the spike §3f capture never touches; races concurrent payments | `recipes/extend_stay.rs:130-142,226` | Drop both columns from the UPDATE (match capture) |
+| 4 | **Room change leaves iHOTEL occupancy stale**: skips cheatsheet §3.17 caller duties (`Cin_Room_No`, `HT_Rooms` flags both rooms); code comment claims "sync mappers" converge it — wrong direction. iHOTEL shows guest in old room; double-assignment risk | `recipes/room_change.rs:25-43`, `service/checkin.rs:697-720` | Emit the companion statements in the same transaction |
 
 ### P1 — correctness bugs with bounded blast radius
 
@@ -107,8 +107,8 @@ guest-registry, and mirror dual-write call sites never received it.
   C0000-cascade idempotency, type-1 bookings, NULL-date poison pill,
   inert echo filter removed honestly, Bangkok-as-UTC event labels.
 - P0-2/3/4 + P1-7/8/9/10 → merge `90bef62` (`fix(writeback)`): payment
-  cart-clear deleted, extend-stay matches the §3f capture with live
-  Balance re-aggregation, room-change emits the full §3.17 companion set
+  cart-clear deleted, extend-stay matches the spike §3f capture with live
+  Balance re-aggregation, room-change emits the full cheatsheet §3.17 companion set
   (+ HT_Room_Status re-point), all N'…' stripped, fingerprint baseline
   extended to all 20 written tables, checkin-to-booking re-save narrowed
   to payload-carried fields, booking-modify caption + MAX(id) Room_Book,

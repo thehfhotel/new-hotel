@@ -229,7 +229,8 @@ pub async fn create_payment(
     })?;
 
     let receipt = build_receipt_header(&state, pool, cin_id).await?;
-    // Per-room apportionment: spike §3h capture line 3 fires
+    // Per-room apportionment: `raw/invoice-20260424-100827/writes.txt:3`
+    // (spike §3h) fires
     // `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note=''`
     // just before inserting the payment. The route currently doesn't
     // know which room a payment maps to (single-room check-ins are

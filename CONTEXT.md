@@ -87,6 +87,18 @@ runs; our app never calls it, drives it, or automates it on her behalf.
 _Avoid_: "auto-refresh iHOTEL", "push to iHOTEL" (both imply we drive the vendor app
 unasked — exactly what ADR 0006 rules out)
 
+**Folio lock token**:
+`HT_CheckIn_H.Cin_Work_number` — iHOTEL's per-folio optimistic-lock token, written on folio
+LOAD by `Module1.GET_WORK_NUMBER` in five reception forms (FrmEditDate, FrmPayAdd,
+FrmPayAddPro, FrmCheckIn, FrmCheckOut) and re-checked in each form's `SAVE_EDIT()` before it
+writes; on mismatch the form shows `มีการแก้ไข … จากเครื่องอื่น`, closes, and discards the
+receptionist's typed work. (In FrmEditDate a save-confirm dialog runs first, so answering
+"No" returns before the token is ever read.) `extend_stay` bumps it deliberately so a stale iHOTEL form
+fails closed rather than overwriting our totals with its pre-extend literals. Advisory only —
+the check and the save are not in one transaction. Detail: `COMPAT_CHEATSHEET.md` §7.4.
+_Avoid_: "TM.30 batch number" (the 2026-04 spike's disproven inference), "work number",
+"async batch job"
+
 ### Sync (established elsewhere, recorded for vocabulary)
 
 **Sync lag / unconverged**:
