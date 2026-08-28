@@ -50,7 +50,7 @@
 # ---- chef: base image with cargo-chef installed ---------------------------
 # Pin to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub API
 # `hub.docker.com/v2/repositories/library/rust/tags/1.89-bookworm` on 2026-04-26.
-FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS chef
+FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
 # Crate-download resilience (set EARLY so it covers cargo-chef install + cook +
