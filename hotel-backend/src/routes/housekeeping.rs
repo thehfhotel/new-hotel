@@ -48,12 +48,19 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
+use crate::domain::hk_signal::{SignalAction, SignalRole};
 use crate::domain::user::User;
 use crate::error::ApiResult;
 use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsReaders};
 use crate::outbox::event::EventSource;
+// The desk endpoints reuse the `/hk` wire types verbatim rather than declaring
+// twins: identical shapes on both surfaces is a CONTRACT of this feature, and
+// two structs with the same fields is exactly how it would quietly stop being
+// true.
+use crate::routes::hk::{RaiseSignalBody, SignalListResponse, SignalResponse};
 use crate::service::{
-    HousekeepingService, MarkCleanCommand, MarkDirtyCommand, MarkMaintenanceCommand,
+    ActOnSignalCommand, HkSignalService, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,
+    MarkMaintenanceCommand, RaiseSignalCommand,
 };
 
 /// Operator label stamped into the legacy `HT_Housewife` audit row when the
@@ -197,6 +204,165 @@ pub async fn set_maintenance(
         message,
         room_id: outcome.room_id,
     }))
+}
+
+// ============================================================================
+// Room signals — the desk half of ADR 0008
+// ============================================================================
+//
+// Reception's own surface, behind this module's EXISTING auth (the cookie-
+// session `auth_layer` in `main.rs`, a no-op while `AUTH_ENABLED=false`) rather
+// than the `/hk` Cloudflare Access application. Deliberately the same request
+// and response SHAPES as the `/hk` endpoints, and the same service and the same
+// pure rules underneath — so "the desk says done" and "the viewer on /hk says
+// done" cannot answer differently.
+//
+// The role is CONSTANT here: this surface is reception, so it always speaks as
+// `SignalRole::Desk`. There is no `can_report`-style boolean to read and no way
+// for a desk request to raise a maid→desk signal.
+//
+// PG-ONLY, like the whole feature (migration 089): no writeback intent, no
+// legacy write, nothing for `HFVILLE_WRITEBACK_INTENTS` to park. Note that
+// these desk paths are NOT added to `middleware::ville_guard`'s exemption list,
+// unlike their `/hk` twins: an exemption exists so a MAID's report is not
+// collateral damage of a front-desk write-policy toggle, and a front-desk
+// mutation is precisely what that toggle is about. With `HFVILLE_WRITES_ENABLED`
+// off (not today's production state) reception simply uses iHOTEL for Ville,
+// which is what the flag means.
+
+/// Operator label stamped as the signal's badge when no session user is wired.
+///
+/// The `/hk` side always has a verified HF ID badge; this surface does not
+/// while `AUTH_ENABLED=false`, and the service refuses a blank badge outright
+/// (a signal row is an audit record behind guest charges). So it falls back to
+/// the same stable sentinel the legacy audit rows use — deliberately the SAME
+/// constant as [`DEFAULT_BY`], because "who did this from the desk" is one
+/// question with one answer, not two.
+const DESK_SIGNAL_BADGE: &str = DEFAULT_BY;
+
+/// `GET /api/housekeeping/signals?branch=` — reception's live signal board.
+///
+/// Same payload as `GET /api/hk/signals`: `open` + `acked`, oldest first,
+/// `{success, signals:[RoomSignal]}`.
+pub async fn list_signals(
+    State(state): State<AppState>,
+    Query(query): Query<HousekeepingQuery>,
+) -> ApiResult<Json<SignalListResponse>> {
+    let signals = signal_service_for(&state, query.branch)?.list_live().await?;
+    Ok(Json(SignalListResponse {
+        success: true,
+        signals,
+    }))
+}
+
+/// `POST /api/housekeeping/rooms/{id}/signals` — the desk raises a signal.
+///
+/// Desk→maid types only; a maid→desk type here is a 403 from the shared role
+/// gate, not a quietly-accepted row in the wrong direction.
+pub async fn raise_signal(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Query(query): Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
+    Json(body): Json<RaiseSignalBody>,
+) -> ApiResult<Json<SignalResponse>> {
+    let (badge, name) = desk_identity(actor.as_deref());
+    let outcome = signal_service_for(&state, query.branch)?
+        .raise(RaiseSignalCommand {
+            room_id,
+            signal_type: body.signal_type,
+            role: SignalRole::Desk,
+            badge,
+            name,
+            source: http_source(),
+        })
+        .await?;
+    Ok(Json(SignalResponse {
+        success: true,
+        signal: outcome.signal,
+    }))
+}
+
+/// `POST /api/housekeeping/signals/{id}/ack` — reception takes a maid's signal.
+pub async fn ack_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
+) -> ApiResult<Json<SignalResponse>> {
+    desk_act(state, path, query, actor, SignalAction::Ack).await
+}
+
+/// `POST /api/housekeeping/signals/{id}/done` — reception completes a maid's
+/// signal (e.g. a มีของหาย settled with the guest).
+pub async fn done_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
+) -> ApiResult<Json<SignalResponse>> {
+    desk_act(state, path, query, actor, SignalAction::Done).await
+}
+
+/// `POST /api/housekeeping/signals/{id}/cancel` — the desk withdraws its OWN
+/// still-open signal (a ขอเช็คห้อง the guest changed their mind about).
+pub async fn cancel_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
+) -> ApiResult<Json<SignalResponse>> {
+    desk_act(state, path, query, actor, SignalAction::Cancel).await
+}
+
+/// Shared body of the three desk actions — one call site, so they cannot drift.
+///
+/// There is no desk `answer` endpoint on purpose: answering a ขอเช็คห้อง is the
+/// MAID's judgement about a room she has just inspected, and the role gate in
+/// `domain::hk_signal` would refuse a desk answer anyway. Routing one here
+/// would be a door that only ever returns 403.
+async fn desk_act(
+    State(state): State<AppState>,
+    Path(signal_id): Path<i64>,
+    Query(query): Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
+    action: SignalAction,
+) -> ApiResult<Json<SignalResponse>> {
+    let (badge, name) = desk_identity(actor.as_deref());
+    let outcome = signal_service_for(&state, query.branch)?
+        .act(ActOnSignalCommand {
+            signal_id,
+            action,
+            role: SignalRole::Desk,
+            badge,
+            name,
+            source: http_source(),
+        })
+        .await?;
+    Ok(Json(SignalResponse {
+        success: true,
+        signal: outcome.signal,
+    }))
+}
+
+/// Build an [`HkSignalService`] bound to the branch's pool — the same
+/// `write_pool` chokepoint [`service_for`] uses, so the Hfville→ville_pool
+/// decision is made in exactly one place.
+fn signal_service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<HkSignalService> {
+    Ok(HkSignalService::new(state.write_pool(branch)?.clone()))
+}
+
+/// `(badge, display name)` for a desk-originated signal.
+///
+/// Prefers the authenticated session user (Task #40) so a real receptionist's
+/// login is recorded once auth is on; falls back to [`DESK_SIGNAL_BADGE`] while
+/// it ships dark. NEVER read from the request body — the identity rule is the
+/// same on both surfaces.
+fn desk_identity(actor: Option<&User>) -> (String, Option<String>) {
+    match actor {
+        Some(user) => (user.username.clone(), Some(user.username.clone())),
+        None => (DESK_SIGNAL_BADGE.to_string(), None),
+    }
 }
 
 // ============================================================================

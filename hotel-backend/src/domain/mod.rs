@@ -14,6 +14,7 @@
 pub mod booking;
 pub mod checkin;
 pub mod customer;
+pub mod hk_signal;
 pub mod payment;
 pub mod room;
 pub mod session;
@@ -23,6 +24,10 @@ pub mod user;
 pub use booking::{Booking, BookingState};
 pub use checkin::{CheckIn, CheckInState};
 pub use customer::{Customer, CustomerType};
+pub use hk_signal::{
+    RoomCheckOutcome, RoomSignal, SignalAction, SignalActor, SignalDirection, SignalDoneSource,
+    SignalRole, SignalRuleError, SignalStatus,
+};
 pub use payment::{Payment, PaymentMethod};
 pub use room::{CleanState, Room, RoomStatus};
 pub use session::Session;

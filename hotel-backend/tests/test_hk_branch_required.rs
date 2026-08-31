@@ -899,3 +899,334 @@ async fn branch_selects_the_right_site_pool() {
         .execute(&ville_pool)
         .await;
 }
+
+// ============================================================================
+// Room signals (ADR 0008) — the role gate, the room_check carve-out, and the
+// same branch gate every other room endpoint answers
+// ============================================================================
+//
+// All DB-free: every assertion below is answered by a pure gate before a pool
+// is touched. The DB-backed paths (a real raise → ack → done round trip, the
+// เสร็จแล้ว auto-complete, the answer's child signals) belong to the live-PG
+// suite the orchestrator runs afterwards; what is pinned HERE is the set of
+// refusals a stale bundle or a hand-rolled request can provoke.
+//
+// The role gate is the interesting one and it is SYMMETRIC: `can_report`
+// decides which SIDE an identity is on, not whether it may write at all. So —
+// unlike the cleaning and linen mutations — a viewer is NOT refused outright on
+// `POST /signals`; it is refused for the maid's TYPES, and the maid is refused
+// for the desk's. Pinning both halves is what stops one role's rules being
+// quietly applied to the other.
+
+/// The signal type an identity of the OTHER side would send.
+const A_MAID_TYPE: &str = "item_missing";
+const A_DESK_TYPE: &str = "priority_clean";
+
+fn assert_forbidden(status: StatusCode, body: &str, what: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{what}: expected 403, body={body}");
+    let json: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|_| panic!("{what}: 403 body must be JSON, got {body}"));
+    assert_eq!(
+        json.get("success").and_then(|v| v.as_bool()),
+        Some(false),
+        "{what}: the repo-wide envelope requires success=false, body={body}"
+    );
+    assert!(
+        json.get("error").and_then(|v| v.as_str()).is_some_and(|e| !e.is_empty()),
+        "{what}: a 403 must carry an actionable message, body={body}"
+    );
+}
+
+fn assert_bad_request(status: StatusCode, body: &str, what: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: expected 400, body={body}");
+    let json: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|_| panic!("{what}: 400 body must be JSON, got {body}"));
+    assert_eq!(
+        json.get("success").and_then(|v| v.as_bool()),
+        Some(false),
+        "{what}: the repo-wide envelope requires success=false, body={body}"
+    );
+}
+
+/// A maid may not speak for reception. `priority_clean` is a REAL, correctly
+/// spelled type — it just belongs to the other direction — so this must be a
+/// permission refusal (403), not a "bad body" (400): the client sent something
+/// valid that this identity may not say.
+#[tokio::test]
+async fn signals_a_maid_cannot_send_a_desk_to_maid_type() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/signals?branch=hfhotel",
+        &format!(r#"{{"type":"{A_DESK_TYPE}"}}"#),
+    )
+    .await;
+    assert_forbidden(status, &body, "maid POSTing a desk→maid type");
+}
+
+/// …and the mirror image: the read-only reception viewer IS the desk on this
+/// surface, so it may not raise a maid→desk signal either.
+#[tokio::test]
+async fn signals_a_viewer_cannot_send_a_maid_to_desk_type() {
+    let app = inner_viewer(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/signals?branch=hfhotel",
+        &format!(r#"{{"type":"{A_MAID_TYPE}"}}"#),
+    )
+    .await;
+    assert_forbidden(status, &body, "viewer POSTing a maid→desk type");
+}
+
+/// A code in NEITHER vocabulary is a malformed request, not an authorization
+/// problem — otherwise a client typo reads to an operator as a permissions bug.
+#[tokio::test]
+async fn signals_an_unknown_type_is_400_not_403() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/signals?branch=hfhotel",
+        r#"{"type":"gossip"}"#,
+    )
+    .await;
+    assert_bad_request(status, &body, "POST /signals with an unknown type");
+}
+
+/// **The checkout carve-out.** ขอเช็คห้อง can never be completed by a bare done
+/// tap — its completion is the maid's judgement — and the refusal must NAME the
+/// answer endpoint so a client can route the user there instead of retrying.
+///
+/// The signal id is fabricated, and that is the point: the type-level refusal
+/// is produced by the transition table AFTER the row is read, so this row
+/// requires a database. It runs against the live pool when one is reachable and
+/// skips otherwise, like every other DB-backed row in this suite.
+#[tokio::test]
+async fn signals_done_on_a_room_check_points_at_the_answer_endpoint() {
+    let Some(pool) = live_pool().await else {
+        eprintln!("skipping signals_done_on_a_room_check — PG not reachable");
+        return;
+    };
+    // Seed one desk→maid room_check against any active room.
+    let Some(room_id) = sqlx::query_scalar::<_, i32>(
+        "SELECT room_id FROM ht_rooms_new WHERE COALESCE(room_active, true) LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("room probe")
+    else {
+        eprintln!("skipping signals_done_on_a_room_check — no rooms seeded");
+        return;
+    };
+    let signal_id: i64 = sqlx::query_scalar(
+        "INSERT INTO ht_hk_room_signals \
+             (sig_room_id, sig_direction, sig_type, sig_created_badge) \
+         VALUES ($1, 'desk_to_maid', 'room_check', 'TEST') RETURNING sig_id",
+    )
+    .bind(room_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a room_check");
+
+    let app = inner(
+        AppState::new(pool.clone()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/api/hk/signals/{signal_id}/done?branch=hfhotel"),
+        "",
+    )
+    .await;
+    assert_bad_request(status, &body, "done tap on a room_check");
+    assert!(
+        body.contains("answer"),
+        "the refusal must point at the answer endpoint, got {body}"
+    );
+
+    sqlx::query("DELETE FROM ht_hk_room_signals WHERE sig_id = $1")
+        .bind(signal_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
+/// Every signal endpoint answers the SAME branch gate as the room endpoints —
+/// a stale bundle that forgot `?branch=` fails loudly instead of silently
+/// acting on HF Hotel.
+#[tokio::test]
+async fn signals_endpoints_all_require_a_branch() {
+    for (method, uri, body) in [
+        ("GET", "/api/hk/signals", ""),
+        ("GET", "/api/hk/events", ""),
+        ("POST", "/api/hk/rooms/1/signals", r#"{"type":"item_missing"}"#),
+        ("POST", "/api/hk/signals/1/ack", ""),
+        ("POST", "/api/hk/signals/1/done", ""),
+        ("POST", "/api/hk/signals/1/cancel", ""),
+        ("POST", "/api/hk/signals/1/answer", r#"{"outcome":"clear"}"#),
+    ] {
+        let app = inner(
+            AppState::new(clamped_lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, got) = call(app, method, uri, body).await;
+        assert_branch_400(status, &got, &format!("{method} {uri} with no branch"));
+    }
+}
+
+/// `branch=all` must be refused here too. `write_pool(Some(All))` returns the
+/// PRIMARY pool, so accepting it would let a Ville signal land in HF Hotel's
+/// database — the identical wrong-hotel bug row 3 pins for the room list.
+#[tokio::test]
+async fn signals_reject_branch_all() {
+    for (method, uri, body) in [
+        ("GET", "/api/hk/signals?branch=all", ""),
+        ("GET", "/api/hk/events?branch=all", ""),
+        (
+            "POST",
+            "/api/hk/rooms/1/signals?branch=all",
+            r#"{"type":"item_missing"}"#,
+        ),
+    ] {
+        let app = inner(
+            AppState::new(clamped_lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, got) = call(app, method, uri, body).await;
+        assert_branch_400(status, &got, &format!("{method} {uri}"));
+    }
+}
+
+/// A branch outside `HK_BRANCHES` is 403 on the signal endpoints too — the
+/// deployment allowlist binds the maid stream exactly as it binds the reads.
+#[tokio::test]
+async fn signals_respect_the_hk_branches_allowlist() {
+    for uri in [
+        "/api/hk/signals?branch=hfville",
+        "/api/hk/events?branch=hfville",
+    ] {
+        let app = inner(
+            AppState::new(clamped_lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, body) = call(app, "GET", uri, "").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GET {uri} must be 403 when HK_BRANCHES omits hfville, body={body}"
+        );
+        assert!(
+            body.contains(BRANCH_NOT_ENABLED_ERROR),
+            "GET {uri}: stable error message, body={body}"
+        );
+    }
+}
+
+/// **Branch isolation on the stream.** A `hfville` request with no Ville
+/// fan-out wired must be `503`, NEVER a silent fall back to HF Hotel's signal
+/// stream. Reception's `/api/events` degrades that way on purpose; a Ville
+/// maid's phone may not, because the fallback would show her another
+/// property's room numbers, maids and guest-accountability notices.
+#[tokio::test]
+async fn the_maid_stream_503s_rather_than_serving_the_other_branch() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel, Branch::Hfville], false),
+    );
+    let (status, body) = call(app, "GET", "/api/hk/events?branch=hfville", "").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unwired Ville fan-out must answer 503, not HF Hotel's stream; body={body}"
+    );
+}
+
+/// The branch gate runs BEFORE the body is judged, so a request with no branch
+/// is never answered on the strength of its payload — the same ordering the
+/// cleaning and linen routes pin.
+#[tokio::test]
+async fn signals_check_the_branch_before_the_body() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/signals",
+        r#"{"type":"totally-not-a-signal"}"#,
+    )
+    .await;
+    assert_branch_400(status, &body, "POST /signals, no branch, bad type");
+}
+
+/// An unrecognised `outcome` on the answer endpoint is a 400 with the repo
+/// envelope — not a serde rejection in a foreign shape the maid's client
+/// cannot parse.
+#[tokio::test]
+async fn the_answer_outcome_is_validated_with_the_repo_envelope() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/signals/1/answer?branch=hfhotel",
+        r#"{"outcome":"maybe"}"#,
+    )
+    .await;
+    assert_bad_request(status, &body, "answer with an unknown outcome");
+    assert!(
+        body.contains("clear") && body.contains("problems"),
+        "the message must name the accepted outcomes, got {body}"
+    );
+}
+
+/// Through the SHIPPED router every signal endpoint is 401 without an Access
+/// assertion. A new mutation that forgot the auth layer would be a silently
+/// unauthenticated write endpoint, so this runs with a never-connecting pool
+/// and therefore everywhere — including CI with no PG.
+#[tokio::test]
+async fn shipped_router_answers_401_for_every_signal_endpoint() {
+    for (method, uri, body) in [
+        ("GET", "/api/hk/signals?branch=hfhotel", ""),
+        ("GET", "/api/hk/events?branch=hfhotel", ""),
+        (
+            "POST",
+            "/api/hk/rooms/1/signals?branch=hfhotel",
+            r#"{"type":"item_missing"}"#,
+        ),
+        ("POST", "/api/hk/signals/1/ack?branch=hfhotel", ""),
+        ("POST", "/api/hk/signals/1/done?branch=hfhotel", ""),
+        ("POST", "/api/hk/signals/1/cancel?branch=hfhotel", ""),
+        (
+            "POST",
+            "/api/hk/signals/1/answer?branch=hfhotel",
+            r#"{"outcome":"clear"}"#,
+        ),
+    ] {
+        let app = hotel_backend::routes::hk::router(
+            AppState::new(clamped_lazy_pool()).with_hfville_writes(true),
+        );
+        let (status, got) = call(app, method, uri, body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must be refused by the Access gate before any signal \
+             logic can answer; got {status} {got}"
+        );
+    }
+}

@@ -39,6 +39,21 @@ pub enum ServiceError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The CALLER's role forbids this operation on this aggregate — not a
+    /// malformed command and not a state precondition, but "this identity may
+    /// not do that at all". The HTTP layer maps it to `403 Forbidden`.
+    ///
+    /// Added for the room signals of ADR 0008
+    /// ([`crate::service::hk_signals`]), where the rule "nobody acts on their
+    /// own direction's signals except cancel-own-while-open" can only be
+    /// evaluated once the signal's direction has been READ — i.e. inside the
+    /// service transaction, not at the route gate the way
+    /// `routes::hk::require_report_capability` works. Without this variant the
+    /// refusal would have to collapse into [`Self::Validation`] and reach a
+    /// maid as a 400, indistinguishable from a typo in her request.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// Preconditions not met for the requested transition (e.g. cancel an
     /// already-cancelled booking, void an already-voided payment).
     #[error("conflict: {0}")]
@@ -70,6 +85,11 @@ impl ServiceError {
     /// Construct a not-found error from any `Display`-able message.
     pub fn not_found(msg: impl Into<String>) -> Self {
         ServiceError::NotFound(msg.into())
+    }
+
+    /// Construct a role-refusal error from any `Display`-able message.
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        ServiceError::Forbidden(msg.into())
     }
 
     /// Construct a conflict error from any `Display`-able message.
@@ -121,6 +141,16 @@ impl From<ServiceError> for ApiError {
         match err {
             ServiceError::Validation(msg) => ApiError::BadRequest(msg),
             ServiceError::NotFound(msg) => ApiError::NotFound(msg),
+            ServiceError::Forbidden(msg) => ApiError::Forbidden(msg),
+            // NOTE: 400, not 409. Kept as-is for the room-signal work of ADR
+            // 0008 rather than "corrected": every existing service (booking
+            // cancel, payment void, the `writeback_jobs` idempotency race)
+            // already answers a precondition failure this way, and `ApiError::
+            // Conflict` is reserved in this repo for a ship-dark FLAG refusing
+            // a request (its doc comment says so). Moving the whole mapping to
+            // 409 for one new feature would change five shipped surfaces'
+            // status codes as a side effect. `service::hk_signals` documents
+            // the choice at its own boundary.
             ServiceError::Conflict(msg) => ApiError::BadRequest(msg),
             ServiceError::Repository(err) => ApiError::Database(err.to_string()),
             ServiceError::Outbox(msg) => ApiError::Internal(format!("outbox: {msg}")),

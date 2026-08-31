@@ -466,6 +466,53 @@ CREATE TABLE IF NOT EXISTS ht_hk_linen_reports (
 CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_room_created
     ON ht_hk_linen_reports (hklr_room_id, hklr_created_at DESC);
 
+-- ht_hk_room_signals - Canned room signals between reception and maids
+-- (ADR 0008, migration 089). One room per signal, broadcast to the other role
+-- at that room's branch; NO free-text column anywhere, by decision.
+-- Lifecycle open -> acked -> done; the creator's SIDE may cancel while open.
+-- A maid's เสร็จแล้ว cleaning report auto-completes that room's open/acked
+-- priority_clean + checked_out signals in the SAME transaction
+-- (sig_done_source='clean_report'); room_check completes ONLY via its answer
+-- endpoint, which also spawns one child signal per problem (sig_parent_id).
+-- PG-CANONICAL ONLY: iHOTEL has no counterpart, so no sync mapper, no
+-- writeback, no WritebackIntent. The domain events it publishes
+-- (RoomSignalRaised/Acked/Completed/Cancelled) are UI plumbing over the
+-- existing event_log + pg_notify('domain_events') fan-out.
+-- sig_type / sig_outcome / sig_done_source are TEXT with NO CHECK on purpose —
+-- the vocabulary lives in domain::hk_signal (mirroring app/hk/signal-vocab.ts)
+-- so extending it needs no migration (the 088 rationale). sig_direction and
+-- sig_status ARE checked because they are structural, not product vocabulary.
+-- sig_escalated_at is both the once-only escalation stamp and the monthly
+-- LINE-push quota ledger (HK_ESCALATION_MONTHLY_CAP).
+-- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
+-- ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_room_signals (
+    sig_id            BIGSERIAL   PRIMARY KEY,
+    sig_room_id       INTEGER     NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    sig_direction     TEXT        NOT NULL CHECK (sig_direction IN ('desk_to_maid', 'maid_to_desk')),
+    sig_type          TEXT        NOT NULL,
+    sig_status        TEXT        NOT NULL DEFAULT 'open'
+                                  CHECK (sig_status IN ('open', 'acked', 'done', 'cancelled')),
+    sig_outcome       TEXT        NULL,
+    sig_parent_id     BIGINT      NULL REFERENCES ht_hk_room_signals(sig_id),
+    sig_created_badge TEXT        NOT NULL,
+    sig_created_name  TEXT,
+    sig_created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sig_acked_badge   TEXT,
+    sig_acked_name    TEXT,
+    sig_acked_at      TIMESTAMPTZ,
+    sig_done_badge    TEXT,
+    sig_done_name     TEXT,
+    sig_done_at       TIMESTAMPTZ,
+    sig_done_source   TEXT        NULL,
+    sig_escalated_at  TIMESTAMPTZ NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_live
+    ON ht_hk_room_signals (sig_status, sig_room_id)
+    WHERE sig_status IN ('open', 'acked');
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_room_created
+    ON ht_hk_room_signals (sig_room_id, sig_created_at DESC);
+
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
 -- folio. The existing ht_checkins.cin_room_id stays in place until the
@@ -2711,6 +2758,16 @@ ON CONFLICT (version) DO NOTHING;
 -- migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('088', '088_create_ht_hk_linen_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 089 — ht_hk_room_signals, the canned reception<->maid room signals
+-- of ADR 0008 (table + both indexes inlined above, after the
+-- ht_hk_linen_reports block). PG-canonical only: no legacy counterpart, no sync
+-- mapper, no writeback; the domain events it publishes are UI plumbing over the
+-- existing SSE fan-out. This seed row records the migration as applied so the
+-- drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('089', '089_create_ht_hk_room_signals.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

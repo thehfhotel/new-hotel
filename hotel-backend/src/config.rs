@@ -777,10 +777,137 @@ impl HfidLocationConfig {
     }
 }
 
+/// The ADR 0008 escalation valve — the ONE place LINE messages are ever spent.
+///
+/// A `room_check` (ขอเช็คห้อง) still unacked after two minutes is POSTed to HF
+/// ID, which resolves the ON-DUTY maids of that branch and LINE-multicasts them
+/// once. Everything else in the housekeeping feature — the boards, the SSE
+/// streams, the whole checkout ritual — costs zero LINE messages, forever
+/// (ADR 0008 §Decision 2).
+///
+///   * `url` (`HFID_ESCALATE_URL`) — full URL of HF ID's `/hk-escalate`
+///     endpoint on its reader surface. **Unset ⇒ escalation is DISABLED**, and
+///     the scheduler logs that once at startup rather than per tick. That is
+///     the feature's ship-dark switch: no default, because a guessed path would
+///     turn a misconfiguration into confident spend against a metered channel.
+///     A plain LAN address, like [`HfidLocationConfig::url`] — never routed
+///     through Cloudflare.
+///   * `resolve_secret` (`HFID_RESOLVE_SECRET`) — REUSED, not a new credential.
+///     HF ID guards its entire app↔central surface with that one secret (see
+///     `CLAUDE.md` → "Credentials & Docker secrets"), so `/hk-escalate` is
+///     behind the same `X-Reader-Secret` the `/hk` badge lookup already sends.
+///     Nothing to provision, nothing new to rotate.
+///   * `monthly_cap` (`HK_ESCALATION_MONTHLY_CAP`, default
+///     [`crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP`]) — the hard
+///     stop ADR 0008 requires so silent quota burn is impossible. Counted over
+///     `ht_hk_room_signals.sig_escalated_at` in the current **Bangkok** month.
+///     A malformed value falls back to the default WITH a warning: refusing to
+///     start over a typo in a rate limiter would be worse than the limit it
+///     protects, and falling through to "no cap" would be worse still.
+#[derive(Debug, Clone)]
+pub struct HkEscalationConfig {
+    pub url: Option<String>,
+    pub resolve_secret: Option<String>,
+    pub monthly_cap: i64,
+}
+
+impl Default for HkEscalationConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            resolve_secret: None,
+            monthly_cap: crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP,
+        }
+    }
+}
+
+impl HkEscalationConfig {
+    pub fn from_env() -> Self {
+        Self {
+            url: optional_env("HFID_ESCALATE_URL"),
+            resolve_secret: optional_env("HFID_RESOLVE_SECRET"),
+            monthly_cap: parse_escalation_cap(optional_env("HK_ESCALATION_MONTHLY_CAP").as_deref()),
+        }
+    }
+
+    /// Both halves present — the job is only registered when this is true.
+    /// Reports configured-ness WITHOUT printing either value.
+    pub fn is_configured(&self) -> bool {
+        self.url.is_some() && self.resolve_secret.is_some()
+    }
+}
+
+/// Parse `HK_ESCALATION_MONTHLY_CAP`. PURE — unit-tested below.
+///
+/// Absent or unparseable ⇒ the ADR's default, never "unlimited". A negative
+/// value is clamped to `0`, which disables escalation entirely (the predicate
+/// is `count < cap`) — a coherent reading of "cap of minus one" that fails
+/// SAFE for a metered channel, rather than an error that stops the process.
+fn parse_escalation_cap(raw: Option<&str>) -> i64 {
+    let Some(raw) = raw else {
+        return crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP;
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(cap) => cap.max(0),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default = crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP,
+                "HK_ESCALATION_MONTHLY_CAP is not an integer; using the default cap"
+            );
+            crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The escalation cap is a rate limiter on METERED spend, so every odd
+    /// input must fail toward "fewer messages", never toward "no limit" and
+    /// never toward a process that refuses to start.
+    #[test]
+    fn escalation_cap_defaults_and_clamps_instead_of_failing() {
+        use crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP;
+        assert_eq!(parse_escalation_cap(None), DEFAULT_ESCALATION_MONTHLY_CAP);
+        assert_eq!(parse_escalation_cap(Some("  200 ")), 200);
+        assert_eq!(parse_escalation_cap(Some("0")), 0, "an explicit 0 disables pushes");
+        assert_eq!(parse_escalation_cap(Some("-5")), 0, "negative clamps to disabled");
+        for bad in ["", "abc", "12.5", "1e3", "''"] {
+            assert_eq!(
+                parse_escalation_cap(Some(bad)),
+                DEFAULT_ESCALATION_MONTHLY_CAP,
+                "{bad:?} must fall back to the default cap"
+            );
+        }
+    }
+
+    /// The escalation config is unconfigured by DEFAULT — ADR 0008's valve
+    /// ships dark, and an unset `HFID_ESCALATE_URL` must never be read as
+    /// "escalate somewhere sensible".
+    #[test]
+    fn escalation_is_unconfigured_by_default() {
+        let cfg = HkEscalationConfig::default();
+        assert!(!cfg.is_configured());
+        assert_eq!(
+            cfg.monthly_cap,
+            crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP
+        );
+        assert!(!HkEscalationConfig {
+            url: Some("http://x/hk-escalate".into()),
+            resolve_secret: None,
+            ..Default::default()
+        }
+        .is_configured());
+        assert!(!HkEscalationConfig {
+            url: None,
+            resolve_secret: Some("s".into()),
+            ..Default::default()
+        }
+        .is_configured());
+    }
 
     /// `HFVILLE_WRITEBACK_INTENTS` parsing. The `None` cases matter most:
     /// they are the "current behavior unchanged" contract — an unset, blank,

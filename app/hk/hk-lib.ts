@@ -7,6 +7,15 @@
 // the pure helpers are unit-testable without a DOM.
 
 import { HK_STATUS_LABELS } from '@/lib/v2/status'
+import {
+  DESK_SIGNALS,
+  MAID_SIGNALS,
+  ROOM_CHECK_PROBLEMS,
+  type RoomCheckOutcome,
+  type RoomSignal,
+  type SignalDirection,
+  type SignalType,
+} from './signal-vocab'
 
 // ---------------------------------------------------------------------------
 // API types (mirror hotel-backend/src/routes/hk.rs)
@@ -689,4 +698,360 @@ export function timeLabel(iso: string): string {
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return ''
   return date.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+}
+
+// ---------------------------------------------------------------------------
+// Room signals — ADR 0008 (`docs/adr/0008-room-signals-not-chat.md`)
+// ---------------------------------------------------------------------------
+//
+// A room signal is a CANNED, room-scoped notice between reception and the
+// maids — deliberately not a chat: there is no free-text field anywhere in
+// this feature, and adding one is the change ADR 0008 exists to refuse. The
+// vocabulary itself lives in `signal-vocab.ts` (shared with the reception v2
+// surfaces and mirrored by the backend's allowlists); this section owns only
+// the /hk client's side of it — the endpoints, and the pure helpers the two
+// /hk screens render from.
+//
+// The vocabulary is RE-EXPORTED here so a /hk page has exactly one import for
+// everything about signals, the same way `LINEN_KINDS` sits beside the linen
+// helpers above. `signal-vocab.ts` stays the ONE place a type is spelled.
+
+export {
+  DESK_SIGNALS,
+  MAID_SIGNALS,
+  ROOM_CHECK_PROBLEMS,
+  signalLabel,
+} from './signal-vocab'
+export type {
+  DeskSignalType,
+  MaidSignalType,
+  RoomCheckOutcome,
+  RoomSignal,
+  SignalDirection,
+  SignalDoneSource,
+  SignalStatus,
+  SignalType,
+} from './signal-vocab'
+
+/** The one signal type whose completion is an ANSWER, never a bare tap
+ * (CONTEXT.md §Housekeeping "Room-check"): the guest is at the counter and the
+ * desk needs เคลียร์ / มีของหาย / มีของเสียหาย, not "done". */
+export const ROOM_CHECK_TYPE = 'room_check'
+
+/** Exactly the two problems a ขอเช็คห้อง answer may carry. */
+export type RoomCheckProblem = (typeof ROOM_CHECK_PROBLEMS)[number]['type']
+
+/**
+ * Which side of the conversation this identity is on — derived from the SAME
+ * `/me` `canReport` flag that already gates the reporting surface, because the
+ * two facts are one fact: a `housekeeping` grant is a maid (sends maid→desk,
+ * acts on desk→maid), a `reception` viewer is the desk (the mirror image).
+ * There is no third role on `/hk`. PURE.
+ */
+export type HkSignalRole = 'maid' | 'reception'
+
+export function signalRole(canReportFlag: boolean): HkSignalRole {
+  return canReportFlag ? 'maid' : 'reception'
+}
+
+/** The direction this role SENDS. PURE. */
+export function sentDirection(role: HkSignalRole): SignalDirection {
+  return role === 'maid' ? 'maid_to_desk' : 'desk_to_maid'
+}
+
+/** The direction this role ACTS ON (acks / completes / answers) — the other
+ * side's. "Nobody acts on their own direction's signals except cancel-own-
+ * while-open" is the whole rule, and it is written here once. PURE. */
+export function actingDirection(role: HkSignalRole): SignalDirection {
+  return role === 'maid' ? 'desk_to_maid' : 'maid_to_desk'
+}
+
+/** The canned types this role may send, in vocabulary display order. PURE. */
+export function sendableSignals(
+  role: HkSignalRole
+): readonly { type: SignalType; label: string }[] {
+  return role === 'maid' ? MAID_SIGNALS : DESK_SIGNALS
+}
+
+/** `open` and `acked` — the two statuses the list endpoint returns and the
+ * only ones that are still somebody's work. `done`/`cancelled` are terminal
+ * and simply leave the screen. PURE. */
+export function isLiveSignal(signal: RoomSignal): boolean {
+  return signal.status === 'open' || signal.status === 'acked'
+}
+
+/** Drop terminal signals, keep the rest. Applied to EVERY list we hold — an
+ * SSE event carrying `done` is how a signal disappears from the other role's
+ * screen, so a client that kept it would leave a completed room looking busy
+ * forever. PURE. */
+export function liveSignals(signals: RoomSignal[]): RoomSignal[] {
+  return signals.filter(isLiveSignal)
+}
+
+/** This room's live signals, oldest first (the order they must be worked).
+ * PURE. */
+export function signalsForRoom(signals: RoomSignal[], roomId: number): RoomSignal[] {
+  return liveSignals(signals)
+    .filter((s) => s.roomId === roomId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.signalId - b.signalId)
+}
+
+/** How many live signals this room carries — the number the list chip shows.
+ * PURE. */
+export function openSignalCount(signals: RoomSignal[], roomId: number): number {
+  return signalsForRoom(signals, roomId).length
+}
+
+/**
+ * Live-signal counts for EVERY room in one pass, keyed by `roomId`.
+ *
+ * The room list renders ~58 cards and would otherwise call `openSignalCount`
+ * once per card (a full scan each). One map, built once per render, keeps the
+ * list cheap on the phone it actually runs on. PURE.
+ */
+export function signalCountsByRoom(signals: RoomSignal[]): Map<number, number> {
+  const counts = new Map<number, number>()
+  for (const signal of liveSignals(signals)) {
+    counts.set(signal.roomId, (counts.get(signal.roomId) ?? 0) + 1)
+  }
+  return counts
+}
+
+/**
+ * The room's signal chip for the chip row, or `null` when the room has none.
+ *
+ * DELIBERATELY the only SOLID chip in that row. Everything else there is a
+ * pale state badge — clean/dirty, today's progress, ขาดผ้า (sky), the movement
+ * tags (orange/violet) — because they describe what a room IS. This one
+ * describes work somebody is WAITING on, and at a glance down a two-column
+ * grid of near-identical cards it has to be the thing that jumps out. Solid
+ * indigo also keeps it clear of every hue already spoken for: red = dirty,
+ * emerald = done, amber = in progress, sky = ขาดผ้า, violet/orange = today's
+ * movement. PURE.
+ */
+export function roomSignalChip(count: number): { label: string; className: string } | null {
+  if (count <= 0) return null
+  return {
+    label: `แจ้ง ${count}`,
+    className: 'bg-indigo-600 text-white border-indigo-700',
+  }
+}
+
+/** Where a signal came from, in the reader's own terms. A maid's screen must
+ * distinguish "the desk is asking me" from "I told the desk" at a glance —
+ * they carry completely different buttons. PURE. */
+export function signalOriginLabel(signal: RoomSignal, role: HkSignalRole): string {
+  const incoming = signal.direction === actingDirection(role)
+  if (role === 'maid') return incoming ? 'จากแผนกต้อนรับ' : 'ส่งถึงแผนกต้อนรับ'
+  return incoming ? 'จากแม่บ้าน' : 'ส่งถึงแม่บ้าน'
+}
+
+/** Status line for one signal: who has it, or that nobody has yet. PURE. */
+export function signalStatusLabel(signal: RoomSignal): string {
+  if (signal.status !== 'acked') return 'รอรับเรื่อง'
+  const who = signal.ackedBy?.name || signal.ackedBy?.badge
+  return who ? `รับเรื่องแล้ว โดย ${who}` : 'รับเรื่องแล้ว'
+}
+
+/** Who filed it — name when we have one, badge otherwise (never blank). PURE. */
+export function signalActorLabel(
+  actor: { badge: string; name: string | null } | null | undefined
+): string {
+  if (!actor) return ''
+  return actor.name || actor.badge
+}
+
+/** May this role ack / complete / answer this signal? Only the OTHER side's
+ * live signals. PURE — the UI gate; the server enforces the same rule. */
+export function canActOnSignal(signal: RoomSignal, role: HkSignalRole): boolean {
+  return isLiveSignal(signal) && signal.direction === actingDirection(role)
+}
+
+/** May this role cancel it? Own side, still `open` — the single exception to
+ * "nobody acts on their own direction". Once the other side has ACKED it, they
+ * are already walking to the room; cancelling out from under them is exactly
+ * the corridor confusion this feature removes. PURE. */
+export function canCancelSignal(signal: RoomSignal, role: HkSignalRole): boolean {
+  return signal.status === 'open' && signal.direction === sentDirection(role)
+}
+
+/** ขอเช็คห้อง — the signal that may NOT be completed by a bare tap. PURE. */
+export function isRoomCheck(signal: RoomSignal): boolean {
+  return signal.type === ROOM_CHECK_TYPE
+}
+
+/**
+ * Is this an arriving signal this role should be ALERTED about (the sound
+ * cue)? A brand-new `open` signal pointed AT this role. An ack/done echo of
+ * one already on screen, and anything this role sent itself, must stay silent:
+ * a cue that fires for one's own taps is a cue people mute. PURE.
+ */
+export function isIncomingSignal(signal: RoomSignal, role: HkSignalRole): boolean {
+  return signal.status === 'open' && signal.direction === actingDirection(role)
+}
+
+/**
+ * Upsert one signal into a held list — the ONE reducer both the SSE stream and
+ * every action response go through, so a signal can never appear twice or
+ * linger after it is finished. Terminal signals (`done`/`cancelled`) are
+ * REMOVED rather than stored; everything else replaces its predecessor by
+ * `signalId`, and the result stays in createdAt order. PURE.
+ */
+export function mergeSignal(signals: RoomSignal[], incoming: RoomSignal): RoomSignal[] {
+  const without = signals.filter((s) => s.signalId !== incoming.signalId)
+  if (!isLiveSignal(incoming)) return without
+  return [...without, incoming].sort(
+    (a, b) => a.createdAt.localeCompare(b.createdAt) || a.signalId - b.signalId
+  )
+}
+
+/** Several at once (a ขอเช็คห้อง answer spawns one child per problem, in one
+ * transaction — they must appear together or not at all). PURE. */
+export function mergeSignals(signals: RoomSignal[], incoming: RoomSignal[]): RoomSignal[] {
+  return incoming.reduce(mergeSignal, signals)
+}
+
+// --- wire shapes -----------------------------------------------------------
+
+/** `GET /hk/api/signals` — this branch's open+acked signals. */
+export interface HkSignalsResponse {
+  success: boolean
+  signals: RoomSignal[]
+}
+
+/** `POST /hk/api/rooms/{id}/signals` and `…/signals/{id}/ack|done|cancel`. */
+export interface HkSignalResponse {
+  success: boolean
+  signal: RoomSignal
+}
+
+/** `POST /hk/api/signals/{id}/answer` — the answer, plus the standing
+ * maid→desk children a `problems` answer spawns (one per problem, same
+ * transaction). `spawned` is `[]` for a `clear` answer. */
+export interface HkSignalAnswerResponse {
+  success: boolean
+  signal: RoomSignal
+  spawned: RoomSignal[]
+}
+
+/** The body of an answer. `clear` carries NO `problems` key — the wire says
+ * what was found, never what was not. */
+export type RoomCheckAnswer =
+  | { outcome: Extract<RoomCheckOutcome, 'clear'> }
+  | { outcome: Extract<RoomCheckOutcome, 'problems'>; problems: RoomCheckProblem[] }
+
+/** The three bare-tap transitions. `answer` is deliberately NOT one of them:
+ * ขอเช็คห้อง has its own endpoint and its own helper. */
+export type HkSignalAction = 'ack' | 'done' | 'cancel'
+
+const SIGNALS_READ_ERROR = 'ไม่สามารถดึงรายการแจ้งได้'
+const SIGNAL_WRITE_ERROR = 'ส่งไม่สำเร็จ กรุณาลองใหม่'
+
+/** POST JSON through `hkFetch`, and treat a 200 carrying `success: false` as a
+ * failure — the same rule the linen report follows, for the same reason: a
+ * green banner over a signal that never landed leaves a guest waiting at a
+ * counter for nothing. */
+async function postSignalJson<T extends { success: boolean }>(
+  path: string,
+  branch: Branch | null,
+  body: unknown
+): Promise<T> {
+  const res = await hkFetch(path, branch, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const parsed: T | null = res.ok ? await res.json().catch(() => null) : null
+  if (!res.ok || !parsed?.success) throw new Error(SIGNAL_WRITE_ERROR)
+  return parsed
+}
+
+/**
+ * This branch's live signals. Returns `[]` — never `undefined` — for a backend
+ * that answers without a `signals` array, so a page can render the list
+ * unconditionally.
+ */
+export async function fetchHkSignals(branch: Branch | null): Promise<RoomSignal[]> {
+  const res = await hkFetch('/signals', branch)
+  if (!res.ok) throw new Error(SIGNALS_READ_ERROR)
+  const body: HkSignalsResponse | null = await res.json().catch(() => null)
+  if (!body?.success) throw new Error(SIGNALS_READ_ERROR)
+  return Array.isArray(body.signals) ? liveSignals(body.signals) : []
+}
+
+/** Send one canned signal about one room. The DIRECTION is derived server-side
+ * from the caller's role — never sent from here, so a client bug cannot file a
+ * desk signal in a maid's name. */
+export async function sendHkSignal(
+  branch: Branch | null,
+  roomId: number,
+  type: SignalType
+): Promise<RoomSignal> {
+  const body = await postSignalJson<HkSignalResponse>(`/rooms/${roomId}/signals`, branch, {
+    type,
+  })
+  return body.signal
+}
+
+/** รับทราบ / เสร็จสิ้น / ยกเลิก. `done` on a ขอเช็คห้อง is refused by the
+ * server (400) — use `answerHkRoomCheck`; the UI never offers the bare tap. */
+export async function actOnHkSignal(
+  branch: Branch | null,
+  signalId: number,
+  action: HkSignalAction
+): Promise<RoomSignal> {
+  const body = await postSignalJson<HkSignalResponse>(
+    `/signals/${signalId}/${action}`,
+    branch,
+    {}
+  )
+  return body.signal
+}
+
+/**
+ * Answer a ขอเช็คห้อง — เคลียร์, or one/both problems. The answer COMPLETES the
+ * check and, for a `problems` answer, the server spawns one standing maid→desk
+ * signal per problem in the SAME transaction; both come back here so the
+ * screen can show the desk exactly what it now owes the guest.
+ */
+export async function answerHkRoomCheck(
+  branch: Branch | null,
+  signalId: number,
+  answer: RoomCheckAnswer
+): Promise<{ signal: RoomSignal; spawned: RoomSignal[] }> {
+  const body = await postSignalJson<HkSignalAnswerResponse>(
+    `/signals/${signalId}/answer`,
+    branch,
+    answer
+  )
+  return { signal: body.signal, spawned: Array.isArray(body.spawned) ? body.spawned : [] }
+}
+
+// ---------------------------------------------------------------------------
+// Signal sound (localStorage) — the mute the cue respects
+// ---------------------------------------------------------------------------
+//
+// Same idiom as the branch above: one key, read defensively, and a storage
+// failure degrades to the safe default rather than throwing. The default is
+// UNMUTED — a maid holding a silent phone in a corridor is the reason the cue
+// exists at all — and the toggle lives on the room list header.
+
+const SOUND_MUTED_KEY = 'hk.signalSoundMuted'
+
+/** `true` ⇒ the cue stays silent. Unknown/unavailable storage reads as `false`
+ * (audible), never as muted. */
+export function readSignalSoundMuted(): boolean {
+  try {
+    return localStorage.getItem(SOUND_MUTED_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function storeSignalSoundMuted(muted: boolean): void {
+  try {
+    localStorage.setItem(SOUND_MUTED_KEY, muted ? '1' : '0')
+  } catch {
+    /* nothing to do — the toggle simply forgets across reloads */
+  }
 }

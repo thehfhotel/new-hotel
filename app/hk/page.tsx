@@ -18,31 +18,42 @@
 // fetch (this page and the room-detail page) carries — `hkFetch` refuses to
 // run with none.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
-import { AlertCircle, Info, Loader2, RefreshCw, Sparkles } from 'lucide-react'
+import { AlertCircle, Info, Loader2, RefreshCw, Sparkles, Volume2, VolumeX } from 'lucide-react'
 import {
+  canReport,
   countRoomsNeedingClean,
+  fetchHkSignals,
   groupRoomsByFloor,
   hkFetch,
   hkFetchMe,
+  isIncomingSignal,
   legacyStatusNote,
   linenShortageTag,
+  mergeSignal,
   movementTags,
   occupancyIndicator,
   progressLabel,
+  readSignalSoundMuted,
   readStoredBranch,
   resolveInitialBranch,
   roomCleanChip,
+  roomSignalChip,
+  signalCountsByRoom,
+  signalRole,
   storeBranch,
+  storeSignalSoundMuted,
   timeLabel,
   type Branch,
   type HkMe,
   type HkRoom,
   type HkRoomsResponse,
+  type RoomSignal,
 } from './hk-lib'
 import { HkBranchChip, HkBranchesUnavailable, HkBranchPicker } from './HkBranchPicker'
 import { useHkAutoRefresh } from './use-hk-auto-refresh'
+import { playHkSignalCue, useHkSignalEvents } from './use-hk-signal-events'
 
 export default function HkRoomListPage() {
   const [me, setMe] = useState<HkMe | null>(null)
@@ -56,6 +67,18 @@ export default function HkRoomListPage() {
   // backend could not reach iHOTEL it serves the PMS mirror and sets this, and
   // the maid is TOLD — a stale list she can work beats an error page.
   const [legacyStale, setLegacyStale] = useState(false)
+
+  // Room signals (ADR 0008) — the branch's live open+acked signals, which this
+  // screen renders as ONE chip per room ("แจ้ง 2"). Held as the branch's whole
+  // list rather than per-room, because that is what both the `/signals` read
+  // and the SSE stream deliver, and `signalCountsByRoom` turns it into the
+  // per-card number in a single pass.
+  const [signals, setSignals] = useState<RoomSignal[]>([])
+  // The same list, eagerly. The cue must fire only for a signal we have NOT
+  // seen, and two events can land inside one React batch — a ref answers
+  // "already known?" without depending on a state update having flushed.
+  const signalsRef = useRef<RoomSignal[]>([])
+  const [soundMuted, setSoundMuted] = useState(false)
 
   // Step 1: identity + which branches exist. Runs once; never guesses a
   // branch itself — it only ever resolves what's already valid.
@@ -126,10 +149,76 @@ export default function HkRoomListPage() {
   const refreshRooms = useCallback(() => loadRooms(true), [loadRooms])
   useHkAutoRefresh(refreshRooms, Boolean(branch))
 
+  // Step 3: this branch's live signals. Deliberately its OWN request and its
+  // own failure story: a signal read that fails must cost the chips, never the
+  // room list — the list is what a maid works from, and it is already on
+  // screen. Nothing here ever raises the page's error banner.
+  const applySignals = useCallback((next: RoomSignal[]) => {
+    signalsRef.current = next
+    setSignals(next)
+  }, [])
+
+  const loadSignals = useCallback(async () => {
+    if (!branch) return
+    try {
+      applySignals(await fetchHkSignals(branch))
+    } catch {
+      /* chips stay as they were; the poll or the stream will catch up */
+    }
+  }, [branch, applySignals])
+
+  useEffect(() => {
+    if (branch) loadSignals()
+  }, [branch, loadSignals])
+
+  // Which side of the conversation this identity is on — the same `/me` flag
+  // that gates the reporting surface on the room screen. It decides only which
+  // arrivals are worth a SOUND here; the chips count both directions, because
+  // "this room has work outstanding" is true for either role.
+  const soundMutedRef = useRef(false)
+  const role = signalRole(canReport(me))
+  const handleSignal = useCallback(
+    (signal: RoomSignal) => {
+      const isNew = !signalsRef.current.some((s) => s.signalId === signal.signalId)
+      applySignals(mergeSignal(signalsRef.current, signal))
+      // Only a brand-new signal pointed at THIS role: never an ack/done echo,
+      // never one this role sent itself.
+      if (isNew && isIncomingSignal(signal, role)) playHkSignalCue()
+    },
+    [role, applySignals]
+  )
+
+  // Live push, with the existing poll as the fallback beneath it: while the
+  // stream is connected the poll would only duplicate it, and the moment it
+  // drops (a lift, a captive portal, a backend restart) the sixty-second
+  // cadence takes over on its own. An SSE failure can never break this page —
+  // the hook swallows everything and simply reports `live: false`.
+  const signalsLive = useHkSignalEvents(branch, handleSignal, Boolean(branch))
+  useHkAutoRefresh(loadSignals, Boolean(branch) && !signalsLive)
+
+  // The mute is stored, not React state alone, so BOTH /hk screens honour one
+  // toggle. Read after mount — localStorage is not available during the
+  // server render.
+  useEffect(() => {
+    const stored = readSignalSoundMuted()
+    soundMutedRef.current = stored
+    setSoundMuted(stored)
+  }, [])
+
+  const toggleSound = () => {
+    const next = !soundMutedRef.current
+    soundMutedRef.current = next
+    setSoundMuted(next)
+    storeSignalSoundMuted(next)
+  }
+
   const pickBranch = (next: Branch) => {
     storeBranch(next)
     setRooms([])
     setError(null)
+    // Signals are branch-scoped exactly as rooms are; carrying the old
+    // branch's chips across would flag the WRONG hotel's rooms for a beat.
+    applySignals([])
     // The note describes the OTHER branch's read; carrying it across would
     // claim iHOTEL is unreachable for a property we have not asked about yet.
     setLegacyStale(false)
@@ -141,6 +230,9 @@ export default function HkRoomListPage() {
   // The number a maid actually plans her round by — merged iHOTEL-wins
   // roomClean, not today's progress. See countRoomsNeedingClean in hk-lib.
   const dirtyCount = countRoomsNeedingClean(rooms)
+  // One pass for the whole grid rather than a scan per card — ~58 cards on a
+  // phone, re-rendered on every stream event.
+  const signalCounts = signalCountsByRoom(signals)
 
   // The EMPTY case (§C): location enforcement resolved this maid to no branch
   // at all. Blocks like the picker does, but offers nothing to tap — there is
@@ -168,9 +260,26 @@ export default function HkRoomListPage() {
             </p>
           )}
         </div>
-        {me && branch && (
-          <HkBranchChip branches={me.branches} current={branch} onSwitch={pickBranch} />
-        )}
+        <div className="flex items-center gap-2">
+          {/* The cue's mute. Lives here, on the screen a maid leaves open all
+              morning, and is honoured by the room screen too (it is stored,
+              not component state). 44px target like every other control on
+              this surface. */}
+          {branch && (
+            <button
+              type="button"
+              onClick={toggleSound}
+              aria-label={soundMuted ? 'เปิดเสียงแจ้งเตือน' : 'ปิดเสียงแจ้งเตือน'}
+              aria-pressed={soundMuted}
+              className="flex h-11 w-11 items-center justify-center rounded-lg border border-gray-300 text-gray-500 active:bg-gray-100"
+            >
+              {soundMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
+            </button>
+          )}
+          {me && branch && (
+            <HkBranchChip branches={me.branches} current={branch} onSwitch={pickBranch} />
+          )}
+        </div>
       </header>
 
       {/* /me failure — fail-closed, no fallback branch */}
@@ -263,6 +372,7 @@ export default function HkRoomListPage() {
                     const occupancy = occupancyIndicator(room.occupancy)
                     const tags = movementTags(room)
                     const linenTag = linenShortageTag(room)
+                    const signalChip = roomSignalChip(signalCounts.get(room.roomId) ?? 0)
                     return (
                       <li key={room.roomId}>
                         <Link
@@ -329,6 +439,23 @@ export default function HkRoomListPage() {
                                 className={`inline-block rounded-full border px-2 py-0.5 text-xs ${linenTag.className}`}
                               >
                                 {linenTag.label}
+                              </span>
+                            )}
+                            {/* Fourth chip, when this room carries live room
+                                signals (ADR 0008). Same row and same idiom as
+                                ขาดผ้า — a fact about the room, not a third
+                                cleanliness severity — but SOLID, because it is
+                                the only chip here describing somebody
+                                WAITING: the desk asking for a checkout
+                                inspection while a guest stands at the counter
+                                must not read like a pale badge in a grid of
+                                pale badges. The room screen lists what the
+                                signals actually are. */}
+                            {signalChip && (
+                              <span
+                                className={`inline-block rounded-full border px-2 py-0.5 text-xs font-semibold ${signalChip.className}`}
+                              >
+                                {signalChip.label}
                               </span>
                             )}
                           </div>

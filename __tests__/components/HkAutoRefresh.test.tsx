@@ -33,6 +33,11 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 const mockHkFetch = jest.fn()
 const mockHkFetchMe = jest.fn()
+// The signal poll (ADR 0008) rides this same hook but is a different request
+// with its own cadence gate; stubbed here so the counts below stay about the
+// ROOM data these tests were written for. Its own scheduling is asserted in
+// `HkRoomSignals.test.tsx`.
+const mockFetchHkSignals = jest.fn()
 
 jest.mock('next/navigation', () => ({
   useParams: () => ({ roomId: '7' }),
@@ -44,6 +49,7 @@ jest.mock('@/app/hk/hk-lib', () => {
     ...actual,
     hkFetch: (...args: unknown[]) => mockHkFetch(...args),
     hkFetchMe: (...args: unknown[]) => mockHkFetchMe(...args),
+    fetchHkSignals: (...args: unknown[]) => mockFetchHkSignals(...args),
   }
 })
 
@@ -99,6 +105,8 @@ beforeEach(() => {
   jest.useFakeTimers()
   mockHkFetch.mockReset()
   mockHkFetchMe.mockReset()
+  mockFetchHkSignals.mockReset()
+  mockFetchHkSignals.mockResolvedValue([])
   Object.defineProperty(document, 'hidden', { value: false, configurable: true })
   mockHkFetchMe.mockResolvedValue(meResponse())
   mockHkFetch.mockResolvedValue(jsonResponse({ success: true, data: ROOMS }))

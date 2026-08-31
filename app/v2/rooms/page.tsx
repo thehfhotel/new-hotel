@@ -444,8 +444,10 @@ export default function V2Rooms() {
           onSuccess={refreshAfterModal}
         />
       )}
+      {/* `roomCheck` is the v2 desk opt-in for the ADR 0008 ขอเช็คห้อง panel;
+          the v1 mounts of this same modal deliberately do not pass it. */}
       {modal === 'checkout' && selected && (
-        <CheckOutModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} />
+        <CheckOutModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} roomCheck />
       )}
       {modal === 'extend' && selected && (
         <ExtendStayModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} />

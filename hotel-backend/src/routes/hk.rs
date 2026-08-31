@@ -327,10 +327,14 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::Response,
+    response::{
+        sse::{Event, Sse},
+        Response,
+    },
     routing::{get, post},
     Extension, Json, Router,
 };
+use futures_util::Stream;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -338,11 +342,15 @@ use sqlx::Row as _;
 use super::mode::{AppState, Branch};
 use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
+use crate::domain::hk_signal::{RoomCheckOutcome, RoomSignal, SignalAction, SignalRole};
 use crate::error::{ApiError, ApiResult};
 use crate::hfid_location::{EmployeeLocation, HfidLocationClient, LocationOutcome};
 use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
+use crate::service::hk_signals::{
+    ActOnSignalCommand, AnswerRoomCheckCommand, HkSignalService, RaiseSignalCommand,
+};
 use crate::service::housekeeping::{
     CleaningProgressStatus, HousekeepingService, LegacyCleanliness, LinenShortageItem,
     ReportCleaningCommand, ReportLinenShortageCommand, MAX_LINEN_QTY, MIN_LINEN_QTY,
@@ -436,6 +444,19 @@ pub const LOCATION_MISMATCH_ERROR: &str =
 /// `location`, an unknown badge, or an inactive/pending employee. The fix is
 /// an admin action, so that is what the message asks for.
 pub const LOCATION_UNKNOWN_ERROR: &str = "ยังไม่ได้กำหนดสาขาของพนักงาน — ติดต่อผู้ดูแลระบบ";
+
+/// 503 body when the requested branch has no live event fan-out, so the maid
+/// signal stream (`GET /api/hk/events`) cannot be served for it.
+///
+/// A 503 with a retryable Thai message, NOT a silent fall back to the other
+/// property's stream: [`crate::routes::events::hk_signal_receiver`] refuses
+/// that fallback on purpose (see its docs). Reception's board may degrade to
+/// HF Hotel; a Ville maid's phone may not.
+pub const SIGNAL_STREAM_UNAVAILABLE_ERROR: &str =
+    "ระบบแจ้งเตือนสดของสาขานี้ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง";
+
+/// 400 body for an unrecognised `outcome` on the ขอเช็คห้อง answer.
+pub const OUTCOME_INVALID_ERROR: &str = "invalid outcome (expected 'clear' or 'problems')";
 
 /// 503 body when the location lookup could not answer (HF ID unreachable,
 /// non-2xx, undecodable, or `HFID_LOCATION_URL`/`HFID_RESOLVE_SECRET` unset).
@@ -886,6 +907,61 @@ fn truncate_h_name(raw: &str) -> String {
     out
 }
 
+/// Build an [`HkSignalService`] bound to the branch's pool — same construction
+/// shape as [`service_for`], through the SAME `write_pool` chokepoint, so a
+/// `branch=hfville` signal can never land in the HF Hotel database.
+fn signal_service_for(state: &AppState, branch: Branch) -> ApiResult<HkSignalService> {
+    Ok(HkSignalService::new(state.write_pool(Some(branch))?.clone()))
+}
+
+/// Which side of the ADR 0008 conversation this `/hk` identity is on.
+///
+/// The SINGLE derivation on this surface, and it reads the SAME boolean
+/// [`require_report_capability`] reads — `can_report`, resolved once in
+/// `middleware::hk_access`. A `housekeeping` grant is the maid; a `reception`-
+/// only viewer IS the desk here (that is the whole point of the viewer role —
+/// reception works the same board), so it sends desk→maid signals and acts on
+/// maid→desk ones. PURE.
+fn hk_role(identity: &HkIdentity) -> SignalRole {
+    SignalRole::from_can_report(identity.can_report)
+}
+
+/// Normalize + validate the ขอเช็คห้อง answer's `outcome`. Trim + lower-case,
+/// the same forgiveness [`parse_cleaning_status`] grants. PURE.
+fn parse_outcome(raw: &str) -> ApiResult<RoomCheckOutcome> {
+    RoomCheckOutcome::parse(raw.trim().to_lowercase().as_str())
+        .ok_or_else(|| ApiError::BadRequest(format!("{OUTCOME_INVALID_ERROR}, got '{raw}'")))
+}
+
+/// May this identity raise this signal type? The route-level pre-check.
+///
+/// The service asserts the SAME rule (it must hold for any caller), so this is
+/// not the enforcement point — it is the ORDERING point. Without it the room
+/// probe would run first, and a misspelled type or a wrong-direction type would
+/// be answered with a database round-trip, or a `500` when the pool is
+/// unreachable, instead of the 400/403 the client can act on. It puts body
+/// validation ahead of room existence, exactly as [`report_linen_shortage`]
+/// documents (`… → body validation (400) → room existence (404)`).
+///
+/// PURE; the verdicts themselves are `domain::hk_signal`'s.
+fn require_signal_type(identity: &HkIdentity, raw: &str) -> ApiResult<()> {
+    let normalized = crate::domain::hk_signal::normalize_type(raw);
+    crate::domain::hk_signal::direction_for_role_type(hk_role(identity), &normalized)
+        .map(|_| ())
+        .map_err(signal_rule_error)
+}
+
+/// A domain rule refusal → the HTTP error, honouring the domain's own
+/// 403-vs-400 split so a route can never re-decide it.
+fn signal_rule_error(err: crate::domain::hk_signal::SignalRuleError) -> ApiError {
+    let message = err.message();
+    if err.is_forbidden() {
+        ApiError::Forbidden(message)
+    } else {
+        ApiError::BadRequest(message)
+    }
+}
+
 /// `EventSource` for a maid-originated cleaning event. Mirrors
 /// `routes::housekeeping::http_source`; a real `user_id` would land here if
 /// maids ever became PMS accounts (they are CF Access identities today).
@@ -974,6 +1050,23 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
             "/api/hk/broken-items/{report_id}/photo",
             get(broken_item_photo),
         )
+        // Room signals (ADR 0008). The two shapes are deliberately different:
+        // raising a signal is ABOUT a room, so it hangs off `/rooms/{id}`
+        // alongside the other maid reports; acting on one addresses the signal
+        // itself, which already knows its room — repeating the room id in the
+        // path would just be a second thing that can disagree with the row.
+        // `middleware::ville_guard` exempts BOTH shapes (they are PG-only).
+        .route("/api/hk/signals", get(list_signals))
+        .route("/api/hk/rooms/{room_id}/signals", post(raise_signal))
+        .route("/api/hk/signals/{signal_id}/ack", post(ack_signal))
+        .route("/api/hk/signals/{signal_id}/done", post(done_signal))
+        .route("/api/hk/signals/{signal_id}/cancel", post(cancel_signal))
+        .route("/api/hk/signals/{signal_id}/answer", post(answer_signal))
+        // The maid's own live stream. Behind the SAME gates as every other
+        // room endpoint (required `?branch=`, the location gate) — a stream is
+        // a read of this branch's data, and showing a maid the other
+        // property's signals is the wrong-hotel bug one tap earlier.
+        .route("/api/hk/events", get(signal_events))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(Extension(policy))
         .with_state(state)
@@ -1299,6 +1392,72 @@ pub struct ReportLinenShortageResponse {
     /// Deliberately not a total of the quantities: it answers "did all my lines
     /// land", which is what a client that just POSTed a list needs to know.
     pub reported: usize,
+}
+
+/// Body for `POST /api/hk/rooms/{id}/signals` — ADR 0008.
+///
+/// `{type}` and nothing else. There is deliberately no `direction` field (the
+/// server derives it from the role), no `note` field (canned-only, ADR 0008
+/// §Alternatives), and no reporter field (identity comes from the verified
+/// assertion, same rule as every other handler here).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaiseSignalBody {
+    /// One of the canned codes in `domain::hk_signal` — mirroring
+    /// `app/hk/signal-vocab.ts`. Trimmed + lower-cased before matching.
+    #[serde(rename = "type")]
+    pub signal_type: String,
+}
+
+/// Body for `POST /api/hk/signals/{id}/answer`.
+///
+/// `problems` is optional so `{"outcome":"clear"}` is a complete body, and so a
+/// `problems` answer that forgot the list is refused by [`parse_outcome`]'s
+/// sibling in the service (with this module's envelope) rather than by serde
+/// inside axum's `Json` extractor, which renders a plain-text shape the maid's
+/// client cannot parse. Same reasoning as
+/// [`ReportLinenShortageBody::items`](ReportLinenShortageBody).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerSignalBody {
+    /// `clear` | `problems`.
+    pub outcome: String,
+    /// One or both of `item_missing` / `item_damaged`; required (non-empty)
+    /// when `outcome` is `problems`, and must be absent/empty for `clear`.
+    pub problems: Option<Vec<String>>,
+}
+
+/// `GET /api/hk/signals` — this branch's live board.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalListResponse {
+    pub success: bool,
+    /// `open` + `acked`, oldest first. The DTO is spelled in
+    /// `domain::hk_signal::RoomSignal`, byte-for-byte the `RoomSignal`
+    /// interface in `app/hk/signal-vocab.ts`.
+    pub signals: Vec<RoomSignal>,
+}
+
+/// The single-signal envelope shared by create / ack / done / cancel.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalResponse {
+    pub success: bool,
+    pub signal: RoomSignal,
+}
+
+/// `POST /api/hk/signals/{id}/answer` — the completed check plus whatever it
+/// spawned.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerSignalResponse {
+    pub success: bool,
+    /// The room_check, now `done` with `outcome` and
+    /// `doneSource: "room_check_answer"`.
+    pub signal: RoomSignal,
+    /// The standing guest-accountability signals this answer raised — one per
+    /// problem, each with `parentId` = the check. `[]` for a `clear` answer.
+    pub spawned: Vec<RoomSignal>,
 }
 
 /// Body of a `410 Gone` answer from a retired endpoint. Same
@@ -2269,6 +2428,239 @@ pub async fn report_linen_shortage(
         room_id,
         reported: report.reported,
     }))
+}
+
+// ============================================================================
+// Room signals (ADR 0008)
+// ============================================================================
+
+/// `GET /api/hk/signals?branch=` — every signal still on this branch's board.
+///
+/// Gated exactly like the room reads: required `?branch=` (400/403) then the
+/// per-employee location gate (403/503, no-op for a viewer and while the flag
+/// is dark). NOT gated on [`require_report_capability`] — a reception viewer
+/// is one of the two intended audiences of this list; what a viewer may not do
+/// is RAISE a maid→desk signal, which the role gate below refuses.
+///
+/// `open` + `acked` only, per CONTEXT.md §Housekeeping: "a signal stays visible
+/// until done, whatever the day". There is no date window and deliberately no
+/// `?since=` — a signal raised before midnight is still the thing that needs
+/// doing at 00:05.
+pub async fn list_signals(
+    State(state): State<AppState>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<SignalListResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let signals = signal_service_for(&state, branch)?.list_live().await?;
+    Ok(Json(SignalListResponse {
+        success: true,
+        signals,
+    }))
+}
+
+/// `POST /api/hk/rooms/{room_id}/signals` — raise one canned signal.
+///
+/// **The direction is DERIVED from the role, never sent by the client.** The
+/// body carries only `{type}`; [`SignalRole::from_can_report`] turns the single
+/// boolean the Access middleware resolved into "which side is this", and
+/// `domain::hk_signal` decides whether that side may say this type. So a
+/// hand-rolled request cannot post a desk→maid signal from a maid's badge by
+/// adding a `direction` field, because there is no such field to add.
+///
+/// Note what is NOT here: [`require_report_capability`]. On the two cleaning
+/// mutations it means "viewers may not write"; on THIS route it would mean
+/// "reception may not raise desk→maid signals", which is the opposite of the
+/// design — the `/hk` viewer IS the desk on this surface. The role gate inside
+/// the service is what constrains each side, and it constrains BOTH.
+pub async fn raise_signal(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<RaiseSignalBody>,
+) -> ApiResult<Json<SignalResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    // Body BEFORE the room probe — same order as `report_linen_shortage`, so a
+    // misspelled or wrong-direction type is a 400/403 rather than a database
+    // round-trip (or a 500 when the pool is unreachable).
+    require_signal_type(&identity, &body.signal_type)?;
+
+    let pool = resolve_pool(&state, branch)?;
+    require_room(pool, room_id).await?;
+
+    let outcome = signal_service_for(&state, branch)?
+        .raise(RaiseSignalCommand {
+            room_id,
+            signal_type: body.signal_type,
+            role: hk_role(&identity),
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+            source: hk_source(),
+        })
+        .await?;
+    Ok(Json(SignalResponse {
+        success: true,
+        signal: outcome.signal,
+    }))
+}
+
+/// `POST /api/hk/signals/{id}/ack` — take a signal ("who's on it").
+pub async fn ack_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HkBranchQuery>,
+    policy: Extension<HkPolicy>,
+    identity: Extension<HkIdentity>,
+) -> ApiResult<Json<SignalResponse>> {
+    act_on_signal(state, path, query, policy, identity, SignalAction::Ack).await
+}
+
+/// `POST /api/hk/signals/{id}/done` — complete a signal.
+///
+/// A ขอเช็คห้อง is refused here with a 400 naming the answer endpoint: its
+/// completion is a JUDGEMENT (เคลียร์ / มีของหาย / มีของเสียหาย), and a bare
+/// tap would silently answer เคลียร์ while a guest waits at the counter. The
+/// refusal is produced by `domain::hk_signal::next_status`, so the desk surface
+/// answers it identically.
+pub async fn done_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HkBranchQuery>,
+    policy: Extension<HkPolicy>,
+    identity: Extension<HkIdentity>,
+) -> ApiResult<Json<SignalResponse>> {
+    act_on_signal(state, path, query, policy, identity, SignalAction::Done).await
+}
+
+/// `POST /api/hk/signals/{id}/cancel` — withdraw a still-open signal.
+///
+/// The ONE action performed on the caller's OWN direction, and only while
+/// `open`: once somebody has acked it, it is their work, not the sender's to
+/// take back.
+pub async fn cancel_signal(
+    state: State<AppState>,
+    path: Path<i64>,
+    query: Query<HkBranchQuery>,
+    policy: Extension<HkPolicy>,
+    identity: Extension<HkIdentity>,
+) -> ApiResult<Json<SignalResponse>> {
+    act_on_signal(state, path, query, policy, identity, SignalAction::Cancel).await
+}
+
+/// The shared body of ack / done / cancel — one gate order, one service call,
+/// one response shape, so the three cannot drift into answering differently.
+async fn act_on_signal(
+    State(state): State<AppState>,
+    Path(signal_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    action: SignalAction,
+) -> ApiResult<Json<SignalResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let outcome = signal_service_for(&state, branch)?
+        .act(ActOnSignalCommand {
+            signal_id,
+            action,
+            role: hk_role(&identity),
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+            source: hk_source(),
+        })
+        .await?;
+    Ok(Json(SignalResponse {
+        success: true,
+        signal: outcome.signal,
+    }))
+}
+
+/// `POST /api/hk/signals/{id}/answer` — the ขอเช็คห้อง answer.
+///
+/// `{"outcome":"clear"}` settles the room; `{"outcome":"problems","problems":
+/// ["item_missing","item_damaged"]}` completes the check AND raises one
+/// standing maid→desk signal per problem in the SAME transaction, each pointing
+/// back at the check via `parentId`. Those children are the
+/// guest-accountability signals the desk resolves before settling
+/// (CONTEXT.md §Housekeeping), which is why they must not be able to go missing
+/// while the check closes.
+pub async fn answer_signal(
+    State(state): State<AppState>,
+    Path(signal_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<AnswerSignalBody>,
+) -> ApiResult<Json<AnswerSignalResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let outcome_code = parse_outcome(&body.outcome)?;
+
+    let answered = signal_service_for(&state, branch)?
+        .answer_room_check(AnswerRoomCheckCommand {
+            signal_id,
+            outcome: outcome_code,
+            problems: body.problems.unwrap_or_default(),
+            role: hk_role(&identity),
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+            source: hk_source(),
+        })
+        .await?;
+    Ok(Json(AnswerSignalResponse {
+        success: true,
+        signal: answered.signal,
+        spawned: answered.spawned,
+    }))
+}
+
+/// `GET /api/hk/events?branch=` — the maid page's live signal stream.
+///
+/// One SSE event name ([`crate::routes::events::HK_SIGNAL_EVENT`]) carrying the
+/// [`RoomSignal`] DTO, plus the 30s keep-alive comments every stream in this
+/// repo sends. It rides the SAME process-wide `domain_events` fan-out
+/// reception's `/api/events` uses — no pool acquire, no second `PgListener`, so
+/// a maid's open phone costs one `broadcast::Receiver` and nothing else (the
+/// 2026-07-29 pool-exhaustion incident's rule).
+///
+/// **Branch isolation is the load-bearing property**, and it holds twice over:
+/// the two sites are separate DATABASES with separate `domain_events` channels,
+/// and [`crate::routes::events::hk_signal_receiver`] deliberately refuses the
+/// hfhotel fallback that `EventFanout::receivers_for` performs for reception's
+/// board. An unavailable Ville channel is a `503`, never HF Hotel's stream.
+///
+/// The gates run BEFORE the stream is built, so a refusal is an ordinary JSON
+/// error response and not a stream that opens and then dies.
+pub async fn signal_events(
+    State(state): State<AppState>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    // `require_branch` already refused `all`, so this cannot be None; the
+    // `ok_or_else` keeps that a checked fact rather than an `unwrap`.
+    let site = crate::routes::events::EventSite::for_branch(branch)
+        .ok_or_else(|| ApiError::BadRequest(BRANCH_REQUIRED_ERROR.to_string()))?;
+    let receiver = crate::routes::events::hk_signal_receiver(&state.event_fanout, site)
+        .ok_or_else(|| {
+            tracing::warn!(
+                branch = branch_id(branch),
+                "/hk signal stream refused: that branch has no event fan-out"
+            );
+            ApiError::ServiceUnavailable(SIGNAL_STREAM_UNAVAILABLE_ERROR.to_string())
+        })?;
+
+    Ok(crate::routes::events::sse_from_frames(
+        crate::routes::events::hk_signal_frames(receiver),
+    ))
 }
 
 /// POST /api/hk/rooms/{id}/broken-items — **RETIRED (410 Gone)**.

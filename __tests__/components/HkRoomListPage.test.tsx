@@ -21,6 +21,9 @@ import { render, screen, within } from '@testing-library/react'
 
 const mockHkFetch = jest.fn()
 const mockHkFetchMe = jest.fn()
+// Room signals (ADR 0008) have their own suite (`HkRoomSignals.test.tsx`);
+// stubbed empty here so the chip-row assertions below stay about cleanliness.
+const mockFetchHkSignals = jest.fn()
 
 jest.mock('@/app/hk/hk-lib', () => {
   const actual = jest.requireActual('@/app/hk/hk-lib')
@@ -28,6 +31,7 @@ jest.mock('@/app/hk/hk-lib', () => {
     ...actual,
     hkFetch: (...args: unknown[]) => mockHkFetch(...args),
     hkFetchMe: (...args: unknown[]) => mockHkFetchMe(...args),
+    fetchHkSignals: (...args: unknown[]) => mockFetchHkSignals(...args),
   }
 })
 
@@ -99,6 +103,7 @@ async function renderList(extra: Record<string, unknown>) {
 beforeEach(() => {
   jest.clearAllMocks()
   localStorage.clear()
+  mockFetchHkSignals.mockResolvedValue([])
 })
 
 it('shows the Thai note when the backend fell back to the PMS mirror', async () => {

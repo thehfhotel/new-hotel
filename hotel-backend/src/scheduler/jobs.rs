@@ -249,6 +249,57 @@ pub async fn init_scheduler(
             ville_covered = ville_pg_pool.is_some(),
             "[Scheduler] - Loyalty hold expiry sweep: every 5 minutes"
         );
+
+        // Room-signal escalation valve (ADR 0008). Every 30 seconds: a
+        // ขอเช็คห้อง still unacked after 2 minutes is POSTed to HF ID, which
+        // LINE-pushes the ON-DUTY maids of that branch once. This is the ONLY
+        // path in the housekeeping feature that spends a metered LINE message;
+        // everything else rides PG + SSE and costs nothing, forever.
+        //
+        // SHIPS DARK: with `HFID_ESCALATE_URL` unset the job is NOT REGISTERED
+        // and this logs the fact ONCE here — never per tick. There is no
+        // default URL, because a guessed path would turn a misconfiguration
+        // into confident spend on a metered channel.
+        //
+        // Covers both sites from the one process where both canonical pools are
+        // co-resident, guarded against an hfville-primary config
+        // double-escalating the same DB — the same pattern as the tripwire and
+        // the loyalty sweep above. Per-signal failures are logged and skipped
+        // inside `run_escalation_tick`, which never returns an error.
+        let escalation_cfg = crate::config::HkEscalationConfig::from_env();
+        if escalation_cfg.is_configured() {
+            let esc_pg = pg.clone();
+            let esc_ville = ville_pg_pool.clone();
+            let esc_site = site.id.clone();
+            let esc_cfg = escalation_cfg.clone();
+            let escalation_job = Job::new_async("0/30 * * * * *", move |_uuid, _l| {
+                let pg = esc_pg.clone();
+                let ville = esc_ville.clone();
+                let site_id = esc_site.clone();
+                let cfg = esc_cfg.clone();
+                Box::pin(async move {
+                    super::hk_escalation::run_escalation_tick(&pg, &site_id, &cfg).await;
+                    if let Some(ref vp) = ville {
+                        if site_id != "hfville" {
+                            super::hk_escalation::run_escalation_tick(vp, "hfville", &cfg).await;
+                        }
+                    }
+                })
+            })?;
+            scheduler.add(escalation_job).await?;
+            tracing::info!(
+                site = %site.id,
+                ville_covered = ville_pg_pool.is_some(),
+                monthly_cap = escalation_cfg.monthly_cap,
+                "[Scheduler] - HK room-check escalation: every 30s (ADR 0008 LINE valve, ENABLED)"
+            );
+        } else {
+            tracing::info!(
+                site = %site.id,
+                "[Scheduler] - HK room-check escalation: DISABLED (HFID_ESCALATE_URL unset) — \
+                 no LINE messages will be sent for unacked ขอเช็คห้อง"
+            );
+        }
     }
 
     // Slack notification jobs only run if Slack is configured

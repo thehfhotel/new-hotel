@@ -705,3 +705,366 @@ describe('canReport', () => {
     expect(canReport({ canReport: undefined })).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Room signals — ADR 0008 (`docs/adr/0008-room-signals-not-chat.md`).
+//
+// The rendering is covered by `HkRoomSignals.test.tsx`; what lives here is the
+// part that decides WHO may do WHAT (the direction rules), and the exact
+// request each helper puts on the wire. Both are places where a quiet mistake
+// is expensive: a maid able to close her own report, or an answer body missing
+// its `problems` array, is a guest charge that never gets raised.
+// ---------------------------------------------------------------------------
+
+import {
+  actingDirection,
+  actOnHkSignal,
+  answerHkRoomCheck,
+  canActOnSignal,
+  canCancelSignal,
+  fetchHkSignals,
+  isIncomingSignal,
+  isLiveSignal,
+  isRoomCheck,
+  liveSignals,
+  mergeSignal,
+  mergeSignals,
+  openSignalCount,
+  readSignalSoundMuted,
+  roomSignalChip,
+  sendableSignals,
+  sendHkSignal,
+  sentDirection,
+  signalActorLabel,
+  signalCountsByRoom,
+  signalOriginLabel,
+  signalRole,
+  signalsForRoom,
+  signalStatusLabel,
+  storeSignalSoundMuted,
+  DESK_SIGNALS,
+  MAID_SIGNALS,
+  type RoomSignal,
+} from '@/app/hk/hk-lib'
+
+function testSignal(overrides: Partial<RoomSignal> = {}): RoomSignal {
+  return {
+    signalId: 1,
+    roomId: 7,
+    roomNo: '104',
+    direction: 'desk_to_maid',
+    type: 'priority_clean',
+    status: 'open',
+    createdBy: { badge: 'R900', name: 'ต้อนรับ' },
+    createdAt: '2026-09-01T03:00:00.000Z',
+    ...overrides,
+  }
+}
+
+describe('signal roles and directions', () => {
+  it('maps the /me canReport flag onto a side of the conversation', () => {
+    expect(signalRole(true)).toBe('maid')
+    expect(signalRole(false)).toBe('reception')
+  })
+
+  // The whole rule in two lines: you send one direction and act on the other.
+  it('sends one direction and acts on the other', () => {
+    expect(sentDirection('maid')).toBe('maid_to_desk')
+    expect(actingDirection('maid')).toBe('desk_to_maid')
+    expect(sentDirection('reception')).toBe('desk_to_maid')
+    expect(actingDirection('reception')).toBe('maid_to_desk')
+  })
+
+  it('offers each role exactly its own vocabulary', () => {
+    expect(sendableSignals('maid')).toBe(MAID_SIGNALS)
+    expect(sendableSignals('reception')).toBe(DESK_SIGNALS)
+  })
+})
+
+describe('canActOnSignal / canCancelSignal', () => {
+  it('lets a maid act on a live desk→maid signal', () => {
+    expect(canActOnSignal(testSignal(), 'maid')).toBe(true)
+    expect(canActOnSignal(testSignal({ status: 'acked' }), 'maid')).toBe(true)
+  })
+
+  // "Nobody acts on their own direction's signals" — the corridor-confusion
+  // rule. A maid closing her own มีของหาย report would erase the desk's only
+  // notice that a guest may owe for something.
+  it('never lets a role act on its own direction', () => {
+    const own = testSignal({ direction: 'maid_to_desk' })
+    expect(canActOnSignal(own, 'maid')).toBe(false)
+    expect(canActOnSignal(testSignal(), 'reception')).toBe(false)
+  })
+
+  it('never lets anyone act on a finished signal', () => {
+    expect(canActOnSignal(testSignal({ status: 'done' }), 'maid')).toBe(false)
+    expect(canActOnSignal(testSignal({ status: 'cancelled' }), 'maid')).toBe(false)
+  })
+
+  // Cancel is the ONE exception, and it closes the moment the other side has
+  // picked the signal up: they are already walking to the room.
+  it('lets the sender cancel while open, and not once acked', () => {
+    expect(canCancelSignal(testSignal(), 'reception')).toBe(true)
+    expect(canCancelSignal(testSignal({ status: 'acked' }), 'reception')).toBe(false)
+    expect(canCancelSignal(testSignal(), 'maid')).toBe(false)
+  })
+})
+
+describe('live-signal helpers', () => {
+  it('counts open and acked as live, done and cancelled as gone', () => {
+    expect(isLiveSignal(testSignal({ status: 'open' }))).toBe(true)
+    expect(isLiveSignal(testSignal({ status: 'acked' }))).toBe(true)
+    expect(isLiveSignal(testSignal({ status: 'done' }))).toBe(false)
+    expect(isLiveSignal(testSignal({ status: 'cancelled' }))).toBe(false)
+  })
+
+  it('drops terminal signals from a list', () => {
+    const list = [testSignal(), testSignal({ signalId: 2, status: 'done' })]
+    expect(liveSignals(list).map((s) => s.signalId)).toEqual([1])
+  })
+
+  // Oldest first: the order they have to be worked, not the order they arrived
+  // over a stream that may have reconnected halfway through.
+  it('narrows to one room, oldest first', () => {
+    const list = [
+      testSignal({ signalId: 3, createdAt: '2026-09-01T05:00:00.000Z' }),
+      testSignal({ signalId: 2, roomId: 8 }),
+      testSignal({ signalId: 1, createdAt: '2026-09-01T03:00:00.000Z' }),
+    ]
+    expect(signalsForRoom(list, 7).map((s) => s.signalId)).toEqual([1, 3])
+    expect(openSignalCount(list, 7)).toBe(2)
+    expect(openSignalCount(list, 999)).toBe(0)
+  })
+
+  it('counts every room in one pass, both directions together', () => {
+    const counts = signalCountsByRoom([
+      testSignal(),
+      testSignal({ signalId: 2, direction: 'maid_to_desk' }),
+      testSignal({ signalId: 3, roomId: 8 }),
+      testSignal({ signalId: 4, status: 'done' }),
+    ])
+    expect(counts.get(7)).toBe(2)
+    expect(counts.get(8)).toBe(1)
+    expect(counts.has(999)).toBe(false)
+  })
+})
+
+describe('roomSignalChip', () => {
+  it('renders nothing for a room with no live signals', () => {
+    expect(roomSignalChip(0)).toBeNull()
+  })
+
+  it('names the count, and is the row’s only SOLID chip', () => {
+    const chip = roomSignalChip(3)
+    expect(chip?.label).toBe('แจ้ง 3')
+    // Solid indigo: clear of red (dirty), emerald (done), amber (in progress),
+    // sky (ขาดผ้า) and violet/orange (today's movement).
+    expect(chip?.className).toContain('bg-indigo-600')
+    expect(chip?.className).toContain('text-white')
+  })
+})
+
+describe('signal display helpers', () => {
+  it('says which side a signal came from, in the reader’s terms', () => {
+    expect(signalOriginLabel(testSignal(), 'maid')).toBe('จากแผนกต้อนรับ')
+    expect(signalOriginLabel(testSignal({ direction: 'maid_to_desk' }), 'maid')).toBe(
+      'ส่งถึงแผนกต้อนรับ'
+    )
+    expect(signalOriginLabel(testSignal({ direction: 'maid_to_desk' }), 'reception')).toBe(
+      'จากแม่บ้าน'
+    )
+    expect(signalOriginLabel(testSignal(), 'reception')).toBe('ส่งถึงแม่บ้าน')
+  })
+
+  it('names who has an acked signal, and says nobody has an open one', () => {
+    expect(signalStatusLabel(testSignal())).toBe('รอรับเรื่อง')
+    expect(
+      signalStatusLabel(
+        testSignal({ status: 'acked', ackedBy: { badge: 'Q1001', name: 'สมศรี' } })
+      )
+    ).toBe('รับเรื่องแล้ว โดย สมศรี')
+  })
+
+  // A nameless identity must still be identifiable — the badge is what the
+  // office can look up.
+  it('falls back to the badge when a name is missing', () => {
+    expect(
+      signalStatusLabel(testSignal({ status: 'acked', ackedBy: { badge: 'Q1001', name: null } }))
+    ).toBe('รับเรื่องแล้ว โดย Q1001')
+    expect(signalActorLabel({ badge: 'Q1001', name: null })).toBe('Q1001')
+    expect(signalActorLabel({ badge: 'Q1001', name: 'สมศรี' })).toBe('สมศรี')
+    expect(signalActorLabel(null)).toBe('')
+  })
+
+  it('recognises the one type that may not be closed by a tap', () => {
+    expect(isRoomCheck(testSignal({ type: 'room_check' }))).toBe(true)
+    expect(isRoomCheck(testSignal({ type: 'priority_clean' }))).toBe(false)
+  })
+})
+
+describe('isIncomingSignal (the sound cue’s gate)', () => {
+  it('is true only for a NEW signal pointed at this role', () => {
+    expect(isIncomingSignal(testSignal(), 'maid')).toBe(true)
+    // Her own report echoing back: silence.
+    expect(isIncomingSignal(testSignal({ direction: 'maid_to_desk' }), 'maid')).toBe(false)
+    // An ack/done echo of something already on screen: silence.
+    expect(isIncomingSignal(testSignal({ status: 'acked' }), 'maid')).toBe(false)
+    expect(isIncomingSignal(testSignal({ status: 'done' }), 'maid')).toBe(false)
+  })
+})
+
+describe('mergeSignal', () => {
+  it('adds a new signal in createdAt order', () => {
+    const earlier = testSignal({ signalId: 1, createdAt: '2026-09-01T03:00:00.000Z' })
+    const later = testSignal({ signalId: 2, createdAt: '2026-09-01T05:00:00.000Z' })
+    expect(mergeSignal([later], earlier).map((s) => s.signalId)).toEqual([1, 2])
+  })
+
+  it('replaces a signal it already holds rather than duplicating it', () => {
+    const acked = testSignal({ status: 'acked' })
+    const merged = mergeSignal([testSignal()], acked)
+    expect(merged).toHaveLength(1)
+    expect(merged[0].status).toBe('acked')
+  })
+
+  // A stream event carrying `done` is HOW a signal leaves the other role's
+  // screen. Keeping it would leave a finished room looking busy forever.
+  it('removes a signal that has become terminal', () => {
+    expect(mergeSignal([testSignal()], testSignal({ status: 'done' }))).toEqual([])
+    expect(mergeSignal([testSignal()], testSignal({ status: 'cancelled' }))).toEqual([])
+  })
+
+  it('merges a whole batch — an answer’s children arrive together', () => {
+    const merged = mergeSignals(
+      [testSignal({ type: 'room_check' })],
+      [
+        testSignal({ type: 'room_check', status: 'done' }),
+        testSignal({ signalId: 21, direction: 'maid_to_desk', type: 'item_missing' }),
+        testSignal({ signalId: 22, direction: 'maid_to_desk', type: 'item_damaged' }),
+      ]
+    )
+    expect(merged.map((s) => s.signalId)).toEqual([21, 22])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The signal endpoints. `hkFetch` construction itself is covered above; these
+// pin the paths and the BODIES — the answer body in particular is the record a
+// guest charge is raised from.
+// ---------------------------------------------------------------------------
+
+describe('signal fetch helpers', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(200))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  function lastCall() {
+    const calls = (global.fetch as jest.Mock).mock.calls
+    const [url, init] = calls[calls.length - 1]
+    return { url: url as string, init: init as RequestInit }
+  }
+
+  it('reads the branch’s signals and keeps only the live ones', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, {
+        success: true,
+        signals: [testSignal(), testSignal({ signalId: 2, status: 'done' })],
+      })
+    )
+    const signals = await fetchHkSignals('hfhotel')
+    expect(lastCall().url).toBe(`${HK_API_BASE}/signals?branch=hfhotel`)
+    expect(signals.map((s) => s.signalId)).toEqual([1])
+  })
+
+  // A newer/older backend that answers without the array must not crash a
+  // maid's screen — the section renders empty instead.
+  it('returns an empty list when the body carries no signals array', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+    await expect(fetchHkSignals('hfhotel')).resolves.toEqual([])
+  })
+
+  it('throws on a 200 that carries success: false', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+    await expect(fetchHkSignals('hfhotel')).rejects.toThrow(/ไม่สามารถดึงรายการแจ้งได้/)
+  })
+
+  // Direction is NEVER sent: the server derives it from the caller's role, so
+  // a client bug cannot file a desk signal in a maid's name.
+  it('sends only the type when filing a signal', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { success: true, signal: testSignal() })
+    )
+    await sendHkSignal('hfhotel', 7, 'guest_in_room')
+    const { url, init } = lastCall()
+    expect(url).toBe(`${HK_API_BASE}/rooms/7/signals?branch=hfhotel`)
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ type: 'guest_in_room' })
+  })
+
+  it.each(['ack', 'done', 'cancel'] as const)('posts the %s transition', async (action) => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { success: true, signal: testSignal() })
+    )
+    await actOnHkSignal('hfhotel', 12, action)
+    expect(lastCall().url).toBe(`${HK_API_BASE}/signals/12/${action}?branch=hfhotel`)
+  })
+
+  // The wire says what was FOUND, never what was fine: a clear answer carries
+  // no `problems` key at all.
+  it('answers เคลียร์ with outcome alone', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { success: true, signal: testSignal(), spawned: [] })
+    )
+    const { spawned } = await answerHkRoomCheck('hfhotel', 12, { outcome: 'clear' })
+    const { url, init } = lastCall()
+    expect(url).toBe(`${HK_API_BASE}/signals/12/answer?branch=hfhotel`)
+    expect(JSON.parse(init.body as string)).toEqual({ outcome: 'clear' })
+    expect(spawned).toEqual([])
+  })
+
+  it('answers with both problems and returns the spawned children', async () => {
+    const child = testSignal({ signalId: 21, direction: 'maid_to_desk', type: 'item_missing' })
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { success: true, signal: testSignal(), spawned: [child] })
+    )
+    const result = await answerHkRoomCheck('hfhotel', 12, {
+      outcome: 'problems',
+      problems: ['item_missing', 'item_damaged'],
+    })
+    expect(JSON.parse(lastCall().init.body as string)).toEqual({
+      outcome: 'problems',
+      problems: ['item_missing', 'item_damaged'],
+    })
+    expect(result.spawned).toEqual([child])
+  })
+
+  // A signal that never landed must never read as sent — the same rule the
+  // linen report follows, and for the same reason: somebody is waiting on it.
+  it('treats a 200 carrying success: false as a failed write', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+    await expect(sendHkSignal('hfhotel', 7, 'guest_in_room')).rejects.toThrow(/ส่งไม่สำเร็จ/)
+  })
+
+  it('refuses to fire at all without a branch', async () => {
+    await expect(sendHkSignal(null, 7, 'guest_in_room')).rejects.toThrow()
+    expect(global.fetch).not.toHaveBeenCalled()
+  })
+})
+
+describe('signal sound mute (localStorage)', () => {
+  beforeEach(() => localStorage.clear())
+
+  // Unmuted by default: a maid holding a silent phone in a corridor is the
+  // reason the cue exists at all.
+  it('is audible until somebody mutes it', () => {
+    expect(readSignalSoundMuted()).toBe(false)
+    storeSignalSoundMuted(true)
+    expect(readSignalSoundMuted()).toBe(true)
+    storeSignalSoundMuted(false)
+    expect(readSignalSoundMuted()).toBe(false)
+  })
+})

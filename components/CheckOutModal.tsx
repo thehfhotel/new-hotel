@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { X, AlertCircle, Loader2, LogOut, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import RoomCheckPanel from '@/components/v2/signals/RoomCheckPanel'
 
 /**
  * Check-out & settle modal (M1 task #37).
@@ -64,6 +65,17 @@ interface CheckOutModalProps {
   room: RoomLite
   onClose: () => void
   onSuccess: () => void
+  /**
+   * Opt-in: append the ขอเช็คห้อง room-signal panel (ADR 0008) below the
+   * existing modal body.
+   *
+   * OPT-IN, not always-on, and deliberately so. This one modal is mounted by
+   * three surfaces — the v2 rooms board, the v1 dashboard, and the v1 rooms
+   * page — and only the v2 desk surface is in the room-signals build. Without
+   * the flag the component is not even mounted, so the v1 screens issue no
+   * signal read, open no event stream, and render no new control.
+   */
+  roomCheck?: boolean
 }
 
 type PaymentMethod = 'cash' | 'credit' | 'transfer' | 'qr'
@@ -93,7 +105,12 @@ function formatCurrency(amount: number): string {
   }).format(amount)
 }
 
-export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModalProps) {
+export default function CheckOutModal({
+  room,
+  onClose,
+  onSuccess,
+  roomCheck = false,
+}: CheckOutModalProps) {
   const branchFetch = useBranchFetch()
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
@@ -433,6 +450,12 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
                   ? 'ยอดคงเหลือจะถูกบันทึกเป็นการชำระเงินก่อนเช็คเอ้าท์'
                   : 'ไม่มียอดค้างชำระ เช็คเอ้าท์ได้ทันที'}
               </div>
+
+              {/* ADR 0008 room-check — APPENDED at the end of the body so no
+                  existing checkout step moves, and adjacent to the confirm
+                  button, which is where an unresolved ของหาย/ของเสียหาย has
+                  to be seen. Manual by contract: it never fires on open. */}
+              {roomCheck && <RoomCheckPanel roomId={room.id} roomNo={room.roomNo} />}
             </>
           ) : null}
 

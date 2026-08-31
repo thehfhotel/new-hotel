@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    booking::BookingState, checkin::CheckInState, customer::CustomerType, payment::PaymentMethod,
-    shared::Money,
+    booking::BookingState, checkin::CheckInState, customer::CustomerType, hk_signal::RoomSignal,
+    payment::PaymentMethod, shared::Money,
 };
 
 /// Every state-mutating action in the system emits exactly one `DomainEvent`.
@@ -132,7 +132,65 @@ pub enum DomainEvent {
         by: String,
         source: EventSource,
     },
+
+    /// A room signal (ADR 0008) was raised — by the desk on the v2 surface, by
+    /// a maid on `/hk`, or as a `problems` room-check answer's child signal.
+    ///
+    /// PG-ONLY, like [`RoomCleaningStarted`](Self::RoomCleaningStarted) and
+    /// more absolutely: `ht_hk_room_signals` has no legacy counterpart at all
+    /// (migration 089), so these four variants have no writeback twin and never
+    /// will. They exist for ONE job — UI event plumbing. Reception's board
+    /// subscribes to the variant names over `routes::events`, and the maid's
+    /// `/hk` page subscribes to `GET /api/hk/events`, which re-frames exactly
+    /// these four under the single `hk_signal` event name carrying `signal` as
+    /// its data.
+    ///
+    /// The whole [`RoomSignal`] DTO rides the event rather than an id: the
+    /// boards render the signal directly from the frame (who raised it, which
+    /// room, which canned type), so carrying only an id would make every live
+    /// update a refetch — the opposite of what the SSE path is for. The DTO is
+    /// ~300 bytes, comfortably inside the 8 KB payload budget
+    /// (`architecture.md` §10).
+    RoomSignalRaised {
+        room_id: Uuid,
+        signal: RoomSignal,
+        source: EventSource,
+    },
+    /// Somebody took a room signal — the ack is what answers "who's on it".
+    RoomSignalAcked {
+        room_id: Uuid,
+        signal: RoomSignal,
+        source: EventSource,
+    },
+    /// A room signal reached `done`. `signal.done_source` says HOW: a tap, a
+    /// maid's เสร็จแล้ว report auto-completing it, or a room-check answer (in
+    /// which case `signal.outcome` carries เคลียร์ / problems).
+    RoomSignalCompleted {
+        room_id: Uuid,
+        signal: RoomSignal,
+        source: EventSource,
+    },
+    /// The creator's side withdrew a still-open room signal.
+    RoomSignalCancelled {
+        room_id: Uuid,
+        signal: RoomSignal,
+        source: EventSource,
+    },
 }
+
+/// The four [`DomainEvent`] variant names that carry a [`RoomSignal`].
+///
+/// The maid stream (`GET /api/hk/events`) filters the shared fan-out on this
+/// list before it parses anything, so a non-signal event costs one `contains`
+/// and never a JSON parse. Kept next to the variants themselves — and pinned
+/// by a test below — because a fifth signal variant added without an entry
+/// here would silently never reach the maid's page.
+pub const ROOM_SIGNAL_EVENT_NAMES: [&str; 4] = [
+    "RoomSignalRaised",
+    "RoomSignalAcked",
+    "RoomSignalCompleted",
+    "RoomSignalCancelled",
+];
 
 impl DomainEvent {
     /// Stable string identifier for this variant — matches the `type` discriminant
@@ -153,6 +211,24 @@ impl DomainEvent {
             DomainEvent::RoomMarkedDirty { .. } => "RoomMarkedDirty",
             DomainEvent::RoomLayoutChanged { .. } => "RoomLayoutChanged",
             DomainEvent::RoomCleaningStarted { .. } => "RoomCleaningStarted",
+            DomainEvent::RoomSignalRaised { .. } => "RoomSignalRaised",
+            DomainEvent::RoomSignalAcked { .. } => "RoomSignalAcked",
+            DomainEvent::RoomSignalCompleted { .. } => "RoomSignalCompleted",
+            DomainEvent::RoomSignalCancelled { .. } => "RoomSignalCancelled",
+        }
+    }
+
+    /// The [`RoomSignal`] this event carries, or `None` for every other
+    /// variant. The maid stream's projection — it turns a `domain_events`
+    /// payload into the DTO the `/hk` page renders, with no second wire shape
+    /// to keep in step.
+    pub fn room_signal(&self) -> Option<&RoomSignal> {
+        match self {
+            DomainEvent::RoomSignalRaised { signal, .. }
+            | DomainEvent::RoomSignalAcked { signal, .. }
+            | DomainEvent::RoomSignalCompleted { signal, .. }
+            | DomainEvent::RoomSignalCancelled { signal, .. } => Some(signal),
+            _ => None,
         }
     }
 
@@ -175,7 +251,11 @@ impl DomainEvent {
             DomainEvent::RoomMarkedClean { room_id, .. }
             | DomainEvent::RoomMarkedDirty { room_id, .. }
             | DomainEvent::RoomLayoutChanged { room_id, .. }
-            | DomainEvent::RoomCleaningStarted { room_id, .. } => *room_id,
+            | DomainEvent::RoomCleaningStarted { room_id, .. }
+            | DomainEvent::RoomSignalRaised { room_id, .. }
+            | DomainEvent::RoomSignalAcked { room_id, .. }
+            | DomainEvent::RoomSignalCompleted { room_id, .. }
+            | DomainEvent::RoomSignalCancelled { room_id, .. } => *room_id,
         }
     }
 
@@ -199,7 +279,114 @@ impl DomainEvent {
             | DomainEvent::RoomMarkedClean { source, .. }
             | DomainEvent::RoomMarkedDirty { source, .. }
             | DomainEvent::RoomLayoutChanged { source, .. }
-            | DomainEvent::RoomCleaningStarted { source, .. } => source,
+            | DomainEvent::RoomCleaningStarted { source, .. }
+            | DomainEvent::RoomSignalRaised { source, .. }
+            | DomainEvent::RoomSignalAcked { source, .. }
+            | DomainEvent::RoomSignalCompleted { source, .. }
+            | DomainEvent::RoomSignalCancelled { source, .. } => source,
+        }
+    }
+}
+
+#[cfg(test)]
+mod room_signal_event_tests {
+    use super::*;
+    use crate::domain::hk_signal::{
+        RoomSignal, SignalActor, SignalDirection, SignalStatus, ROOM_CHECK,
+    };
+
+    fn dto() -> RoomSignal {
+        RoomSignal {
+            signal_id: 1,
+            room_id: 42,
+            room_no: "104".to_string(),
+            direction: SignalDirection::DeskToMaid,
+            signal_type: ROOM_CHECK.to_string(),
+            status: SignalStatus::Open,
+            outcome: None,
+            parent_id: None,
+            created_by: SignalActor {
+                badge: "Q1".to_string(),
+                name: None,
+            },
+            created_at: "2026-09-01T03:00:00Z".to_string(),
+            acked_by: None,
+            acked_at: None,
+            done_by: None,
+            done_at: None,
+            done_source: None,
+        }
+    }
+
+    fn variants() -> Vec<DomainEvent> {
+        let room_id = Uuid::nil();
+        let source = EventSource::our_app(Uuid::nil(), Uuid::nil());
+        vec![
+            DomainEvent::RoomSignalRaised {
+                room_id,
+                signal: dto(),
+                source: source.clone(),
+            },
+            DomainEvent::RoomSignalAcked {
+                room_id,
+                signal: dto(),
+                source: source.clone(),
+            },
+            DomainEvent::RoomSignalCompleted {
+                room_id,
+                signal: dto(),
+                source: source.clone(),
+            },
+            DomainEvent::RoomSignalCancelled {
+                room_id,
+                signal: dto(),
+                source,
+            },
+        ]
+    }
+
+    /// The maid stream filters on [`ROOM_SIGNAL_EVENT_NAMES`] before parsing.
+    /// A fifth signal variant added without an entry there would silently never
+    /// reach `/hk`, so the list is pinned against the variants themselves.
+    #[test]
+    fn every_signal_variant_is_listed_and_exposes_its_dto() {
+        let built = variants();
+        assert_eq!(built.len(), ROOM_SIGNAL_EVENT_NAMES.len());
+        for event in &built {
+            assert!(
+                ROOM_SIGNAL_EVENT_NAMES.contains(&event.type_name()),
+                "{} is missing from ROOM_SIGNAL_EVENT_NAMES",
+                event.type_name()
+            );
+            assert!(
+                event.room_signal().is_some(),
+                "{} must expose its DTO to the maid stream",
+                event.type_name()
+            );
+        }
+    }
+
+    /// A non-signal event must not be projected as one — the filter is a
+    /// whitelist, and `room_signal()` is the second, independent gate.
+    #[test]
+    fn non_signal_events_carry_no_dto() {
+        let event = DomainEvent::RoomMarkedDirty {
+            room_id: Uuid::nil(),
+            source: EventSource::our_app(Uuid::nil(), Uuid::nil()),
+        };
+        assert!(event.room_signal().is_none());
+        assert!(!ROOM_SIGNAL_EVENT_NAMES.contains(&event.type_name()));
+    }
+
+    /// The wire round-trip the SSE relay depends on: publish → `pg_notify`
+    /// payload → `serde_json::from_str::<DomainEvent>` → the same DTO.
+    #[test]
+    fn a_signal_event_round_trips_through_the_notify_payload() {
+        for event in variants() {
+            let payload = serde_json::to_string(&event).expect("serializes");
+            let decoded: DomainEvent = serde_json::from_str(&payload).expect("deserializes");
+            assert_eq!(decoded.type_name(), event.type_name());
+            assert_eq!(decoded.room_signal(), event.room_signal());
         }
     }
 }

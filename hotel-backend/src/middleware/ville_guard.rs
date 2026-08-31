@@ -9,10 +9,11 @@
 //! integration tests can drive the REAL layered router — see
 //! `tests/test_hk_ville_guard.rs`.
 //!
-//! ## The exemptions (housekeeping-ops, 2026-08-11; linen 2026-08-31)
+//! ## The exemptions (housekeeping-ops, 2026-08-11; linen 2026-08-31;
+//! room signals 2026-09-01)
 //!
-//! [`is_ville_exempt_path`] admits exactly TWO routes regardless of the flag,
-//! both maid reports on the `/hk` surface:
+//! [`is_ville_exempt_path`] admits, regardless of the flag, exactly the maid
+//! surface's own write routes — and nothing else:
 //!
 //! * `POST /api/hk/rooms/{id}/cleaning` — the cleaning report.
 //! * `POST /api/hk/rooms/{id}/linen-shortage` — the linen-shortage (ขาดผ้า)
@@ -23,6 +24,20 @@
 //!   vacuous: there is no intent that `HFVILLE_WRITEBACK_INTENTS` could park as
 //!   `'skipped'`, hence no way for canonical PG to run ahead of Ville's iHOTEL.
 //!   This is the safest possible thing to exempt.
+//! * `POST /api/hk/rooms/{id}/signals` and
+//!   `POST /api/hk/signals/{id}/{ack|done|cancel|answer}` — the room signals of
+//!   ADR 0008 (migration 089). **PG-ONLY on the same terms as linen, and
+//!   irreversibly so**: `ht_hk_room_signals` has no legacy counterpart to
+//!   mirror to, so there is no writeback recipe to write, no intent to
+//!   allowlist, and no dark flag waiting to enable one. They DO publish domain
+//!   events — but those are `event_log` + `pg_notify` rows feeding this app's
+//!   own SSE fan-out, not a legacy write, and the writeback worker dispatches
+//!   `WritebackIntent`s, not events.
+//!
+//!   The DESK half of the same feature (`/api/housekeeping/signals/*`) is
+//!   deliberately NOT exempt. The exemption exists so a MAID's work is not
+//!   collateral damage of a front-desk write-policy toggle; a front-desk
+//!   mutation is exactly what that toggle governs.
 //!
 //! ### Current production state
 //!
@@ -66,37 +81,73 @@ use crate::routes::mode::AppState;
 /// `ht_hk_linen_reports` and enqueues nothing, so admitting it cannot desync
 /// canonical PG from Ville's iHOTEL under any setting of
 /// `HFVILLE_WRITEBACK_INTENTS`. See the module docs.
-const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 2] = ["cleaning", "linen-shortage"];
+///
+/// `signals` (migration 089, ADR 0008) is PG-only in the same absolute sense,
+/// and more so: `ht_hk_room_signals` has no legacy counterpart to mirror TO —
+/// iHOTEL knows nothing about room signals — so there is no writeback recipe,
+/// no intent, and no future one to gate. It raises one row and publishes a
+/// domain event for the SSE fan-out; an event is not a legacy write.
+const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 3] = ["cleaning", "linen-shortage", "signals"];
+
+/// The exempt leaf segments under `/api/hk/signals/{signal_id}/` — ADR 0008's
+/// lifecycle actions. A closed list, matched by exact equality.
+///
+/// These are NOT under `/rooms/`, which is why they need their own matcher
+/// rather than an entry in [`VILLE_EXEMPT_ROOM_ACTIONS`]: acting on a signal
+/// addresses the signal, which already knows its room. Same PG-only argument
+/// as `signals` above — each one flips `sig_status` and publishes an event, and
+/// `answer` additionally inserts child signal rows. All canonical PG, none of
+/// it legacy.
+///
+/// `answer` is included deliberately: without it a HF Ville maid could open a
+/// ขอเช็คห้อง's answer screen and be 403'd at the one moment a guest is waiting
+/// at the counter — the exact "housekeeping is not collateral damage of a
+/// front-desk write-policy toggle" case the exemption exists for.
+const VILLE_EXEMPT_SIGNAL_ACTIONS: [&str; 4] = ["ack", "done", "cancel", "answer"];
 
 /// Is this request path one of the Ville-exempt routes? PURE.
 ///
-/// Matches exactly `/api/hk/rooms/{room_id}/{action}` with a numeric `room_id`
-/// and `action` in [`VILLE_EXEMPT_ROOM_ACTIONS`] — five segments, no more. A
-/// trailing slash yields a trailing empty segment and therefore does NOT match,
-/// and no prefix/substring test is used, so `/api/hk/rooms/1/cleaning/anything`,
-/// `/api/hk/rooms/1/linen-shortageX` and `/api/hk/rooms/1/broken-items` all fall
-/// through to the normal gate.
+/// TWO shapes, both five segments, both requiring a numeric id and nothing
+/// after the leaf:
+///
+/// * `/api/hk/rooms/{room_id}/{action}` with `action` in
+///   [`VILLE_EXEMPT_ROOM_ACTIONS`];
+/// * `/api/hk/signals/{signal_id}/{action}` with `action` in
+///   [`VILLE_EXEMPT_SIGNAL_ACTIONS`].
+///
+/// A trailing slash yields a trailing empty segment and therefore does NOT
+/// match, and no prefix/substring test is used, so
+/// `/api/hk/rooms/1/cleaning/anything`, `/api/hk/rooms/1/linen-shortageX`,
+/// `/api/hk/signals/1/ackX` and `/api/hk/rooms/1/broken-items` all fall through
+/// to the normal gate.
+///
+/// `GET /api/hk/signals` and `GET /api/hk/events` need no entry at all — the
+/// gate only ever fires on mutating methods.
 pub fn is_ville_exempt_path(path: &str) -> bool {
     let mut segments = path.split('/');
     // A path starts with '/', so the first split segment is empty.
     if segments.next() != Some("") {
         return false;
     }
-    match (
+    let (collection, id, action) = match (
         segments.next(),
         segments.next(),
         segments.next(),
         segments.next(),
         segments.next(),
     ) {
-        (Some("api"), Some("hk"), Some("rooms"), Some(room_id), Some(action))
-            if VILLE_EXEMPT_ROOM_ACTIONS.contains(&action) =>
-        {
-            // Nothing may follow the fifth segment.
-            segments.next().is_none()
-                && !room_id.is_empty()
-                && room_id.bytes().all(|b| b.is_ascii_digit())
+        (Some("api"), Some("hk"), Some(collection), Some(id), Some(action)) => {
+            (collection, id, action)
         }
+        _ => return false,
+    };
+    // Nothing may follow the fifth segment, and the id must be a bare number.
+    if segments.next().is_some() || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match collection {
+        "rooms" => VILLE_EXEMPT_ROOM_ACTIONS.contains(&action),
+        "signals" => VILLE_EXEMPT_SIGNAL_ACTIONS.contains(&action),
         _ => false,
     }
 }
@@ -169,6 +220,11 @@ mod tests {
 
     const CLEANING: &str = "/api/hk/rooms/42/cleaning";
     const LINEN: &str = "/api/hk/rooms/42/linen-shortage";
+    const SIGNALS: &str = "/api/hk/rooms/42/signals";
+    const SIGNAL_ACK: &str = "/api/hk/signals/7/ack";
+    const SIGNAL_DONE: &str = "/api/hk/signals/7/done";
+    const SIGNAL_CANCEL: &str = "/api/hk/signals/7/cancel";
+    const SIGNAL_ANSWER: &str = "/api/hk/signals/7/answer";
     const BROKEN: &str = "/api/hk/rooms/42/broken-items";
     const BOOKING: &str = "/api/new/bookings";
     const VILLE_Q: Option<&str> = Some("branch=hfville");
@@ -176,14 +232,46 @@ mod tests {
     // ---- path matcher ---------------------------------------------------
 
     #[test]
-    fn exempt_path_matches_only_the_two_maid_report_routes() {
+    fn exempt_path_matches_only_the_maid_tree_write_routes() {
         assert!(is_ville_exempt_path(CLEANING));
         assert!(is_ville_exempt_path("/api/hk/rooms/1/cleaning"));
         assert!(is_ville_exempt_path(LINEN));
         assert!(is_ville_exempt_path("/api/hk/rooms/1/linen-shortage"));
+        // ADR 0008 room signals: the raise hangs off /rooms/, the lifecycle
+        // actions off /signals/ — two shapes, one matcher.
+        assert!(is_ville_exempt_path(SIGNALS));
+        assert!(is_ville_exempt_path("/api/hk/rooms/1/signals"));
+        for action in [SIGNAL_ACK, SIGNAL_DONE, SIGNAL_CANCEL, SIGNAL_ANSWER] {
+            assert!(is_ville_exempt_path(action), "{action} must be exempt");
+        }
 
         for not_exempt in [
             BROKEN,
+            // The two collections' action lists are NOT interchangeable: a
+            // leaf is exempt under the collection it belongs to and nowhere
+            // else, which is what keeps the widening narrow.
+            "/api/hk/rooms/42/ack",
+            "/api/hk/rooms/42/answer",
+            "/api/hk/signals/7/cleaning",
+            "/api/hk/signals/7/linen-shortage",
+            "/api/hk/signals/7/signals",
+            // Near-misses and malformed ids on the new shape.
+            "/api/hk/signals/7/ackX",
+            "/api/hk/signals/7/ack/",
+            "/api/hk/signals/7/ack/extra",
+            "/api/hk/signals//ack",
+            "/api/hk/signals/7a/ack",
+            "/api/hk/signals/7",
+            "/api/hk/signals",
+            "/x/api/hk/signals/7/ack",
+            "api/hk/signals/7/ack",
+            "/api/hk/rooms/42/signalsX",
+            "/api/hk/rooms/42/signals/",
+            "/api/hk/rooms/42/signals/extra",
+            // A collection this matcher does not know must never be exempt,
+            // however plausible its leaf looks.
+            "/api/hk/notes/7/ack",
+            "/api/housekeeping/signals/7/ack",
             BOOKING,
             "/api/hk/rooms/42",
             "/api/hk/rooms/42/cleaning/",            // trailing slash
@@ -242,6 +330,22 @@ mod tests {
             !ville_write_blocked(&Method::POST, LINEN, VILLE_Q, false),
             "hfville linen-shortage must be admitted while Ville writes are disabled"
         );
+        // Room signals (ADR 0008) are PG-only in the strongest sense: iHOTEL
+        // has no counterpart at all, so there is not even a writeback recipe
+        // that a narrowed HFVILLE_WRITEBACK_INTENTS could park.
+        for signal_path in [SIGNALS, SIGNAL_ACK, SIGNAL_DONE, SIGNAL_CANCEL, SIGNAL_ANSWER] {
+            assert!(
+                !ville_write_blocked(&Method::POST, signal_path, VILLE_Q, false),
+                "hfville {signal_path} must be admitted while Ville writes are disabled"
+            );
+        }
+        // The DESK half of the same feature is NOT exempt: an exemption exists
+        // so a maid's report is not collateral damage of a FRONT-DESK write
+        // policy toggle, and a front-desk mutation is what that toggle is for.
+        assert!(
+            ville_write_blocked(&Method::POST, "/api/housekeeping/signals/7/ack", VILLE_Q, false),
+            "the reception signal routes must follow front-desk write policy"
+        );
 
         // Everything else on branch=hfville stays blocked.
         assert!(
@@ -264,7 +368,15 @@ mod tests {
     /// DELETE/PUT aimed at either path must not slip through.
     #[test]
     fn exemption_is_post_only() {
-        for path in [CLEANING, LINEN] {
+        for path in [
+            CLEANING,
+            LINEN,
+            SIGNALS,
+            SIGNAL_ACK,
+            SIGNAL_DONE,
+            SIGNAL_CANCEL,
+            SIGNAL_ANSWER,
+        ] {
             for method in [Method::PUT, Method::PATCH, Method::DELETE] {
                 assert!(
                     ville_write_blocked(&method, path, VILLE_Q, false),
@@ -291,7 +403,17 @@ mod tests {
     /// behavior in the eventual coequal-writes world.
     #[test]
     fn writes_enabled_blocks_nothing() {
-        for path in [CLEANING, LINEN, BROKEN, BOOKING] {
+        for path in [
+            CLEANING,
+            LINEN,
+            SIGNALS,
+            SIGNAL_ACK,
+            SIGNAL_DONE,
+            SIGNAL_CANCEL,
+            SIGNAL_ANSWER,
+            BROKEN,
+            BOOKING,
+        ] {
             assert!(!ville_write_blocked(&Method::POST, path, VILLE_Q, true));
         }
     }

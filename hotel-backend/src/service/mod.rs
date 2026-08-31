@@ -41,6 +41,7 @@ pub mod checkin;
 pub mod coupon;
 pub mod customer;
 pub mod error;
+pub mod hk_signals;
 pub mod housekeeping;
 pub mod ids;
 pub mod loyalty;
@@ -72,6 +73,10 @@ pub use customer::{
     UpdateCustomerCommand,
 };
 pub use error::{ServiceError, ServiceResult};
+pub use hk_signals::{
+    ActOnSignalCommand, AnswerOutcome, AnswerRoomCheckCommand, HkSignalService,
+    RaiseSignalCommand, SignalOutcome,
+};
 pub use housekeeping::{
     HousekeepingOutcome, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,
     MarkMaintenanceCommand,

@@ -63,6 +63,50 @@ Room-state hues are legacy vocabulary, not design assets: the hue that means eac
 rendered in v2-quality shades — one color language across every surface that shows room state.
 _Avoid_: per-surface palettes, v2-native tones for room state
 
+### Housekeeping
+
+**Room signal**:
+A canned, room-scoped notice between reception and maids on the housekeeping surface —
+strictly one of the fixed types below, never free text (anything unanticipated stays a phone
+call). Always about ONE room; broadcast to the other role at that room's branch (no personal
+addressing — the first responder acts). Lifecycle: open → acked (by name) → done (by name);
+the sender may cancel while open; a signal stays visible until done, whatever the day. A
+maid's เสร็จแล้ว report auto-completes that room's open cleaning-urgency signals
+(ทำห้องนี้ก่อน, แขกเช็คเอาท์แล้ว), recorded as completed by her report. Desk→maid types:
+ทำห้องนี้ก่อน, แขกขอผ้าเพิ่ม, งดทำห้องนี้, แขกเช็คเอาท์แล้ว, ขอเช็คห้อง. Maid→desk types:
+ลูกค้ายังอยู่ในห้อง, พบของลืมในห้อง, มีของหาย, มีของเสียหาย.
+_Avoid_: "chat", "message" (imply conversation and threading — ruled out), "notification"
+(that's a delivery mechanism, not the domain object)
+
+**Room-check (ขอเช็คห้อง)**:
+The checkout coordination signal — fired manually by the desk when a guest asks to check
+out (never auto-fired by the PMS checkout itself), the most urgent signal in the system
+because the guest is waiting at the counter. Unlike other signals its completion is an
+ANSWER, not a bare tap: the maid inspects and answers **เคลียร์** (all good — settle now) or
+one or both of มีของหาย / มีของเสียหาย, which then also stand as guest-accountability
+signals for the desk to act on before settling. The answer completes the check.
+_Avoid_: "inspection checklist" (no per-item checklist exists — the answer is the maid's
+judgment), auto-firing on checkout open (many checkouts settle without an inspection)
+
+**On-duty maid**:
+A maid who clocked in today at a given branch's fingerprint device and has not clocked out —
+the attendance system's answer to "who is physically working here right now." The day's punch
+device decides her branch, beating her stored home branch (a maid covering the other property
+is on-duty THERE). The only audience an escalation may ever reach; nobody on-duty ⇒ no
+escalation at all (the desk phones).
+_Avoid_: "branch roster" (home-branch membership — includes day-off and gone-home maids),
+"active maid" (is_active is an employment flag, not a shift state)
+
+**Guest-accountability signal**:
+The maid→desk room signals that mean "this room's guest may owe for something — know it
+BEFORE they settle": มีของหาย (an expected room item is missing, e.g. รีโมททีวี, towels
+gone with the guest) and มีของเสียหาย (an item damaged). Distinct from **ขาดผ้า** (the maid
+is short of linen and needs a restock brought to her) and from แจ้งซ่อม (a maintenance work
+order in the housekeeping ops app — if damage also needs a technician, แจ้งซ่อม is still
+filed there separately).
+_Avoid_: folding these into ขาดผ้า (restock ≠ missing item), "damage report" routed to the
+repair queue (the desk, not the technician, is the audience)
+
 ### Coexistence
 
 **Legacy-stale signal**:

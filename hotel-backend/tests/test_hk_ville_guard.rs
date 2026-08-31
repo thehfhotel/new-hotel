@@ -369,3 +369,116 @@ async fn ville_cleaning_flips_ville_pg_and_enqueues_only_mark_room_clean() {
         .execute(&ville_pool)
         .await;
 }
+
+// ============================================================================
+// Room signals (ADR 0008 / migration 089) — the two exempt shapes
+// ============================================================================
+//
+// Same proof, same mechanics: 401 = the Ville guard ADMITTED the request and
+// the Access gate refused it; 403 = the guard refused it. All DB-free — both
+// layers answer before a pool is touched.
+//
+// The safety argument here is the strongest of the three exemptions.
+// `linen-shortage` is PG-only because iHOTEL has no linen table TODAY; room
+// signals are PG-only because iHOTEL has no concept of a room signal AT ALL, so
+// there is not merely no intent enqueued — there is no writeback recipe that
+// could ever be written, and nothing for a narrowed `HFVILLE_WRITEBACK_INTENTS`
+// to park. The domain events the routes publish are `event_log` +
+// `pg_notify` rows feeding this app's own SSE fan-out; the writeback worker
+// dispatches `WritebackIntent`s, not events.
+
+const SIGNAL_BODY: &str = r#"{"type":"item_missing"}"#;
+const ANSWER_BODY: &str = r#"{"outcome":"clear"}"#;
+
+/// The maid tree's signal writes must all be admitted while Ville writes are
+/// disabled — the raise (under `/rooms/`) and each lifecycle action (under
+/// `/signals/`). A 403 on any of them means a HF Ville maid cannot coordinate a
+/// checkout whenever front-desk Ville writes are turned off, which is exactly
+/// the collateral damage the exemption exists to prevent.
+#[tokio::test]
+async fn hfville_room_signals_are_admitted_while_ville_writes_are_disabled() {
+    for (uri, body) in [
+        ("/api/hk/rooms/1/signals?branch=hfville", SIGNAL_BODY),
+        ("/api/hk/signals/1/ack?branch=hfville", ""),
+        ("/api/hk/signals/1/done?branch=hfville", ""),
+        ("/api/hk/signals/1/cancel?branch=hfville", ""),
+        ("/api/hk/signals/1/answer?branch=hfville", ANSWER_BODY),
+    ] {
+        let status = probe_with_body(lazy_pool(), "POST", uri, false, body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "expected the Ville guard to ADMIT {uri} (leaving the Access gate to \
+             answer 401); a 403 means the room-signal exemption regressed"
+        );
+    }
+}
+
+/// The exemption is POST-only, exact-match, and per-COLLECTION — the shipped
+/// router must consult the matcher, not a prefix.
+///
+/// The per-collection half matters most: `ack` is exempt under `/signals/` and
+/// must NOT be under `/rooms/`, and `signals` is exempt under `/rooms/` and
+/// must not be a magic leaf under `/signals/`. Cross-admitting them would turn
+/// a closed list into a fuzzy one.
+#[tokio::test]
+async fn the_signal_exemption_does_not_widen_on_the_shipped_router() {
+    for uri in [
+        // Near-miss leaves.
+        "/api/hk/signals/1/ackX?branch=hfville",
+        "/api/hk/rooms/1/signalsX?branch=hfville",
+        // Deeper paths and trailing slashes.
+        "/api/hk/signals/1/ack/extra?branch=hfville",
+        "/api/hk/signals/1/ack/?branch=hfville",
+        // Non-numeric / empty ids.
+        "/api/hk/signals/1a/ack?branch=hfville",
+        "/api/hk/signals//ack?branch=hfville",
+        // The two collections' action lists are NOT interchangeable.
+        "/api/hk/rooms/1/ack?branch=hfville",
+        "/api/hk/signals/1/cleaning?branch=hfville",
+        // The DESK half of the same feature follows front-desk write policy.
+        "/api/housekeeping/signals/1/ack?branch=hfville",
+        "/api/housekeeping/rooms/1/signals?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "POST", uri, false, SIGNAL_BODY).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{uri} must be refused by the Ville guard; 401 would mean the \
+             room-signal exemption is matching too broadly"
+        );
+    }
+
+    // The exempt paths with a mutating non-POST method.
+    for uri in [
+        "/api/hk/rooms/1/signals?branch=hfville",
+        "/api/hk/signals/1/ack?branch=hfville",
+    ] {
+        for method in ["PUT", "PATCH", "DELETE"] {
+            let status = probe_with_body(lazy_pool(), method, uri, false, SIGNAL_BODY).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} on {uri} must NOT be exempt"
+            );
+        }
+    }
+}
+
+/// Reads are never blocked by this gate, so the maid's board and her live
+/// stream keep working on `branch=hfville` regardless of the write flag — they
+/// reach the Access gate (401) rather than the Ville guard (403).
+#[tokio::test]
+async fn hfville_signal_reads_are_never_touched_by_the_write_gate() {
+    for uri in [
+        "/api/hk/signals?branch=hfville",
+        "/api/hk/events?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "GET", uri, false, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "GET {uri} must pass the write gate untouched"
+        );
+    }
+}

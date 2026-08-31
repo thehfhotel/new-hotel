@@ -16,9 +16,17 @@
  * Plus the rollback property inherited from CR-1: the stale note appears on
  * `legacyStatusStale === true` and on nothing else. A backend that stops
  * sending the key must not paint a permanent banner.
+ *
+ * Since ADR 0008 the screen also carries ROOM SIGNALS. That does not soften
+ * property (1): the board still adds no clean/dirty write shape, which is the
+ * invariant that keeps it from becoming a second source of housekeeping truth.
+ * A signal is a different domain object with its own table and no legacy
+ * mirror. The signal tests below pin the seam (one stream, room ids resolved
+ * before a send is offered); the panel's own behaviour is pinned in
+ * `__tests__/components/signals/`.
  */
 
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
 const branchFetchMock = jest.fn()
 const useLiveRefreshMock = jest.fn()
@@ -40,6 +48,10 @@ jest.mock('@/lib/v2/use-live-refresh', () => ({
 import V2Housekeeping, { DIVERGENT_BADGE, groupRoomsByHkStatus } from '@/app/v2/housekeeping/page'
 import { LEGACY_STATUS_STALE_NOTE } from '@/app/hk/hk-lib'
 import { HK_STATUS_LABELS, type HkStatus } from '@/lib/v2/status'
+import { EMPTY_TITLE as SIGNALS_EMPTY } from '@/components/v2/signals/SignalsPanel'
+
+/** Asserted as a literal so a silent reword of the panel heading fails here. */
+const SIGNALS_TITLE = 'สัญญาณห้องพัก'
 
 /** A real instant — `at` is a PG timestamptz, so the screen formats it in the
  *  browser's own local zone (no UTC override, no forced Asia/Bangkok). The
@@ -73,15 +85,65 @@ const BOARD = {
   ],
 }
 
+/** The room list the board reads purely to turn a room NUMBER into the room ID
+ *  the signal-send endpoint needs. */
+const ROOMS = [
+  { id: 1, roomNo: '101' },
+  { id: 2, roomNo: '102' },
+  { id: 3, roomNo: '103' },
+  { id: 4, roomNo: '104' },
+]
+
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body }
 }
 
+/** Every request the board made, in order. */
+let calls: { url: string; init?: RequestInit }[] = []
+
+/** Route the board's three reads by URL. `signals` seeds the ADR 0008 panel. */
+function scriptFetch(
+  overrides: Record<string, unknown> = {},
+  signals: unknown[] = [],
+  rooms: unknown[] = ROOMS,
+) {
+  branchFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    calls.push({ url, init })
+    if (url.startsWith('/api/housekeeping/signals')) {
+      return jsonResponse({ success: true, signals })
+    }
+    if (url.startsWith('/api/rooms')) return jsonResponse({ success: true, data: rooms })
+    if (/\/api\/housekeeping\/(rooms|signals)\//.test(url)) {
+      return jsonResponse({ success: true, signal: {} })
+    }
+    return jsonResponse({ ...BOARD, ...overrides })
+  })
+}
+
 /** Render with a scripted payload and wait for the board to settle. */
-async function renderBoard(overrides: Record<string, unknown> = {}) {
-  branchFetchMock.mockResolvedValue(jsonResponse({ ...BOARD, ...overrides }))
+async function renderBoard(
+  overrides: Record<string, unknown> = {},
+  signals: unknown[] = [],
+  rooms: unknown[] = ROOMS,
+) {
+  scriptFetch(overrides, signals, rooms)
   render(<V2Housekeeping />)
-  await screen.findByText('101')
+  // `findAllBy`: a room number can legitimately appear twice once a signal for
+  // that room is listed in the panel as well as in its cleaning group.
+  await screen.findAllByText('101')
+}
+
+function signal(partial: Record<string, unknown> & { signalId: number }) {
+  return {
+    roomId: 1,
+    roomNo: '101',
+    direction: 'maid_to_desk',
+    type: 'item_missing',
+    status: 'open',
+    createdBy: { badge: 'Q1001', name: 'สมหญิง' },
+    createdAt: '2026-09-01T03:00:00Z',
+    ...partial,
+  }
 }
 
 /** The header strip of one group — `<h2>` plus its count badge. */
@@ -91,13 +153,19 @@ function groupHeader(hkStatusLabel: string): HTMLElement {
 
 beforeEach(() => {
   jest.clearAllMocks()
+  calls = []
   useLiveRefreshMock.mockReturnValue(true)
 })
 
 describe('V2Housekeeping — the three housekeeping groups', () => {
   it('renders dirty → cleaning → clean, in that order', async () => {
     await renderBoard()
-    const headings = screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)
+    const headings = screen
+      .getAllByRole('heading', { level: 2 })
+      .map((h) => h.textContent)
+      // The ADR 0008 signals panel is its own section ABOVE the groups; the
+      // group ORDER is what this test owns.
+      .filter((text) => text !== SIGNALS_TITLE)
     expect(headings).toEqual([
       HK_STATUS_LABELS.dirty,
       HK_STATUS_LABELS.cleaning,
@@ -128,7 +196,10 @@ describe('V2Housekeeping — the three housekeeping groups', () => {
 
   it('shows an empty-group notice rather than dropping the section', async () => {
     await renderBoard({ housekeeping: [{ roomNo: '101', hkStatus: 'dirty', divergent: false }] })
-    expect(screen.getAllByRole('heading', { level: 2 })).toHaveLength(3)
+    const groupHeadings = screen
+      .getAllByRole('heading', { level: 2 })
+      .filter((h) => h.textContent !== SIGNALS_TITLE)
+    expect(groupHeadings).toHaveLength(3)
     expect(screen.getAllByText('ไม่มีห้องในกลุ่มนี้')).toHaveLength(2)
   })
 
@@ -204,6 +275,75 @@ describe('V2Housekeeping — the legacy-stale note (CR-1 rollback property)', ()
   })
 })
 
+describe('V2Housekeeping — room signals on the desk board (ADR 0008)', () => {
+  it('reads the DESK signals endpoint, never the maid one', async () => {
+    await renderBoard()
+    expect(calls.some((call) => call.url.startsWith('/api/housekeeping/signals'))).toBe(true)
+    expect(calls.some((call) => call.url.startsWith('/api/hk/'))).toBe(false)
+  })
+
+  it('shows the panel above the cleaning groups, empty when nothing is outstanding', async () => {
+    await renderBoard()
+    const panel = await screen.findByRole('heading', { level: 2, name: SIGNALS_TITLE })
+    const firstGroup = screen.getByRole('heading', {
+      level: 2,
+      name: HK_STATUS_LABELS.dirty,
+    })
+    // Node.DOCUMENT_POSITION_FOLLOWING === 4
+    expect(panel.compareDocumentPosition(firstGroup) & 4).toBeTruthy()
+    expect(screen.getByText(SIGNALS_EMPTY)).toBeInTheDocument()
+  })
+
+  it('lists an outstanding signal with its room and type', async () => {
+    await renderBoard({}, [signal({ signalId: 1, roomNo: '103', roomId: 3 })])
+    expect(await screen.findByText(SIGNALS_TITLE)).toBeInTheDocument()
+    expect(screen.getAllByText('มีของหาย').length).toBeGreaterThan(0)
+  })
+
+  it('marks the room itself on the cleaning list, so the board reads as room state', async () => {
+    await renderBoard({}, [
+      signal({ signalId: 1, roomNo: '104', roomId: 4, direction: 'desk_to_maid', type: 'priority_clean' }),
+    ])
+    const cleanGroup = groupHeader(HK_STATUS_LABELS.clean).parentElement as HTMLElement
+    await waitFor(() =>
+      expect(within(cleanGroup).getByText('ทำห้องนี้ก่อน')).toBeInTheDocument(),
+    )
+    // …and not on a room that has no signal.
+    expect(within(cleanGroup).getAllByText('ทำห้องนี้ก่อน')).toHaveLength(1)
+  })
+
+  it('sends a desk signal about the row’s room, by id', async () => {
+    await renderBoard()
+    const dirtyGroup = groupHeader(HK_STATUS_LABELS.dirty).parentElement as HTMLElement
+    const trigger = await within(dirtyGroup).findByRole('button', {
+      name: 'แจ้งแม่บ้าน ห้อง 101',
+    })
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'แขกขอผ้าเพิ่ม' }))
+
+    await waitFor(() =>
+      expect(calls.some((call) => call.url === '/api/housekeeping/rooms/1/signals')).toBe(true),
+    )
+    const sent = calls.find((call) => call.url === '/api/housekeeping/rooms/1/signals')
+    expect(sent?.init?.method).toBe('POST')
+    expect(JSON.parse(String(sent?.init?.body))).toEqual({ type: 'deliver_linen' })
+  })
+
+  it('offers NO send action for a room whose id could not be resolved', async () => {
+    await renderBoard({}, [], [])
+    await screen.findByText('101')
+    expect(screen.queryByRole('button', { name: /แจ้งแม่บ้าน/ })).not.toBeInTheDocument()
+  })
+
+  it('acts on a maid signal through the desk endpoint', async () => {
+    await renderBoard({}, [signal({ signalId: 9, roomNo: '101', roomId: 1 })])
+    fireEvent.click(await screen.findByText('รับทราบ'))
+    await waitFor(() =>
+      expect(calls.some((call) => call.url === '/api/housekeeping/signals/9/ack')).toBe(true),
+    )
+  })
+})
+
 describe('groupRoomsByHkStatus — the grouping rule on its own', () => {
   it('orders each group the way a human reads room numbers', () => {
     const groups = groupRoomsByHkStatus([
@@ -230,20 +370,42 @@ describe('V2Housekeeping — plumbing', () => {
     expect(branchFetchMock).toHaveBeenCalledWith('/api/housekeeping/cleaning')
   })
 
-  it('subscribes to the maid-progress live events for the active branch', async () => {
+  it('subscribes on ONE stream to both the cleaning and the signal events', async () => {
     await renderBoard()
-    expect(useLiveRefreshMock).toHaveBeenCalledWith(
-      'hfhotel',
-      ['RoomMarkedClean', 'RoomMarkedDirty', 'RoomCleaningStarted'],
-      expect.any(Function),
+    const [branchArg, events] = useLiveRefreshMock.mock.calls.at(-1) as [string, string[]]
+    expect(branchArg).toBe('hfhotel')
+    expect(events).toEqual(
+      expect.arrayContaining([
+        'RoomMarkedClean',
+        'RoomMarkedDirty',
+        'RoomCleaningStarted',
+        // The four names the backend's reception relay actually publishes
+        // (outbox::event::ROOM_SIGNAL_EVENT_NAMES) — pinned as literals so a
+        // rename on either side fails THIS test, not silently downgrades the
+        // board to the safety poll.
+        'RoomSignalRaised',
+        'RoomSignalAcked',
+        'RoomSignalCompleted',
+        'RoomSignalCancelled',
+      ]),
     )
+    // ONE subscription for the whole screen: the signals client is the
+    // no-stream `useDeskSignalsCore`, so there is no second call carrying a
+    // different (signal-only) event list.
+    const eventLists = new Set(
+      useLiveRefreshMock.mock.calls.map((call) => (call[1] as string[]).join(',')),
+    )
+    expect(eventLists.size).toBe(1)
   })
 
-  it('is READ-ONLY — it renders no action buttons and issues no writes', async () => {
+  it('still adds NO clean/dirty write shape — the invariant that keeps it one source of truth', async () => {
     await renderBoard()
-    expect(screen.queryAllByRole('button')).toHaveLength(0)
-    for (const call of branchFetchMock.mock.calls) {
-      expect(call[1]).toBeUndefined()
+    for (const call of calls) {
+      expect(call.url).not.toMatch(/\/rooms\/\d+\/(clean|dirty|maintenance)$/)
+    }
+    // Every read is a plain GET; only the signal endpoints ever carry a body.
+    for (const call of calls) {
+      if (call.init) expect(call.url).toMatch(/\/api\/housekeeping\/(rooms|signals)\//)
     }
   })
 

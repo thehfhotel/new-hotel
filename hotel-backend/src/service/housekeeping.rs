@@ -297,6 +297,17 @@ pub struct CleaningReport {
     /// enqueued a writeback job. ENQUEUED, NOT DELIVERED. Always `false` for
     /// `started` (legacy-inert) and for a repeat that changed nothing.
     pub writeback_enqueued: bool,
+    /// Room signals this เสร็จแล้ว report auto-completed (ADR 0008) — the
+    /// room's live ทำห้องนี้ก่อน / แขกเช็คเอาท์แล้ว, closed in THIS call's
+    /// transaction with `done_source = 'clean_report'`. Empty for `started` /
+    /// `dirty` and whenever the room had none.
+    ///
+    /// Not rendered in the `/hk` cleaning response: both boards already learn
+    /// about the closures from the `RoomSignalCompleted` frames this call
+    /// published, and adding them to that response would give the maid surface
+    /// two sources of truth for the same fact. It is here so the closure is
+    /// assertable from a test without reading the table back.
+    pub auto_completed_signals: Vec<crate::domain::hk_signal::RoomSignal>,
 }
 
 /// Service handle for the housekeeping aggregate.
@@ -555,6 +566,33 @@ impl HousekeepingService {
 
         let aggregate_id = aggregate_uuid(AggregateKind::Room, cmd.room_id);
 
+        // 1b. ADR 0008: a maid's เสร็จแล้ว report auto-completes that room's
+        // live cleaning-urgency signals (ทำห้องนี้ก่อน, แขกเช็คเอาท์แล้ว),
+        // recorded as completed by her report. IN THIS TRANSACTION — the
+        // closure must not be able to survive a rolled-back cleaning report,
+        // nor be lost when one commits.
+        //
+        // Placed HERE, before the status branch, deliberately: every early
+        // return below (`started`, an idempotent no-op, a suppressed mirror
+        // repair) still commits this tx, and a เสร็จแล้ว tap on an ALREADY-clean
+        // room is exactly the case where the signals are most likely to still
+        // be open. Gating the sweep on the cleanliness flip would strand them.
+        //
+        // ขอเช็คห้อง is deliberately NOT swept — see
+        // `domain::hk_signal::CLEAN_REPORT_AUTO_COMPLETE_TYPES`.
+        let auto_completed = if cmd.status == CleaningProgressStatus::Done {
+            crate::service::hk_signals::auto_complete_clean_report(
+                &mut tx,
+                cmd.room_id,
+                &cmd.badge,
+                cmd.name.as_deref(),
+                cmd.source.clone(),
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
         // 2. Branch on status: only the two terminal states touch cleanliness.
         let (intent, event) = match cmd.status {
             CleaningProgressStatus::Started => {
@@ -574,6 +612,7 @@ impl HousekeepingService {
                     room_id: cmd.room_id,
                     event_id,
                     writeback_enqueued: false,
+                    auto_completed_signals: auto_completed.clone(),
                 });
             }
             // `done` and `dirty` are ONE path with opposite polarity — the D1
@@ -625,6 +664,7 @@ impl HousekeepingService {
                             room_id: cmd.room_id,
                             event_id,
                             writeback_enqueued: false,
+                            auto_completed_signals: auto_completed.clone(),
                         });
                     }
                     CleanlinessDecision::Transition => {
@@ -643,6 +683,7 @@ impl HousekeepingService {
                                 room_id: cmd.room_id,
                                 event_id,
                                 writeback_enqueued: false,
+                                auto_completed_signals: auto_completed.clone(),
                             });
                         }
                     }
@@ -658,6 +699,7 @@ impl HousekeepingService {
                                 room_id: cmd.room_id,
                                 event_id,
                                 writeback_enqueued: false,
+                                auto_completed_signals: auto_completed.clone(),
                             });
                         }
                         // Operator signal, same family as `routes::hk`'s
@@ -695,6 +737,7 @@ impl HousekeepingService {
             room_id: cmd.room_id,
             event_id,
             writeback_enqueued: true,
+            auto_completed_signals: auto_completed,
         })
     }
 

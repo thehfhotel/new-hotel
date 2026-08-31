@@ -26,27 +26,36 @@
 // maid sees it: reception's reason for opening this screen is to READ it. The
 // hiding is UX only; the server refuses a viewer's POST with 403 regardless.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
 import {
   AlertCircle,
   AlertTriangle,
+  Bell,
   Check,
   ChevronLeft,
   Info,
   Loader2,
   Minus,
   Plus,
+  Send,
   Shirt,
   Sparkles,
 } from 'lucide-react'
 import {
+  actOnHkSignal,
+  answerHkRoomCheck,
+  canActOnSignal,
+  canCancelSignal,
   canReport,
   clampLinenQty,
   emptyLinenCounts,
+  fetchHkSignals,
   hkFetch,
   hkFetchMe,
+  isIncomingSignal,
+  isRoomCheck,
   legacyStatusNote,
   LINEN_KINDS,
   LINEN_MAX_QTY,
@@ -55,12 +64,23 @@ import {
   linenShortageSummary,
   linenShortageTag,
   markDirtyConfirmMessage,
+  mergeSignal,
+  mergeSignals,
   movementTags,
   occupancyIndicator,
   progressLabel,
   readStoredBranch,
   resolveInitialBranch,
   roomCleanChip,
+  ROOM_CHECK_PROBLEMS,
+  sendableSignals,
+  sendHkSignal,
+  signalActorLabel,
+  signalLabel,
+  signalOriginLabel,
+  signalRole,
+  signalStatusLabel,
+  signalsForRoom,
   timeLabel,
   type Branch,
   type CleaningStatus,
@@ -70,8 +90,12 @@ import {
   type LinenCounts,
   type LinenKind,
   type LinenShortageItem,
+  type RoomCheckProblem,
+  type RoomSignal,
+  type SignalType,
 } from '../../hk-lib'
 import { useHkAutoRefresh } from '../../use-hk-auto-refresh'
+import { playHkSignalCue, useHkSignalEvents } from '../../use-hk-signal-events'
 
 export default function HkRoomPage() {
   const params = useParams<{ roomId: string }>()
@@ -108,6 +132,24 @@ export default function HkRoomPage() {
   const [linenOpen, setLinenOpen] = useState(false)
   const [linenCounts, setLinenCounts] = useState<LinenCounts>(emptyLinenCounts)
   const [linenPosting, setLinenPosting] = useState(false)
+
+  // Room signals (ADR 0008). The branch's whole live list is held — that is
+  // what both `/signals` and the SSE stream deliver — and `signalsForRoom`
+  // narrows it to this room for rendering. A ref mirrors it so the sound cue
+  // can tell a NEW arrival from an echo without waiting for a state flush.
+  const [signals, setSignals] = useState<RoomSignal[]>([])
+  const signalsRef = useRef<RoomSignal[]>([])
+  // WHICH signal write is in flight, as `"<action>:<id|type>"` — one at a
+  // time, for the same reason the two report paths above share a lock (two
+  // acks from one thumb is never what she meant), and keyed by action rather
+  // than by row so the spinner lands on the exact button that was tapped.
+  const [signalBusy, setSignalBusy] = useState<string | null>(null)
+  // The send panel expands in place, exactly like แจ้งขาดผ้า: the first tap
+  // opens a list of canned types and files NOTHING.
+  const [sendOpen, setSendOpen] = useState(false)
+  // Per-ขอเช็คห้อง problem toggles, keyed by signalId — the maid may find both
+  // มีของหาย and มีของเสียหาย in one room, and the answer carries both.
+  const [problemDraft, setProblemDraft] = useState<Record<number, RoomCheckProblem[]>>({})
 
   // Resolve the already-chosen branch from storage; only /hk itself may pick
   // one. `resolveInitialBranch` still discards a stale value (branch removed
@@ -179,7 +221,142 @@ export default function HkRoomPage() {
   // background re-render mid-submit is exactly when a half-counted report gets
   // lost.
   const refreshDetail = useCallback(() => load(true), [load])
-  useHkAutoRefresh(refreshDetail, Boolean(branch) && posting === null && !linenPosting)
+  useHkAutoRefresh(
+    refreshDetail,
+    Boolean(branch) && posting === null && !linenPosting && signalBusy === null
+  )
+
+  // --- room signals (ADR 0008) ---------------------------------------------
+  //
+  // Their own request, their own failure story: a signals read that fails must
+  // cost the signal list, never the room screen. Nothing in this block raises
+  // the page's error banner on a READ — only on an action the user just took,
+  // where silence would be a lie.
+  const role = signalRole(canReportFlag)
+
+  const applySignals = useCallback((next: RoomSignal[]) => {
+    signalsRef.current = next
+    setSignals(next)
+  }, [])
+
+  const loadSignals = useCallback(async () => {
+    if (!branch) return
+    try {
+      applySignals(await fetchHkSignals(branch))
+    } catch {
+      /* keep what is on screen; the stream or the poll will catch up */
+    }
+  }, [branch, applySignals])
+
+  useEffect(() => {
+    if (branch) loadSignals()
+  }, [branch, loadSignals])
+
+  const handleSignal = useCallback(
+    (signal: RoomSignal) => {
+      const isNew = !signalsRef.current.some((s) => s.signalId === signal.signalId)
+      applySignals(mergeSignal(signalsRef.current, signal))
+      // Only a new signal aimed at THIS role, and only for THIS room: a maid
+      // standing in 104 does not need a chime for the desk's request about
+      // 312 — she is looking at 104, and the list screen already carries the
+      // branch-wide cue.
+      if (isNew && signal.roomId === roomId && isIncomingSignal(signal, role)) {
+        playHkSignalCue()
+      }
+    },
+    [role, roomId, applySignals]
+  )
+
+  const signalsLive = useHkSignalEvents(branch, handleSignal, Boolean(branch))
+  useHkAutoRefresh(loadSignals, Boolean(branch) && !signalsLive && signalBusy === null)
+
+  /** Run one signal write, merge whatever the server hands back, and say so.
+   * Every signal action goes through here so the busy lock, the banners and
+   * the merge cannot drift apart between five call sites. */
+  const runSignalAction = async (
+    key: string,
+    successNotice: string,
+    action: () => Promise<RoomSignal[]>
+  ) => {
+    if (!branch) return
+    setSignalBusy(key)
+    setNotice(null)
+    try {
+      const updated = await action()
+      applySignals(mergeSignals(signalsRef.current, updated))
+      setError(null)
+      setNotice(successNotice)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setSignalBusy(null)
+    }
+  }
+
+  const sendSignal = (type: SignalType, label: string) =>
+    runSignalAction(`send:${type}`, `ส่งแล้ว: ${label}`, async () => {
+      const signal = await sendHkSignal(branch, roomId, type)
+      // Only a landed signal closes the panel — a failure leaves it open so
+      // the retry is one tap, not four.
+      setSendOpen(false)
+      return [signal]
+    })
+
+  const ackSignal = (signal: RoomSignal) =>
+    runSignalAction(`ack:${signal.signalId}`, 'บันทึกแล้ว: รับทราบ', async () => [
+      await actOnHkSignal(branch, signal.signalId, 'ack'),
+    ])
+
+  const doneSignal = (signal: RoomSignal) =>
+    runSignalAction(`done:${signal.signalId}`, 'บันทึกแล้ว: เสร็จสิ้น', async () => [
+      await actOnHkSignal(branch, signal.signalId, 'done'),
+    ])
+
+  const cancelSignal = (signal: RoomSignal) =>
+    runSignalAction(`cancel:${signal.signalId}`, 'ยกเลิกแล้ว', async () => [
+      await actOnHkSignal(branch, signal.signalId, 'cancel'),
+    ])
+
+  const answerRoomCheck = (signal: RoomSignal, problems: RoomCheckProblem[]) =>
+    runSignalAction(
+      problems.length === 0
+        ? `answer-clear:${signal.signalId}`
+        : `answer-problems:${signal.signalId}`,
+      problems.length === 0 ? 'ส่งคำตอบแล้ว: เคลียร์' : 'ส่งคำตอบแล้ว',
+      async () => {
+        const { signal: answered, spawned } = await answerHkRoomCheck(
+          branch,
+          signal.signalId,
+          problems.length === 0
+            ? { outcome: 'clear' }
+            : { outcome: 'problems', problems }
+        )
+        // The draft has done its job; a stale set of toggles behind a
+        // completed check is a trap for the next one on the same room.
+        setProblemDraft((prev) => {
+          const next = { ...prev }
+          delete next[signal.signalId]
+          return next
+        })
+        // The children (one per problem) come back in the SAME transaction and
+        // must appear together with the answered check's removal.
+        return [answered, ...spawned]
+      }
+    )
+
+  const toggleProblem = (signalId: number, problem: RoomCheckProblem) => {
+    setProblemDraft((prev) => {
+      const current = prev[signalId] ?? []
+      const next = current.includes(problem)
+        ? current.filter((p) => p !== problem)
+        : // Kept in ROOM_CHECK_PROBLEMS order, so the body reads the same way
+          // the buttons did however they were tapped.
+          ROOM_CHECK_PROBLEMS.filter(
+            ({ type }) => type === problem || current.includes(type)
+          ).map(({ type }) => type)
+      return { ...prev, [signalId]: next }
+    })
+  }
 
   const reportCleaning = async (status: CleaningStatus) => {
     if (!branch) return
@@ -204,6 +381,12 @@ export default function HkRoomPage() {
             : 'บันทึกแล้ว: เริ่มทำความสะอาด'
       )
       await load()
+      // A เสร็จแล้ว report auto-completes this room's open/acked ทำห้องนี้ก่อน
+      // and แขกเช็คเอาท์แล้ว server-side, in the SAME transaction (ADR 0008 /
+      // CONTEXT.md §Housekeeping). Those rows are now done, so re-read them —
+      // otherwise the maid is left looking at requests she has just satisfied
+      // and will tap เสร็จสิ้น on each of them for nothing.
+      if (status === 'done') await loadSignals()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
@@ -314,6 +497,15 @@ export default function HkRoomPage() {
   // selected", so the button and the request can never disagree.
   const linenItems = linenShortageItems(linenCounts)
 
+  // Signals for THIS room, oldest first — the order they must be worked. The
+  // signal controls have their own lock (`signalBusy`) rather than sharing
+  // `busy`: acking the desk's ขอเช็คห้อง while a linen report is in flight is
+  // a perfectly sensible thing to do, and a guest is waiting on it.
+  const roomSignals = signalsForRoom(signals, roomId)
+  const signalsBusy = signalBusy !== null
+  const sendable = sendableSignals(role)
+  const sendPanelLabel = role === 'maid' ? 'แจ้งแผนกต้อนรับ' : 'แจ้งแม่บ้าน'
+
   return (
     <main>
       {/* Back + header */}
@@ -415,6 +607,223 @@ export default function HkRoomPage() {
               {room.building ? ` · ${room.building}` : ''}
             </p>
           </header>
+
+          {/* ------------------------------------------------------------- *
+           * ROOM SIGNALS (ADR 0008). Canned, one-room notices between the
+           * desk and the maids — deliberately NOT a chat: there is no free
+           * text here, and the ADR's Consequences section asks anyone tempted
+           * to add some to read its Context first.
+           *
+           * Placed ABOVE the cleaning buttons on purpose. For a maid the top
+           * item is frequently ขอเช็คห้อง, which means a guest is standing at
+           * the reception counter waiting for her answer — the most urgent
+           * thing on this screen, and it must not sit below a form. For a
+           * reception viewer this section IS the screen: it is the only place
+           * she can act, and everything below it is read-only for her.
+           * ------------------------------------------------------------- */}
+          <section className="mb-6" data-testid="hk-signals">
+            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-gray-600">
+              <Bell className="h-4 w-4 text-indigo-600" />
+              งานแจ้งของห้องนี้
+            </h2>
+
+            {roomSignals.length === 0 ? (
+              <p className="text-xs text-gray-400">ยังไม่มีงานแจ้งของห้องนี้</p>
+            ) : (
+              <ul className="space-y-2">
+                {roomSignals.map((signal) => {
+                  const actionable = canActOnSignal(signal, role)
+                  const cancellable = canCancelSignal(signal, role)
+                  const problems = problemDraft[signal.signalId] ?? []
+                  const sender = signalActorLabel(signal.createdBy)
+                  return (
+                    <li
+                      key={signal.signalId}
+                      data-testid={`hk-signal-${signal.signalId}`}
+                      className={`rounded-xl border p-3 ${
+                        isRoomCheck(signal)
+                          ? 'border-indigo-300 bg-indigo-50'
+                          : 'border-gray-200 bg-white'
+                      }`}
+                    >
+                      <p className="text-base font-semibold text-gray-900">
+                        {signalLabel(signal.type)}
+                      </p>
+                      <p className="mt-0.5 text-xs text-gray-500">
+                        {signalOriginLabel(signal, role)}
+                        {sender ? ` · ${sender}` : ''}
+                        {` · ${timeLabel(signal.createdAt)}`}
+                      </p>
+                      <p
+                        className={`text-xs ${
+                          signal.status === 'acked' ? 'text-emerald-700' : 'text-gray-500'
+                        }`}
+                      >
+                        {signalStatusLabel(signal)}
+                      </p>
+
+                      {/* ขอเช็คห้อง cannot be closed by a bare tap: the desk
+                          needs an ANSWER (CONTEXT.md §Housekeeping). เคลียร์
+                          is one tap because it is the common case and a guest
+                          is waiting; the two problem toggles are laid out flat
+                          beside it rather than behind an expand, for the same
+                          reason. ส่งคำตอบ stays dead until at least one is on,
+                          so it can never send an empty `problems` list. */}
+                      {actionable && isRoomCheck(signal) && (
+                        <div className="mt-3 space-y-2">
+                          <button
+                            type="button"
+                            onClick={() => answerRoomCheck(signal, [])}
+                            disabled={signalsBusy}
+                            className="flex min-h-[44px] w-full items-center justify-center rounded-lg border border-emerald-400 bg-emerald-600 px-3 py-3 text-sm font-semibold text-white active:bg-emerald-700 disabled:opacity-50"
+                          >
+                            {signalBusy === `answer-clear:${signal.signalId}` ? (
+                              <Loader2 className="h-5 w-5 animate-spin" />
+                            ) : (
+                              'เคลียร์'
+                            )}
+                          </button>
+                          <div className="grid grid-cols-2 gap-2">
+                            {ROOM_CHECK_PROBLEMS.map(({ type, label }) => {
+                              const on = problems.includes(type)
+                              return (
+                                <button
+                                  key={type}
+                                  type="button"
+                                  aria-pressed={on}
+                                  onClick={() => toggleProblem(signal.signalId, type)}
+                                  disabled={signalsBusy}
+                                  className={`min-h-[44px] rounded-lg border px-3 py-3 text-sm font-semibold disabled:opacity-50 ${
+                                    on
+                                      ? 'border-red-500 bg-red-600 text-white'
+                                      : 'border-red-300 bg-white text-red-700 active:bg-red-50'
+                                  }`}
+                                >
+                                  {label}
+                                </button>
+                              )
+                            })}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => answerRoomCheck(signal, problems)}
+                            disabled={signalsBusy || problems.length === 0}
+                            className="flex min-h-[44px] w-full items-center justify-center rounded-lg border border-red-400 bg-white px-3 py-3 text-sm font-semibold text-red-700 active:bg-red-50 disabled:opacity-50"
+                          >
+                            {signalBusy === `answer-problems:${signal.signalId}` ? (
+                              <Loader2 className="h-5 w-5 animate-spin" />
+                            ) : (
+                              'ส่งคำตอบ'
+                            )}
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Every other type closes on a tap. รับทราบ disappears
+                          once somebody has taken it — the row already names
+                          who, and a second ack would only overwrite that. */}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {actionable && signal.status === 'open' && (
+                          <button
+                            type="button"
+                            onClick={() => ackSignal(signal)}
+                            disabled={signalsBusy}
+                            className="min-h-[44px] flex-1 rounded-lg border border-sky-400 bg-white px-3 py-3 text-sm font-semibold text-sky-800 active:bg-sky-50 disabled:opacity-50"
+                          >
+                            รับทราบ
+                          </button>
+                        )}
+                        {actionable && !isRoomCheck(signal) && (
+                          <button
+                            type="button"
+                            onClick={() => doneSignal(signal)}
+                            disabled={signalsBusy}
+                            className="flex min-h-[44px] flex-1 items-center justify-center rounded-lg border border-emerald-400 bg-emerald-600 px-3 py-3 text-sm font-semibold text-white active:bg-emerald-700 disabled:opacity-50"
+                          >
+                            {signalBusy === `done:${signal.signalId}` ? (
+                              <Loader2 className="h-5 w-5 animate-spin" />
+                            ) : (
+                              'เสร็จสิ้น'
+                            )}
+                          </button>
+                        )}
+                        {/* The sender's own escape hatch, and only while
+                            nobody has picked it up: once it is acked, someone
+                            is already walking to the room. */}
+                        {cancellable && (
+                          <button
+                            type="button"
+                            onClick={() => cancelSignal(signal)}
+                            disabled={signalsBusy}
+                            className="min-h-[44px] flex-1 rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                          >
+                            ยกเลิก
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+
+            {/* Sending one. The panel expands IN PLACE (the แจ้งขาดผ้า idiom):
+                the first tap opens a list of canned types and files NOTHING,
+                and each type then sends on a SINGLE tap.
+
+                No second confirm here, unlike แจ้งห้องไม่สะอาด, and the
+                difference is deliberate. Mark-dirty flips a real room in
+                iHOTEL, which the maid cannot undo from her phone — so it earns
+                a confirm. A signal is cancellable in place: a mis-tap appears
+                in the list directly above with its own ยกเลิก while it is
+                still open, and it writes nothing to iHOTEL at all. Adding a
+                confirm to a recoverable, frequent action is how confirms stop
+                being read on the one action that needs it. */}
+            {sendOpen ? (
+              <div className="mt-3 rounded-xl border border-indigo-300 bg-indigo-50 p-3">
+                <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold text-indigo-900">
+                  <Send className="h-4 w-4 shrink-0" />
+                  <span>{sendPanelLabel}</span>
+                </p>
+                <div className="space-y-2">
+                  {sendable.map(({ type, label }) => (
+                    <button
+                      key={type}
+                      type="button"
+                      onClick={() => sendSignal(type, label)}
+                      disabled={signalsBusy}
+                      className="flex min-h-[44px] w-full items-center justify-center rounded-lg border border-indigo-300 bg-white px-3 py-3 text-sm font-semibold text-indigo-900 active:bg-indigo-100 disabled:opacity-50"
+                    >
+                      {signalBusy === `send:${type}` ? (
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      ) : (
+                        label
+                      )}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSendOpen(false)}
+                  disabled={signalsBusy}
+                  className="mt-3 min-h-[44px] w-full rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                >
+                  ปิด
+                </button>
+              </div>
+            ) : (
+              /* Opens the list. Fires NO request. */
+              <button
+                type="button"
+                onClick={() => setSendOpen(true)}
+                disabled={signalsBusy}
+                className="mt-3 flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-xl border border-indigo-300 bg-indigo-50 px-3 py-3 text-sm font-semibold text-indigo-900 active:bg-indigo-100 disabled:opacity-50"
+              >
+                <Send className="h-4 w-4" />
+                {sendPanelLabel}
+              </button>
+            )}
+          </section>
 
           {/* Cleaning progress buttons, then what has already been reported. */}
           <section className="mb-6">

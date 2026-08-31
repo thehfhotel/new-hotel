@@ -15,14 +15,34 @@ import {
   V2Spinner,
   VilleNotice,
 } from '@/components/v2/primitives'
+import SignalsPanel from '@/components/v2/signals/SignalsPanel'
+import SendSignalMenu from '@/components/v2/signals/SendSignalMenu'
+import { useDeskSignalsCore } from '@/components/v2/signals/use-desk-signals'
+import {
+  SIGNAL_LIVE_EVENTS,
+  signalLabel,
+  signalTone,
+  signalsByRoomNo,
+  type RoomSignal,
+} from '@/components/v2/signals/signal-lib'
 
 /**
  * RECEPTION's housekeeping screen (v2), superseding the v1 kanban board at
- * `/housekeeping`. READ-ONLY by design: it adds zero write shapes — marking a
- * room clean or dirty stays on the maid surface (`/hk`) and in iHOTEL, so this
- * screen can never become a second, competing source of housekeeping truth.
+ * `/housekeeping`.
  *
- * Everything comes from ONE read, `GET /api/housekeeping/cleaning`:
+ * READ-ONLY ABOUT CLEANLINESS, by design: it still adds zero clean/dirty write
+ * shapes — marking a room clean or dirty stays on the maid surface (`/hk`) and
+ * in iHOTEL, so this screen can never become a second, competing source of
+ * housekeeping truth.
+ *
+ * What it now DOES write is room signals (ADR 0008): canned, room-scoped
+ * notices between reception and maids. They are a separate domain object with
+ * their own table and no legacy mirror — sending ทำห้องนี้ก่อน asserts nothing
+ * about whether the room is clean, so the invariant above is untouched. The
+ * signal client, its endpoints and its rules live in
+ * `components/v2/signals/`.
+ *
+ * The cleaning half comes from ONE read, `GET /api/housekeeping/cleaning`:
  *
  * - `housekeeping[]` — EVERY active room on the derived housekeeping axis,
  *   already merged iHOTEL-wins by the backend. This is what the three groups
@@ -72,6 +92,13 @@ interface CleaningBoardResponse {
  *  stream on every render. */
 const CLEANING_LIVE_EVENTS = ['RoomMarkedClean', 'RoomMarkedDirty', 'RoomCleaningStarted']
 
+/** ONE stream for the whole screen: the cleaning events plus the ADR 0008
+ *  signal events, folded into the board's single `useLiveRefresh`. The signals
+ *  client is therefore the no-subscription `useDeskSignalsCore` — a second
+ *  EventSource to the same relay would buy nothing and burn one of the
+ *  browser's six per-host connections. */
+const BOARD_LIVE_EVENTS = [...CLEANING_LIVE_EVENTS, ...SIGNAL_LIVE_EVENTS]
+
 /** Belt to the SSE braces, matching the v1 board's interval: this only covers
  *  a missed or dropped stream, so 60s (not 30s) is deliberate. */
 const SAFETY_POLL_MS = 60000
@@ -79,6 +106,10 @@ const SAFETY_POLL_MS = 60000
 /** Worst first — a receptionist scanning this screen is looking for what is
  *  not ready yet, not for what already is. */
 const GROUP_ORDER: HkStatus[] = ['dirty', 'cleaning', 'clean']
+
+/** Stable identity for "this room has no signals", so a row without any does
+ *  not get a fresh array (and a re-render) on every board refresh. */
+const EMPTY_SIGNALS: RoomSignal[] = []
 
 /** `cleaning` shares the dirt tone with `dirty` (see `vacantHkView` in
  *  lib/v2/status.ts): neither is sellable-clean. The group heading is what
@@ -150,14 +181,38 @@ export function groupRoomsByHkStatus(
   return groups
 }
 
-function RoomRow({ room, progress }: { room: HousekeepingRoom; progress?: CleaningEvent }) {
+function RoomRow({
+  room,
+  progress,
+  signals,
+  roomId,
+  sending,
+  onSend,
+}: {
+  room: HousekeepingRoom
+  progress?: CleaningEvent
+  /** This room's open/acked signals — the per-room indication (ADR 0008). */
+  signals: RoomSignal[]
+  /** `/api/housekeeping/cleaning` carries only `roomNo`, so the id for the
+   *  send endpoint is resolved from the room list. Undefined ⇒ no send action
+   *  on this row rather than a POST to an invented id. */
+  roomId?: number
+  sending?: boolean
+  onSend?: (roomId: number, type: string) => void
+}) {
   return (
-    <div className="flex items-center gap-2.5 px-4 lg:px-5 py-2.5">
+    <div className="flex flex-wrap items-center gap-2.5 px-4 lg:px-5 py-2.5">
       <span className="v2-num text-[14px] font-semibold" style={{ color: 'var(--v2-ink)' }}>
         {room.roomNo}
       </span>
 
       {room.divergent && <span className="v2-pill s-fix">{DIVERGENT_BADGE}</span>}
+
+      {signals.map((signal) => (
+        <span key={signal.signalId} className={`v2-pill s-${signalTone(signal)}`}>
+          {signalLabel(signal.type)}
+        </span>
+      ))}
 
       <div className="flex-1" />
 
@@ -169,6 +224,15 @@ function RoomRow({ room, progress }: { room: HousekeepingRoom; progress?: Cleani
           <User size={13} />
           {reporterName(progress)} · {formatEventTime(progress.at)}
         </span>
+      )}
+
+      {roomId !== undefined && onSend && (
+        <SendSignalMenu
+          roomId={roomId}
+          roomNo={room.roomNo}
+          busy={sending}
+          onSend={onSend}
+        />
       )}
     </div>
   )
@@ -224,12 +288,55 @@ export default function V2Housekeeping() {
     return () => clearInterval(interval)
   }, [fetchBoard])
 
-  const live = useLiveRefresh(branch, CLEANING_LIVE_EVENTS, fetchBoard)
+  // ADR 0008 room signals. `Core` = no stream of its own; this page folds the
+  // signal events into the single subscription below.
+  const deskSignals = useDeskSignalsCore()
+  const refreshSignals = deskSignals.refresh
+
+  // `/api/housekeeping/cleaning` returns room NUMBERS only, but sending a
+  // signal needs the room ID. Resolved once per branch off the same room list
+  // the rooms board reads; a row whose number is unresolved simply shows no
+  // send action (never a POST to a guessed id).
+  const [roomIds, setRoomIds] = useState<Map<string, number>>(new Map())
+  useEffect(() => {
+    let cancelled = false
+    branchFetch('/api/rooms?limit=300')
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        if (cancelled || !payload) return
+        const list = (payload.data ?? payload) as unknown
+        if (!Array.isArray(list)) return
+        const pairs = list
+          .filter(
+            (room): room is { id: number; roomNo: string } =>
+              typeof room?.id === 'number' && typeof room?.roomNo === 'string',
+          )
+          .map((room) => [room.roomNo, room.id] as const)
+        setRoomIds(new Map(pairs))
+      })
+      .catch(() => {
+        /* send actions stay hidden; the board itself is unaffected */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [branchFetch])
+
+  const refreshAll = useCallback(() => {
+    fetchBoard()
+    refreshSignals()
+  }, [fetchBoard, refreshSignals])
+
+  const live = useLiveRefresh(branch, BOARD_LIVE_EVENTS, refreshAll)
 
   const rooms = useMemo(() => board?.housekeeping ?? [], [board])
   const groups = useMemo(() => groupRoomsByHkStatus(rooms), [rooms])
   const progress = useMemo(() => progressByRoomNo(board?.data ?? []), [board])
   const hasDivergence = rooms.some((room) => room.divergent)
+  const signalsByRoom = useMemo(
+    () => signalsByRoomNo(deskSignals.signals),
+    [deskSignals.signals],
+  )
 
   // `=== true` only — a backend that stops sending the flag (rollback) must
   // read as "nothing to say", never as a permanent warning banner.
@@ -260,6 +367,32 @@ export default function V2Housekeeping() {
         </div>
       )}
 
+      {deskSignals.error && (
+        <div
+          className="v2-card flex items-start gap-3 px-4 py-3"
+          style={{ borderColor: 'var(--v2-fix)', background: 'var(--v2-fix-bg)' }}
+          role="alert"
+        >
+          <AlertCircle size={18} className="mt-0.5 shrink-0" style={{ color: 'var(--v2-fix)' }} />
+          <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
+            {deskSignals.error}
+          </p>
+        </div>
+      )}
+
+      {/* Room signals sit ABOVE the cleaning groups: a signal is somebody
+          waiting on reception right now, while the groups are the state of the
+          floor. Hidden entirely in the aggregate ("ทั้งหมด") view, which has no
+          single branch to scope a signal to. */}
+      {deskSignals.enabled && (
+        <SignalsPanel
+          signals={deskSignals.signals}
+          busySignalId={deskSignals.busySignalId}
+          loading={deskSignals.loading}
+          onAct={deskSignals.act}
+        />
+      )}
+
       {loading ? (
         <V2Spinner label="กำลังโหลดสถานะความสะอาด…" />
       ) : rooms.length === 0 ? (
@@ -278,7 +411,15 @@ export default function V2Housekeeping() {
               ) : (
                 <div className="divide-y" style={{ borderColor: 'var(--v2-line)' }}>
                   {groups[status].map((room) => (
-                    <RoomRow key={room.roomNo} room={room} progress={progress.get(room.roomNo)} />
+                    <RoomRow
+                      key={room.roomNo}
+                      room={room}
+                      progress={progress.get(room.roomNo)}
+                      signals={signalsByRoom.get(room.roomNo) ?? EMPTY_SIGNALS}
+                      roomId={deskSignals.enabled ? roomIds.get(room.roomNo) : undefined}
+                      sending={deskSignals.sendingRoomId === roomIds.get(room.roomNo)}
+                      onSend={deskSignals.send}
+                    />
                   ))}
                 </div>
               )}

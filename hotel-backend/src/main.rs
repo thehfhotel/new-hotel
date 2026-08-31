@@ -991,6 +991,34 @@ fn build_new_routes(app_state: AppState, room_flags_readers: RoomFlagsReaders) -
             "/api/housekeeping/cleaning",
             get(routes::housekeeping::list_cleaning_progress),
         )
+        // Room signals — the DESK half of ADR 0008 (migration 089). Same
+        // request/response shapes and the same service as the `/hk` twins, so
+        // reception and the maid surface cannot answer the same action
+        // differently; the role here is constantly `SignalRole::Desk`.
+        // PG-canonical only: no writeback intent, no legacy write. Unlike the
+        // `/hk` paths these are NOT ville-guard-exempt — an exemption exists so
+        // a maid's work is not collateral damage of a FRONT-DESK write-policy
+        // toggle, and these are front-desk mutations.
+        .route(
+            "/api/housekeeping/signals",
+            get(routes::housekeeping::list_signals),
+        )
+        .route(
+            "/api/housekeeping/rooms/{id}/signals",
+            post(routes::housekeeping::raise_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/ack",
+            post(routes::housekeeping::ack_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/done",
+            post(routes::housekeeping::done_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/cancel",
+            post(routes::housekeeping::cancel_signal),
+        )
         // Bookings CRUD (canonical)
         .route(
             "/api/bookings",

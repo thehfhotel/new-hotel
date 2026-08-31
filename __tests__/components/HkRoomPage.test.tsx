@@ -30,6 +30,10 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 
 const mockHkFetch = jest.fn()
 const mockHkFetchMe = jest.fn()
+// The room-signal reads (ADR 0008) are a SEPARATE concern with their own
+// suite (`HkRoomSignals.test.tsx`); stubbed empty here so this file keeps
+// asserting only what it was written for — the cleaning/linen surface.
+const mockFetchHkSignals = jest.fn()
 
 jest.mock('next/navigation', () => ({
   useParams: () => ({ roomId: '7' }),
@@ -41,6 +45,7 @@ jest.mock('@/app/hk/hk-lib', () => {
     ...actual,
     hkFetch: (...args: unknown[]) => mockHkFetch(...args),
     hkFetchMe: (...args: unknown[]) => mockHkFetchMe(...args),
+    fetchHkSignals: (...args: unknown[]) => mockFetchHkSignals(...args),
   }
 })
 
@@ -96,6 +101,7 @@ async function renderRoom(detail: Record<string, unknown>) {
 beforeEach(() => {
   jest.clearAllMocks()
   localStorage.clear()
+  mockFetchHkSignals.mockResolvedValue([])
 })
 
 describe('mark-dirty confirm step (R2b)', () => {
@@ -756,12 +762,19 @@ describe('viewer mode (reception grant — canReport: false)', () => {
   })
 
   // THE assertion: there is no control on this screen a receptionist could tap
-  // to file anything — not a disabled one, not a hidden one. `markDirtyEnabled`
-  // is TRUE in this `/me` payload, so this also proves the viewer gate wins
-  // over the mark-dirty flag rather than merely agreeing with it.
-  it('offers no tappable control at all, and fires no POST', async () => {
+  // to file a CLEANING or LINEN report — not a disabled one, not a hidden one.
+  // `markDirtyEnabled` is TRUE in this `/me` payload, so this also proves the
+  // viewer gate wins over the mark-dirty flag rather than merely agreeing.
+  //
+  // The one control she does get is the room-signal send panel (ADR 0008) —
+  // the desk's own half of the conversation, which is hers to use and files
+  // nothing about cleaning. Asserted as an exact list rather than "no buttons"
+  // so a future action leaking into viewer mode still fails this test.
+  it('offers no cleaning or linen control, and fires no POST', async () => {
     await renderAs({ canReport: false })
-    expect(screen.queryAllByRole('button')).toHaveLength(0)
+    expect(screen.queryAllByRole('button').map((b) => b.textContent)).toEqual([
+      'แจ้งแม่บ้าน',
+    ])
     expect(postCalls()).toHaveLength(0)
   })
 
