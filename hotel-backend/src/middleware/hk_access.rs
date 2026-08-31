@@ -31,9 +31,36 @@
 //!   uppercased to match the canonical badge format). No badge ⇒ 401.
 //! * **Grant re-check** (defence-in-depth on top of the edge policy): when an
 //!   `apps` claim IS present (`custom.apps` or top-level), it must contain
-//!   [`HK_GRANT`] (`"housekeeping"`) or the request is rejected 403. When the
-//!   claim is absent the edge policy remains the (sole) authority — CF only
-//!   lets granted employees through in the first place.
+//!   [`HK_GRANT`] (`"housekeeping"`) or [`RECEPTION_GRANT`] (`"reception"`) or
+//!   the request is rejected 403. When the claim is absent the edge policy
+//!   remains the (sole) authority — CF only lets granted employees through in
+//!   the first place.
+//!
+//! ## Two roles on one surface (reception viewer, 2026-09)
+//!
+//! The `/hk` room board is also what reception wants at the desk: "which rooms
+//! are clean right now". That is a READ of the same data, so rather than
+//! duplicating the surface we admit the `reception` grant here as a READ-ONLY
+//! viewer and resolve the capability ONCE, into [`HkIdentity::can_report`]:
+//!
+//! | `apps` claim contains | admitted | `can_report` |
+//! |---|---|---|
+//! | `housekeeping` (± `reception`) | yes | `true` |
+//! | `reception` only | yes | `false` |
+//! | neither | **no — 403** | — |
+//! | claim absent entirely | yes (edge policy) | `true` (see below) |
+//!
+//! Downstream (`routes::hk`) never re-parses `apps`: it reads the resolved
+//! boolean, which is what keeps the two mutations' refusal and the `/api/hk/me`
+//! payload from drifting apart.
+//!
+//! **The absent-claim row is deliberately permissive, and it is a preserved
+//! behavior, not a new one.** Before this change an apps-less token was
+//! admitted with the full maid capability; making it `can_report = false` would
+//! 403 a real maid the moment Cloudflare stopped forwarding the claim. The HF
+//! ID IdP config forwards `apps` (`claims: ["apps", "badge"]`), so this row is
+//! the degraded path, and on it the Access policy is — as it has always been —
+//! the sole authority over what the token may do.
 //!
 //! ## Layering
 //!
@@ -56,7 +83,18 @@ use super::cf_access::{self, Jwk, JwkSet, CF_ACCESS_TEAM_DOMAIN};
 
 /// The HF ID grant key gating this surface (Access policy
 /// `HF ID grant: housekeeping`; managed per-employee in Employee Management).
+///
+/// It is the grant that carries the WRITE capability — see [`HkRole`].
 pub const HK_GRANT: &str = "housekeeping";
+
+/// The HF ID grant key that opens this surface READ-ONLY (Access policy
+/// `HF ID grant: reception`; a NEW grant minted 2026-09 in HF ID's app
+/// catalog — granted per employee in Employee Management, like housekeeping).
+///
+/// It admits the room board and refuses every mutation. Holding it ALONGSIDE
+/// [`HK_GRANT`] changes nothing — housekeeping wins, because a capability
+/// union of "full" and "read-only" is "full".
+pub const RECEPTION_GRANT: &str = "reception";
 
 /// Env var carrying the housekeeping Access application's AUD tag. No baked-in
 /// default — unset means the surface is not wired yet and MUST fail closed.
@@ -67,6 +105,32 @@ pub const HK_AUD_ENV: &str = "CF_ACCESS_HK_AUD";
 /// auto-fills on approval). Used only as the LAST-RESORT badge derivation when
 /// the explicit `badge` claim is missing.
 const SYNTHETIC_EMAIL_DOMAIN: &str = "@emp.thehfhotel.org";
+
+/// What a verified identity may DO on the `/hk` surface, resolved from the
+/// `apps` grant list ONCE by [`role_from_apps`].
+///
+/// Two variants and no `None`: an identity that resolves to neither never
+/// becomes an [`HkIdentity`] at all — it is [`HkAccessError::NotGranted`], and
+/// making that a `Result` rather than a third variant is what stops a
+/// downstream `match` from accidentally treating "no grant" as a weak role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HkRole {
+    /// Holds [`HK_GRANT`] — the maid surface exactly as it has always been:
+    /// reads AND the cleaning / linen-shortage reports.
+    Housekeeping,
+    /// Holds [`RECEPTION_GRANT`] but NOT [`HK_GRANT`] — the desk's read-only
+    /// room board. Every mutation is refused by `routes::hk`.
+    ReceptionViewer,
+}
+
+impl HkRole {
+    /// May this role file a report (`POST …/cleaning`, `POST
+    /// …/linen-shortage`)? THE capability question this whole role exists to
+    /// answer, and the only one `routes::hk` asks.
+    pub fn can_report(self) -> bool {
+        matches!(self, HkRole::Housekeeping)
+    }
+}
 
 /// A verified maid identity extracted from a valid housekeeping-app assertion.
 #[derive(Debug, Clone)]
@@ -79,6 +143,14 @@ pub struct HkIdentity {
     /// The CF-asserted email (synthetic for LINE-only employees). Logged for
     /// audit; not used as an identity key.
     pub email: Option<String>,
+    /// May this identity file reports? `true` for [`HK_GRANT`] holders (and
+    /// for the apps-less edge-policy path), `false` for a
+    /// [`RECEPTION_GRANT`]-only viewer — see [`HkRole::can_report`].
+    ///
+    /// Resolved HERE, once, from the verified claims. `routes::hk` reads this
+    /// boolean and never re-parses `apps`, so there is exactly one place where
+    /// a grant becomes a permission.
+    pub can_report: bool,
 }
 
 /// Errors from the housekeeping Access verification path. Coarse on purpose —
@@ -107,9 +179,9 @@ pub enum HkAccessError {
     #[error("verified token carries no badge claim")]
     NoBadge,
 
-    /// Token verified and carries an `apps` grant list, but the list does not
-    /// contain the `housekeeping` grant.
-    #[error("verified token does not grant '{HK_GRANT}'")]
+    /// Token verified and carries an `apps` grant list, but the list contains
+    /// NEITHER the `housekeeping` grant nor the `reception` one.
+    #[error("verified token grants neither '{HK_GRANT}' nor '{RECEPTION_GRANT}'")]
     NotGranted,
 }
 
@@ -129,6 +201,10 @@ impl HkAccessError {
 impl IntoResponse for HkAccessError {
     fn into_response(self) -> Response {
         let message = match self {
+            // Deliberately UNCHANGED by the reception-viewer work. The body is
+            // coarse by design (detail stays in logs, where the `Display` impl
+            // now names both grants), and a no-grant identity's wire answer is
+            // one of the behaviors this surface promises to keep byte-stable.
             HkAccessError::NotGranted => "housekeeping grant required",
             _ => "unauthenticated",
         };
@@ -266,19 +342,48 @@ pub fn verify_hk_token(
     Err(last_err)
 }
 
-/// Turn VERIFIED claims into an [`HkIdentity`]: badge required, grant
-/// re-checked when the `apps` claim is present.
-fn identity_from_claims(claims: &Value) -> Result<HkIdentity, HkAccessError> {
-    if let Some(apps) = extract_apps(claims) {
-        if !apps.iter().any(|app| app == HK_GRANT) {
-            return Err(HkAccessError::NotGranted);
-        }
+/// THE GRANT → ROLE MAPPING. PURE, total, and table-tested below.
+///
+/// `None` means "neither grant" ⇒ [`HkAccessError::NotGranted`] (403).
+///
+/// Both comparisons are EXACT EQUALITY, never `starts_with` / `contains`, and
+/// that is load-bearing twice over: `"housekeeping_admin"` has `"housekeeping"`
+/// as a prefix (it widens branches, it is not a way in — see the test below),
+/// and `"receptionist"` has `"reception"` as one. A substring "fix" here would
+/// hand the surface to every badge whose grant merely looks similar.
+///
+/// Housekeeping wins over reception when both are present: the union of "full"
+/// and "read-only" is "full", so an employee who covers both jobs keeps the
+/// maid capability rather than being demoted by holding an extra grant.
+fn role_from_apps(apps: &[String]) -> Option<HkRole> {
+    if apps.iter().any(|app| app == HK_GRANT) {
+        return Some(HkRole::Housekeeping);
     }
+    if apps.iter().any(|app| app == RECEPTION_GRANT) {
+        return Some(HkRole::ReceptionViewer);
+    }
+    None
+}
+
+/// Turn VERIFIED claims into an [`HkIdentity`]: badge required, grant
+/// re-checked (and resolved to a capability) when the `apps` claim is present.
+fn identity_from_claims(claims: &Value) -> Result<HkIdentity, HkAccessError> {
+    // Absent `apps` ⇒ the edge policy is the sole authority, and the
+    // capability is the pre-reception-viewer one (full). See the module doc's
+    // table: making this row `false` would 403 a real maid the day Cloudflare
+    // stopped forwarding the claim.
+    let can_report = match extract_apps(claims) {
+        Some(apps) => role_from_apps(&apps)
+            .ok_or(HkAccessError::NotGranted)?
+            .can_report(),
+        None => true,
+    };
     let badge = extract_badge(claims).ok_or(HkAccessError::NoBadge)?;
     Ok(HkIdentity {
         badge,
         display_name: claim(claims, "name").and_then(value_as_string),
         email: claims.get("email").and_then(value_as_string),
+        can_report,
     })
 }
 
@@ -303,7 +408,11 @@ pub async fn require_hk_access(mut req: Request, next: Next) -> Response {
 
     match verify_hk_assertion(&token).await {
         Ok(identity) => {
-            tracing::debug!(badge = %identity.badge, "hk_access: verified maid identity");
+            tracing::debug!(
+                badge = %identity.badge,
+                can_report = identity.can_report,
+                "hk_access: verified /hk identity"
+            );
             req.extensions_mut().insert(identity);
             next.run(req).await
         }
@@ -406,6 +515,111 @@ qHreiO5t7e6J+dsQVkE3dg==
         assert_eq!(id.badge, "Q1001");
         assert_eq!(id.email.as_deref(), Some("q1001@emp.thehfhotel.org"));
         assert!(id.display_name.is_none());
+        assert!(
+            id.can_report,
+            "a `housekeeping` holder keeps the full maid capability"
+        );
+    }
+
+    // ---- the grant → role mapping ---------------------------------------
+
+    /// The whole mapping as one table. PURE — no JWT, no JWKS, no env.
+    ///
+    /// The near-miss rows are the point: `housekeeping_admin` and
+    /// `receptionist` each have a real grant as a PREFIX, and a `starts_with` /
+    /// `contains` implementation would silently admit both.
+    #[test]
+    fn role_from_apps_maps_every_grant_combination() {
+        fn apps(list: &[&str]) -> Vec<String> {
+            list.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        for (list, expected, why) in [
+            (&["housekeeping"][..], Some(HkRole::Housekeeping), "the maid"),
+            (
+                &["reception"][..],
+                Some(HkRole::ReceptionViewer),
+                "the desk's read-only board",
+            ),
+            (
+                &["reception", "housekeeping"][..],
+                Some(HkRole::Housekeeping),
+                "both grants ⇒ full: the union of full and read-only is full",
+            ),
+            (
+                &["housekeeping", "reception"][..],
+                Some(HkRole::Housekeeping),
+                "…and the list ORDER must not decide it",
+            ),
+            (
+                &["hotel", "reception", "payroll"][..],
+                Some(HkRole::ReceptionViewer),
+                "unrelated grants alongside are ignored",
+            ),
+            (&[][..], None, "an empty grant list opens nothing"),
+            (
+                &["hotel", "payroll"][..],
+                None,
+                "grants for other apps open nothing",
+            ),
+            (
+                &["housekeeping_admin"][..],
+                None,
+                "PREFIX TRAP: admin widens branches, it is not a way in",
+            ),
+            (
+                &["receptionist"][..],
+                None,
+                "PREFIX TRAP: `reception` must match exactly",
+            ),
+            (
+                &["Reception"][..],
+                None,
+                "grant keys are case-sensitive, like every other HF ID grant",
+            ),
+            (
+                &["reception "][..],
+                None,
+                "no trimming: the claim list is emitted by HF ID, not typed",
+            ),
+        ] {
+            assert_eq!(role_from_apps(&apps(list)), expected, "{list:?}: {why}");
+        }
+
+        assert!(HkRole::Housekeeping.can_report());
+        assert!(
+            !HkRole::ReceptionViewer.can_report(),
+            "the viewer is READ-ONLY — this is the one bit `routes::hk` gates on"
+        );
+    }
+
+    /// A `reception`-only badge is ADMITTED (200-able) but carries
+    /// `can_report = false`. Both halves matter: refusing it would leave the
+    /// desk without a board, and admitting it with `can_report = true` would
+    /// hand reception the maid's writeback.
+    #[test]
+    fn reception_only_grant_is_admitted_read_only() {
+        let mut claims = valid_claims();
+        claims["custom"]["apps"] = json!(["hotel", "reception"]);
+        let token = sign(&claims, Some("hk-key-1"));
+        let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+            .expect("a reception badge must reach the room board");
+        assert_eq!(id.badge, "Q1001");
+        assert!(
+            !id.can_report,
+            "reception is a VIEWER — `routes::hk` refuses its mutations"
+        );
+    }
+
+    /// Someone who works both jobs is a maid, not a demoted one.
+    #[test]
+    fn holding_both_grants_keeps_the_full_capability() {
+        let mut claims = valid_claims();
+        claims["custom"]["apps"] = json!(["reception", "housekeeping"]);
+        let token = sign(&claims, Some("hk-key-1"));
+        let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+            .expect("both grants must verify");
+        assert!(id.can_report, "housekeeping wins over reception");
     }
 
     #[test]
@@ -503,6 +717,21 @@ qHreiO5t7e6J+dsQVkE3dg==
         let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
             .expect("housekeeping + admin must verify");
         assert_eq!(id.badge, "Q1001");
+        assert!(id.can_report);
+
+        // The reception-viewer era adds one row to the same rule: admin PLUS
+        // reception is admitted — but by the RECEPTION grant, read-only. The
+        // branch-widening admin grant must not smuggle in a write capability
+        // it never carried.
+        let mut claims = valid_claims();
+        claims["custom"]["apps"] = json!(["housekeeping_admin", "reception"]);
+        let token = sign(&claims, Some("hk-key-1"));
+        let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+            .expect("reception opens the board even next to an admin grant");
+        assert!(
+            !id.can_report,
+            "`housekeeping_admin` widens branches; it never grants reporting"
+        );
     }
 
     #[test]
@@ -516,6 +745,28 @@ qHreiO5t7e6J+dsQVkE3dg==
         let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
             .expect("apps-less token must verify (edge policy authoritative)");
         assert_eq!(id.badge, "Q1001");
+        // PRESERVED, not new: this is the capability an apps-less token has
+        // always had. Flipping it to `false` would 403 a real maid the day
+        // Cloudflare stopped forwarding `apps`.
+        assert!(
+            id.can_report,
+            "the apps-less path keeps the pre-reception-viewer capability"
+        );
+    }
+
+    /// The reception grant works from the TOP LEVEL too, not only inside
+    /// `custom` — same either-placement robustness the badge claim has.
+    #[test]
+    fn top_level_reception_grant_is_admitted_read_only() {
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("custom");
+        claims["badge"] = json!("1188");
+        claims["apps"] = json!(["reception"]);
+        let token = sign(&claims, Some("hk-key-1"));
+        let id = verify_hk_token(&token, &test_jwks(), TEST_ISS, TEST_AUD)
+            .expect("top-level reception grant must verify");
+        assert_eq!(id.badge, "1188");
+        assert!(!id.can_report);
     }
 
     #[test]

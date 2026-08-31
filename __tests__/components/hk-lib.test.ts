@@ -11,6 +11,7 @@
 
 import {
   branchesUnavailableMessage,
+  canReport,
   countRoomsNeedingClean,
   emptyLinenCounts,
   groupRoomsByFloor,
@@ -665,5 +666,42 @@ describe('linenShortageSummary', () => {
     expect(linenShortageSummary([])).toBeNull()
     expect(linenShortageSummary(null)).toBeNull()
     expect(linenShortageSummary(undefined)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// canReport — the ONE place the viewer/maid skew rule lives. `/hk` now admits
+// two grants: `housekeeping` (files reports) and `reception` (reads only).
+// ---------------------------------------------------------------------------
+
+describe('canReport', () => {
+  it('is true for a maid the backend explicitly admits as a reporter', () => {
+    expect(canReport({ canReport: true })).toBe(true)
+  })
+
+  it('is false for a reception-only viewer', () => {
+    expect(canReport({ canReport: false })).toBe(false)
+  })
+
+  // THE skew rule, and the reason this helper exists rather than a bare
+  // `me.canReport` read at each call site: before the `reception` viewer grant
+  // existed, /hk only ever admitted maids, so a backend that omits the field is
+  // one where every admitted identity could report. Defaulting to `false` would
+  // strip the buttons from every maid on the floor for the length of a rollback.
+  it('is true when the field is absent (older backend ⇒ maid)', () => {
+    expect(canReport({})).toBe(true)
+  })
+
+  // The `/me` call has not answered yet, or failed outright. Same rule, same
+  // reason — and nothing renders in that state anyway.
+  it('is true for null and undefined', () => {
+    expect(canReport(null)).toBe(true)
+    expect(canReport(undefined)).toBe(true)
+  })
+
+  // Only an explicit `false` is a viewer. A newer backend that ever sent
+  // something odd must not silently demote a maid.
+  it('treats an explicitly undefined field the same as an absent one', () => {
+    expect(canReport({ canReport: undefined })).toBe(true)
   })
 })

@@ -17,6 +17,14 @@
 // comes from the same `/me` call and gates the third "แจ้งห้องไม่สะอาด" button
 // (§B5 — off by default; the write shape is proven, the phone-as-trigger is
 // new).
+//
+// VIEWER MODE. `/hk` now admits two grants: `housekeeping` (a maid — full
+// access) and `reception` (read-only). `canReport` from the same `/me` call
+// gates the whole ACTION surface below — the progress buttons, the mark-dirty
+// block and แจ้งขาดผ้า — while every informational part of the screen (chips,
+// today's linen totals, the event list, the stale notice) stays exactly as a
+// maid sees it: reception's reason for opening this screen is to READ it. The
+// hiding is UX only; the server refuses a viewer's POST with 403 regardless.
 
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
@@ -34,6 +42,7 @@ import {
   Sparkles,
 } from 'lucide-react'
 import {
+  canReport,
   clampLinenQty,
   emptyLinenCounts,
   hkFetch,
@@ -71,6 +80,12 @@ export default function HkRoomPage() {
   const [branch, setBranch] = useState<Branch | null>(null)
   const [branchChecked, setBranchChecked] = useState(false)
   const [markDirtyEnabled, setMarkDirtyEnabled] = useState(false)
+  // Viewer mode, from the same `/me` call. Initial value TRUE, unlike
+  // `markDirtyEnabled` above, because the skew rule for this one runs the other
+  // way (see `canReport` in hk-lib): a missing answer means "maid". Nothing
+  // renders before `/me` settles anyway — the screen is on its spinner until
+  // `branchChecked` — so this initial value never reaches the glass.
+  const [canReportFlag, setCanReportFlag] = useState(true)
 
   const [detail, setDetail] = useState<HkRoomDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -107,6 +122,7 @@ export default function HkRoomPage() {
         if (!live || !data.success) return
         const resolved = resolveInitialBranch(data.branches, readStoredBranch())
         setMarkDirtyEnabled(Boolean(data.markDirtyEnabled))
+        setCanReportFlag(canReport(data))
         setBranch(resolved)
       })
       .catch(() => {
@@ -167,6 +183,10 @@ export default function HkRoomPage() {
 
   const reportCleaning = async (status: CleaningStatus) => {
     if (!branch) return
+    // A viewer has no button to reach this with; the guard is here for the same
+    // reason `hkFetch` refuses a null branch — a caller bug must become nothing
+    // at all, never a request the server has to refuse.
+    if (!canReportFlag) return
     setPosting(status)
     setNotice(null)
     try {
@@ -209,6 +229,9 @@ export default function HkRoomPage() {
 
   const reportLinenShortage = async (items: LinenShortageItem[]) => {
     if (!branch) return
+    // Same viewer guard as `reportCleaning` — the panel that calls this is not
+    // rendered for a viewer at all.
+    if (!canReportFlag) return
     // Belt to the disabled button's braces — an empty report is an errand for
     // nobody, and must never reach the linen room as a no-op row.
     if (items.length === 0) return
@@ -393,183 +416,196 @@ export default function HkRoomPage() {
             </p>
           </header>
 
-          {/* Cleaning progress buttons */}
+          {/* Cleaning progress buttons, then what has already been reported. */}
           <section className="mb-6">
-            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-gray-600">
-              <Sparkles className="h-4 w-4 text-red-600" />
-              รายงานความคืบหน้า
-            </h2>
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => reportCleaning('started')}
-                disabled={busy}
-                className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-4 text-base font-semibold text-amber-800 active:bg-amber-100 disabled:opacity-50"
-              >
-                {posting === 'started' ? (
-                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
-                ) : (
-                  'เริ่มทำความสะอาด'
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => reportCleaning('done')}
-                disabled={busy}
-                className="rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-4 text-base font-semibold text-emerald-800 active:bg-emerald-100 disabled:opacity-50"
-              >
-                {posting === 'done' ? (
-                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
-                ) : (
-                  'เสร็จแล้ว'
-                )}
-              </button>
-            </div>
-
-            {/* Mark-dirty (§B5): dark-shipped, HK_MARK_DIRTY_ENABLED-gated via
-                /api/hk/me. Hidden entirely rather than offered as a dead tap
-                that would 403. */}
-            {markDirtyEnabled &&
-              (confirmingDirty ? (
-                /* Step 2 — the confirm. Rendered IN PLACE of the button, not
-                   over it: a modal/`window.confirm` on a phone in a corridor is
-                   easy to dismiss by reflex, while replacing the control forces
-                   a deliberate second tap. ยกเลิก is listed FIRST and is the
-                   visually calmer option, so the reflex tap is the safe one. */
-                <div className="mt-3 rounded-xl border border-red-300 bg-red-50 p-3">
-                  <p className="mb-3 flex items-start gap-1.5 text-sm font-semibold text-red-800">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                    <span>{markDirtyConfirmMessage(room.roomNo)}</span>
-                  </p>
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setConfirmingDirty(false)}
-                      disabled={busy}
-                      className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
-                    >
-                      ยกเลิก
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => reportCleaning('dirty')}
-                      disabled={busy}
-                      className="flex items-center justify-center rounded-lg border border-red-400 bg-red-600 px-3 py-3 text-sm font-semibold text-white active:bg-red-700 disabled:opacity-50"
-                    >
-                      {posting === 'dirty' ? (
-                        <Loader2 className="h-5 w-5 animate-spin" />
-                      ) : (
-                        'ยืนยัน'
-                      )}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                /* Step 1 — arms the confirm. Fires NO request. */
-                <button
-                  type="button"
-                  onClick={() => setConfirmingDirty(true)}
-                  disabled={busy}
-                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-red-300 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800 active:bg-red-100 disabled:opacity-50"
-                >
-                  <AlertTriangle className="h-4 w-4" />
-                  แจ้งห้องไม่สะอาด
-                </button>
-              ))}
-
-            {/* แจ้งขาดผ้า (linen shortage). Expands IN PLACE of its button, the
-                same two-step shape as the confirm above and for the same
-                reason: a maid counting missing towels in a doorway needs the
-                room she is looking at to stay on screen behind the form, and a
-                modal on a phone is dismissed by reflex. Sky-toned so it reads
-                as neither the red destructive report nor the amber/emerald
-                progress pair — a different KIND of report, not a third
-                severity. Not gated by `markDirtyEnabled`: nothing here writes
-                to iHOTEL. */}
-            {linenOpen ? (
-              <div className="mt-3 rounded-xl border border-sky-300 bg-sky-50 p-3">
-                <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold text-sky-900">
-                  <Shirt className="h-4 w-4 shrink-0" />
-                  <span>แจ้งขาดผ้า</span>
-                </p>
-                <ul className="space-y-2">
-                  {LINEN_KINDS.map(({ kind, label }) => (
-                    <li
-                      key={kind}
-                      className="flex items-center justify-between gap-2 rounded-lg border border-sky-200 bg-white px-3 py-2"
-                    >
-                      <span className="text-sm font-medium text-gray-800">{label}</span>
-                      {/* h-11/w-11 is 44px — the smallest target a thumb hits
-                          reliably, and why these are squares rather than the
-                          py-3 pills the rest of the screen uses. The aria-label
-                          names the kind: "+" alone tells a screen reader (and a
-                          test) nothing about WHICH row it stepped. */}
-                      <span className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          aria-label={`ลด ${label}`}
-                          onClick={() => stepLinen(kind, -1)}
-                          disabled={busy || linenCounts[kind] <= LINEN_MIN_QTY}
-                          className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
-                        >
-                          <Minus className="h-5 w-5" />
-                        </button>
-                        <span className="w-7 text-center text-base font-semibold tabular-nums text-gray-900">
-                          {linenCounts[kind]}
-                        </span>
-                        <button
-                          type="button"
-                          aria-label={`เพิ่ม ${label}`}
-                          onClick={() => stepLinen(kind, 1)}
-                          disabled={busy || linenCounts[kind] >= LINEN_MAX_QTY}
-                          className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
-                        >
-                          <Plus className="h-5 w-5" />
-                        </button>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                {/* ยกเลิก first and calmer, same as the dirty confirm — the
-                    reflex tap is the one that files nothing. */}
-                <div className="mt-3 grid grid-cols-2 gap-3">
+            {/* THE ACTION SURFACE — every control that can FILE something,
+                hidden WHOLE for a read-only (reception) viewer rather than
+                disabled: a greyed-out row of buttons reads as "broken" and
+                invites a support call, while their absence reads as "not my
+                job", which is exactly right. Everything informational below
+                this block stays, for both audiences. UX only — the server 403s
+                a viewer's POST either way. */}
+            {canReportFlag && (
+              <>
+                <h2 className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-gray-600">
+                  <Sparkles className="h-4 w-4 text-red-600" />
+                  รายงานความคืบหน้า
+                </h2>
+                <div className="grid grid-cols-2 gap-3">
                   <button
                     type="button"
-                    onClick={closeLinenPanel}
+                    onClick={() => reportCleaning('started')}
                     disabled={busy}
-                    className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                    className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-4 text-base font-semibold text-amber-800 active:bg-amber-100 disabled:opacity-50"
                   >
-                    ยกเลิก
+                    {posting === 'started' ? (
+                      <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                    ) : (
+                      'เริ่มทำความสะอาด'
+                    )}
                   </button>
                   <button
                     type="button"
-                    onClick={() => reportLinenShortage(linenItems)}
-                    disabled={busy || linenItems.length === 0}
-                    className="flex items-center justify-center rounded-lg border border-sky-500 bg-sky-600 px-3 py-3 text-sm font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+                    onClick={() => reportCleaning('done')}
+                    disabled={busy}
+                    className="rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-4 text-base font-semibold text-emerald-800 active:bg-emerald-100 disabled:opacity-50"
                   >
-                    {linenPosting ? <Loader2 className="h-5 w-5 animate-spin" /> : 'ส่งแจ้ง'}
+                    {posting === 'done' ? (
+                      <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                    ) : (
+                      'เสร็จแล้ว'
+                    )}
                   </button>
                 </div>
-              </div>
-            ) : (
-              /* Opens the form. Fires NO request. */
-              <button
-                type="button"
-                onClick={() => setLinenOpen(true)}
-                disabled={busy}
-                className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-sky-300 bg-sky-50 px-3 py-3 text-sm font-semibold text-sky-800 active:bg-sky-100 disabled:opacity-50"
-              >
-                <Shirt className="h-4 w-4" />
-                แจ้งขาดผ้า
-              </button>
+
+                {/* Mark-dirty (§B5): dark-shipped, HK_MARK_DIRTY_ENABLED-gated via
+                    /api/hk/me. Hidden entirely rather than offered as a dead tap
+                    that would 403. */}
+                {markDirtyEnabled &&
+                  (confirmingDirty ? (
+                    /* Step 2 — the confirm. Rendered IN PLACE of the button, not
+                       over it: a modal/`window.confirm` on a phone in a corridor is
+                       easy to dismiss by reflex, while replacing the control forces
+                       a deliberate second tap. ยกเลิก is listed FIRST and is the
+                       visually calmer option, so the reflex tap is the safe one. */
+                    <div className="mt-3 rounded-xl border border-red-300 bg-red-50 p-3">
+                      <p className="mb-3 flex items-start gap-1.5 text-sm font-semibold text-red-800">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span>{markDirtyConfirmMessage(room.roomNo)}</span>
+                      </p>
+                      <div className="grid grid-cols-2 gap-3">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingDirty(false)}
+                          disabled={busy}
+                          className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                        >
+                          ยกเลิก
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => reportCleaning('dirty')}
+                          disabled={busy}
+                          className="flex items-center justify-center rounded-lg border border-red-400 bg-red-600 px-3 py-3 text-sm font-semibold text-white active:bg-red-700 disabled:opacity-50"
+                        >
+                          {posting === 'dirty' ? (
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                          ) : (
+                            'ยืนยัน'
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Step 1 — arms the confirm. Fires NO request. */
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingDirty(true)}
+                      disabled={busy}
+                      className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-red-300 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800 active:bg-red-100 disabled:opacity-50"
+                    >
+                      <AlertTriangle className="h-4 w-4" />
+                      แจ้งห้องไม่สะอาด
+                    </button>
+                  ))}
+
+                {/* แจ้งขาดผ้า (linen shortage). Expands IN PLACE of its button, the
+                    same two-step shape as the confirm above and for the same
+                    reason: a maid counting missing towels in a doorway needs the
+                    room she is looking at to stay on screen behind the form, and a
+                    modal on a phone is dismissed by reflex. Sky-toned so it reads
+                    as neither the red destructive report nor the amber/emerald
+                    progress pair — a different KIND of report, not a third
+                    severity. Not gated by `markDirtyEnabled`: nothing here writes
+                    to iHOTEL. */}
+                {linenOpen ? (
+                  <div className="mt-3 rounded-xl border border-sky-300 bg-sky-50 p-3">
+                    <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold text-sky-900">
+                      <Shirt className="h-4 w-4 shrink-0" />
+                      <span>แจ้งขาดผ้า</span>
+                    </p>
+                    <ul className="space-y-2">
+                      {LINEN_KINDS.map(({ kind, label }) => (
+                        <li
+                          key={kind}
+                          className="flex items-center justify-between gap-2 rounded-lg border border-sky-200 bg-white px-3 py-2"
+                        >
+                          <span className="text-sm font-medium text-gray-800">{label}</span>
+                          {/* h-11/w-11 is 44px — the smallest target a thumb hits
+                              reliably, and why these are squares rather than the
+                              py-3 pills the rest of the screen uses. The aria-label
+                              names the kind: "+" alone tells a screen reader (and a
+                              test) nothing about WHICH row it stepped. */}
+                          <span className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              aria-label={`ลด ${label}`}
+                              onClick={() => stepLinen(kind, -1)}
+                              disabled={busy || linenCounts[kind] <= LINEN_MIN_QTY}
+                              className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
+                            >
+                              <Minus className="h-5 w-5" />
+                            </button>
+                            <span className="w-7 text-center text-base font-semibold tabular-nums text-gray-900">
+                              {linenCounts[kind]}
+                            </span>
+                            <button
+                              type="button"
+                              aria-label={`เพิ่ม ${label}`}
+                              onClick={() => stepLinen(kind, 1)}
+                              disabled={busy || linenCounts[kind] >= LINEN_MAX_QTY}
+                              className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
+                            >
+                              <Plus className="h-5 w-5" />
+                            </button>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                    {/* ยกเลิก first and calmer, same as the dirty confirm — the
+                        reflex tap is the one that files nothing. */}
+                    <div className="mt-3 grid grid-cols-2 gap-3">
+                      <button
+                        type="button"
+                        onClick={closeLinenPanel}
+                        disabled={busy}
+                        className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                      >
+                        ยกเลิก
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => reportLinenShortage(linenItems)}
+                        disabled={busy || linenItems.length === 0}
+                        className="flex items-center justify-center rounded-lg border border-sky-500 bg-sky-600 px-3 py-3 text-sm font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+                      >
+                        {linenPosting ? <Loader2 className="h-5 w-5 animate-spin" /> : 'ส่งแจ้ง'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  /* Opens the form. Fires NO request. */
+                  <button
+                    type="button"
+                    onClick={() => setLinenOpen(true)}
+                    disabled={busy}
+                    className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-sky-300 bg-sky-50 px-3 py-3 text-sm font-semibold text-sky-800 active:bg-sky-100 disabled:opacity-50"
+                  >
+                    <Shirt className="h-4 w-4" />
+                    แจ้งขาดผ้า
+                  </button>
+                )}
+              </>
             )}
 
             {/* What has ALREADY been reported for this room today — the detail
                 behind the ขาดผ้า chip in the header, in the same muted register
-                as the cleaning-event list below. It sits directly under the
-                button that files a report so a maid can see, before she counts
-                anything, that the morning shift already asked for two
-                pillowcases. Rendered only when there is something to say. */}
+                as the cleaning-event list below. For a maid it sits directly
+                under the button that files a report, so she can see before she
+                counts anything that the morning shift already asked for two
+                pillowcases; for a viewer it is one of the facts she opened the
+                screen to read. Rendered for BOTH, only when there is something
+                to say. */}
             {linenSummary && (
               <p className="mt-2 text-xs text-gray-500">{linenSummary}</p>
             )}

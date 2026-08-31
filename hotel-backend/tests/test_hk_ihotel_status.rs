@@ -105,6 +105,7 @@ fn maid() -> HkIdentity {
         badge: "Q1001".to_string(),
         display_name: None,
         email: None,
+        can_report: true,
     }
 }
 

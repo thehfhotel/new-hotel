@@ -92,6 +92,7 @@ fn maid() -> HkIdentity {
         badge: "Q1001".to_string(),
         display_name: Some("นก".to_string()),
         email: None,
+        can_report: true,
     }
 }
 

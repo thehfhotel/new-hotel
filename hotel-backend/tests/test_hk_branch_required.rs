@@ -33,6 +33,17 @@
 //! admission guard still admits `POST /api/hk/rooms/{id}/cleaning` and still
 //! refuses everything else for `branch=hfville`.
 //!
+//! ## The reception viewer (2026-09)
+//!
+//! The suite also owns the read-only `reception` role, because it is a gate in
+//! the same handlers and observable only from the same inner router: a viewer
+//! reads the board, is `403` on both mutations, and reads `canReport: false` /
+//! `markDirtyEnabled: false` from `/api/hk/me`. Every viewer row is DB-free,
+//! and each is paired with the equivalent maid row so the two roles cannot
+//! drift into each other. An identity holding NEITHER grant never reaches this
+//! table at all — `middleware::hk_access` answers 403 first, which is pinned by
+//! that module's own unit tests and by `shipped_router_answers_401_*` below.
+//!
 //! ## Running
 //! Rows 1-10 need NO database (the gate answers before any pool is touched;
 //! the pool is lazy). The two-site pool-routing proof needs `DATABASE_URL` and
@@ -45,6 +56,7 @@ use axum::Extension;
 use hotel_backend::middleware::hk_access::HkIdentity;
 use hotel_backend::routes::hk::{
     HkPolicy, BRANCH_NOT_ENABLED_ERROR, BRANCH_REQUIRED_ERROR, MARK_DIRTY_DISABLED_ERROR,
+    REPORT_NOT_PERMITTED_ERROR,
 };
 use hotel_backend::routes::mode::{AppState, Branch};
 use sqlx::PgPool;
@@ -69,6 +81,18 @@ fn maid() -> HkIdentity {
         badge: "Q1001".to_string(),
         display_name: None,
         email: None,
+        // The `housekeeping` grant. Every row in this suite is a MAID row, so
+        // the reception-viewer work must not move a single status code here.
+        can_report: true,
+    }
+}
+
+/// The read-only reception viewer (`reception` grant, no `housekeeping`) — the
+/// identity the "viewer" rows below inject in the maid's place.
+fn viewer() -> HkIdentity {
+    HkIdentity {
+        can_report: false,
+        ..maid()
     }
 }
 
@@ -457,6 +481,266 @@ async fn unknown_status_is_still_400() {
     assert!(
         body.contains("invalid status"),
         "the status error must survive the branch gate: {body}"
+    );
+}
+
+// ============================================================================
+// The reception viewer — read-only on the SAME surface
+// ============================================================================
+//
+// `reception` opens this surface as a viewer: the desk gets the room board,
+// and neither mutation. `canReport` in `/api/hk/me` is UX only — these rows
+// are the server-side enforcement behind it, which is what a stale bundle
+// hits.
+//
+// All DB-free: every assertion is answered before a pool is touched (the
+// refusals by the capability gate, `me` by the policy alone).
+
+/// The handler table with a READ-ONLY reception identity injected where the
+/// Access layer would have put one.
+fn inner_viewer(state: AppState, policy: HkPolicy) -> axum::Router {
+    hotel_backend::routes::hk::routes_inside_access(state, policy).layer(Extension(viewer()))
+}
+
+/// [`lazy_pool`] with the acquire timeout clamped, for the rows that
+/// deliberately fall THROUGH to the database. At sqlx's 30 s default the three
+/// viewer read endpoints alone cost 90 s of CI per run — the same clamp, and
+/// the same reason, as `tests/test_hk_location_enforcement.rs`.
+fn clamped_lazy_pool() -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(250))
+        .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/never")
+        .expect("a lazy pool needs no live server")
+}
+
+fn assert_report_403(status: StatusCode, body: &str, what: &str) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{what}: expected 403, body={body}");
+    let json: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|_| panic!("{what}: 403 body must be JSON, got {body}"));
+    assert_eq!(
+        json.get("success").and_then(|v| v.as_bool()),
+        Some(false),
+        "{what}: the repo-wide envelope requires success=false, body={body}"
+    );
+    assert_eq!(
+        json.get("error").and_then(|v| v.as_str()),
+        Some(REPORT_NOT_PERMITTED_ERROR),
+        "{what}: stable error message, body={body}"
+    );
+}
+
+/// **The headline row.** A viewer is refused on BOTH mutations, with the repo
+/// envelope and the read-only message — never a 401 (the identity is proven),
+/// never a 404, and never a success.
+#[tokio::test]
+async fn viewer_is_403_on_both_mutations() {
+    for (uri, payload, what) in [
+        (
+            "/api/hk/rooms/1/cleaning?branch=hfhotel",
+            r#"{"status":"done"}"#,
+            "cleaning: done",
+        ),
+        (
+            "/api/hk/rooms/1/cleaning?branch=hfhotel",
+            r#"{"status":"started"}"#,
+            "cleaning: started",
+        ),
+        (
+            "/api/hk/rooms/1/cleaning?branch=hfhotel",
+            r#"{"status":"dirty"}"#,
+            "cleaning: dirty",
+        ),
+        (
+            "/api/hk/rooms/1/linen-shortage?branch=hfhotel",
+            r#"{"items":[{"kind":"bath_towel","qty":2}]}"#,
+            "linen shortage",
+        ),
+    ] {
+        // `mark_dirty_enabled: true` on purpose: the capability refusal must
+        // not depend on a flag that only ever narrows what a MAID may do.
+        let app = inner_viewer(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], true),
+        );
+        let (status, body) = call(app, "POST", uri, payload).await;
+        assert_report_403(status, &body, what);
+    }
+}
+
+/// The capability is checked BEFORE the branch gate and before body
+/// VALIDATION: a viewer's branch-less, nonsense-bodied POST is still the
+/// capability 403, never a 400. That ordering is what keeps a read-only badge
+/// from spending an HF ID location lookup per rejected write — and from using
+/// body or branch errors to probe the surface.
+///
+/// "Before validation", not "before deserialization": axum runs the
+/// `Json<…>` extractor ahead of every handler line, so a body that cannot
+/// DESERIALIZE is a 422 from axum for a viewer and a maid alike. That is
+/// pre-existing (`ReportCleaningBody::status` is a required serde field —
+/// which is exactly why row 8c pins the ordering on the linen route, whose
+/// `items` is an `Option`), so the shapeless bodies below are on that route.
+#[tokio::test]
+async fn viewer_capability_is_checked_before_branch_and_body() {
+    for (uri, payload, what) in [
+        (
+            "/api/hk/rooms/1/cleaning",
+            r#"{"status":"done"}"#,
+            "no branch at all",
+        ),
+        (
+            "/api/hk/rooms/1/cleaning?branch=all",
+            r#"{"status":"nonsense"}"#,
+            "branch=all, bad status",
+        ),
+        (
+            "/api/hk/rooms/1/linen-shortage",
+            r#"{}"#,
+            "no branch, and no items either",
+        ),
+        (
+            "/api/hk/rooms/1/linen-shortage?branch=hfville",
+            r#"{"items":[{"kind":"blanket","qty":99}]}"#,
+            "unoffered branch, invalid items",
+        ),
+    ] {
+        let app = inner_viewer(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], true),
+        );
+        let (status, body) = call(app, "POST", uri, payload).await;
+        assert_report_403(status, &body, what);
+    }
+}
+
+/// The other half: the READS are unchanged for a viewer. Asserted negatively
+/// (not 401/403) because what happens next depends on a database — the point
+/// is only that no auth or capability gate fired.
+#[tokio::test]
+async fn viewer_passes_the_gates_on_every_read() {
+    for uri in [
+        "/api/hk/rooms?branch=hfhotel",
+        "/api/hk/rooms/1?branch=hfhotel",
+        "/api/hk/broken-items/1/photo?branch=hfhotel",
+    ] {
+        let app = inner_viewer(
+            AppState::new(clamped_lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, body) = call(app, "GET", uri, "").await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "GET {uri}: the viewer identity is verified: {body}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GET {uri}: reads are the whole point of the viewer role: {body}"
+        );
+    }
+}
+
+/// `HK_BRANCHES` still binds for a viewer — the role is read-only, not
+/// unbounded. An unoffered property is the same 403 a maid gets.
+#[tokio::test]
+async fn viewer_is_still_bound_by_hk_branches_on_reads() {
+    let app = inner_viewer(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(app, "GET", "/api/hk/rooms?branch=hfville", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("403 body must be JSON");
+    assert_eq!(
+        json.get("error").and_then(|v| v.as_str()),
+        Some(BRANCH_NOT_ENABLED_ERROR),
+        "the refusal must be the ALLOWLIST's, not the capability's: {body}"
+    );
+}
+
+/// `GET /api/hk/me` for a viewer: `canReport: false`, and `markDirtyEnabled`
+/// forced to `false` EVEN THOUGH `HK_MARK_DIRTY_ENABLED` is on — a report the
+/// identity may not file is a dead tap however the env is set.
+#[tokio::test]
+async fn me_reports_a_viewer_as_read_only_regardless_of_the_mark_dirty_flag() {
+    let app = inner_viewer(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], true),
+    );
+    let (status, body) = call(app, "GET", "/api/hk/me", "").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("me body must be JSON");
+    assert_eq!(json.get("success").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(json.get("badge").and_then(|v| v.as_str()), Some("Q1001"));
+    assert_eq!(
+        json.get("canReport").and_then(|v| v.as_bool()),
+        Some(false),
+        "the desk's board is read-only: {body}"
+    );
+    assert_eq!(
+        json.get("markDirtyEnabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "HK_MARK_DIRTY_ENABLED is ON here — the capability must still win: {body}"
+    );
+    // The viewer still gets a board to look at.
+    let branches = json.get("branches").and_then(|v| v.as_array()).expect("branches");
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].get("id").and_then(|v| v.as_str()), Some("hfhotel"));
+    assert!(
+        json.get("branchesUnavailableReason")
+            .expect("the key is always present")
+            .is_null(),
+        "nothing is empty, so there is nothing to explain: {body}"
+    );
+}
+
+/// The maid's side of the same payload, so the two cannot drift: `canReport`
+/// is `true` and `markDirtyEnabled` still tracks the env exactly as before.
+#[tokio::test]
+async fn me_reports_a_maid_as_able_to_report() {
+    for mark_dirty in [false, true] {
+        let app = inner(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], mark_dirty),
+        );
+        let (status, body) = call(app, "GET", "/api/hk/me", "").await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("me body must be JSON");
+        assert_eq!(
+            json.get("canReport").and_then(|v| v.as_bool()),
+            Some(true),
+            "a housekeeping badge keeps the full capability: {body}"
+        );
+        assert_eq!(
+            json.get("markDirtyEnabled").and_then(|v| v.as_bool()),
+            Some(mark_dirty),
+            "for a maid the flag is still the ONLY input: {body}"
+        );
+    }
+}
+
+/// A maid is untouched by the capability gate: `dirty` with the flag ON still
+/// reaches the room lookup, and `dirty` with the flag OFF is still the
+/// mark-dirty 403 — never the read-only one.
+#[tokio::test]
+async fn the_capability_gate_is_invisible_to_maids() {
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/cleaning?branch=hfhotel",
+        r#"{"status":"dirty"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("403 body must be JSON");
+    assert_eq!(
+        json.get("error").and_then(|v| v.as_str()),
+        Some(MARK_DIRTY_DISABLED_ERROR),
+        "a maid's refusal must still name the FLAG, not the capability: {body}"
     );
 }
 

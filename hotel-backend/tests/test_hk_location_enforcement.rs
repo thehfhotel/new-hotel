@@ -85,6 +85,16 @@ fn maid(badge: &str) -> HkIdentity {
         badge: badge.to_string(),
         display_name: None,
         email: None,
+        can_report: true,
+    }
+}
+
+/// A read-only reception viewer. Viewers are EXEMPT from location enforcement
+/// (see `routes::hk`'s module doc) — asserted by the rows at the end.
+fn viewer(badge: &str) -> HkIdentity {
+    HkIdentity {
+        can_report: false,
+        ..maid(badge)
     }
 }
 
@@ -1076,4 +1086,144 @@ async fn row19_the_cache_carries_the_grant_alongside_the_location() {
         1,
         "one LAN round-trip, then the cache — the grant is cached like a location"
     );
+}
+
+// ============================================================================
+// Rows 20-22 — the read-only reception viewer is EXEMPT from this whole gate
+// ============================================================================
+//
+// `reception` (without `housekeeping`) opens `/hk` as a READ-ONLY viewer, and
+// the location gate does not apply to it. That is a deliberate scoping
+// decision, not an oversight — three reasons, in order of weight:
+//
+//  1. This gate exists to stop a maid FILING against the wrong property. A
+//     viewer files nothing: `routes::hk::require_report_capability` refuses
+//     both mutations with a 403 before the branch is even parsed, so the
+//     failure mode the gate guards cannot occur.
+//  2. A receptionist's HF ID `Employee.location` is routinely NULL — nobody
+//     ever needed it. That is `LocationOutcome::NoLocation` ⇒ 403 and a
+//     permanently empty board, i.e. the feature would not work at all for the
+//     people it is for.
+//  3. "Which property may I LOOK at" is still answered, by `HK_BRANCHES`:
+//     every handler runs `require_branch` first, so a viewer gets the
+//     properties this deployment serves and never one it does not. That is the
+//     same outer bound the `housekeeping_admin` widening cannot cross.
+//
+// The exemption is scoped to viewers and must not leak: every row below pairs
+// the viewer with the SAME badge as a maid, which is still refused.
+
+/// Row 20. Every read endpoint, both branches, for the two outcomes that would
+/// refuse a maid — `NoLocation` (403) and `Unavailable` (503). A viewer clears
+/// them all.
+#[tokio::test]
+async fn row20_a_viewer_clears_the_location_gate_on_every_read() {
+    let reads: &[(&str, &str, &str)] = &[
+        ("GET", "/api/hk/rooms", ""),
+        ("GET", "/api/hk/rooms/1", ""),
+        ("GET", "/api/hk/broken-items/1/photo", ""),
+    ];
+    // `NULL_LOCATION_BADGE` ⇒ NoLocation (a maid's 403);
+    // `NO-SUCH-LOOKUP` ⇒ Unavailable (a maid's 503).
+    for badge in [NULL_LOCATION_BADGE, "NO-SUCH-LOOKUP"] {
+        for (method, uri, body) in reads {
+            for branch in ["hfhotel", "hfville"] {
+                let (status, resp) = call(
+                    enforcing(vec![Branch::Hfhotel, Branch::Hfville]),
+                    viewer(badge),
+                    method,
+                    &with_branch(uri, branch),
+                    body,
+                )
+                .await;
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{badge}: {method} {uri}?branch={branch} — a viewer is exempt: {resp}"
+                );
+                assert_ne!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{badge}: {method} {uri}?branch={branch} — a viewer costs no lookup: {resp}"
+                );
+            }
+        }
+    }
+}
+
+/// Row 21. **The exemption is the VIEWER's, not the badge's.** The identical
+/// policy and the identical badge, injected as a MAID, is still refused — 403
+/// for a definite "no location", 503 for "cannot tell". This is the pairing
+/// that would catch an exemption written as an unconditional early return.
+#[tokio::test]
+async fn row21_the_exemption_does_not_leak_to_maids() {
+    for (badge, expected, error) in [
+        (NULL_LOCATION_BADGE, StatusCode::FORBIDDEN, LOCATION_UNKNOWN_ERROR),
+        (
+            "NO-SUCH-LOOKUP",
+            StatusCode::SERVICE_UNAVAILABLE,
+            LOCATION_LOOKUP_UNAVAILABLE_ERROR,
+        ),
+    ] {
+        let (status, resp) = call(
+            enforcing(vec![Branch::Hfhotel, Branch::Hfville]),
+            maid(badge),
+            "GET",
+            "/api/hk/rooms?branch=hfhotel",
+            "",
+        )
+        .await;
+        assert_eq!(status, expected, "{badge} as a MAID must still be refused: {resp}");
+        assert_envelope(&resp, error, &format!("{badge} as a maid"));
+    }
+}
+
+/// Row 22. The picker half. `/api/hk/me` must offer a viewer exactly what the
+/// per-request gate then admits — the WHOLE allowlist, with no
+/// `branchesUnavailableReason` — or the board would list a property every
+/// subsequent call refuses. Same badge as a maid: `[]` plus a reason.
+#[tokio::test]
+async fn row22_me_serves_a_viewer_the_whole_allowlist() {
+    let policy = enforcing(vec![Branch::Hfhotel, Branch::Hfville]);
+
+    let (status, resp) = call(
+        policy.clone(),
+        viewer(NULL_LOCATION_BADGE),
+        "GET",
+        "/api/hk/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("me body must be JSON");
+    assert_eq!(
+        me_branch_ids(&json),
+        vec!["hfhotel".to_string(), "hfville".to_string()],
+        "a viewer sees every property this deployment serves: {resp}"
+    );
+    assert!(
+        json.get("branchesUnavailableReason")
+            .expect("the key is always present")
+            .is_null(),
+        "nothing is empty, so there is nothing to explain: {resp}"
+    );
+    assert_eq!(
+        json.get("canReport").and_then(|v| v.as_bool()),
+        Some(false),
+        "…and the board is read-only: {resp}"
+    );
+
+    // The same badge as a MAID: the intersection is empty and says why.
+    let (status, resp) = call(policy, maid(NULL_LOCATION_BADGE), "GET", "/api/hk/me", "").await;
+    assert_eq!(status, StatusCode::OK, "body={resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("me body must be JSON");
+    assert!(
+        me_branch_ids(&json).is_empty(),
+        "a maid with no location still gets an empty picker: {resp}"
+    );
+    assert_eq!(
+        json.get("branchesUnavailableReason").and_then(|v| v.as_str()),
+        Some(REASON_NO_LOCATION),
+        "…and the actionable reason for it: {resp}"
+    );
+    assert_eq!(json.get("canReport").and_then(|v| v.as_bool()), Some(true));
 }

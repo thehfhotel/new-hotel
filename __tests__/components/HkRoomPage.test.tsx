@@ -67,8 +67,11 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 /** `/me` with the mark-dirty button enabled and a single branch (so the page
- * auto-selects it and never blocks on the picker). */
-function meResponse() {
+ * auto-selects it and never blocks on the picker). `overrides` is how the
+ * viewer-mode suite below flips `canReport` — the default payload deliberately
+ * OMITS the field, which is the deploy-skew shape (an older backend) and must
+ * keep behaving exactly like a maid's. */
+function meResponse(overrides: Record<string, unknown> = {}) {
   return jsonResponse({
     success: true,
     badge: 'Q1001',
@@ -76,6 +79,7 @@ function meResponse() {
     branches: [{ id: 'hfhotel', labelTh: 'ฮาร์เบอร์ฟร้อนท์' }],
     markDirtyEnabled: true,
     branchesUnavailableReason: null,
+    ...overrides,
   })
 }
 
@@ -683,5 +687,138 @@ describe('iHOTEL-unavailable note (R2a / CR-1)', () => {
     expect(screen.getByText(LEGACY_STATUS_STALE_NOTE)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'เสร็จแล้ว' })).toBeEnabled()
     expect(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).toBeEnabled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Viewer mode — the `reception` grant. `/hk` now admits two identities: a maid
+// (`housekeeping`) who reports, and reception (`reception`) who only READS the
+// same screen. The whole action surface disappears for the viewer; every
+// informational part stays, because reading them is the entire reason
+// reception opened the room.
+//
+// The hiding is UX, not enforcement — the server 403s a viewer's POST either
+// way — so these assertions are about what a receptionist can SEE and TAP, and
+// the "no POST" assertion is the one that says she cannot tap her way to a
+// write at all.
+// ---------------------------------------------------------------------------
+
+describe('viewer mode (reception grant — canReport: false)', () => {
+  /** A room carrying one of everything informational: both header chips, the
+   * ขาดผ้า chip, today's totals, an event, and the stale notice. */
+  const RICH_DETAIL = {
+    room: { ...ROOM, linenShortageToday: true },
+    events: [
+      {
+        eventId: 11,
+        status: 'started',
+        badge: 'Q1001',
+        name: 'สมศรี',
+        at: '2026-09-01T03:00:00.000Z',
+      },
+    ],
+    linenShortages: [{ kind: 'pillowcase', qty: 2 }],
+    legacyStatusStale: true,
+  }
+
+  /** Render the room screen for an identity with the given `/me` extras. */
+  async function renderAs(meExtras: Record<string, unknown>) {
+    mockHkFetchMe.mockResolvedValue(meResponse(meExtras))
+    mockHkFetch.mockResolvedValue(jsonResponse({ success: true, ...RICH_DETAIL }))
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+  }
+
+  /** Every POST the page has issued — the thing that reaches the backend. */
+  function postCalls() {
+    return mockHkFetch.mock.calls.filter(
+      ([, , init]) => (init as RequestInit | undefined)?.method === 'POST'
+    )
+  }
+
+  const ACTION_BUTTONS = [
+    'เริ่มทำความสะอาด',
+    'เสร็จแล้ว',
+    /แจ้งห้องไม่สะอาด/,
+    'แจ้งขาดผ้า',
+  ] as const
+
+  it.each(ACTION_BUTTONS)('does not render the %s control', async (name) => {
+    await renderAs({ canReport: false })
+    expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
+  })
+
+  // The heading labels the action surface; with nothing under it, it would read
+  // as a section that failed to load.
+  it('does not render the รายงานความคืบหน้า heading', async () => {
+    await renderAs({ canReport: false })
+    expect(screen.queryByText('รายงานความคืบหน้า')).not.toBeInTheDocument()
+  })
+
+  // THE assertion: there is no control on this screen a receptionist could tap
+  // to file anything — not a disabled one, not a hidden one. `markDirtyEnabled`
+  // is TRUE in this `/me` payload, so this also proves the viewer gate wins
+  // over the mark-dirty flag rather than merely agreeing with it.
+  it('offers no tappable control at all, and fires no POST', async () => {
+    await renderAs({ canReport: false })
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+    expect(postCalls()).toHaveLength(0)
+  })
+
+  it('still shows both header chips', async () => {
+    await renderAs({ canReport: false })
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+    expect(screen.getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+  })
+
+  // The ขาดผ้า chip is the fact reception most needs off this screen, and it
+  // must not vanish with the button that files one.
+  it('still shows the ขาดผ้า chip', async () => {
+    await renderAs({ canReport: false })
+    expect(screen.getByText('ขาดผ้า')).toBeInTheDocument()
+  })
+
+  it("still shows today's linen totals line", async () => {
+    await renderAs({ canReport: false })
+    expect(screen.getByText('วันนี้แจ้งขาดผ้า: ปลอกหมอน 2')).toBeInTheDocument()
+  })
+
+  it("still shows today's cleaning events", async () => {
+    await renderAs({ canReport: false })
+    expect(screen.getByText(/กำลังทำความสะอาด โดย สมศรี/)).toBeInTheDocument()
+  })
+
+  it('still shows the occupancy indicator and the legacy-stale notice', async () => {
+    await renderAs({ canReport: false })
+    expect(screen.getByText('มีแขกพัก')).toBeInTheDocument()
+    expect(screen.getByText(LEGACY_STATUS_STALE_NOTE)).toBeInTheDocument()
+  })
+
+  // The other two identities are unchanged, and both must stay that way: an
+  // explicit maid, and the deploy-skew case where an older backend sends no
+  // `canReport` at all (it only ever admitted maids, so absent means maid).
+  describe.each([
+    ['canReport: true', { canReport: true }],
+    ['an absent canReport (older backend)', {}],
+  ])('%s renders the action surface exactly as before', (_label, meExtras) => {
+    it.each(ACTION_BUTTONS)('renders the %s control', async (name) => {
+      await renderAs(meExtras)
+      expect(screen.getByRole('button', { name })).toBeEnabled()
+    })
+
+    it('renders the รายงานความคืบหน้า heading', async () => {
+      await renderAs(meExtras)
+      expect(screen.getByText('รายงานความคืบหน้า')).toBeInTheDocument()
+    })
+
+    // And the buttons still WORK — hiding them for a viewer must not have made
+    // them inert for a maid.
+    it('still files a report on เสร็จแล้ว', async () => {
+      await renderAs(meExtras)
+      fireEvent.click(screen.getByRole('button', { name: 'เสร็จแล้ว' }))
+
+      await waitFor(() => expect(postCalls()).toHaveLength(1))
+      expect(postCalls()[0][0]).toBe('/rooms/7/cleaning')
+    })
   })
 })

@@ -53,14 +53,45 @@ export interface HkMe {
    * An empty list is never a reason to fall back to a default branch.
    */
   branches: HkBranchOption[]
-  /** `HK_MARK_DIRTY_ENABLED` — hides the "แจ้งห้องไม่สะอาด" button when false. */
+  /** `HK_MARK_DIRTY_ENABLED` — hides the "แจ้งห้องไม่สะอาด" button when false.
+   * For a reception-only (viewer) identity the server always sends `false`. */
   markDirtyEnabled: boolean
+  /**
+   * `true` ⇒ this identity holds the `housekeeping` grant and may FILE reports
+   * (cleaning progress, mark-dirty, แจ้งขาดผ้า). `false` ⇒ a `reception`-only
+   * identity: a read-only viewer of the same screens.
+   *
+   * Optional on the type (not on the wire — a current backend always sends it)
+   * for deploy skew, and `canReport()` below owns what an absent value means.
+   * Do not read this field directly; read it through that helper.
+   */
+  canReport?: boolean
   /**
    * Set exactly when `branches` is empty; `null` otherwise (and always while
    * location enforcement is off). Always PRESENT — branch on the value, not on
    * the key.
    */
   branchesUnavailableReason: HkBranchesUnavailableReason | null
+}
+
+/**
+ * May this identity FILE reports, or is it a read-only viewer? PURE — the ONE
+ * place the backend-skew rule for `HkMe.canReport` is written down.
+ *
+ * An ABSENT field means `true`, and the asymmetry is deliberate: `/hk` only
+ * ever admitted maids before the `reception` viewer grant existed, so a bundle
+ * talking to an older backend that omits the field is, by construction, talking
+ * to one where every admitted identity could report. Defaulting to `false`
+ * instead would strip the buttons from every maid on the floor for the length
+ * of a rollback — a much worse failure than briefly offering a button the
+ * server would refuse.
+ *
+ * `null`/`undefined` (the `/me` call has not answered, or failed) reads the
+ * same way for the same reason. This is UX only: the server is the enforcement
+ * — a reception-only identity's POST is refused with 403 whatever the UI shows.
+ */
+export function canReport(me: Pick<HkMe, 'canReport'> | null | undefined): boolean {
+  return me?.canReport !== false
 }
 
 export interface HkCleaningProgress {

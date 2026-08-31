@@ -117,11 +117,54 @@
 //! ## Identity & auth
 //!
 //! The router is wrapped by [`crate::middleware::hk_access::require_hk_access`]
-//! (its own Cloudflare Access application, HF ID silent login, grant key
-//! `housekeeping`) which injects the verified [`HkIdentity`] — handlers NEVER
-//! trust client-supplied reporter fields; the badge/name stamped into rows
-//! come exclusively from the verified assertion. Fail closed: no valid
-//! identity ⇒ the middleware already answered 401/403.
+//! (its own Cloudflare Access application, HF ID silent login, grant keys
+//! `housekeeping` / `reception`) which injects the verified [`HkIdentity`] —
+//! handlers NEVER trust client-supplied reporter fields; the badge/name
+//! stamped into rows come exclusively from the verified assertion. Fail
+//! closed: no valid identity ⇒ the middleware already answered 401/403.
+//!
+//! ## Two roles: the maid and the reception viewer (2026-09)
+//!
+//! Reception wants the same board the maid works from — "which rooms are clean
+//! right now" — and that is a READ of this exact data, so the `reception`
+//! grant opens this surface READ-ONLY rather than getting a second copy of it.
+//! The middleware resolves the capability once into
+//! [`HkIdentity::can_report`](crate::middleware::hk_access::HkIdentity::can_report);
+//! nothing here re-parses grants.
+//!
+//! | endpoint | `housekeeping` | `reception` only |
+//! |---|---|---|
+//! | `GET /api/hk/me` | `canReport: true` | `canReport: false`, `markDirtyEnabled: false` |
+//! | `GET /api/hk/rooms`, `/rooms/{id}`, `/broken-items/{id}/photo` | ✅ | ✅ |
+//! | `POST …/cleaning`, `POST …/linen-shortage` | ✅ | **403** [`REPORT_NOT_PERMITTED_ERROR`] |
+//!
+//! [`require_report_capability`] is the enforcement and it runs FIRST in both
+//! mutations. `canReport` in `/api/hk/me` is UX only: it lets the client hide
+//! controls it cannot use, and a stale bundle that still shows them gets a
+//! loud 403 instead of a silent write.
+//!
+//! ### Location enforcement and the reception viewer
+//!
+//! **Viewers are EXEMPT from the per-employee location gate below**, in BOTH
+//! of its halves ([`require_location`] and [`me_branches`]), and no HF ID
+//! lookup is issued for them at all. Three reasons, in order of weight:
+//!
+//! 1. The gate exists to stop a maid FILING against the wrong property. A
+//!    viewer files nothing — [`require_report_capability`] already refused
+//!    every mutation before the branch is even parsed — so the failure mode it
+//!    guards cannot occur.
+//! 2. A receptionist's HF ID `Employee.location` is routinely NULL; nobody
+//!    ever needed it. Under enforcement that is [`LocationOutcome::NoLocation`]
+//!    ⇒ `403` and a permanently empty board, i.e. the feature would not work
+//!    at all for the people it is for.
+//! 3. The desk is at the desk. "Which property's rooms may I LOOK at" is
+//!    answered by `HK_BRANCHES`, which still binds: every handler runs
+//!    [`require_branch`] first, so a viewer gets the properties this
+//!    deployment serves and never one it does not — the same outer bound the
+//!    `housekeeping_admin` widening cannot cross.
+//!
+//! Exempting both halves together is what keeps the picker and the per-request
+//! gate in agreement, which is the invariant [`me_branches`] documents.
 //!
 //! ## Coexistence stance (ADR 0002 / invariant #6)
 //!
@@ -373,6 +416,17 @@ pub const BRANCH_NOT_ENABLED_ERROR: &str = "branch not enabled for the housekeep
 pub const MARK_DIRTY_DISABLED_ERROR: &str =
     "ยังไม่เปิดใช้งานการแจ้งห้องไม่สะอาด กรุณาแจ้งแผนกต้อนรับ";
 
+/// 403 body when a READ-ONLY viewer (the `reception` grant without
+/// `housekeeping` — see [`crate::middleware::hk_access::HkRole`]) posts to one
+/// of the two maid mutations.
+///
+/// Thai, and in [`MARK_DIRTY_DISABLED_ERROR`]'s class rather than
+/// [`BRANCH_NOT_ENABLED_ERROR`]'s: a real person at the desk reads it, and they
+/// reach it only from a stale bundle (the viewer UI renders no report controls)
+/// or a hand-rolled request. So it says what the account CAN do and who to ask.
+pub const REPORT_NOT_PERMITTED_ERROR: &str =
+    "บัญชีนี้ดูสถานะห้องได้อย่างเดียว ไม่สามารถส่งรายงานได้ กรุณาติดต่อผู้ดูแลระบบ";
+
 /// 403 body when the requested branch is not the employee's own location.
 /// ACTIONABLE: it names what to do (pick your own branch) and who to ask.
 pub const LOCATION_MISMATCH_ERROR: &str =
@@ -605,6 +659,36 @@ fn require_branch(policy: &HkPolicy, raw: Option<&str>) -> ApiResult<Branch> {
     Ok(branch)
 }
 
+/// The report-capability gate: the ONE thing that separates a maid from a
+/// read-only reception viewer on this surface. PURE — unit-tested below.
+///
+/// It reads the boolean the middleware already resolved
+/// ([`HkIdentity::can_report`]); it deliberately does NOT re-derive the role
+/// from grants, so there is exactly one place in the codebase where an HF ID
+/// grant becomes a permission and no way for the two to drift.
+///
+/// Both mutations call it FIRST — ahead of [`require_branch`], and therefore
+/// ahead of [`require_location`]:
+///
+/// * "you may not report anywhere" outranks "that branch is not offered" and
+///   "that status is misspelled", the same reasoning that puts the location
+///   gate ahead of status validation.
+/// * a refused viewer never triggers the HF ID location lookup, so a read-only
+///   badge cannot cost a network round-trip per rejected write.
+///
+/// A `housekeeping` identity has `can_report == true`, so for every maid this
+/// function is a no-op and the pre-existing rejection order is unchanged.
+fn require_report_capability(identity: &HkIdentity) -> ApiResult<()> {
+    if identity.can_report {
+        return Ok(());
+    }
+    tracing::warn!(
+        badge = %identity.badge,
+        "/hk refused a report from a read-only (reception) identity"
+    );
+    Err(ApiError::Forbidden(REPORT_NOT_PERMITTED_ERROR.to_string()))
+}
+
 /// THE MAPPING. HF ID's `Employee.location` → our `?branch=` branch. PURE, and
 /// pinned by an explicit table test below.
 ///
@@ -689,11 +773,22 @@ async fn resolve_location(policy: &HkPolicy, badge: &str) -> LocationOutcome {
 /// Applied to READS as well as mutations. A maid who can list the other
 /// property's rooms is already looking at the wrong hotel; refusing only the
 /// write would leave the bug visible and one tap away.
+///
+/// **Read-only viewers are EXEMPT** — see the module doc's "Location
+/// enforcement and the reception viewer". The gate exists to stop a maid
+/// filing against the wrong property; a viewer files nothing, and a
+/// receptionist's `Employee.location` is very often NULL (nobody ever needed
+/// it), which under enforcement would answer `403 LOCATION_UNKNOWN_ERROR` and
+/// leave the desk with a permanently empty board. The exemption is checked
+/// BEFORE the flag so no lookup is issued for a viewer at all.
 async fn require_location(
     policy: &HkPolicy,
     identity: &HkIdentity,
     branch: Branch,
 ) -> ApiResult<()> {
+    if !identity.can_report {
+        return Ok(());
+    }
     if !policy.location_enforcement_enabled {
         return Ok(());
     }
@@ -918,9 +1013,27 @@ pub struct MeResponse {
     /// enforcement it was documented "never empty"; that invariant is now the
     /// flag-off case only.)
     pub branches: Vec<HkBranchOption>,
-    /// `HK_MARK_DIRTY_ENABLED`. `false` ⇒ the client hides the
-    /// "แจ้งห้องไม่สะอาด" button rather than offering a dead tap.
+    /// `HK_MARK_DIRTY_ENABLED` **AND** [`Self::can_report`]. `false` ⇒ the
+    /// client hides the "แจ้งห้องไม่สะอาด" button rather than offering a dead
+    /// tap.
+    ///
+    /// The conjunction is not redundant: mark-dirty is a REPORT, so offering
+    /// it to a read-only viewer would be a dead tap even with the flag on.
+    /// A viewer therefore always reads `false` here, whatever the env says.
     pub mark_dirty_enabled: bool,
+    /// May this identity file reports at all — `true` for the `housekeeping`
+    /// grant, `false` for a `reception`-only viewer
+    /// ([`crate::middleware::hk_access::HkIdentity::can_report`]).
+    ///
+    /// `false` ⇒ the client renders the room board WITHOUT the cleaning and
+    /// linen-shortage controls. That is UX only: both `POST` handlers refuse a
+    /// viewer server-side ([`REPORT_NOT_PERMITTED_ERROR`]), so a stale bundle
+    /// fails loudly rather than writing.
+    ///
+    /// ADDITIVE and always serialized. An older backend never served the key
+    /// because it only ever admitted maids, so a client MUST read a MISSING
+    /// `canReport` as `true`.
+    pub can_report: bool,
     /// Why [`Self::branches`] is empty, when it is: [`REASON_NO_LOCATION`] or
     /// [`REASON_LOOKUP_UNAVAILABLE`]. `None` whenever `branches` is non-empty
     /// (and always, while enforcement is off).
@@ -1857,6 +1970,7 @@ pub async fn me(
     Extension(policy): Extension<HkPolicy>,
 ) -> ApiResult<Json<MeResponse>> {
     let (branches, branches_unavailable_reason) = me_branches(&policy, &identity).await;
+    let can_report = identity.can_report;
     Ok(Json(MeResponse {
         success: true,
         badge: identity.badge,
@@ -1868,7 +1982,10 @@ pub async fn me(
                 label_th: branch_label_th(b).to_string(),
             })
             .collect(),
-        mark_dirty_enabled: policy.mark_dirty_enabled,
+        // A report the identity may not file is a dead tap however the env is
+        // set, so the capability gates the flag rather than sitting beside it.
+        mark_dirty_enabled: policy.mark_dirty_enabled && can_report,
+        can_report,
         branches_unavailable_reason,
     }))
 }
@@ -1884,6 +2001,14 @@ async fn me_branches(
     policy: &HkPolicy,
     identity: &HkIdentity,
 ) -> (Vec<Branch>, Option<&'static str>) {
+    // A read-only viewer is exempt from location enforcement, so the picker
+    // must offer exactly what [`require_location`] will then admit: the whole
+    // allowlist. Checked FIRST, so no lookup is issued for a viewer — the same
+    // symmetry the flag-off case relies on, and the reason a receptionist with
+    // a NULL `Employee.location` gets a board instead of an empty picker.
+    if !identity.can_report {
+        return (policy.branches.clone(), None);
+    }
     if !policy.location_enforcement_enabled {
         return (policy.branches.clone(), None);
     }
@@ -2018,6 +2143,11 @@ pub async fn room_detail(
 /// branch (400/403) BEFORE status (400) BEFORE the mark-dirty flag (403). A
 /// request with no branch must never be answered on the strength of its body.
 ///
+/// [`require_report_capability`] sits ahead of ALL of it: a `reception`-only
+/// viewer may not report on any branch, so there is nothing for the branch gate
+/// to decide and no reason to spend an HF ID lookup on the refusal. For a
+/// `housekeeping` identity it is a no-op, so the order above is unchanged.
+///
 /// The location gate joins the FIRST tier, immediately after the allowlist
 /// check and still ahead of status validation: "you may not act on this
 /// property at all" outranks "that status is misspelled". While the flag is
@@ -2033,6 +2163,7 @@ pub async fn report_cleaning(
     Extension(identity): Extension<HkIdentity>,
     Json(body): Json<ReportCleaningBody>,
 ) -> ApiResult<Json<ReportCleaningResponse>> {
+    require_report_capability(&identity)?;
     let branch = require_branch(&policy, query.branch.as_deref())?;
     require_location(&policy, &identity, branch).await?;
     let status = parse_cleaning_status(&body.status)?;
@@ -2094,10 +2225,11 @@ pub async fn report_cleaning(
 ///
 /// Gating is IDENTICAL to [`report_cleaning`] and in the same order, which is
 /// what keeps the two maid mutations indistinguishable from the client's point
-/// of view: required `?branch=` (400/403) → location gate (403/503) → body
-/// validation (400) → room existence (404). A request with no branch is never
-/// answered on the strength of its body, and an unknown room is resolved before
-/// any insert, so the FK on `hklr_room_id` is a backstop rather than the gate.
+/// of view: report capability (403) → required `?branch=` (400/403) → location
+/// gate (403/503) → body validation (400) → room existence (404). A request
+/// with no branch is never answered on the strength of its body, and an unknown
+/// room is resolved before any insert, so the FK on `hklr_room_id` is a
+/// backstop rather than the gate.
 ///
 /// There is no ship-dark flag between the location gate and validation — the
 /// cleaning route's `HK_MARK_DIRTY_ENABLED` tier exists because `dirty` triggers
@@ -2114,6 +2246,7 @@ pub async fn report_linen_shortage(
     Extension(identity): Extension<HkIdentity>,
     Json(body): Json<ReportLinenShortageBody>,
 ) -> ApiResult<Json<ReportLinenShortageResponse>> {
+    require_report_capability(&identity)?;
     let branch = require_branch(&policy, query.branch.as_deref())?;
     require_location(&policy, &identity, branch).await?;
     let items = parse_linen_items(body.items)?;
@@ -2681,11 +2814,23 @@ mod tests {
         }
     }
 
+    /// A verified maid: the `housekeeping` grant, so `can_report` is `true`
+    /// and every pre-reception-viewer assertion below is unchanged.
     fn maid(badge: &str) -> HkIdentity {
         HkIdentity {
             badge: badge.to_string(),
             display_name: None,
             email: None,
+            can_report: true,
+        }
+    }
+
+    /// A verified READ-ONLY viewer: the `reception` grant without
+    /// `housekeeping`.
+    fn viewer(badge: &str) -> HkIdentity {
+        HkIdentity {
+            can_report: false,
+            ..maid(badge)
         }
     }
 
@@ -2971,6 +3116,116 @@ mod tests {
         {
             ApiError::Forbidden(msg) => assert_eq!(msg, LOCATION_MISMATCH_ERROR),
             other => panic!("expected 403, got {other:?}"),
+        }
+    }
+
+    // ---- the report capability (reception viewer) ------------------------
+
+    /// The gate itself, both ways. A maid passes (so every pre-existing
+    /// rejection order below is untouched); a viewer is refused with the
+    /// repo's 403 and the stable Thai message.
+    #[test]
+    fn require_report_capability_admits_maids_and_refuses_viewers() {
+        require_report_capability(&maid("Q1001")).expect("a housekeeping badge may report");
+
+        match require_report_capability(&viewer("R2002"))
+            .expect_err("a reception-only badge may not report")
+        {
+            ApiError::Forbidden(msg) => assert_eq!(msg, REPORT_NOT_PERMITTED_ERROR),
+            other => panic!("expected a 403, got {other:?}"),
+        }
+    }
+
+    /// The message a viewer actually reads. Thai (a person at the desk reads
+    /// it, same class as [`MARK_DIRTY_DISABLED_ERROR`]) and it must not be
+    /// silently reused for the branch/location errors, which mean something
+    /// else entirely.
+    #[test]
+    fn report_not_permitted_error_is_its_own_thai_message() {
+        assert!(
+            REPORT_NOT_PERMITTED_ERROR.contains("ดูสถานะห้องได้อย่างเดียว"),
+            "the copy must say what the account CAN do"
+        );
+        for other in [
+            BRANCH_NOT_ENABLED_ERROR,
+            MARK_DIRTY_DISABLED_ERROR,
+            LOCATION_MISMATCH_ERROR,
+            LOCATION_UNKNOWN_ERROR,
+            LOCATION_LOOKUP_UNAVAILABLE_ERROR,
+        ] {
+            assert_ne!(
+                REPORT_NOT_PERMITTED_ERROR, other,
+                "each 403 on this surface names a DIFFERENT cause"
+            );
+        }
+    }
+
+    /// **The location-gate exemption.** A viewer clears the gate for every
+    /// branch the allowlist offers, on every enforcement outcome — including
+    /// the two that 403/503 a maid. The NoLocation row is the one that matters
+    /// in production: reception badges routinely have a NULL
+    /// `Employee.location`, and without this exemption the desk's board would
+    /// be permanently empty.
+    #[tokio::test]
+    async fn viewers_are_exempt_from_the_location_gate() {
+        for outcome in [
+            LocationOutcome::Resolved(EmployeeLocation::HfVille),
+            LocationOutcome::NoLocation,
+            LocationOutcome::Unavailable,
+            LocationOutcome::AnyLocation,
+        ] {
+            let p = enforcing(vec![Branch::Hfhotel, Branch::Hfville], outcome);
+            for branch in [Branch::Hfhotel, Branch::Hfville] {
+                assert!(
+                    require_location(&p, &viewer("R2002"), branch)
+                        .await
+                        .is_ok(),
+                    "{outcome:?} / {branch:?}: a viewer files nothing, so the \
+                     wrong-property gate has nothing to guard"
+                );
+            }
+        }
+    }
+
+    /// The exemption is the VIEWER's, not everybody's: the identical policy
+    /// still refuses the same maid. This is the pairing that would catch an
+    /// exemption written as an unconditional early return.
+    #[tokio::test]
+    async fn the_exemption_does_not_leak_to_maids() {
+        let p = enforcing(vec![Branch::Hfhotel, Branch::Hfville], LocationOutcome::NoLocation);
+        assert!(
+            require_location(&p, &viewer("R2002"), Branch::Hfhotel)
+                .await
+                .is_ok()
+        );
+        match require_location(&p, &maid("421"), Branch::Hfhotel)
+            .await
+            .expect_err("a maid with no location is still refused")
+        {
+            ApiError::Forbidden(msg) => assert_eq!(msg, LOCATION_UNKNOWN_ERROR),
+            other => panic!("expected 403, got {other:?}"),
+        }
+    }
+
+    /// The picker half of the same exemption. `me_branches` and
+    /// [`require_location`] must agree, or the board offers a branch every
+    /// subsequent call then refuses — so a viewer gets the WHOLE allowlist and
+    /// no `branchesUnavailableReason`, exactly what the gate above admits.
+    #[tokio::test]
+    async fn me_serves_a_viewer_the_whole_allowlist_under_enforcement() {
+        for outcome in [
+            LocationOutcome::NoLocation,
+            LocationOutcome::Unavailable,
+            LocationOutcome::Resolved(EmployeeLocation::Hf),
+        ] {
+            let p = enforcing(vec![Branch::Hfhotel, Branch::Hfville], outcome);
+            let (branches, reason) = me_branches(&p, &viewer("R2002")).await;
+            assert_eq!(
+                branches,
+                vec![Branch::Hfhotel, Branch::Hfville],
+                "{outcome:?}: a viewer sees every property this deployment serves"
+            );
+            assert_eq!(reason, None, "{outcome:?}: nothing to explain — nothing is empty");
         }
     }
 
@@ -3637,6 +3892,7 @@ mod tests {
             badge: "Q1001".into(),
             display_name: Some("นก".into()),
             email: None,
+            can_report: true,
         };
         assert_eq!(maid_label(&with_name), "นก");
 
@@ -3645,6 +3901,7 @@ mod tests {
             badge: "Q1001".into(),
             display_name: None,
             email: None,
+            can_report: true,
         };
         assert_eq!(maid_label(&no_name), "Q1001");
 
@@ -3653,6 +3910,7 @@ mod tests {
             badge: "Q1001".into(),
             display_name: Some("   ".into()),
             email: None,
+            can_report: true,
         };
         assert_eq!(maid_label(&blank_name), "Q1001");
     }
@@ -3669,6 +3927,7 @@ mod tests {
             badge: "Q1001".into(),
             display_name: Some(long_thai),
             email: None,
+            can_report: true,
         });
         assert_eq!(clamped.chars().count(), MAX_H_NAME_CHARS);
         assert!(
@@ -3687,6 +3946,7 @@ mod tests {
             badge: "Q1001".into(),
             display_name: Some(long_ascii),
             email: None,
+            can_report: true,
         });
         assert_eq!(clamped_ascii.len(), MAX_H_NAME_CHARS);
 
@@ -3696,6 +3956,7 @@ mod tests {
                 badge: "Q1001".into(),
                 display_name: Some("นก สมใจ".into()),
                 email: None,
+                can_report: true,
             }),
             "นก สมใจ"
         );
