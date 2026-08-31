@@ -9,6 +9,15 @@
 //!
 //! When SYSTEM_MODE=new, the app can run without the legacy database.
 //! Legacy routes will return 503 Service Unavailable when legacy DB is unavailable.
+//
+// Build-trigger note (2026-09-01): the room-signals push (0938e95) had its
+// backend image build CANCELED by the concurrency group when the env-plumbing
+// push (69ae588) superseded it — but its WEB image had already been pushed, so
+// the plumbing run (build jobs path-filtered out) deployed a new frontend over
+// a 3-hour-old backend. This comment exists to put hotel-backend/ in the push's
+// changed paths so test-backend + build-backend + deploy all run from the
+// current tree. See the workflow's force_deploy note for why an empty commit
+// cannot do this.
 
 // Modules live in `lib.rs` so they're reachable from integration tests under
 // `tests/`. The binary brings them into scope via `use hotel_backend::*`.
