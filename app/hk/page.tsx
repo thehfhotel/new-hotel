@@ -27,6 +27,7 @@ import {
   hkFetch,
   hkFetchMe,
   legacyStatusNote,
+  linenShortageTag,
   movementTags,
   occupancyIndicator,
   progressLabel,
@@ -261,6 +262,7 @@ export default function HkRoomListPage() {
                     const cleanChip = roomCleanChip(room.roomClean)
                     const occupancy = occupancyIndicator(room.occupancy)
                     const tags = movementTags(room)
+                    const linenTag = linenShortageTag(room)
                     return (
                       <li key={room.roomId}>
                         <Link
@@ -304,7 +306,13 @@ export default function HkRoomListPage() {
                           {/* Primary: explicit clean/dirty (merged iHOTEL-wins
                               roomClean). Secondary: today's maid-reported
                               progress — dirty + ยังไม่เริ่ม is the ordinary
-                              morning state, both chips stay visible together. */}
+                              morning state, both chips stay visible together.
+                              Third, when there is one: ขาดผ้า. It lives in the
+                              CHIP row, which every room always renders, rather
+                              than in the conditional tag row above — so it
+                              shows next to EVERY cleaning state, and above all
+                              next to เสร็จแล้ว: a finished room still short of
+                              linen must not read as finished-and-forgotten. */}
                           <div className="mt-2 flex flex-wrap items-center gap-1">
                             <span
                               className={`inline-block rounded-full border px-2 py-0.5 text-xs ${cleanChip.className}`}
@@ -316,6 +324,13 @@ export default function HkRoomListPage() {
                             >
                               {badge.label}
                             </span>
+                            {linenTag && (
+                              <span
+                                className={`inline-block rounded-full border px-2 py-0.5 text-xs ${linenTag.className}`}
+                              >
+                                {linenTag.label}
+                              </span>
+                            )}
                           </div>
                           {room.cleaning && (
                             <p className="mt-1 text-[11px] text-gray-400">

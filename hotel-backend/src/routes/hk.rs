@@ -18,6 +18,12 @@
 //! gate with the cleaning route (required `?branch=`, the location gate, the
 //! Ville-guard exemption) so the two maid mutations behave identically.
 //!
+//! Those rows ARE read back on this surface — canonically, still with no legacy
+//! coupling: every room carries `linenShortageToday` (any report filed for it
+//! today), and the detail card additionally carries `linenShortages`, today's
+//! reports for that room summed per kind. Both are scoped by the SAME Bangkok
+//! civil day as today's cleaning events ([`TODAY_BKK_LINEN`]).
+//!
 //! ## `?branch=` is REQUIRED on every room endpoint (wave-4 A)
 //!
 //! It used to be optional, and `None` fell through to `Branch::default()` =
@@ -308,16 +314,22 @@ pub const VALID_CLEANING_STATUSES: [&str; 3] = ["started", "done", "dirty"];
 /// Linen kinds a maid can report short (ขาดผ้า) — migration 088.
 ///
 /// **This constant is the ONLY allowlist.** `ht_hk_linen_reports.hklr_kind` is
-/// deliberately plain `TEXT` with no CHECK, so adding a sixth kind
-/// (`bed_sheet` / ผ้าปูที่นอน, say) is a one-line change here plus the
-/// frontend's label — no migration, no `ALTER` on a live table at two sites,
-/// and no window where the deployed binary and the deployed constraint
-/// disagree about the valid set. That is exactly the coupling migration 087
-/// had to unpick for `hkev_status`; this table does not inherit it.
+/// deliberately plain `TEXT` with no CHECK, so widening the vocabulary is a
+/// one-line change here plus the frontend's label — no migration, no `ALTER` on
+/// a live table at two sites, and no window where the deployed binary and the
+/// deployed constraint disagree about the valid set. That is exactly the
+/// coupling migration 087 had to unpick for `hkev_status`; this table does not
+/// inherit it. `bed_sheet` (ผ้าปูที่นอน) was added exactly that way — code
+/// only, migration 088 untouched.
+///
+/// ORDER IS THE DISPLAY ORDER, mirrored by the frontend and by the room
+/// detail's `linenShortages` aggregation: bed linen largest-first, then the
+/// towels. Reordering this array reorders both surfaces.
 ///
 /// Thai labels belong to the client (which knows how to render them), so the
 /// wire codes stay ASCII snake_case and are compared after normalisation.
-pub const VALID_LINEN_KINDS: [&str; 5] = [
+pub const VALID_LINEN_KINDS: [&str; 6] = [
+    "bed_sheet",   // ผ้าปูที่นอน
     "pillowcase",  // ปลอกหมอน
     "duvet_cover", // ปลอกผ้านวม
     "bath_towel",  // ผ้าเช็ดตัว
@@ -332,7 +344,7 @@ pub const VALID_LINEN_KINDS: [&str; 5] = [
 /// there are kinds is necessarily malformed regardless of the duplicate check.
 /// Kept as its own constant so widening the vocabulary later does not silently
 /// widen the accepted body size before anyone has thought about it.
-pub const MAX_LINEN_ITEMS: usize = 5;
+pub const MAX_LINEN_ITEMS: usize = 6;
 
 /// Env var listing the branches the `/hk` surface may serve. Comma-separated;
 /// unset ⇒ [`DEFAULT_HK_BRANCH`].
@@ -1014,6 +1026,18 @@ pub struct HkRoom {
     pub expected_departure: bool,
     /// Today's latest maid-reported progress; `None` = nothing reported yet.
     pub cleaning: Option<CleaningProgress>,
+    /// At least one `ht_hk_linen_reports` row was filed for this room TODAY
+    /// (Bangkok civil day, [`TODAY_BKK_LINEN`]) — migration 088.
+    ///
+    /// A FLAG, not a count: the list only needs to badge the card, and the
+    /// per-kind totals live on the detail card
+    /// ([`RoomDetailResponse::linen_shortages`]).
+    ///
+    /// Dies at Bangkok midnight — pure per-fetch derivation, no stored state,
+    /// nothing to clear. Canonical-side fact exactly like
+    /// [`Self::expected_arrival`]: it never consults iHOTEL (which has no linen
+    /// counterpart at all), so it is NOT covered by `legacy_status_stale`.
+    pub linen_shortage_today: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1061,10 +1085,37 @@ pub struct RoomDetailResponse {
     pub room: HkRoom,
     /// Today's cleaning events, recent first.
     pub events: Vec<CleaningEvent>,
+    /// Today's linen shortages for this room, summed per kind — migration 088.
+    ///
+    /// One entry per kind actually reported (never a zero row), ordered by
+    /// [`VALID_LINEN_KINDS`]; `[]` when nothing was reported today. The
+    /// list's [`HkRoom::linen_shortage_today`] is exactly `!is_empty()` of this
+    /// — same table, same Thai day, so the badge and the breakdown can never
+    /// disagree.
+    ///
+    /// ADDITIVE and always serialized, so a client branches on the VALUE, not
+    /// on whether the key exists.
+    pub linen_shortages: Vec<LinenShortageTotal>,
     /// Same meaning as [`RoomsResponse::legacy_status_stale`]. Carried here
     /// too so the two screens can never tell the maid different stories about
     /// the same room.
     pub legacy_status_stale: bool,
+}
+
+/// One linen kind reported short for a room today, summed across that day's
+/// submissions — an entry of [`RoomDetailResponse::linen_shortages`].
+///
+/// Wire codes only (`{"kind":"bath_towel","qty":5}`): the Thai labels belong to
+/// the client, same rule as [`VALID_LINEN_KINDS`] itself.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinenShortageTotal {
+    /// A [`VALID_LINEN_KINDS`] code, as stored (already normalised on write).
+    pub kind: String,
+    /// Pieces missing, SUMmed across today's submissions for this room. Each
+    /// row is 1..=20, but a maid may submit more than once in a day, so this
+    /// total is deliberately not bounded by [`MAX_LINEN_QTY`].
+    pub qty: i64,
 }
 
 /// Body for `POST /api/hk/rooms/{id}/cleaning`.
@@ -1456,6 +1507,17 @@ pub(crate) const TODAY_BKK: &str =
 /// `CURRENT_DATE` — that is the wrong idiom and must not be copied here.
 pub(crate) const TODAY_BKK_DATE: &str = "(NOW() AT TIME ZONE 'Asia/Bangkok')::date";
 
+/// [`TODAY_BKK`] for `ht_hk_linen_reports` (migration 088) — character-for-
+/// character the same Bangkok civil-day boundary, on that table's own
+/// `hklr_created_at` instead of `hkev_created_at`.
+///
+/// Spelled out rather than derived so it reads as SQL at the call site, and
+/// pinned to [`TODAY_BKK`] by `today_bkk_linen_is_the_cleaning_day_boundary`:
+/// a maid's "ขาดผ้า today" and her "cleaned today" MUST roll over at the same
+/// instant, or the room-list badge outlives the events that explain it.
+pub(crate) const TODAY_BKK_LINEN: &str =
+    "(hklr_created_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date";
+
 /// The per-room resolution shared by the occupancy and departure predicates:
 /// which ACTIVE folio, if any, holds this room right now.
 ///
@@ -1518,6 +1580,25 @@ fn derived_room_facts_sql() -> String {
     )
 }
 
+/// Today's linen-shortage flag, as a SELECT-list fragment shared VERBATIM by
+/// [`rooms_list_sql`] and [`room_detail_sql`] — same one-definition rule as
+/// [`derived_room_facts_sql`], kept separate from it because this fact is not
+/// part of the CR-1 legacy merge (iHOTEL has no linen counterpart).
+///
+/// An `EXISTS` correlated on `r.room_id`, NOT a per-room query: the list is one
+/// statement and must stay one statement. `ix_ht_hk_linen_reports_room_created`
+/// is exactly the index it wants.
+fn linen_shortage_today_sql() -> String {
+    format!(
+        r#"
+            EXISTS (
+              SELECT 1 FROM ht_hk_linen_reports lr
+               WHERE lr.hklr_room_id = r.room_id
+                 AND {TODAY_BKK_LINEN}
+            ) AS linen_shortage_today"#
+    )
+}
+
 /// `GET /api/hk/rooms` — the active-room list with today's latest cleaning
 /// progress and the three derived facts.
 ///
@@ -1532,7 +1613,7 @@ pub(crate) fn rooms_list_sql() -> String {
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,{facts},
+            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1548,7 +1629,8 @@ pub(crate) fn rooms_list_sql() -> String {
         WHERE COALESCE(r.room_active, true) = true
         ORDER BY r.room_no
         "#,
-        facts = derived_room_facts_sql()
+        facts = derived_room_facts_sql(),
+        linen = linen_shortage_today_sql()
     )
 }
 
@@ -1562,7 +1644,7 @@ pub(crate) fn room_detail_sql() -> String {
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,{facts},
+            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1577,7 +1659,8 @@ pub(crate) fn room_detail_sql() -> String {
         ) ev ON TRUE
         WHERE r.room_id = $1 AND COALESCE(r.room_active, true) = true
         "#,
-        facts = derived_room_facts_sql()
+        facts = derived_room_facts_sql(),
+        linen = linen_shortage_today_sql()
     )
 }
 
@@ -1630,7 +1713,41 @@ fn room_from_row(row: &sqlx::postgres::PgRow) -> HkRoom {
             .try_get::<bool, _>("expected_departure")
             .unwrap_or(false),
         cleaning,
+        // Same `false`-on-a-read-failure rule as the three above: a badge we
+        // could not compute is better absent than invented.
+        linen_shortage_today: row
+            .try_get::<bool, _>("linen_shortage_today")
+            .unwrap_or(false),
     }
+}
+
+/// Where `kind` sorts in [`VALID_LINEN_KINDS`]; anything outside the vocabulary
+/// ranks LAST (`len()`), never panics and is never dropped.
+///
+/// The DB column has no CHECK on purpose, so a code this binary does not know
+/// is representable — an older row from before a kind was renamed, say. Showing
+/// it at the end beats hiding a real shortage from housekeeping.
+fn linen_kind_rank(kind: &str) -> usize {
+    VALID_LINEN_KINDS
+        .iter()
+        .position(|known| *known == kind)
+        .unwrap_or(VALID_LINEN_KINDS.len())
+}
+
+/// Put a room's per-kind totals in [`VALID_LINEN_KINDS`] order — the ONE
+/// display order, shared with the frontend's label list.
+///
+/// Ordered here rather than in SQL: the vocabulary is a Rust constant, and a
+/// `CASE`-ladder `ORDER BY` regenerated from it would be a second place for the
+/// order to live. Unknown codes tie at the end and are broken alphabetically,
+/// so the output is total and deterministic.
+fn order_linen_totals(mut totals: Vec<LinenShortageTotal>) -> Vec<LinenShortageTotal> {
+    totals.sort_by(|a, b| {
+        linen_kind_rank(&a.kind)
+            .cmp(&linen_kind_rank(&b.kind))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    totals
 }
 
 /// Today's cleaning events for one room, recent first.
@@ -1661,6 +1778,35 @@ async fn fetch_today_events(
                 .unwrap_or_else(|_| Utc::now()),
         })
         .collect())
+}
+
+/// Today's linen shortages for one room, summed per kind — migration 088.
+///
+/// GROUPed in the database (one row per kind, not one per submission) and
+/// ORDERed in Rust by [`order_linen_totals`]. `SUM` widens to `numeric`, so the
+/// cast to `bigint` is what makes the value readable as an `i64`.
+async fn fetch_today_linen_shortages(
+    pool: &PgPool,
+    room_id: i32,
+) -> Result<Vec<LinenShortageTotal>, sqlx::Error> {
+    let sql = format!(
+        "SELECT hklr_kind, SUM(hklr_qty)::bigint AS qty \
+           FROM ht_hk_linen_reports \
+          WHERE hklr_room_id = $1 AND {TODAY_BKK_LINEN} \
+          GROUP BY hklr_kind"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(room_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(order_linen_totals(
+        rows.iter()
+            .map(|row| LinenShortageTotal {
+                kind: row.try_get::<String, _>("hklr_kind").unwrap_or_default(),
+                qty: row.try_get::<i64, _>("qty").unwrap_or(0),
+            })
+            .collect(),
+    ))
 }
 
 /// What the 404 probe now brings back with it: the room's legacy join key and
@@ -1840,6 +1986,9 @@ pub async fn room_detail(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
     let events = fetch_today_events(pool, room_id).await?;
+    // Today's ขาดผ้า breakdown, from the SAME table and the SAME Thai day the
+    // room's `linenShortageToday` badge was derived from.
+    let linen_shortages = fetch_today_linen_shortages(pool, room_id).await?;
     // CR-1: the SAME merge as the list, so a maid who taps into a room never
     // sees a different answer than the tile she tapped.
     let mut rooms = [room];
@@ -1850,6 +1999,7 @@ pub async fn room_detail(
         success: true,
         room,
         events,
+        linen_shortages,
         legacy_status_stale,
     }))
 }
@@ -2133,15 +2283,16 @@ mod tests {
     #[test]
     fn linen_items_accept_every_kind_and_both_qty_bounds() {
         let parsed = parse_linen_items(linen_entries(&[
-            ("pillowcase", 1),
-            ("duvet_cover", 20),
+            ("bed_sheet", 1),
+            ("pillowcase", 20),
+            ("duvet_cover", 4),
             ("bath_towel", 7),
             ("face_towel", 2),
             ("foot_towel", 3),
         ]))
         .expect("a full, valid submission must parse");
 
-        assert_eq!(parsed.len(), 5, "one item per reported kind");
+        assert_eq!(parsed.len(), 6, "one item per reported kind");
         assert_eq!(
             parsed.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>(),
             VALID_LINEN_KINDS.to_vec(),
@@ -2175,12 +2326,13 @@ mod tests {
         );
     }
 
-    /// Five kinds is the whole vocabulary, so a sixth entry is malformed by
+    /// Six kinds is the whole vocabulary, so a seventh entry is malformed by
     /// construction — and the size check fires BEFORE any entry is judged, so
     /// an oversized body is never answered with a complaint about its content.
     #[test]
     fn linen_items_over_the_cap_is_400() {
-        let six = linen_entries(&[
+        let seven = linen_entries(&[
+            ("bed_sheet", 1),
             ("pillowcase", 1),
             ("duvet_cover", 1),
             ("bath_towel", 1),
@@ -2189,14 +2341,14 @@ mod tests {
             ("pillowcase", 1),
         ]);
         assert_linen_400(
-            parse_linen_items(six),
+            parse_linen_items(seven),
             "too many linen entries",
-            "6 entries",
+            "7 entries",
         );
 
         // Shape is judged before content: an oversized list of INVALID kinds
         // still reports the size, not the first bad kind.
-        let bogus: Vec<LinenShortageEntry> = (0..6)
+        let bogus: Vec<LinenShortageEntry> = (0..7)
             .map(|n| LinenShortageEntry {
                 kind: format!("nonsense_{n}"),
                 qty: serde_json::json!(1),
@@ -2205,7 +2357,7 @@ mod tests {
         assert_linen_400(
             parse_linen_items(Some(bogus)),
             "too many linen entries",
-            "6 invalid entries",
+            "7 invalid entries",
         );
     }
 
@@ -2242,7 +2394,7 @@ mod tests {
     fn linen_unknown_kind_is_400() {
         for bad in [
             "",
-            "bed_sheet",  // the plausible next kind — not shipped yet
+            "blanket",    // ผ้าห่ม — the plausible next kind, not shipped yet
             "bath-towel", // hyphen, not underscore
             "bathtowel",
             "ผ้าเช็ดตัว", // the Thai label; the wire codes are ASCII
@@ -2320,6 +2472,139 @@ mod tests {
     fn linen_qty_bounds_match_the_service_constants() {
         assert_eq!(MIN_LINEN_QTY, 1);
         assert_eq!(MAX_LINEN_QTY, 20);
+    }
+
+    // ---- linen READ surface (migration 088, room shapes) -----------------
+
+    fn linen_total(kind: &str, qty: i64) -> LinenShortageTotal {
+        LinenShortageTotal {
+            kind: kind.to_string(),
+            qty,
+        }
+    }
+
+    /// The detail aggregation is displayed in VOCABULARY order, not in whatever
+    /// order the `GROUP BY` happened to hand back — bed linen largest-first,
+    /// the same sequence the frontend labels.
+    #[test]
+    fn linen_totals_are_ordered_by_the_vocabulary() {
+        let ordered = order_linen_totals(vec![
+            linen_total("foot_towel", 1),
+            linen_total("bed_sheet", 2),
+            linen_total("bath_towel", 3),
+            linen_total("pillowcase", 4),
+        ]);
+        assert_eq!(
+            ordered.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>(),
+            vec!["bed_sheet", "pillowcase", "bath_towel", "foot_towel"],
+            "VALID_LINEN_KINDS is the display order"
+        );
+        // The quantities ride along with their kind, not with their position.
+        assert_eq!(ordered[0].qty, 2);
+        assert_eq!(ordered[3].qty, 1);
+    }
+
+    /// Every kind sorts, and each one sorts where the constant puts it — so
+    /// reordering `VALID_LINEN_KINDS` reorders the response, which is the whole
+    /// point of keeping the order in one place.
+    #[test]
+    fn linen_totals_ordering_covers_the_whole_vocabulary() {
+        let ordered = order_linen_totals(
+            VALID_LINEN_KINDS
+                .iter()
+                .rev()
+                .map(|kind| linen_total(kind, 1))
+                .collect(),
+        );
+        assert_eq!(
+            ordered.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>(),
+            VALID_LINEN_KINDS.to_vec()
+        );
+    }
+
+    /// A code outside the vocabulary is a row the DB accepted and this binary
+    /// does not know (the column has no CHECK on purpose). It must be shown
+    /// LAST, never dropped — a hidden shortage is worse than an odd label — and
+    /// unknowns tie alphabetically so the output is deterministic.
+    #[test]
+    fn linen_totals_keep_unknown_kinds_at_the_end() {
+        let ordered = order_linen_totals(vec![
+            linen_total("zzz_retired", 1),
+            linen_total("blanket", 2),
+            linen_total("bath_towel", 3),
+        ]);
+        assert_eq!(
+            ordered.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>(),
+            vec!["bath_towel", "blanket", "zzz_retired"]
+        );
+        assert_eq!(linen_kind_rank("bed_sheet"), 0, "first in the vocabulary");
+        assert_eq!(
+            linen_kind_rank("blanket"),
+            VALID_LINEN_KINDS.len(),
+            "an unknown kind ranks last, it does not panic"
+        );
+    }
+
+    /// The LOCKED wire contract the `/hk` client is built against:
+    /// `linenShortageToday` on every room, `linenShortages` on the detail —
+    /// both ALWAYS present, the empty case an empty array rather than a missing
+    /// key or `null`. Asserted on the SERIALIZED body, because camelCase and
+    /// presence are the parts a Rust-side field check cannot see.
+    #[test]
+    fn the_linen_read_surface_serializes_under_its_locked_names() {
+        let empty = serde_json::to_string(&RoomDetailResponse {
+            success: true,
+            room: pg_room("104", true),
+            events: vec![],
+            linen_shortages: vec![],
+            legacy_status_stale: false,
+        })
+        .expect("serializes");
+        assert!(empty.contains("\"linenShortageToday\":false"), "{empty}");
+        assert!(empty.contains("\"linenShortages\":[]"), "{empty}");
+
+        let reported = serde_json::to_string(&RoomDetailResponse {
+            success: true,
+            room: HkRoom {
+                linen_shortage_today: true,
+                ..pg_room("104", true)
+            },
+            events: vec![],
+            linen_shortages: order_linen_totals(vec![
+                linen_total("bath_towel", 5),
+                linen_total("bed_sheet", 2),
+            ]),
+            legacy_status_stale: false,
+        })
+        .expect("serializes");
+        assert!(reported.contains("\"linenShortageToday\":true"), "{reported}");
+        assert!(
+            reported.contains(
+                "\"linenShortages\":[{\"kind\":\"bed_sheet\",\"qty\":2},\
+                 {\"kind\":\"bath_towel\",\"qty\":5}]"
+            ),
+            "wire codes only, vocabulary order, {{kind,qty}} shape: {reported}"
+        );
+    }
+
+    /// The list carries the flag too, and stays truthful during a legacy
+    /// outage: linen is canonical-only, so `legacyStatusStale` never scopes it.
+    #[test]
+    fn the_linen_flag_survives_a_stale_legacy_read() {
+        let mut rooms = vec![HkRoom {
+            linen_shortage_today: true,
+            ..pg_room("104", false)
+        }];
+        let stale =
+            merge_legacy_room_flags(&mut rooms, &RoomFlagsOutcome::Unavailable, Branch::Hfhotel);
+        let body = serde_json::to_string(&RoomsResponse {
+            success: true,
+            data: rooms,
+            legacy_status_stale: stale,
+        })
+        .expect("serializes");
+        assert!(body.contains("\"legacyStatusStale\":true"), "{body}");
+        assert!(body.contains("\"linenShortageToday\":true"), "{body}");
     }
 
     // ---- HK_BRANCHES parsing -------------------------------------------
@@ -2855,6 +3140,7 @@ mod tests {
             expected_arrival: false,
             expected_departure: false,
             cleaning: None,
+            linen_shortage_today: false,
         }
     }
 
@@ -3305,6 +3591,41 @@ mod tests {
             2,
             "occupancy and departure must use the same resolution verbatim: {facts}"
         );
+    }
+
+    /// Both statements carry today's linen flag, from the ONE shared fragment —
+    /// same rule as the three derived facts: a list tile badged ขาดผ้า and a
+    /// detail card that is not would be the identical "two screens, two
+    /// answers" defect.
+    #[test]
+    fn both_fetch_statements_carry_todays_linen_flag() {
+        let linen = linen_shortage_today_sql();
+        for sql in [rooms_list_sql(), room_detail_sql()] {
+            assert!(sql.contains(&linen), "shared fragment missing: {sql}");
+            assert!(sql.contains("AS linen_shortage_today"), "{sql}");
+            // ONE statement for the whole list: the flag is a correlated
+            // EXISTS, never a per-room round trip.
+            assert!(
+                sql.contains("EXISTS (\n              SELECT 1 FROM ht_hk_linen_reports lr"),
+                "the flag must stay an EXISTS subquery, not an N+1: {sql}"
+            );
+        }
+    }
+
+    /// "Linen today" and "cleaned today" MUST roll over at the same instant, or
+    /// the room-list badge outlives the events that explain it. Pinned as the
+    /// cleaning predicate with ONLY the column swapped — and `CURRENT_DATE`, the
+    /// SERVER's date, stays banned here too.
+    #[test]
+    fn today_bkk_linen_is_the_cleaning_day_boundary() {
+        assert_eq!(
+            TODAY_BKK_LINEN,
+            TODAY_BKK.replace("hkev_created_at", "hklr_created_at"),
+            "the linen day boundary must be the cleaning one, column swapped"
+        );
+        assert!(TODAY_BKK_LINEN.contains(TODAY_BKK_DATE));
+        assert!(!TODAY_BKK_LINEN.contains("CURRENT_DATE"));
+        assert!(linen_shortage_today_sql().contains(TODAY_BKK_LINEN));
     }
 
     /// The maid label stamped into `HT_Housewife.h_name` prefers the verified

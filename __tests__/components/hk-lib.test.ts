@@ -12,6 +12,7 @@
 import {
   branchesUnavailableMessage,
   countRoomsNeedingClean,
+  emptyLinenCounts,
   groupRoomsByFloor,
   HK_API_BASE,
   hkFetch,
@@ -19,6 +20,11 @@ import {
   HOUSEKEEPING_URL,
   LEGACY_STATUS_STALE_NOTE,
   legacyStatusNote,
+  LINEN_KINDS,
+  linenKindLabel,
+  linenShortageItems,
+  linenShortageSummary,
+  linenShortageTag,
   markDirtyConfirmMessage,
   movementTags,
   occupancyIndicator,
@@ -538,5 +544,126 @@ describe('markDirtyConfirmMessage', () => {
   it('asks a yes/no question in Thai', () => {
     expect(markDirtyConfirmMessage('104')).toContain('ยืนยัน')
     expect(markDirtyConfirmMessage('104')).toContain('?')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// แจ้งขาดผ้า vocabulary and its two display helpers.
+//
+// LINEN_KINDS is the single source of the kinds: the wire codes, the Thai
+// labels, the stepper rows, the request body's order and the totals line all
+// derive from it. These tests pin the properties the rest of the surface is
+// allowed to rely on — including that everything below still derives after a
+// sixth kind was added, rather than needing its own edit.
+// ---------------------------------------------------------------------------
+
+describe('LINEN_KINDS', () => {
+  it('leads with ผ้าปูที่นอน (bed linen largest-first)', () => {
+    expect(LINEN_KINDS[0]).toEqual({ kind: 'bed_sheet', label: 'ผ้าปูที่นอน' })
+  })
+
+  it('carries the six reportable kinds, in display order', () => {
+    expect(LINEN_KINDS.map((k) => k.kind)).toEqual([
+      'bed_sheet',
+      'pillowcase',
+      'duvet_cover',
+      'bath_towel',
+      'face_towel',
+      'foot_towel',
+    ])
+  })
+
+  // A duplicated code would silently collapse two stepper rows into one
+  // request row; a missing label would render a wire code to a maid.
+  it('has a unique code and a Thai label for every row', () => {
+    const codes = LINEN_KINDS.map((k) => k.kind)
+    expect(new Set(codes).size).toBe(codes.length)
+    for (const { label } of LINEN_KINDS) {
+      expect(label.trim()).not.toBe('')
+      expect(label).toMatch(/[ก-๙]/)
+    }
+  })
+
+  // The derivation the "everything derives from LINEN_KINDS" claim rests on.
+  it('drives emptyLinenCounts and linenShortageItems without a second list', () => {
+    const counts = emptyLinenCounts()
+    expect(Object.keys(counts).sort()).toEqual(LINEN_KINDS.map((k) => k.kind).sort())
+    expect(Object.values(counts).every((v) => v === 0)).toBe(true)
+    expect(linenShortageItems(counts)).toEqual([])
+
+    // Non-zero rows ship in LINEN_KINDS order regardless of entry order.
+    const filled = { ...counts, foot_towel: 1, bed_sheet: 2 }
+    expect(linenShortageItems(filled)).toEqual([
+      { kind: 'bed_sheet', qty: 2 },
+      { kind: 'foot_towel', qty: 1 },
+    ])
+  })
+})
+
+describe('linenKindLabel', () => {
+  it('gives the Thai label for a known code', () => {
+    expect(linenKindLabel('bed_sheet')).toBe('ผ้าปูที่นอน')
+    expect(linenKindLabel('bath_towel')).toBe('ผ้าเช็ดตัว')
+  })
+
+  // Server→client skew: a newer backend ships a kind this bundle predates.
+  // A readable row beats a dropped one.
+  it('falls back to the raw code for a kind it does not know', () => {
+    expect(linenKindLabel('mattress_protector')).toBe('mattress_protector')
+  })
+})
+
+describe('linenShortageTag', () => {
+  it('tags a room that reported a shortage today', () => {
+    const tag = linenShortageTag(room({ linenShortageToday: true }))
+    expect(tag?.label).toBe('ขาดผ้า')
+    // Sky-toned, matching the แจ้งขาดผ้า button that files the report — not
+    // the red of a dirty room nor the emerald of a finished one.
+    expect(tag?.className).toContain('sky')
+  })
+
+  // The pairing the tag exists for: a finished room can still be short of
+  // linen, and the tag is independent of every cleaning state.
+  it('tags a room whose cleaning is already done', () => {
+    const tag = linenShortageTag(
+      room({
+        roomClean: true,
+        cleaning: { status: 'done', badge: 'Q1', name: null, at: '2026-09-01T03:00:00.000Z' },
+        linenShortageToday: true,
+      })
+    )
+    expect(tag?.label).toBe('ขาดผ้า')
+  })
+
+  it('returns null for false and for an absent field (older backend)', () => {
+    expect(linenShortageTag(room({ linenShortageToday: false }))).toBeNull()
+    expect(linenShortageTag(room({}))).toBeNull()
+  })
+})
+
+describe('linenShortageSummary', () => {
+  it('reads as one Thai line, labels and quantities, in the delivered order', () => {
+    expect(
+      linenShortageSummary([
+        { kind: 'pillowcase', qty: 2 },
+        { kind: 'bath_towel', qty: 1 },
+      ])
+    ).toBe('วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, ผ้าเช็ดตัว 1')
+  })
+
+  it('does not re-sort what the server ordered', () => {
+    expect(
+      linenShortageSummary([
+        { kind: 'foot_towel', qty: 1 },
+        { kind: 'bed_sheet', qty: 4 },
+      ])
+    ).toBe('วันนี้แจ้งขาดผ้า: ผ้าเช็ดเท้า 1, ผ้าปูที่นอน 4')
+  })
+
+  // Nothing reported and an older backend are the same on screen: no line.
+  it('returns null for an empty list, null and undefined', () => {
+    expect(linenShortageSummary([])).toBeNull()
+    expect(linenShortageSummary(null)).toBeNull()
+    expect(linenShortageSummary(undefined)).toBeNull()
   })
 })

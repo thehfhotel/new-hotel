@@ -18,7 +18,7 @@
  * 3. **แจ้งขาดผ้า (linen shortage).** The same "first tap files nothing" shape,
  *    plus a payload that has to be exactly right: the linen room acts on the
  *    kinds and quantities in that body, and a report that fails must leave the
- *    counts on screen — retyping five steppers in a corridor is how a report
+ *    counts on screen — retyping six steppers in a corridor is how a report
  *    stops getting filed at all.
  *
  * `hkFetch` / `hkFetchMe` are mocked at the module boundary: this suite is
@@ -26,7 +26,7 @@
  * the URL construction and the pure helpers.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
 const mockHkFetch = jest.fn()
 const mockHkFetchMe = jest.fn()
@@ -45,7 +45,7 @@ jest.mock('@/app/hk/hk-lib', () => {
 })
 
 import HkRoomPage from '@/app/hk/rooms/[roomId]/page'
-import { LEGACY_STATUS_STALE_NOTE } from '@/app/hk/hk-lib'
+import { LEGACY_STATUS_STALE_NOTE, LINEN_KINDS } from '@/app/hk/hk-lib'
 import { HK_STATUS_LABELS } from '@/lib/v2/status'
 
 const ROOM = {
@@ -192,6 +192,12 @@ describe('แจ้งขาดผ้า — linen shortage', () => {
     )
   }
 
+  /** Every READ the page has issued (no `init` ⇒ a GET), in order — the
+   * reload after a landed report is one of these. */
+  function getCalls() {
+    return mockHkFetch.mock.calls.filter(([, , init]) => init === undefined)
+  }
+
   /** The one POST the page must have issued, decoded. */
   function soleLinenPost() {
     const posts = postCalls()
@@ -303,6 +309,65 @@ describe('แจ้งขาดผ้า — linen shortage', () => {
     expect(await screen.findByText('บันทึกไม่สำเร็จ กรุณาลองใหม่')).toBeInTheDocument()
     expect(screen.queryByText('บันทึกแล้ว: แจ้งขาดผ้า')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'ส่งแจ้ง' })).toBeInTheDocument()
+  })
+
+  // The kinds ARE the vocabulary: the stepper rows come from LINEN_KINDS, and
+  // that list is what the linen room reads. A sixth kind that renders in the
+  // wrong place (or not at all) is a maid who cannot report a missing bed
+  // sheet — so both the count and the leading row are asserted.
+  it('offers every LINEN_KINDS row, ผ้าปูที่นอน first', async () => {
+    await openPanel()
+    const plusButtons = screen.getAllByRole('button', { name: /^เพิ่ม / })
+    expect(plusButtons).toHaveLength(LINEN_KINDS.length)
+    expect(plusButtons).toHaveLength(6)
+    expect(plusButtons.map((b) => b.getAttribute('aria-label'))).toEqual(
+      LINEN_KINDS.map(({ label }) => `เพิ่ม ${label}`)
+    )
+    // Bed linen largest-first: ผ้าปูที่นอน leads, ปลอกหมอน follows.
+    expect(plusButtons[0]).toHaveAttribute('aria-label', 'เพิ่ม ผ้าปูที่นอน')
+    expect(plusButtons[1]).toHaveAttribute('aria-label', 'เพิ่ม ปลอกหมอน')
+  })
+
+  // The new kind must reach the wire under the code the backend allowlists.
+  it('sends the bed_sheet code for the ผ้าปูที่นอน row', async () => {
+    await openPanel()
+    step('ผ้าปูที่นอน', 2)
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    expect(soleLinenPost().body).toEqual({ items: [{ kind: 'bed_sheet', qty: 2 }] })
+  })
+
+  // A landed report changes what this room IS (the ขาดผ้า chip, today's
+  // totals). Without the reload the maid is left looking at the pre-report
+  // room and may well file the same shortage twice.
+  it('re-fetches the room after a successful report', async () => {
+    await openPanel()
+    step('ปลอกหมอน', 1)
+    const getsBefore = getCalls().length
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    await waitFor(() => expect(getCalls().length).toBe(getsBefore + 1))
+    expect(getCalls().at(-1)?.[0]).toBe('/rooms/7')
+  })
+
+  // ...and only after a successful one. A failed report leaves the screen
+  // exactly as she left it, counts included (asserted above).
+  it('does NOT re-fetch when the report fails', async () => {
+    await openPanel()
+    step('ปลอกหมอน', 1)
+    const getsBefore = getCalls().length
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: false }, 500))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกไม่สำเร็จ กรุณาลองใหม่')
+    expect(getCalls().length).toBe(getsBefore)
   })
 
   it('ยกเลิก files nothing and resets the counts', async () => {
@@ -481,6 +546,115 @@ describe('movement tags (phase 2 delta: arrivals/departures today)', () => {
     expect(screen.queryByText('แขกเข้าวันนี้')).not.toBeInTheDocument()
     expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
     expect(screen.getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ขาดผ้า tag + today's totals. The tag is the same one the room list carries
+// (one helper, two screens); the totals line is the detail behind it — what a
+// maid needs before she counts anything, so she does not file this morning's
+// shortage a second time.
+// ---------------------------------------------------------------------------
+
+describe('ขาดผ้า tag and today\'s totals on the detail screen', () => {
+  it('shows the chip beside the cleaning chips when today carries a report', async () => {
+    await renderRoom({ room: { ...ROOM, linenShortageToday: true } })
+    expect(screen.getByText('ขาดผ้า')).toBeInTheDocument()
+    // The cleaning chips are untouched — a linen shortage is a different axis,
+    // not a replacement status.
+    expect(screen.getByText(HK_STATUS_LABELS.dirty)).toBeInTheDocument()
+    expect(screen.getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+  })
+
+  // The case the whole tag exists for, on this screen too.
+  it('shows the chip on a room already reported เสร็จแล้ว', async () => {
+    await renderRoom({
+      room: {
+        ...ROOM,
+        roomClean: true,
+        cleaning: { status: 'done', badge: 'Q1001', name: null, at: '2026-09-01T03:00:00.000Z' },
+        linenShortageToday: true,
+      },
+    })
+    // Scoped to the header: "เสร็จแล้ว" is also the label of the progress
+    // BUTTON further down, and the chip is the one under test.
+    const header = screen.getByText('ห้อง 104').closest('header') as HTMLElement
+    expect(within(header).getByText('เสร็จแล้ว')).toBeInTheDocument()
+    expect(within(header).getByText('ขาดผ้า')).toBeInTheDocument()
+  })
+
+  it('shows no chip when the room reported no shortage today', async () => {
+    await renderRoom({ room: { ...ROOM, linenShortageToday: false } })
+    expect(screen.queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+
+  // Deploy skew — the ROOM fixture carries no such field.
+  it('shows no chip when the backend omits the field entirely', async () => {
+    await renderRoom({})
+    expect(screen.queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+
+  // The totals line: Thai labels from LINEN_KINDS, quantities as delivered,
+  // in the order delivered.
+  it('renders today\'s totals with Thai labels, in the delivered order', async () => {
+    await renderRoom({
+      room: { ...ROOM, linenShortageToday: true },
+      linenShortages: [
+        { kind: 'pillowcase', qty: 2 },
+        { kind: 'bath_towel', qty: 1 },
+      ],
+    })
+    expect(screen.getByText('วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, ผ้าเช็ดตัว 1')).toBeInTheDocument()
+  })
+
+  it('renders the new ผ้าปูที่นอน label in the totals line', async () => {
+    await renderRoom({
+      room: { ...ROOM, linenShortageToday: true },
+      linenShortages: [{ kind: 'bed_sheet', qty: 3 }],
+    })
+    expect(screen.getByText('วันนี้แจ้งขาดผ้า: ผ้าปูที่นอน 3')).toBeInTheDocument()
+  })
+
+  it('renders no totals line for an empty list', async () => {
+    await renderRoom({ linenShortages: [] })
+    expect(screen.queryByText(/วันนี้แจ้งขาดผ้า/)).not.toBeInTheDocument()
+  })
+
+  it('renders no totals line when the backend omits the field entirely', async () => {
+    await renderRoom({})
+    expect(screen.queryByText(/วันนี้แจ้งขาดผ้า/)).not.toBeInTheDocument()
+  })
+
+  // The reload after a landed report is what makes both appear without a
+  // manual refresh: the second GET answers with the room as it now is.
+  it('shows the chip and totals as soon as the reload answers', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(jsonResponse({ success: true, room: ROOM, events: [] }))
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    expect(screen.queryByText('ขาดผ้า')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'แจ้งขาดผ้า' }))
+    await screen.findByRole('button', { name: 'ส่งแจ้ง' })
+    fireEvent.click(screen.getByRole('button', { name: 'เพิ่ม ปลอกหมอน' }))
+
+    // The POST lands, and the reload behind it returns the updated room.
+    mockHkFetch
+      .mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          room: { ...ROOM, linenShortageToday: true },
+          events: [],
+          linenShortages: [{ kind: 'pillowcase', qty: 1 }],
+        })
+      )
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    expect(await screen.findByText('ขาดผ้า')).toBeInTheDocument()
+    expect(screen.getByText('วันนี้แจ้งขาดผ้า: ปลอกหมอน 1')).toBeInTheDocument()
+    // The success banner is unchanged by any of this.
+    expect(screen.getByText('บันทึกแล้ว: แจ้งขาดผ้า')).toBeInTheDocument()
   })
 })
 

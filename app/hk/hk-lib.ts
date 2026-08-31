@@ -108,6 +108,16 @@ export interface HkRoom {
    */
   expectedArrival?: boolean
   expectedDeparture?: boolean
+  /**
+   * `true` ⇒ at least one linen shortage was reported for this room TODAY
+   * (Thai day, the same day scope as `cleaning`). Sent on the list AND the
+   * detail room so the two screens can never disagree about it.
+   *
+   * Optional for the same bundle/backend-skew reason as `occupancy`: an older
+   * backend simply omits it, and `linenShortageTag` renders nothing rather
+   * than a guessed "no shortage" claim.
+   */
+  linenShortageToday?: boolean
 }
 
 /** `GET /hk/api/rooms`. */
@@ -141,6 +151,16 @@ export interface HkRoomDetail {
   /** Same meaning as `HkRoomsResponse.legacyStatusStale`. Present on both so
    * the two screens can never tell the maid different stories. */
   legacyStatusStale?: boolean
+  /**
+   * Today's linen-shortage TOTALS for this room, one row per kind, in
+   * `LINEN_KINDS` order; `[]` when nothing was reported today. The detail of
+   * the tag `room.linenShortageToday` raises — so a maid who taps into a
+   * flagged room sees WHAT is missing, not just THAT something is.
+   *
+   * Optional for backend skew (an older backend omits it ⇒ no totals line).
+   * See `HkLinenShortageTotal` for why `kind` is a plain `string` here.
+   */
+  linenShortages?: HkLinenShortageTotal[]
 }
 
 // ---------------------------------------------------------------------------
@@ -154,11 +174,17 @@ export interface HkRoomDetail {
 // coincidence between a list and a switch.
 
 /**
- * The reportable linen kinds, in DISPLAY ORDER (bed linen first, then towels
- * largest to smallest — the order a maid walks a room in). `kind` is the wire
- * code the backend accepts; the Thai label never crosses the wire.
+ * The reportable linen kinds, in DISPLAY ORDER (bed linen largest-first, then
+ * towels largest to smallest — the order a maid walks a room in). `kind` is the
+ * wire code the backend accepts; the Thai label never crosses the wire.
+ *
+ * This list is the ONLY place a kind is spelled: the wire type (`LinenKind`),
+ * the form record (`LinenCounts`), the stepper rows, the request body's order
+ * and the totals line all derive from it, so adding a kind here is the whole
+ * change — matched, on the wire, by the backend's own allowlist.
  */
 export const LINEN_KINDS = [
+  { kind: 'bed_sheet', label: 'ผ้าปูที่นอน' },
   { kind: 'pillowcase', label: 'ปลอกหมอน' },
   { kind: 'duvet_cover', label: 'ปลอกผ้านวม' },
   { kind: 'bath_towel', label: 'ผ้าเช็ดตัว' },
@@ -177,6 +203,21 @@ export type LinenCounts = Record<LinenKind, number>
 /** One row of the request body. Only counts ABOVE zero become items. */
 export interface LinenShortageItem {
   kind: LinenKind
+  qty: number
+}
+
+/**
+ * One row of `HkRoomDetail.linenShortages` — today's total for one kind.
+ *
+ * `kind` is a plain `string`, NOT `LinenKind`, on purpose: this direction is
+ * SERVER→client, and a newer backend that ships a sixth kind before this bundle
+ * knows about it must render as a readable row, not crash a maid's screen or be
+ * silently dropped. `linenKindLabel` falls back to the raw code for exactly
+ * that case. The client→server direction stays strictly typed
+ * (`LinenShortageItem`), because there we choose what to send.
+ */
+export interface HkLinenShortageTotal {
+  kind: string
   qty: number
 }
 
@@ -480,6 +521,53 @@ export function movementTags(
     })
   }
   return tags
+}
+
+/**
+ * The ขาดผ้า tag for a room, or `null` when there is nothing to say.
+ *
+ * Shared by BOTH `/hk` screens so a room cannot be flagged on one and plain on
+ * the other. Sky-toned to match the แจ้งขาดผ้า button that files the report —
+ * it is the same subject, and deliberately neither the red of a dirty room nor
+ * the emerald of a finished one: a linen shortage is a DIFFERENT kind of fact,
+ * not a third cleanliness severity.
+ *
+ * It therefore renders ALONGSIDE every cleaning state, เสร็จแล้ว included —
+ * that pairing is the whole point. A room that is finished but still short of
+ * linen is not finished, and must not read as finished-and-forgotten.
+ *
+ * `undefined` (older backend) and `false` both render nothing: silence is not
+ * evidence of a shortage. PURE.
+ */
+export function linenShortageTag(
+  room: Pick<HkRoom, 'linenShortageToday'>
+): { label: string; className: string } | null {
+  return room.linenShortageToday === true
+    ? { label: 'ขาดผ้า', className: 'bg-sky-50 text-sky-800 border-sky-300' }
+    : null
+}
+
+/** Thai label for a wire `kind` code, falling back to the code itself for a
+ * kind a newer backend knows and this bundle does not — a readable row beats a
+ * dropped one. PURE. */
+export function linenKindLabel(kind: string): string {
+  return LINEN_KINDS.find((k) => k.kind === kind)?.label ?? kind
+}
+
+/**
+ * The one-line totals summary under the แจ้งขาดผ้า button
+ * ("วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, ผ้าเช็ดตัว 1"), or `null` when nothing was
+ * reported today (and for an older backend that sends no totals at all).
+ *
+ * Rows are rendered in the order DELIVERED — the server already orders them
+ * like `LINEN_KINDS`, and re-sorting here would invent a second opinion about
+ * an order that is already agreed. PURE. */
+export function linenShortageSummary(
+  shortages: HkLinenShortageTotal[] | null | undefined
+): string | null {
+  if (!shortages || shortages.length === 0) return null
+  const parts = shortages.map(({ kind, qty }) => `${linenKindLabel(kind)} ${qty}`)
+  return `วันนี้แจ้งขาดผ้า: ${parts.join(', ')}`
 }
 
 /**

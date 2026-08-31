@@ -295,3 +295,81 @@ describe('movement tags row', () => {
     expect(within(card).getByText('ยังไม่เริ่ม')).toBeInTheDocument()
   })
 })
+
+// ---------------------------------------------------------------------------
+// ขาดผ้า tag — a room with at least one linen shortage reported TODAY.
+//
+// The reason this tag exists at all is the finished room: cleaning เสร็จแล้ว
+// and still short of linen is the case the list used to hide, because a green
+// "done" chip is where a maid's eye stops. So the tag must be visible ALONGSIDE
+// every cleaning state, and the done+ขาดผ้า pairing is the assertion that
+// actually protects the feature.
+// ---------------------------------------------------------------------------
+
+describe('ขาดผ้า tag', () => {
+  const doneCleaning = {
+    status: 'done',
+    badge: 'Q1001',
+    name: null,
+    at: '2026-09-01T03:00:00.000Z',
+  }
+  const finishedRoom = {
+    roomId: 5,
+    roomNo: '301',
+    floor: 3,
+    building: null,
+    roomClean: true,
+    cleaning: doneCleaning,
+  }
+
+  // THE case: a room that looks finished but is not.
+  it('renders alongside the เสร็จแล้ว chip on a finished room', async () => {
+    await renderRooms([{ ...finishedRoom, linenShortageToday: true }], '301')
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    // Both visible together — the done chip is NOT replaced or hidden.
+    expect(within(card).getByText('เสร็จแล้ว')).toBeInTheDocument()
+    expect(within(card).getByText('ขาดผ้า')).toBeInTheDocument()
+    // And the clean/dirty chip is untouched by either.
+    expect(within(card).getByText(HK_STATUS_LABELS.clean)).toBeInTheDocument()
+  })
+
+  it('renders on an unfinished room too — the tag is not tied to a cleaning state', async () => {
+    await renderRooms(
+      [{ ...finishedRoom, roomClean: false, cleaning: null, linenShortageToday: true }],
+      '301'
+    )
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).getByText('ยังไม่เริ่ม')).toBeInTheDocument()
+    expect(within(card).getByText('ขาดผ้า')).toBeInTheDocument()
+  })
+
+  it('renders NO tag when the room reported no shortage today', async () => {
+    await renderRooms([{ ...finishedRoom, linenShortageToday: false }], '301')
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).getByText('เสร็จแล้ว')).toBeInTheDocument()
+    expect(within(card).queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+
+  // Deploy skew: an older backend has not shipped the field. Silence is not
+  // evidence of a shortage — and must not become a tag on every room.
+  it('renders NO tag when the backend omits the field entirely', async () => {
+    await renderRooms([finishedRoom], '301')
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+
+  // Per-room, not per-list: one flagged room must not tag its neighbours.
+  it('tags only the rooms the server flagged', async () => {
+    await renderRooms(
+      [
+        { ...finishedRoom, linenShortageToday: true },
+        { roomId: 6, roomNo: '302', floor: 3, building: null, roomClean: true, cleaning: null },
+      ],
+      '301'
+    )
+    const flagged = screen.getByText('301').closest('li') as HTMLElement
+    const plain = screen.getByText('302').closest('li') as HTMLElement
+    expect(within(flagged).getByText('ขาดผ้า')).toBeInTheDocument()
+    expect(within(plain).queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+})

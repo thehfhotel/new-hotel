@@ -285,7 +285,7 @@ async fn linen_body_errors_use_the_repo_envelope() {
         (r#"{}"#, "items is required", "items absent"),
         (r#"{"items":[]}"#, "items is required", "items empty"),
         (
-            r#"{"items":[{"kind":"bed_sheet","qty":1}]}"#,
+            r#"{"items":[{"kind":"blanket","qty":1}]}"#,
             "invalid linen kind",
             "unknown kind",
         ),
@@ -320,11 +320,12 @@ async fn linen_body_errors_use_the_repo_envelope() {
             "fractional qty",
         ),
         (
-            r#"{"items":[{"kind":"pillowcase","qty":1},{"kind":"duvet_cover","qty":1},
-                        {"kind":"bath_towel","qty":1},{"kind":"face_towel","qty":1},
-                        {"kind":"foot_towel","qty":1},{"kind":"pillowcase","qty":1}]}"#,
+            r#"{"items":[{"kind":"bed_sheet","qty":1},{"kind":"pillowcase","qty":1},
+                        {"kind":"duvet_cover","qty":1},{"kind":"bath_towel","qty":1},
+                        {"kind":"face_towel","qty":1},{"kind":"foot_towel","qty":1},
+                        {"kind":"pillowcase","qty":1}]}"#,
             "too many linen entries",
-            "six entries",
+            "seven entries",
         ),
     ] {
         let app = inner(

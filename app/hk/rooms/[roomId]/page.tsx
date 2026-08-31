@@ -43,6 +43,8 @@ import {
   LINEN_MAX_QTY,
   LINEN_MIN_QTY,
   linenShortageItems,
+  linenShortageSummary,
+  linenShortageTag,
   markDirtyConfirmMessage,
   movementTags,
   occupancyIndicator,
@@ -231,9 +233,15 @@ export default function HkRoomPage() {
       setError(null)
       setNotice('บันทึกแล้ว: แจ้งขาดผ้า')
       // Only a landed report resets the form and collapses the panel. On a
-      // failure the counts stay exactly as she entered them — retyping five
+      // failure the counts stay exactly as she entered them — retyping six
       // steppers in a corridor is how a report stops getting filed at all.
       closeLinenPanel()
+      // Same reload `reportCleaning` does, for the same reason: the report she
+      // just filed is now a fact about this room (the ขาดผ้า chip and today's
+      // totals line), and a screen that still shows the pre-report room would
+      // invite her to file it a second time. Awaited inside the try so the
+      // in-flight lock covers it, exactly as the cleaning path does.
+      await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
@@ -271,6 +279,10 @@ export default function HkRoomPage() {
   const badge = progressLabel(room?.cleaning?.status)
   const occupancy = occupancyIndicator(room?.occupancy)
   const tags = room ? movementTags(room) : []
+  const linenTag = room ? linenShortageTag(room) : null
+  // Today's totals behind that tag ("วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, …"), or
+  // null when nothing was reported today / the backend sends no totals.
+  const linenSummary = linenShortageSummary(detail?.linenShortages)
   // ONE in-flight report at a time, whichever kind it is: two reports on one
   // room from one thumb is never what she meant, and the auto-refresh gate
   // above already treats both the same way.
@@ -346,6 +358,17 @@ export default function HkRoomPage() {
                 >
                   {badge.label}
                 </span>
+                {/* Third chip, when today carries a linen report — same chip,
+                    same words, same row position as the room list, so the two
+                    screens can never disagree about this room. Rendered beside
+                    EVERY cleaning state, เสร็จแล้ว included. */}
+                {linenTag && (
+                  <span
+                    className={`inline-block rounded-full border px-2.5 py-1 text-xs ${linenTag.className}`}
+                  >
+                    {linenTag.label}
+                  </span>
+                )}
               </span>
             </div>
             {/* Day-scoped movement (arrivals/departures today) — a different
@@ -539,6 +562,16 @@ export default function HkRoomPage() {
                 <Shirt className="h-4 w-4" />
                 แจ้งขาดผ้า
               </button>
+            )}
+
+            {/* What has ALREADY been reported for this room today — the detail
+                behind the ขาดผ้า chip in the header, in the same muted register
+                as the cleaning-event list below. It sits directly under the
+                button that files a report so a maid can see, before she counts
+                anything, that the morning shift already asked for two
+                pillowcases. Rendered only when there is something to say. */}
+            {linenSummary && (
+              <p className="mt-2 text-xs text-gray-500">{linenSummary}</p>
             )}
 
             {detail && detail.events.length > 0 && (
