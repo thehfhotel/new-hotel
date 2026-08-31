@@ -98,7 +98,7 @@ jobs:
         # If you add a new top-level path, decide which filter it belongs
         # under and add it. Catch-all globs (`**` at the root) are deliberately
         # NOT used here — explicit lists make the test/build matrix legible.
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
         id: filter
         with:
           filters: |
