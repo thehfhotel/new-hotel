@@ -15,6 +15,11 @@
  *    reach iHOTEL it serves the PMS mirror and flags it. The maid must SEE
  *    that, and must still get a fully working screen — stale-but-shown beats a
  *    dead screen on a stairwell.
+ * 3. **แจ้งขาดผ้า (linen shortage).** The same "first tap files nothing" shape,
+ *    plus a payload that has to be exactly right: the linen room acts on the
+ *    kinds and quantities in that body, and a report that fails must leave the
+ *    counts on screen — retyping five steppers in a corridor is how a report
+ *    stops getting filed at all.
  *
  * `hkFetch` / `hkFetchMe` are mocked at the module boundary: this suite is
  * about what the page DOES with an answer, and `hk-lib.test.ts` already owns
@@ -175,6 +180,182 @@ describe('mark-dirty confirm step (R2b)', () => {
 
     expect(screen.queryByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'ยืนยัน' })).not.toBeInTheDocument()
+  })
+})
+
+describe('แจ้งขาดผ้า — linen shortage', () => {
+  /** Every POST the page has issued, in order. The GETs (initial load, polls)
+   * are noise here — what reaches the linen room is a POST. */
+  function postCalls() {
+    return mockHkFetch.mock.calls.filter(
+      ([, , init]) => (init as RequestInit | undefined)?.method === 'POST'
+    )
+  }
+
+  /** The one POST the page must have issued, decoded. */
+  function soleLinenPost() {
+    const posts = postCalls()
+    expect(posts).toHaveLength(1)
+    const init = posts[0][2] as RequestInit
+    return { path: posts[0][0] as string, init, body: JSON.parse(init.body as string) }
+  }
+
+  async function openPanel() {
+    await renderRoom({})
+    fireEvent.click(screen.getByRole('button', { name: 'แจ้งขาดผ้า' }))
+    await screen.findByRole('button', { name: 'ส่งแจ้ง' })
+  }
+
+  /** Tap a kind's + button `times` times. The node identity survives the
+   * re-renders, so one lookup is enough. */
+  function step(label: string, times: number) {
+    const plus = screen.getByRole('button', { name: `เพิ่ม ${label}` })
+    for (let i = 0; i < times; i += 1) fireEvent.click(plus)
+  }
+
+  // Same regression as the mark-dirty confirm: opening a form is not filing a
+  // report. Asserted on the POST count, because that is what the linen room acts on.
+  it('the first tap issues NO request — it only opens the form', async () => {
+    await renderRoom({})
+    const readCalls = mockHkFetch.mock.calls.length
+
+    fireEvent.click(screen.getByRole('button', { name: 'แจ้งขาดผ้า' }))
+
+    await screen.findByRole('button', { name: 'ส่งแจ้ง' })
+    expect(mockHkFetch.mock.calls.length).toBe(readCalls)
+    expect(postCalls()).toHaveLength(0)
+    // Every row starts at zero, so every − starts dead.
+    expect(screen.getByRole('button', { name: 'ลด ปลอกหมอน' })).toBeDisabled()
+  })
+
+  it('ส่งแจ้ง is dead until at least one kind is above zero', async () => {
+    await openPanel()
+    expect(screen.getByRole('button', { name: 'ส่งแจ้ง' })).toBeDisabled()
+
+    step('ผ้าเช็ดตัว', 1)
+
+    expect(screen.getByRole('button', { name: 'ส่งแจ้ง' })).toBeEnabled()
+  })
+
+  // The payload IS the feature: wrong codes or wrong quantities send someone
+  // up with the wrong armful of linen. Zero rows must not ship at all.
+  it('POSTs exactly the non-zero rows, then confirms and collapses', async () => {
+    await openPanel()
+    step('ปลอกหมอน', 2)
+    step('ผ้าเช็ดเท้า', 3)
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 2 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    const post = soleLinenPost()
+    expect(post.path).toBe('/rooms/7/linen-shortage')
+    expect(post.init.method).toBe('POST')
+    expect(post.init.headers).toEqual({ 'Content-Type': 'application/json' })
+    expect(post.body).toEqual({
+      items: [
+        { kind: 'pillowcase', qty: 2 },
+        { kind: 'foot_towel', qty: 3 },
+      ],
+    })
+
+    // Panel gone, trigger back, and the form is empty again on reopen.
+    expect(screen.queryByRole('button', { name: 'ส่งแจ้ง' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'แจ้งขาดผ้า' }))
+    expect(await screen.findByRole('button', { name: 'ส่งแจ้ง' })).toBeDisabled()
+  })
+
+  // The retry path. Losing the counts on a failure is how a report stops
+  // getting filed at all — she is standing in a corridor, not at a desk.
+  it('keeps the panel open and the counts intact when the report fails', async () => {
+    await openPanel()
+    step('ผ้าเช็ดหน้า', 2)
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: false }, 500))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    expect(await screen.findByText('บันทึกไม่สำเร็จ กรุณาลองใหม่')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ส่งแจ้ง' })).toBeInTheDocument()
+    expect(screen.queryByText('บันทึกแล้ว: แจ้งขาดผ้า')).not.toBeInTheDocument()
+
+    // Counts survived: the retry sends the same body, and the green banner
+    // replaces the red one rather than hiding behind it.
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    const posts = postCalls()
+    expect(posts).toHaveLength(2)
+    expect(JSON.parse((posts[1][2] as RequestInit).body as string)).toEqual({
+      items: [{ kind: 'face_towel', qty: 2 }],
+    })
+  })
+
+  // A 200 is not the answer — the body's `success` is. A green banner over a
+  // report that never landed is worse than an error.
+  it('treats a 200 carrying success: false as a failure', async () => {
+    await openPanel()
+    step('ปลอกผ้านวม', 1)
+
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: false, roomId: 7, reported: 0 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    expect(await screen.findByText('บันทึกไม่สำเร็จ กรุณาลองใหม่')).toBeInTheDocument()
+    expect(screen.queryByText('บันทึกแล้ว: แจ้งขาดผ้า')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ส่งแจ้ง' })).toBeInTheDocument()
+  })
+
+  it('ยกเลิก files nothing and resets the counts', async () => {
+    await openPanel()
+    step('ผ้าเช็ดตัว', 2)
+
+    fireEvent.click(screen.getByRole('button', { name: 'ยกเลิก' }))
+
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'ส่งแจ้ง' })).not.toBeInTheDocument()
+    )
+    expect(postCalls()).toHaveLength(0)
+    // Reopening gives a blank form, not the abandoned one.
+    fireEvent.click(screen.getByRole('button', { name: 'แจ้งขาดผ้า' }))
+    expect(await screen.findByRole('button', { name: 'ส่งแจ้ง' })).toBeDisabled()
+  })
+
+  // The ceiling is the contract (qty ≤ 20), so it is enforced in the reducer,
+  // not only by the disabled +: a bound that lives on an attribute is one
+  // double-tap away from not existing.
+  it('clamps a runaway stepper at 20 and never sends more', async () => {
+    await openPanel()
+    step('ปลอกหมอน', 25)
+
+    expect(screen.getByRole('button', { name: 'เพิ่ม ปลอกหมอน' })).toBeDisabled()
+    mockHkFetch.mockResolvedValueOnce(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    expect(soleLinenPost().body).toEqual({ items: [{ kind: 'pillowcase', qty: 20 }] })
+  })
+
+  // One in-flight report at a time, whichever kind it is — two reports on one
+  // room from one thumb is never what she meant.
+  it('locks every other action while the linen report is in flight', async () => {
+    await openPanel()
+    step('ผ้าเช็ดตัว', 1)
+
+    let settle: (value: unknown) => void = () => {}
+    mockHkFetch.mockReturnValueOnce(
+      new Promise((resolve) => {
+        settle = resolve
+      })
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'ส่งแจ้ง' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'เสร็จแล้ว' })).toBeDisabled())
+    expect(screen.getByRole('button', { name: 'เริ่มทำความสะอาด' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /แจ้งห้องไม่สะอาด/ })).toBeDisabled()
+
+    settle(jsonResponse({ success: true, roomId: 7, reported: 1 }))
+    await screen.findByText('บันทึกแล้ว: แจ้งขาดผ้า')
+    expect(screen.getByRole('button', { name: 'เสร็จแล้ว' })).toBeEnabled()
   })
 })
 

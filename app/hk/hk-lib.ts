@@ -144,6 +144,93 @@ export interface HkRoomDetail {
 }
 
 // ---------------------------------------------------------------------------
+// แจ้งขาดผ้า — linen shortage (`POST /hk/api/rooms/{roomId}/linen-shortage`)
+// ---------------------------------------------------------------------------
+//
+// The maid finds a room short of linen while she is standing in it; the linen
+// room needs to know WHAT and HOW MANY, and nothing else. The whole vocabulary
+// lives here — wire codes AND their Thai labels — so the room screen never
+// spells a `kind` twice and the display order is a single fact rather than a
+// coincidence between a list and a switch.
+
+/**
+ * The reportable linen kinds, in DISPLAY ORDER (bed linen first, then towels
+ * largest to smallest — the order a maid walks a room in). `kind` is the wire
+ * code the backend accepts; the Thai label never crosses the wire.
+ */
+export const LINEN_KINDS = [
+  { kind: 'pillowcase', label: 'ปลอกหมอน' },
+  { kind: 'duvet_cover', label: 'ปลอกผ้านวม' },
+  { kind: 'bath_towel', label: 'ผ้าเช็ดตัว' },
+  { kind: 'face_towel', label: 'ผ้าเช็ดหน้า' },
+  { kind: 'foot_towel', label: 'ผ้าเช็ดเท้า' },
+] as const
+
+/** Exactly the `kind` codes `LINEN_KINDS` carries — derived, never re-typed. */
+export type LinenKind = (typeof LINEN_KINDS)[number]['kind']
+
+/** Every kind's current count on the form. `0` means "not reported", which is
+ * why it is a full record rather than a sparse map: the steppers need a number
+ * to render for every row, and only `linenShortageItems` decides what ships. */
+export type LinenCounts = Record<LinenKind, number>
+
+/** One row of the request body. Only counts ABOVE zero become items. */
+export interface LinenShortageItem {
+  kind: LinenKind
+  qty: number
+}
+
+/** Stepper floor. A row at zero is simply not part of the report. */
+export const LINEN_MIN_QTY = 0
+
+/**
+ * Stepper ceiling. Nothing about a single room justifies more than this, and a
+ * runaway stepper (a stuck thumb on a phone in a pocket) must not turn into a
+ * 400-pillowcase errand for the linen room.
+ */
+export const LINEN_MAX_QTY = 20
+
+/** A fresh, all-zero form. PURE. */
+export function emptyLinenCounts(): LinenCounts {
+  return Object.fromEntries(LINEN_KINDS.map(({ kind }) => [kind, 0])) as LinenCounts
+}
+
+/**
+ * Hold a stepper value inside the contract (an integer in
+ * `LINEN_MIN_QTY..LINEN_MAX_QTY`). One place, so the − and + buttons cannot
+ * disagree with each other or with the server's own bounds. PURE.
+ */
+export function clampLinenQty(qty: number): number {
+  if (!Number.isFinite(qty)) return LINEN_MIN_QTY
+  return Math.min(LINEN_MAX_QTY, Math.max(LINEN_MIN_QTY, Math.trunc(qty)))
+}
+
+/**
+ * The request body's `items` — every kind whose count is ABOVE zero, in
+ * `LINEN_KINDS` display order so the report reads the same way the form did.
+ * Zero-count rows are DROPPED, not sent as `qty: 0`: the wire says what is
+ * missing, never what is fine. PURE.
+ */
+export function linenShortageItems(counts: LinenCounts): LinenShortageItem[] {
+  return LINEN_KINDS.filter(({ kind }) => counts[kind] > 0).map(({ kind }) => ({
+    kind,
+    qty: counts[kind],
+  }))
+}
+
+/**
+ * `POST /hk/api/rooms/{roomId}/linen-shortage`. The client branches on
+ * `success` ALONE — a 200 carrying `success: false` is a failure, and the maid
+ * must be told to retry rather than shown a green banner for a report that
+ * never landed. `reported` (how many rows the server recorded) is not rendered.
+ */
+export interface HkLinenShortageResponse {
+  success: boolean
+  roomId: number
+  reported: number
+}
+
+// ---------------------------------------------------------------------------
 // Branch selection (localStorage)
 // ---------------------------------------------------------------------------
 //

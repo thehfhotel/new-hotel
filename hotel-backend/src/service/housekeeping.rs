@@ -238,6 +238,55 @@ pub struct ReportCleaningCommand {
     pub source: EventSource,
 }
 
+/// Inclusive quantity bounds for ONE linen-shortage line.
+///
+/// Mirrored by the `CHECK (hklr_qty >= 1 AND hklr_qty <= 20)` in migration 088
+/// and re-stated by `routes::hk` so a bad body is a 400, not a 500 from the
+/// constraint. Kept here (not only in the route) because
+/// [`HousekeepingService::report_linen_shortage`] must hold for ANY caller.
+pub const MIN_LINEN_QTY: i32 = 1;
+pub const MAX_LINEN_QTY: i32 = 20;
+
+/// One line of a linen-shortage report: "I am short N of this kind".
+///
+/// `kind` is an already-validated code from `routes::hk::VALID_LINEN_KINDS`.
+/// The service does NOT re-check the vocabulary — the DB column is
+/// unconstrained `TEXT` on purpose (migration 088) so the allowlist can move
+/// without a migration, and duplicating it here would recreate exactly the
+/// two-places-to-change coupling that decision avoids.
+#[derive(Debug, Clone)]
+pub struct LinenShortageItem {
+    pub kind: String,
+    pub qty: i32,
+}
+
+/// Command for [`HousekeepingService::report_linen_shortage`] — one maid
+/// submission on `POST /api/hk/rooms/{id}/linen-shortage`.
+#[derive(Debug, Clone)]
+pub struct ReportLinenShortageCommand {
+    pub room_id: i32,
+    /// One entry per kind, already deduplicated and validated by the route.
+    pub items: Vec<LinenShortageItem>,
+    /// Verified HF ID badge — ALWAYS present (the Access middleware 401s
+    /// without one). Stamped into `hklr_badge`.
+    pub badge: String,
+    /// Display-name snapshot for `hklr_name`.
+    pub name: Option<String>,
+    // Deliberately NO `source: EventSource`: this command publishes no domain
+    // event and enqueues no writeback, so an event source would be a field that
+    // only ever gets discarded — and a misleading hint that one day it won't be.
+}
+
+/// Outcome of [`HousekeepingService::report_linen_shortage`].
+#[derive(Debug, Clone)]
+pub struct LinenShortageReport {
+    pub room_id: i32,
+    /// The server-minted `hklr_report_uuid` shared by every row this call wrote.
+    pub report_uuid: Uuid,
+    /// How many item rows were actually inserted (== `items.len()`).
+    pub reported: usize,
+}
+
 /// Outcome of [`HousekeepingService::report_cleaning_progress`].
 #[derive(Debug, Clone)]
 pub struct CleaningReport {
@@ -752,6 +801,97 @@ impl HousekeepingService {
             aggregate_id,
         })
     }
+
+    /// Record ONE maid linen-shortage report (ขาดผ้า) — migration 088,
+    /// `POST /api/hk/rooms/{id}/linen-shortage`.
+    ///
+    /// ## RECORD-ONLY, and deliberately unlike every other method here
+    ///
+    /// Every sibling on this service exists to move canonical state and mirror
+    /// it to iHOTEL. This one does NOT, and the difference is the design:
+    ///
+    /// * no `ht_rooms_new` column is touched — a shortage of pillowcases is not
+    ///   a cleanliness or occupancy fact;
+    /// * NO [`WritebackIntent`] is enqueued and NO [`DomainEvent`] is published.
+    ///   That is not a dark-ship pending verification (invariant #6) — it is
+    ///   terminal. iHOTEL has no linen-inventory table, so there is nothing on
+    ///   the legacy side to write and nothing for a later flag to enable;
+    /// * no notification of any kind. The rows ARE the feature.
+    ///
+    /// Adding an outbox row here later would be a real design change, not a
+    /// fill-in-the-blank — it would need a legacy counterpart to exist first.
+    ///
+    /// ## Shape
+    ///
+    /// One row per (submission, kind), all sharing `hklr_report_uuid` — minted
+    /// HERE (uuid v4), never accepted from the client, so a replayed body cannot
+    /// merge into or overwrite an earlier submission. Rows are inserted by a
+    /// single `UNNEST` statement inside ONE transaction, so a partial submission
+    /// can never be observed: either every kind the maid reported lands, or none
+    /// does.
+    ///
+    /// ## Validation split
+    ///
+    /// The kind ALLOWLIST is the route's (`routes::hk::VALID_LINEN_KINDS`) —
+    /// the DB column is deliberately unconstrained `TEXT` so a new kind needs no
+    /// migration. What is re-checked here is only what must hold for ANY caller
+    /// of this method: a verified badge, a non-empty item list, and the same
+    /// 1..=20 quantity bound the DB `CHECK` enforces. This method is not a
+    /// second gate on the product's kind vocabulary and must not grow into one.
+    ///
+    /// There is no idempotency key and no dedup: two identical reports are two
+    /// real reports (a maid can be short of the same linen twice in a day), and
+    /// with nothing crossing to legacy there is no double-write to prevent.
+    pub async fn report_linen_shortage(
+        &self,
+        cmd: ReportLinenShortageCommand,
+    ) -> ServiceResult<LinenShortageReport> {
+        if cmd.badge.trim().is_empty() {
+            return Err(ServiceError::validation(
+                "report_linen_shortage requires a non-empty verified badge",
+            ));
+        }
+        if cmd.items.is_empty() {
+            return Err(ServiceError::validation(
+                "report_linen_shortage requires at least one linen item",
+            ));
+        }
+        if let Some(bad) = cmd
+            .items
+            .iter()
+            .find(|item| !(MIN_LINEN_QTY..=MAX_LINEN_QTY).contains(&item.qty))
+        {
+            return Err(ServiceError::validation(format!(
+                "linen quantity {} for '{}' is outside {MIN_LINEN_QTY}..={MAX_LINEN_QTY}",
+                bad.qty, bad.kind
+            )));
+        }
+
+        let report_uuid = Uuid::new_v4();
+
+        let mut tx = self.pg.begin().await?;
+        let reported = insert_linen_report_rows(
+            &mut tx,
+            report_uuid,
+            cmd.room_id,
+            &cmd.items,
+            &cmd.badge,
+            cmd.name.as_deref(),
+        )
+        .await?;
+
+        // No enqueue, no publish — see the doc comment. The handles are held
+        // for symmetry with the other methods on this service.
+        let _ = (&self.repo, &self.outbox, &self.events);
+
+        tx.commit().await?;
+
+        Ok(LinenShortageReport {
+            room_id: cmd.room_id,
+            report_uuid,
+            reported,
+        })
+    }
 }
 
 /// Set `ht_rooms_new.room_clean` directly via dynamic SQL.
@@ -851,6 +991,44 @@ async fn insert_cleaning_event(
     .fetch_one(&mut **tx)
     .await?;
     Ok(sqlx::Row::try_get(&row, "hkev_id")?)
+}
+
+/// Insert every line of ONE linen-shortage submission — migration 088.
+///
+/// A single `UNNEST` statement rather than a loop of INSERTs: one round-trip,
+/// and the all-or-nothing property is a property of the statement itself, not
+/// of remembering to keep the loop inside the transaction. Returns the number
+/// of rows written, which the handler reports as `reported`.
+///
+/// The arrays are bound as parameters (`$5::text[]`, `$6::int[]`) — nothing
+/// about a maid's report is ever concatenated into SQL.
+async fn insert_linen_report_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    report_uuid: Uuid,
+    room_id: i32,
+    items: &[LinenShortageItem],
+    badge: &str,
+    name: Option<&str>,
+) -> ServiceResult<usize> {
+    let kinds: Vec<String> = items.iter().map(|item| item.kind.clone()).collect();
+    let quantities: Vec<i32> = items.iter().map(|item| item.qty).collect();
+
+    let result = sqlx::query(
+        "INSERT INTO ht_hk_linen_reports \
+             (hklr_report_uuid, hklr_room_id, hklr_kind, hklr_qty, hklr_badge, hklr_name) \
+         SELECT $1, $2, line.kind, line.qty, $3, $4 \
+           FROM UNNEST($5::text[], $6::int[]) AS line(kind, qty)",
+    )
+    .bind(report_uuid)
+    .bind(room_id)
+    .bind(badge)
+    .bind(name)
+    .bind(&kinds)
+    .bind(&quantities)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected() as usize)
 }
 
 /// Read `ht_rooms_new.room_clean` for one room AND take its row lock — the

@@ -7,8 +7,16 @@
 //! - `GET  /api/hk/rooms`                       — room list + today's progress.
 //! - `GET  /api/hk/rooms/{id}`                  — one room + today's events.
 //! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`/`dirty`).
+//! - `POST /api/hk/rooms/{id}/linen-shortage`   — report a linen shortage (ขาดผ้า).
 //! - `POST /api/hk/rooms/{id}/broken-items`     — RETIRED, answers `410 Gone`.
 //! - `GET  /api/hk/broken-items/{id}/photo`     — stream a report's photo.
+//!
+//! `linen-shortage` (migration 088) is the RECORD-ONLY one: it writes
+//! `ht_hk_linen_reports` rows and returns. No notification, no domain event, no
+//! outbox row, no legacy writeback — iHOTEL has no linen counterpart, so there
+//! is nothing to mirror and no dark flag waiting to enable one. It shares every
+//! gate with the cleaning route (required `?branch=`, the location gate, the
+//! Ville-guard exemption) so the two maid mutations behave identically.
 //!
 //! ## `?branch=` is REQUIRED on every room endpoint (wave-4 A)
 //!
@@ -287,7 +295,8 @@ use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::housekeeping::{
-    CleaningProgressStatus, HousekeepingService, LegacyCleanliness, ReportCleaningCommand,
+    CleaningProgressStatus, HousekeepingService, LegacyCleanliness, LinenShortageItem,
+    ReportCleaningCommand, ReportLinenShortageCommand, MAX_LINEN_QTY, MIN_LINEN_QTY,
 };
 
 /// Cleaning-progress statuses a maid can report. `started` =
@@ -295,6 +304,35 @@ use crate::service::housekeeping::{
 /// CHECK constraint on `ht_hk_cleaning_events.hkev_status` (migration 077,
 /// widened by migration 087) — keep the two in lock-step.
 pub const VALID_CLEANING_STATUSES: [&str; 3] = ["started", "done", "dirty"];
+
+/// Linen kinds a maid can report short (ขาดผ้า) — migration 088.
+///
+/// **This constant is the ONLY allowlist.** `ht_hk_linen_reports.hklr_kind` is
+/// deliberately plain `TEXT` with no CHECK, so adding a sixth kind
+/// (`bed_sheet` / ผ้าปูที่นอน, say) is a one-line change here plus the
+/// frontend's label — no migration, no `ALTER` on a live table at two sites,
+/// and no window where the deployed binary and the deployed constraint
+/// disagree about the valid set. That is exactly the coupling migration 087
+/// had to unpick for `hkev_status`; this table does not inherit it.
+///
+/// Thai labels belong to the client (which knows how to render them), so the
+/// wire codes stay ASCII snake_case and are compared after normalisation.
+pub const VALID_LINEN_KINDS: [&str; 5] = [
+    "pillowcase",  // ปลอกหมอน
+    "duvet_cover", // ปลอกผ้านวม
+    "bath_towel",  // ผ้าเช็ดตัว
+    "face_towel",  // ผ้าเช็ดหน้า
+    "foot_towel",  // ผ้าเช็ดเท้า
+];
+
+/// Most kinds one linen-shortage submission may carry.
+///
+/// Equal to `VALID_LINEN_KINDS.len()` today, and that is not a coincidence: a
+/// submission may name each kind at most once, so a body with more entries than
+/// there are kinds is necessarily malformed regardless of the duplicate check.
+/// Kept as its own constant so widening the vocabulary later does not silently
+/// widen the accepted body size before anyone has thought about it.
+pub const MAX_LINEN_ITEMS: usize = 5;
 
 /// Env var listing the branches the `/hk` surface may serve. Comma-separated;
 /// unset ⇒ [`DEFAULT_HK_BRANCH`].
@@ -818,6 +856,10 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
         .route("/api/hk/rooms/{room_id}", get(room_detail))
         .route("/api/hk/rooms/{room_id}/cleaning", post(report_cleaning))
         .route(
+            "/api/hk/rooms/{room_id}/linen-shortage",
+            post(report_linen_shortage),
+        )
+        .route(
             "/api/hk/rooms/{room_id}/broken-items",
             post(report_broken_item),
         )
@@ -1054,6 +1096,47 @@ pub struct ReportCleaningResponse {
     pub writeback_enqueued: bool,
 }
 
+/// Body for `POST /api/hk/rooms/{id}/linen-shortage` — migration 088.
+///
+/// `items` is an `Option` on purpose. A body of `{}` (or `{"items":null}`) must
+/// answer with THIS module's `{success:false,error}` envelope, and a required
+/// field would instead be rejected by serde inside axum's `Json` extractor,
+/// which renders its own plain-text shape the maid's client cannot parse.
+/// Making it optional moves the rejection into [`parse_linen_items`], where the
+/// envelope is ours.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportLinenShortageBody {
+    pub items: Option<Vec<LinenShortageEntry>>,
+}
+
+/// One `{kind, qty}` line as it arrives on the wire.
+///
+/// `qty` is a raw [`serde_json::Value`], NOT an `i32`, for the same reason
+/// `items` is optional: `{"qty": 1.5}`, `{"qty": "3"}` and `{"qty": null}` are
+/// all things a hand-rolled or half-broken client sends, and each of them
+/// would otherwise be a serde rejection with a foreign body shape. Taking the
+/// value untyped lets [`parse_linen_items`] answer every one of them with the
+/// repo envelope and a message that names the offending kind.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinenShortageEntry {
+    pub kind: String,
+    pub qty: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportLinenShortageResponse {
+    pub success: bool,
+    pub room_id: i32,
+    /// How many item ROWS were written — one per kind in the submission.
+    ///
+    /// Deliberately not a total of the quantities: it answers "did all my lines
+    /// land", which is what a client that just POSTed a list needs to know.
+    pub reported: usize,
+}
+
 /// Body of a `410 Gone` answer from a retired endpoint. Same
 /// `{success:false, error}` shape the frontend's `hkFetch` already expects.
 #[derive(Debug, Serialize)]
@@ -1079,6 +1162,85 @@ fn parse_cleaning_status(raw: &str) -> Result<CleaningProgressStatus, ApiError> 
                 "invalid status '{raw}' (expected one of {VALID_CLEANING_STATUSES:?})"
             ))
         })
+}
+
+/// Normalize + validate a whole linen-shortage submission — migration 088.
+/// PURE, and the single place the wire contract is enforced; unit-tested below.
+///
+/// Every rejection is an [`ApiError::BadRequest`], so every one of them reaches
+/// the maid as the repo's `{success:false,error}` envelope with a 400.
+///
+/// Order, and why: **shape before content**. The list must exist and be a
+/// plausible size before any single entry is judged, so an empty or oversized
+/// body is never answered with a complaint about its first item. Within the
+/// loop the kind is resolved first (an unknown kind makes the rest of the line
+/// meaningless), then checked for a duplicate — the duplicate test necessarily
+/// runs on the NORMALIZED code, otherwise `"Bath_Towel"` and `"bath_towel"`
+/// would slip past as two lines and land as two rows for one kind — and only
+/// then is the quantity read.
+///
+/// Kinds are trimmed and lower-cased before matching, the same forgiveness
+/// [`parse_cleaning_status`] already grants a status. The normalized code is
+/// what gets stored, so the table never accumulates casing variants of one kind.
+fn parse_linen_items(
+    items: Option<Vec<LinenShortageEntry>>,
+) -> Result<Vec<LinenShortageItem>, ApiError> {
+    let items = items.unwrap_or_default();
+    if items.is_empty() {
+        return Err(ApiError::BadRequest(
+            "items is required and must contain at least one linen entry".to_string(),
+        ));
+    }
+    if items.len() > MAX_LINEN_ITEMS {
+        return Err(ApiError::BadRequest(format!(
+            "too many linen entries ({}); at most {MAX_LINEN_ITEMS} are accepted",
+            items.len()
+        )));
+    }
+
+    let mut parsed: Vec<LinenShortageItem> = Vec::with_capacity(items.len());
+    for entry in items {
+        let wanted = entry.kind.trim().to_lowercase();
+        let kind = VALID_LINEN_KINDS
+            .iter()
+            .find(|valid| ***valid == *wanted)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "invalid linen kind '{}' (expected one of {VALID_LINEN_KINDS:?})",
+                    entry.kind
+                ))
+            })?;
+
+        if parsed.iter().any(|item| item.kind == *kind) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate linen kind '{kind}'; report each kind once with its total"
+            )));
+        }
+
+        // `as_i64` is the whole integer test: it says None for `1.5`, for
+        // `"3"`, for `null` and for `true`, and Some only for a JSON integer.
+        // The i32 narrowing then rejects anything beyond i32 before the range
+        // check, so a 2^40 quantity cannot wrap into an accepted value.
+        let qty = entry
+            .qty
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|n| (MIN_LINEN_QTY..=MAX_LINEN_QTY).contains(n))
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "invalid qty {} for linen kind '{kind}' (expected an integer \
+                     {MIN_LINEN_QTY}..={MAX_LINEN_QTY})",
+                    entry.qty
+                ))
+            })?;
+
+        parsed.push(LinenShortageItem {
+            kind: (*kind).to_string(),
+            qty,
+        });
+    }
+
+    Ok(parsed)
 }
 
 // ============================================================================
@@ -1768,6 +1930,64 @@ pub async fn report_cleaning(
     }))
 }
 
+/// POST /api/hk/rooms/{id}/linen-shortage — report a linen shortage (ขาดผ้า).
+///
+/// A thin gate over
+/// [`HousekeepingService::report_linen_shortage`](crate::service::housekeeping::HousekeepingService::report_linen_shortage),
+/// which writes one `ht_hk_linen_reports` row per reported kind in ONE
+/// transaction (migration 088).
+///
+/// **RECORD-ONLY.** No notification, no Slack, no domain event, no outbox row,
+/// no legacy writeback — iHOTEL has no linen-inventory counterpart, so there is
+/// nothing to mirror and no dark-shipped flag waiting to enable one. Reading
+/// this handler top to bottom is the whole blast radius.
+///
+/// Gating is IDENTICAL to [`report_cleaning`] and in the same order, which is
+/// what keeps the two maid mutations indistinguishable from the client's point
+/// of view: required `?branch=` (400/403) → location gate (403/503) → body
+/// validation (400) → room existence (404). A request with no branch is never
+/// answered on the strength of its body, and an unknown room is resolved before
+/// any insert, so the FK on `hklr_room_id` is a backstop rather than the gate.
+///
+/// There is no ship-dark flag between the location gate and validation — the
+/// cleaning route's `HK_MARK_DIRTY_ENABLED` tier exists because `dirty` triggers
+/// a LEGACY write. Nothing here reaches legacy, so invariant #6 has nothing to
+/// gate.
+///
+/// The reporter's badge and display name come from the verified `HkIdentity`,
+/// never from the body — same rule as every other handler on this surface.
+pub async fn report_linen_shortage(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<ReportLinenShortageBody>,
+) -> ApiResult<Json<ReportLinenShortageResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let items = parse_linen_items(body.items)?;
+
+    let pool = resolve_pool(&state, branch)?;
+    require_room(pool, room_id).await?;
+
+    let svc = service_for(&state, branch)?;
+    let report = svc
+        .report_linen_shortage(ReportLinenShortageCommand {
+            room_id,
+            items,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+        })
+        .await?;
+
+    Ok(Json(ReportLinenShortageResponse {
+        success: true,
+        room_id,
+        reported: report.reported,
+    }))
+}
+
 /// POST /api/hk/rooms/{id}/broken-items — **RETIRED (410 Gone)**.
 ///
 /// Breakage intake moved to the Housekeeping ops app
@@ -1873,6 +2093,233 @@ mod tests {
                 .unwrap_or_else(|| panic!("service must accept '{literal}'"));
             assert_eq!(parsed.as_str(), literal, "round-trip must be stable");
         }
+    }
+
+    // ---- linen-shortage body validation (migration 088) ------------------
+
+    /// Build the wire body from `(kind, qty)` pairs with integer quantities.
+    fn linen_entries(pairs: &[(&str, i64)]) -> Option<Vec<LinenShortageEntry>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(kind, qty)| LinenShortageEntry {
+                    kind: (*kind).to_string(),
+                    qty: serde_json::json!(qty),
+                })
+                .collect(),
+        )
+    }
+
+    /// Assert a rejection is a 400 whose message mentions `needle`. Pinning the
+    /// VARIANT matters as much as the fact of rejection: an `Internal` here
+    /// would reach the maid as a 500 with no actionable text.
+    fn assert_linen_400(
+        result: Result<Vec<LinenShortageItem>, ApiError>,
+        needle: &str,
+        what: &str,
+    ) {
+        match result {
+            Err(ApiError::BadRequest(msg)) => assert!(
+                msg.contains(needle),
+                "{what}: expected the 400 to mention '{needle}', got '{msg}'"
+            ),
+            Err(other) => panic!("{what}: expected 400 BadRequest, got {other:?}"),
+            Ok(items) => panic!("{what}: expected a rejection, got {items:?}"),
+        }
+    }
+
+    /// The happy path: every valid kind, at the quantity bounds, in one
+    /// submission — and the parsed order matches the submitted order.
+    #[test]
+    fn linen_items_accept_every_kind_and_both_qty_bounds() {
+        let parsed = parse_linen_items(linen_entries(&[
+            ("pillowcase", 1),
+            ("duvet_cover", 20),
+            ("bath_towel", 7),
+            ("face_towel", 2),
+            ("foot_towel", 3),
+        ]))
+        .expect("a full, valid submission must parse");
+
+        assert_eq!(parsed.len(), 5, "one item per reported kind");
+        assert_eq!(
+            parsed.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>(),
+            VALID_LINEN_KINDS.to_vec(),
+            "submitted order is preserved"
+        );
+        assert_eq!(parsed[0].qty, MIN_LINEN_QTY, "1 is accepted");
+        assert_eq!(parsed[1].qty, MAX_LINEN_QTY, "20 is accepted");
+    }
+
+    /// Kinds are trimmed + lower-cased, and the NORMALIZED code is what gets
+    /// stored — otherwise the table accumulates casing variants of one kind.
+    #[test]
+    fn linen_kinds_are_normalized_before_storage() {
+        let parsed = parse_linen_items(Some(vec![LinenShortageEntry {
+            kind: "  Bath_Towel ".to_string(),
+            qty: serde_json::json!(2),
+        }]))
+        .expect("a normalizable kind must parse");
+        assert_eq!(parsed[0].kind, "bath_towel");
+    }
+
+    /// A missing `items` key and an explicitly empty list are the same answer:
+    /// there is nothing to record.
+    #[test]
+    fn linen_items_missing_or_empty_is_400() {
+        assert_linen_400(parse_linen_items(None), "items is required", "items absent");
+        assert_linen_400(
+            parse_linen_items(Some(vec![])),
+            "items is required",
+            "items empty",
+        );
+    }
+
+    /// Five kinds is the whole vocabulary, so a sixth entry is malformed by
+    /// construction — and the size check fires BEFORE any entry is judged, so
+    /// an oversized body is never answered with a complaint about its content.
+    #[test]
+    fn linen_items_over_the_cap_is_400() {
+        let six = linen_entries(&[
+            ("pillowcase", 1),
+            ("duvet_cover", 1),
+            ("bath_towel", 1),
+            ("face_towel", 1),
+            ("foot_towel", 1),
+            ("pillowcase", 1),
+        ]);
+        assert_linen_400(
+            parse_linen_items(six),
+            "too many linen entries",
+            "6 entries",
+        );
+
+        // Shape is judged before content: an oversized list of INVALID kinds
+        // still reports the size, not the first bad kind.
+        let bogus: Vec<LinenShortageEntry> = (0..6)
+            .map(|n| LinenShortageEntry {
+                kind: format!("nonsense_{n}"),
+                qty: serde_json::json!(1),
+            })
+            .collect();
+        assert_linen_400(
+            parse_linen_items(Some(bogus)),
+            "too many linen entries",
+            "6 invalid entries",
+        );
+    }
+
+    /// Each kind may appear once, with its total. Two lines for one kind would
+    /// land as two rows and double-count the shortage.
+    #[test]
+    fn linen_duplicate_kind_is_400() {
+        assert_linen_400(
+            parse_linen_items(linen_entries(&[("bath_towel", 2), ("bath_towel", 3)])),
+            "duplicate linen kind",
+            "exact duplicate",
+        );
+        // The duplicate test runs on the NORMALIZED code — otherwise these two
+        // slip through as separate lines for the same kind.
+        assert_linen_400(
+            parse_linen_items(Some(vec![
+                LinenShortageEntry {
+                    kind: "bath_towel".to_string(),
+                    qty: serde_json::json!(2),
+                },
+                LinenShortageEntry {
+                    kind: "BATH_TOWEL".to_string(),
+                    qty: serde_json::json!(3),
+                },
+            ])),
+            "duplicate linen kind",
+            "case-variant duplicate",
+        );
+    }
+
+    /// Anything outside [`VALID_LINEN_KINDS`] is refused here, which is the ONLY
+    /// place it can be refused: the DB column has no CHECK on purpose.
+    #[test]
+    fn linen_unknown_kind_is_400() {
+        for bad in [
+            "",
+            "bed_sheet",  // the plausible next kind — not shipped yet
+            "bath-towel", // hyphen, not underscore
+            "bathtowel",
+            "ผ้าเช็ดตัว", // the Thai label; the wire codes are ASCII
+            "pillowcase; DROP TABLE ht_hk_linen_reports",
+        ] {
+            assert_linen_400(
+                parse_linen_items(linen_entries(&[(bad, 1)])),
+                "invalid linen kind",
+                bad,
+            );
+        }
+    }
+
+    /// The quantity must be a JSON INTEGER inside 1..=20. Every rejected shape
+    /// here is one a hand-rolled client actually sends.
+    #[test]
+    fn linen_qty_must_be_an_integer_in_range() {
+        for bad_qty in [0i64, -1, 21, 1000, i64::from(i32::MAX)] {
+            assert_linen_400(
+                parse_linen_items(linen_entries(&[("bath_towel", bad_qty)])),
+                "invalid qty",
+                &format!("qty {bad_qty}"),
+            );
+        }
+
+        // A value beyond i32 must be refused, never wrapped into range.
+        assert_linen_400(
+            parse_linen_items(Some(vec![LinenShortageEntry {
+                kind: "bath_towel".to_string(),
+                qty: serde_json::json!(i64::MAX),
+            }])),
+            "invalid qty",
+            "qty i64::MAX",
+        );
+
+        // Non-integer JSON types: each would otherwise be a serde rejection
+        // with a body shape the maid's client cannot parse.
+        for bad in [
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!([2]),
+            serde_json::json!({"qty": 2}),
+        ] {
+            let label = bad.to_string();
+            assert_linen_400(
+                parse_linen_items(Some(vec![LinenShortageEntry {
+                    kind: "bath_towel".to_string(),
+                    qty: bad,
+                }])),
+                "invalid qty",
+                &label,
+            );
+        }
+    }
+
+    /// The cap and the vocabulary are stated separately but must stay
+    /// consistent: a submission may name each kind at most once, so accepting
+    /// more entries than there are kinds could only ever admit a duplicate.
+    #[test]
+    fn linen_cap_matches_the_vocabulary_size() {
+        assert_eq!(
+            MAX_LINEN_ITEMS,
+            VALID_LINEN_KINDS.len(),
+            "widening VALID_LINEN_KINDS without revisiting MAX_LINEN_ITEMS (or vice \
+             versa) leaves the body cap and the dedup rule disagreeing"
+        );
+    }
+
+    /// The route's bounds MUST equal the service's, which in turn mirror the
+    /// `CHECK (hklr_qty >= 1 AND hklr_qty <= 20)` in migration 088 — otherwise a
+    /// quantity the route admits dies on the constraint as a 500, not a 400.
+    #[test]
+    fn linen_qty_bounds_match_the_service_constants() {
+        assert_eq!(MIN_LINEN_QTY, 1);
+        assert_eq!(MAX_LINEN_QTY, 20);
     }
 
     // ---- HK_BRANCHES parsing -------------------------------------------

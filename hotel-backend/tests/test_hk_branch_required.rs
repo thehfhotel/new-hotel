@@ -241,6 +241,122 @@ async fn row8_cleaning_post_without_branch_is_400() {
     assert_branch_400(status, &body, "POST cleaning with no branch");
 }
 
+/// Row 8b. The linen-shortage report (migration 088) is gated identically to
+/// the cleaning report, and the branch is likewise checked BEFORE the body: a
+/// request with no branch must never be answered on the strength of its items.
+#[tokio::test]
+async fn row8b_linen_shortage_post_without_branch_is_400() {
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/linen-shortage",
+        r#"{"items":[{"kind":"bath_towel","qty":2}]}"#,
+    )
+    .await;
+    assert_branch_400(status, &body, "POST linen-shortage with no branch");
+}
+
+/// Row 8c. A body so malformed it could not possibly be recorded STILL yields
+/// the branch 400 first. This is the ordering half of row 8b: it proves the
+/// branch gate is not merely present but ahead of validation, so an
+/// unauthorised caller cannot use body errors to probe the surface.
+#[tokio::test]
+async fn row8c_linen_branch_is_checked_before_the_body() {
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(app, "POST", "/api/hk/rooms/1/linen-shortage", r#"{}"#).await;
+    assert_branch_400(status, &body, "linen POST with neither branch nor items");
+}
+
+/// Row 8d. Past the branch gate, a bad body is a 400 in the REPO's envelope —
+/// not axum's serde rejection, which the maid's `hkFetch` cannot parse. This is
+/// what `items: Option<…>` and the untyped `qty` buy; asserting the envelope
+/// (not just the status) is the part that would catch a regression to a
+/// required serde field.
+#[tokio::test]
+async fn linen_body_errors_use_the_repo_envelope() {
+    for (payload, needle, what) in [
+        (r#"{}"#, "items is required", "items absent"),
+        (r#"{"items":[]}"#, "items is required", "items empty"),
+        (
+            r#"{"items":[{"kind":"bed_sheet","qty":1}]}"#,
+            "invalid linen kind",
+            "unknown kind",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":2},{"kind":"bath_towel","qty":1}]}"#,
+            "duplicate linen kind",
+            "duplicate kind",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":0}]}"#,
+            "invalid qty",
+            "qty 0",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":21}]}"#,
+            "invalid qty",
+            "qty 21",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":-3}]}"#,
+            "invalid qty",
+            "negative qty",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":"2"}]}"#,
+            "invalid qty",
+            "qty as a string",
+        ),
+        (
+            r#"{"items":[{"kind":"bath_towel","qty":1.5}]}"#,
+            "invalid qty",
+            "fractional qty",
+        ),
+        (
+            r#"{"items":[{"kind":"pillowcase","qty":1},{"kind":"duvet_cover","qty":1},
+                        {"kind":"bath_towel","qty":1},{"kind":"face_towel","qty":1},
+                        {"kind":"foot_towel","qty":1},{"kind":"pillowcase","qty":1}]}"#,
+            "too many linen entries",
+            "six entries",
+        ),
+    ] {
+        let app = inner(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/hk/rooms/1/linen-shortage?branch=hfhotel",
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: body={body}");
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|_| panic!("{what}: 400 body must be JSON, got {body}"));
+        assert_eq!(
+            json.get("success").and_then(|v| v.as_bool()),
+            Some(false),
+            "{what}: the repo envelope requires success=false, body={body}"
+        );
+        let error = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{what}: 400 body must carry `error`, got {body}"));
+        assert!(
+            error.contains(needle),
+            "{what}: expected the error to mention '{needle}', got '{error}'"
+        );
+    }
+}
+
 /// Row 9. `GET /api/hk/me` NEVER 400s on a missing branch — it is what tells
 /// the client which branches exist, so requiring one would be circular.
 #[tokio::test]
@@ -370,6 +486,11 @@ async fn shipped_router_answers_401_before_the_branch_gate() {
             "/api/hk/rooms/1/cleaning?branch=hfhotel",
             r#"{"status":"dirty"}"#,
         ),
+        (
+            "POST",
+            "/api/hk/rooms/1/linen-shortage?branch=hfhotel",
+            r#"{"items":[{"kind":"bath_towel","qty":2}]}"#,
+        ),
     ] {
         let app = hotel_backend::routes::hk::router(
             AppState::new(pool.clone()).with_hfville_writes(true),
@@ -380,6 +501,42 @@ async fn shipped_router_answers_401_before_the_branch_gate() {
             StatusCode::UNAUTHORIZED,
             "{method} {uri} must be refused by the Access gate before any branch \
              or flag logic can answer; got {status} {got}"
+        );
+    }
+}
+
+/// The same proof for the linen-shortage route, WITHOUT needing a database.
+///
+/// `router()` answers 401 from `require_hk_access` before any handler can
+/// resolve a pool, so a never-connecting lazy pool is sufficient — which means
+/// this one runs everywhere, including a CI job with no PG. A new mutation that
+/// forgot the Access layer would be a silently unauthenticated write endpoint,
+/// so this assertion should never be gated behind an optional dependency.
+///
+/// Every valid body and branch combination is exercised: the refusal must come
+/// from auth, never from the branch gate or body validation.
+#[tokio::test]
+async fn shipped_router_answers_401_for_linen_shortage_without_a_db() {
+    for uri in [
+        "/api/hk/rooms/1/linen-shortage",
+        "/api/hk/rooms/1/linen-shortage?branch=hfhotel",
+        "/api/hk/rooms/1/linen-shortage?branch=hfville",
+        "/api/hk/rooms/1/linen-shortage?branch=all",
+    ] {
+        let app =
+            hotel_backend::routes::hk::router(AppState::new(lazy_pool()).with_hfville_writes(true));
+        let (status, got) = call(
+            app,
+            "POST",
+            uri,
+            r#"{"items":[{"kind":"bath_towel","qty":2}]}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "POST {uri} must be refused by the Access gate before any branch, body \
+             or pool logic can answer; got {status} {got}"
         );
     }
 }

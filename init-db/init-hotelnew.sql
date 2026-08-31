@@ -440,6 +440,32 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_room_created
 CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_status
     ON ht_hk_broken_reports (hkbr_status, hkbr_created_at DESC);
 
+-- ht_hk_linen_reports - Maid-reported linen shortages (ขาดผ้า) from the /hk
+-- surface (migration 088). Append-only, one row per (submission, kind);
+-- hklr_report_uuid groups the rows of ONE submission and is generated
+-- server-side in service::housekeeping::report_linen_shortage.
+-- RECORD-ONLY and PG-CANONICAL ONLY: iHOTEL has no linen counterpart at all, so
+-- no sync mapper, no writeback, no domain event, no notification.
+-- hklr_kind is TEXT with NO CHECK on purpose — the kind allowlist lives in
+-- routes::hk::VALID_LINEN_KINDS (pillowcase | duvet_cover | bath_towel |
+-- face_towel | foot_towel), so adding a kind later needs no migration and no
+-- window where the deployed binary and the deployed CHECK disagree. The qty
+-- bound IS a data invariant and is enforced here as well as in the app.
+-- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
+-- ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_linen_reports (
+    hklr_id          BIGSERIAL    PRIMARY KEY,
+    hklr_report_uuid UUID         NOT NULL,
+    hklr_room_id     INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    hklr_kind        TEXT         NOT NULL,
+    hklr_qty         INTEGER      NOT NULL CHECK (hklr_qty >= 1 AND hklr_qty <= 20),
+    hklr_badge       TEXT         NOT NULL,
+    hklr_name        TEXT,
+    hklr_created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_room_created
+    ON ht_hk_linen_reports (hklr_room_id, hklr_created_at DESC);
+
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
 -- folio. The existing ht_checkins.cin_room_id stays in place until the
@@ -2676,6 +2702,15 @@ ON CONFLICT (version) DO NOTHING;
 -- existing byte-pinned MarkRoomClean / MarkRoomDirty recipes.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('087', '087_hk_cleaning_events_dirty_status.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 088 — ht_hk_linen_reports, the maid's linen-shortage (ขาดผ้า)
+-- report on /hk (table + index inlined above, after the ht_hk_broken_reports
+-- block). RECORD-ONLY and PG-canonical only: no legacy counterpart, no sync, no
+-- writeback, no domain event, no notification. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('088', '088_create_ht_hk_linen_reports.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

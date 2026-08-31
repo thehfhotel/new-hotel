@@ -7,11 +7,13 @@
 //! is inert. These tests pin the DISABLED posture — the one an operator can
 //! return to — because that is where the exemption has teeth:
 //!
-//! - the maid's cleaning route must still be admitted, so a housekeeping
-//!   report is not collateral damage of a front-desk write-policy toggle;
+//! - the maid's two report routes — `cleaning` and, since migration 088,
+//!   `linen-shortage` — must still be admitted, so a housekeeping report is not
+//!   collateral damage of a front-desk write-policy toggle;
 //! - nothing else may be, so an admitted mutation can never outrun a narrowed
 //!   `HFVILLE_WRITEBACK_INTENTS`, which would leave canonical PG ahead of
-//!   Ville's iHOTEL.
+//!   Ville's iHOTEL. (`linen-shortage` cannot outrun anything even in
+//!   principle: it is PG-only and enqueues no intent at all.)
 //!
 //! ## How the layer is identified without a valid Access assertion
 //!
@@ -47,9 +49,30 @@ async fn new_pool() -> Option<PgPool> {
     PgPool::connect(&url).await.ok()
 }
 
+/// A pool that never connects. The guard and the Access gate both answer before
+/// any handler could resolve a pool — which is itself part of the assertion —
+/// so the exemption tests need no database at all.
+fn lazy_pool() -> PgPool {
+    PgPool::connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/never")
+        .expect("a lazy pool needs no live server")
+}
+
 /// Send an UNAUTHENTICATED request through the real hk router and return the
 /// status. `hfville_writes` mirrors `HFVILLE_WRITES_ENABLED`.
 async fn probe(pool: PgPool, method: &str, uri: &str, hfville_writes: bool) -> StatusCode {
+    probe_with_body(pool, method, uri, hfville_writes, r#"{"status":"done"}"#).await
+}
+
+/// [`probe`] with an explicit body — the linen route's payload is a different
+/// shape, and sending a cleaning body to it would confound "the guard admitted
+/// it" with "the body was rejected" if the layer order ever regressed.
+async fn probe_with_body(
+    pool: PgPool,
+    method: &str,
+    uri: &str,
+    hfville_writes: bool,
+    body: &str,
+) -> StatusCode {
     // No ville pool wired: the guard/auth layers must answer before any
     // handler could resolve a pool, which is itself part of the assertion.
     let state = AppState::new(pool).with_hfville_writes(hfville_writes);
@@ -58,10 +81,12 @@ async fn probe(pool: PgPool, method: &str, uri: &str, hfville_writes: bool) -> S
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"status":"done"}"#))
+        .body(Body::from(body.to_string()))
         .expect("request builds");
     app.oneshot(req).await.expect("router responds").status()
 }
+
+const LINEN_BODY: &str = r#"{"items":[{"kind":"bath_towel","qty":2}]}"#;
 
 /// The admitted flow: with Ville writes DISABLED, the maid's cleaning report
 /// for `branch=hfville` must pass the Ville guard. It then
@@ -87,6 +112,77 @@ async fn hfville_cleaning_is_admitted_while_ville_writes_are_disabled() {
          Access gate to answer 401); a 403 means the exemption regressed and \
          Ville maids cannot report cleaning at launch"
     );
+}
+
+/// The linen-shortage report (migration 088) must be admitted for
+/// `branch=hfville` exactly the way the cleaning report is — 401 from the
+/// Access gate, never 403 from the Ville guard.
+///
+/// The safety argument is STRONGER here than for cleaning, and worth stating
+/// because it is why this exemption is not a widening of risk: the linen route
+/// is PG-only. It inserts `ht_hk_linen_reports` rows and enqueues NO writeback
+/// intent, so there is no intent for `HFVILLE_WRITEBACK_INTENTS` to park as
+/// `'skipped'` and therefore no way for canonical PG to run ahead of Ville's
+/// iHOTEL — the exact failure mode the narrow-exemption rule exists to prevent.
+///
+/// Needs no database: both layers answer before a pool is touched.
+#[tokio::test]
+async fn hfville_linen_shortage_is_admitted_while_ville_writes_are_disabled() {
+    let status = probe_with_body(
+        lazy_pool(),
+        "POST",
+        "/api/hk/rooms/1/linen-shortage?branch=hfville",
+        false,
+        LINEN_BODY,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "expected the Ville guard to ADMIT the maid linen-shortage route (leaving \
+         the Access gate to answer 401); a 403 means Ville maids cannot report a \
+         linen shortage whenever front-desk Ville writes are turned off"
+    );
+}
+
+/// The exemption is POST-only and exact-match, on the SHIPPED router. A
+/// near-miss path or a non-POST method on the linen route must fall through to
+/// the normal gate and be refused with 403 — the unit tests pin the pure
+/// matcher, this pins that the shipped stack actually consults it.
+#[tokio::test]
+async fn linen_exemption_does_not_widen_on_the_shipped_router() {
+    // A near-miss path: not the exempt leaf, so the guard refuses it.
+    let status = probe_with_body(
+        lazy_pool(),
+        "POST",
+        "/api/hk/rooms/1/linen-shortages?branch=hfville",
+        false,
+        LINEN_BODY,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a near-miss of the linen path must be refused by the Ville guard; 401 \
+         would mean the exemption is matching on a prefix"
+    );
+
+    // The exempt path with a mutating non-POST method.
+    for method in ["PUT", "PATCH", "DELETE"] {
+        let status = probe_with_body(
+            lazy_pool(),
+            method,
+            "/api/hk/rooms/1/linen-shortage?branch=hfville",
+            false,
+            LINEN_BODY,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} on the linen path must NOT be exempt"
+        );
+    }
 }
 
 /// The other half of the boundary: a NON-exempt hk mutation on
@@ -124,6 +220,8 @@ async fn hf_hotel_writes_and_all_reads_are_ungated() {
     for (method, uri) in [
         ("POST", "/api/hk/rooms/1/cleaning?branch=hfhotel"),
         ("POST", "/api/hk/rooms/1/cleaning"),
+        ("POST", "/api/hk/rooms/1/linen-shortage?branch=hfhotel"),
+        ("POST", "/api/hk/rooms/1/linen-shortage"),
         ("POST", "/api/hk/rooms/1/broken-items?branch=hfhotel"),
         ("GET", "/api/hk/rooms?branch=hfville"),
     ] {

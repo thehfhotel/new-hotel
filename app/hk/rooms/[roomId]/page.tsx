@@ -4,9 +4,11 @@
 // Part of the maid-facing housekeeping surface (employee-login plan Phase 4,
 // wave-4 §A+B). แจ้งซ่อม / เบิกของ are NOT linked from here: both are
 // top-level tiles on the LINE rich menu, and a second route to the same place
-// is a cost for this audience. The reporter identity is stamped SERVER-SIDE
-// from the verified Cloudflare Access assertion; nothing identity-like is
-// sent from this form.
+// is a cost for this audience. แจ้งขาดผ้า IS here, for the opposite reason: a
+// linen shortage is a fact about THIS room, discovered while standing in it,
+// and the room is already on screen. The reporter identity is stamped
+// SERVER-SIDE from the verified Cloudflare Access assertion; nothing
+// identity-like is sent from this form.
 //
 // The branch is never chosen here — only the room LIST page (/hk) offers the
 // picker. This screen only ever READS what's already stored (§A1: never
@@ -26,12 +28,21 @@ import {
   ChevronLeft,
   Info,
   Loader2,
+  Minus,
+  Plus,
+  Shirt,
   Sparkles,
 } from 'lucide-react'
 import {
+  clampLinenQty,
+  emptyLinenCounts,
   hkFetch,
   hkFetchMe,
   legacyStatusNote,
+  LINEN_KINDS,
+  LINEN_MAX_QTY,
+  LINEN_MIN_QTY,
+  linenShortageItems,
   markDirtyConfirmMessage,
   movementTags,
   occupancyIndicator,
@@ -42,8 +53,12 @@ import {
   timeLabel,
   type Branch,
   type CleaningStatus,
+  type HkLinenShortageResponse,
   type HkMe,
   type HkRoomDetail,
+  type LinenCounts,
+  type LinenKind,
+  type LinenShortageItem,
 } from '../../hk-lib'
 import { useHkAutoRefresh } from '../../use-hk-auto-refresh'
 
@@ -66,6 +81,16 @@ export default function HkRoomPage() {
   // single-tap: they are the normal flow, and a confirm on every tap is a
   // confirm nobody reads.
   const [confirmingDirty, setConfirmingDirty] = useState(false)
+
+  // แจ้งขาดผ้า (linen shortage). Same in-place expand as the confirm above: the
+  // first tap opens a panel and fires NO request, because "how many of what" is
+  // a question the maid answers ON the screen, not a decision the button can
+  // make for her. Counts live as ONE record rather than per-row state so ยกเลิก
+  // resets the whole form in a single move, and so the submit button can tell
+  // "nothing selected" from "something selected" without walking the DOM.
+  const [linenOpen, setLinenOpen] = useState(false)
+  const [linenCounts, setLinenCounts] = useState<LinenCounts>(emptyLinenCounts)
+  const [linenPosting, setLinenPosting] = useState(false)
 
   // Resolve the already-chosen branch from storage; only /hk itself may pick
   // one. `resolveInitialBranch` still discards a stale value (branch removed
@@ -131,9 +156,12 @@ export default function HkRoomPage() {
   // iHOTEL while the maid has its screen open. DISABLED while her own report
   // is in flight — `reportCleaning` does its own `load()` on completion, and a
   // poll landing mid-POST could otherwise paint the pre-write answer back over
-  // the room she just finished.
+  // the room she just finished. The linen report is gated for the same reason
+  // AND a second one: its panel is a form the maid is still filling in, and a
+  // background re-render mid-submit is exactly when a half-counted report gets
+  // lost.
   const refreshDetail = useCallback(() => load(true), [load])
-  useHkAutoRefresh(refreshDetail, Boolean(branch) && posting === null)
+  useHkAutoRefresh(refreshDetail, Boolean(branch) && posting === null && !linenPosting)
 
   const reportCleaning = async (status: CleaningStatus) => {
     if (!branch) return
@@ -162,6 +190,54 @@ export default function HkRoomPage() {
       // ยืนยัน button can carry the spinner while it is in flight, and a
       // failed report does not leave a re-armed one-tap button behind.
       setConfirmingDirty(false)
+    }
+  }
+
+  const stepLinen = (kind: LinenKind, delta: number) => {
+    // Clamped in the reducer, not only on the buttons' `disabled`: the bounds
+    // are the CONTRACT (1..LINEN_MAX_QTY on the wire), and a bound that only
+    // exists as a disabled attribute is one double-tap away from not existing.
+    setLinenCounts((prev) => ({ ...prev, [kind]: clampLinenQty(prev[kind] + delta) }))
+  }
+
+  const closeLinenPanel = () => {
+    setLinenOpen(false)
+    setLinenCounts(emptyLinenCounts())
+  }
+
+  const reportLinenShortage = async (items: LinenShortageItem[]) => {
+    if (!branch) return
+    // Belt to the disabled button's braces — an empty report is an errand for
+    // nobody, and must never reach the linen room as a no-op row.
+    if (items.length === 0) return
+    setLinenPosting(true)
+    setNotice(null)
+    try {
+      const res = await hkFetch(`/rooms/${roomId}/linen-shortage`, branch, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      // Unlike the cleaning POST, a 2xx alone is not the answer here: the
+      // contract carries an explicit `success`, and a 200 that says `false` is
+      // a report that did NOT land. Showing the green banner for it would send
+      // the maid away believing the linen room had been told.
+      const body: HkLinenShortageResponse | null = res.ok
+        ? await res.json().catch(() => null)
+        : null
+      if (!res.ok || !body?.success) throw new Error('บันทึกไม่สำเร็จ กรุณาลองใหม่')
+      // Clear a previous failure's banner, or the green notice below it would
+      // stay hidden behind the red one on a successful retry.
+      setError(null)
+      setNotice('บันทึกแล้ว: แจ้งขาดผ้า')
+      // Only a landed report resets the form and collapses the panel. On a
+      // failure the counts stay exactly as she entered them — retyping five
+      // steppers in a corridor is how a report stops getting filed at all.
+      closeLinenPanel()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setLinenPosting(false)
     }
   }
 
@@ -195,6 +271,13 @@ export default function HkRoomPage() {
   const badge = progressLabel(room?.cleaning?.status)
   const occupancy = occupancyIndicator(room?.occupancy)
   const tags = room ? movementTags(room) : []
+  // ONE in-flight report at a time, whichever kind it is: two reports on one
+  // room from one thumb is never what she meant, and the auto-refresh gate
+  // above already treats both the same way.
+  const busy = posting !== null || linenPosting
+  // What ส่งแจ้ง would send right now — also the answer to "is anything
+  // selected", so the button and the request can never disagree.
+  const linenItems = linenShortageItems(linenCounts)
 
   return (
     <main>
@@ -297,7 +380,7 @@ export default function HkRoomPage() {
               <button
                 type="button"
                 onClick={() => reportCleaning('started')}
-                disabled={posting !== null}
+                disabled={busy}
                 className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-4 text-base font-semibold text-amber-800 active:bg-amber-100 disabled:opacity-50"
               >
                 {posting === 'started' ? (
@@ -309,7 +392,7 @@ export default function HkRoomPage() {
               <button
                 type="button"
                 onClick={() => reportCleaning('done')}
-                disabled={posting !== null}
+                disabled={busy}
                 className="rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-4 text-base font-semibold text-emerald-800 active:bg-emerald-100 disabled:opacity-50"
               >
                 {posting === 'done' ? (
@@ -339,7 +422,7 @@ export default function HkRoomPage() {
                     <button
                       type="button"
                       onClick={() => setConfirmingDirty(false)}
-                      disabled={posting !== null}
+                      disabled={busy}
                       className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
                     >
                       ยกเลิก
@@ -347,7 +430,7 @@ export default function HkRoomPage() {
                     <button
                       type="button"
                       onClick={() => reportCleaning('dirty')}
-                      disabled={posting !== null}
+                      disabled={busy}
                       className="flex items-center justify-center rounded-lg border border-red-400 bg-red-600 px-3 py-3 text-sm font-semibold text-white active:bg-red-700 disabled:opacity-50"
                     >
                       {posting === 'dirty' ? (
@@ -363,13 +446,100 @@ export default function HkRoomPage() {
                 <button
                   type="button"
                   onClick={() => setConfirmingDirty(true)}
-                  disabled={posting !== null}
+                  disabled={busy}
                   className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-red-300 bg-red-50 px-3 py-3 text-sm font-semibold text-red-800 active:bg-red-100 disabled:opacity-50"
                 >
                   <AlertTriangle className="h-4 w-4" />
                   แจ้งห้องไม่สะอาด
                 </button>
               ))}
+
+            {/* แจ้งขาดผ้า (linen shortage). Expands IN PLACE of its button, the
+                same two-step shape as the confirm above and for the same
+                reason: a maid counting missing towels in a doorway needs the
+                room she is looking at to stay on screen behind the form, and a
+                modal on a phone is dismissed by reflex. Sky-toned so it reads
+                as neither the red destructive report nor the amber/emerald
+                progress pair — a different KIND of report, not a third
+                severity. Not gated by `markDirtyEnabled`: nothing here writes
+                to iHOTEL. */}
+            {linenOpen ? (
+              <div className="mt-3 rounded-xl border border-sky-300 bg-sky-50 p-3">
+                <p className="mb-3 flex items-center gap-1.5 text-sm font-semibold text-sky-900">
+                  <Shirt className="h-4 w-4 shrink-0" />
+                  <span>แจ้งขาดผ้า</span>
+                </p>
+                <ul className="space-y-2">
+                  {LINEN_KINDS.map(({ kind, label }) => (
+                    <li
+                      key={kind}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-sky-200 bg-white px-3 py-2"
+                    >
+                      <span className="text-sm font-medium text-gray-800">{label}</span>
+                      {/* h-11/w-11 is 44px — the smallest target a thumb hits
+                          reliably, and why these are squares rather than the
+                          py-3 pills the rest of the screen uses. The aria-label
+                          names the kind: "+" alone tells a screen reader (and a
+                          test) nothing about WHICH row it stepped. */}
+                      <span className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          aria-label={`ลด ${label}`}
+                          onClick={() => stepLinen(kind, -1)}
+                          disabled={busy || linenCounts[kind] <= LINEN_MIN_QTY}
+                          className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
+                        >
+                          <Minus className="h-5 w-5" />
+                        </button>
+                        <span className="w-7 text-center text-base font-semibold tabular-nums text-gray-900">
+                          {linenCounts[kind]}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`เพิ่ม ${label}`}
+                          onClick={() => stepLinen(kind, 1)}
+                          disabled={busy || linenCounts[kind] >= LINEN_MAX_QTY}
+                          className="flex h-11 w-11 items-center justify-center rounded-lg border border-sky-300 bg-white text-sky-800 active:bg-sky-100 disabled:opacity-40"
+                        >
+                          <Plus className="h-5 w-5" />
+                        </button>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {/* ยกเลิก first and calmer, same as the dirty confirm — the
+                    reflex tap is the one that files nothing. */}
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={closeLinenPanel}
+                    disabled={busy}
+                    className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                  >
+                    ยกเลิก
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => reportLinenShortage(linenItems)}
+                    disabled={busy || linenItems.length === 0}
+                    className="flex items-center justify-center rounded-lg border border-sky-500 bg-sky-600 px-3 py-3 text-sm font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+                  >
+                    {linenPosting ? <Loader2 className="h-5 w-5 animate-spin" /> : 'ส่งแจ้ง'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* Opens the form. Fires NO request. */
+              <button
+                type="button"
+                onClick={() => setLinenOpen(true)}
+                disabled={busy}
+                className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl border border-sky-300 bg-sky-50 px-3 py-3 text-sm font-semibold text-sky-800 active:bg-sky-100 disabled:opacity-50"
+              >
+                <Shirt className="h-4 w-4" />
+                แจ้งขาดผ้า
+              </button>
+            )}
 
             {detail && detail.events.length > 0 && (
               <ul className="mt-3 space-y-1 text-xs text-gray-500">
