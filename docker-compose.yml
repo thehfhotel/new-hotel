@@ -286,6 +286,10 @@ services:
       # Deliberately no default: unset must read as "unconfigured" (⇒ 503,
       # fail closed), never as a confident lookup against a guessed path.
       - HFID_LOCATION_URL=${HFID_LOCATION_URL:-}
+      # HF ID's on-duty escalation endpoint (ADR 0008 room signals). Same
+      # posture: no default — unset means the escalation scheduler never
+      # registers (one startup log line), which is "off", not an error.
+      - HFID_ESCALATE_URL=${HFID_ESCALATE_URL:-}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap

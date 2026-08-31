@@ -1034,6 +1034,11 @@ jobs:
           # PENDING-VERIFICATIONS.md V14 for the checklist.
           HK_LOCATION_ENFORCEMENT_ENABLED: ${{ vars.HK_LOCATION_ENFORCEMENT_ENABLED || 'false' }}
           HFID_LOCATION_URL:               ${{ vars.HFID_LOCATION_URL || '' }}
+          # HF ID's on-duty escalation endpoint (ADR 0008 room signals) — same
+          # variable-not-secret reasoning as HFID_LOCATION_URL; the secret it
+          # authenticates with is the SAME HFID_RESOLVE_SECRET below. Empty =
+          # escalation disabled (scheduler logs once and never fires).
+          HFID_ESCALATE_URL:               ${{ vars.HFID_ESCALATE_URL || '' }}
           # Shared secret for that lookup, sent as `X-Reader-Secret`. Delivered
           # via the payload's `secrets:` block ONLY — never as an `env:` entry
           # in the container.
@@ -1198,6 +1203,7 @@ jobs:
             --arg HK_BRANCHES           "${HK_BRANCHES:-hfhotel}" \
             --arg HK_LOCATION_ENFORCEMENT_ENABLED "${HK_LOCATION_ENFORCEMENT_ENABLED:-false}" \
             --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
+            --arg HFID_ESCALATE_URL               "${HFID_ESCALATE_URL:-}" \
             --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
@@ -1235,6 +1241,7 @@ jobs:
                 HK_BRANCHES:                  $HK_BRANCHES,
                 HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
                 HFID_LOCATION_URL:            $HFID_LOCATION_URL,
+                HFID_ESCALATE_URL:            $HFID_ESCALATE_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
