@@ -24,6 +24,13 @@ on:
       # what changed. It does NOT rebuild — pair it with a real code push if
       # you need new images.
       #
+      # Since the `promote` job landed (incident 2026-08-31), ":latest" means
+      # "the last web+backend pair a fully-green run promoted", not "whatever
+      # the last build job happened to push". force_deploy therefore re-rolls
+      # a KNOWN-COHERENT pair: the promote job never moves a tag for an image
+      # this run did not successfully build, so a force_deploy that builds
+      # nothing moves nothing and redeploys exactly what is already promoted.
+      #
       # NOTE: flag flips do NOT need this. Since ADR 0004 flag state lives in
       # docker-compose.yml, which is in the `deploy` paths filter, so editing a
       # flag triggers its own deploy.
@@ -45,10 +52,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 # Workflow-level concurrency: cancel an in-flight test/build run when a
-# fresh push lands on the same ref. The `deploy` job overrides this with
-# its own group (`deploy-prod-evergreen`, cancel-in-progress: false) so
-# in-flight deploys are NEVER cancelled — a partially-rolled deploy is
-# worse than a wasted runner minute.
+# fresh push lands on the same ref.
+#
+# CORRECTION (incident 2026-08-31, runs 33441012355 vs 33441186346). This
+# block used to claim that the `deploy` job's own group
+# (`deploy-prod-evergreen`, cancel-in-progress: false) meant "in-flight
+# deploys are NEVER cancelled". THAT IS FALSE. A job-level `concurrency:`
+# only orders jobs against each other; it does not exempt a job from
+# workflow-level cancellation. `cancel-in-progress: true` here cancels the
+# ENTIRE RUN — every job in it, whatever group each one declares.
+#
+# That is what broke production: push A's build-frontend had already pushed
+# a new web image to :latest when push B superseded the run; A's
+# build-backend was cancelled before it pushed; B path-filtered both builds
+# away and deployed, pairing A's new frontend with a 3-hour-old backend.
+#
+# The fix is NOT to stop cancelling — cancellation is what guarantees that
+# the newest push is the one that reaches production (see the `promote` job
+# for why removing it would be worse). The fix is to make cancellation
+# HARMLESS: build jobs now push immutable sha-tagged images only, and a
+# single `promote` job moves :latest for the pair at the very end. A run
+# cancelled at any point before `promote` leaves the promoted pair exactly
+# as it was, so a later run always deploys a coherent pair.
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -75,7 +100,9 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       # `deploy` — files that ONLY affect the running services (compose,
       # migrations, deploy/runner scripts). When any of these fires WITHOUT
-      # a build, the deploy job re-rolls the existing :latest images.
+      # a build, the deploy job re-rolls the currently promoted images —
+      # `promote` moves no tag for a half this run did not build, so the
+      # pair stays exactly as the last green run left it.
       deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
@@ -757,8 +784,10 @@ jobs:
     # Build runs in PARALLEL with test-frontend (Track F CI optimization).
     # The deploy job still gates on `test-frontend.result == success` so a
     # red test never reaches prod — but the build doesn't have to WAIT
-    # for tests. Worst case: tests fail, an unused :latest image lands on
-    # GHCR and gets garbage-collected by the next green build.
+    # for tests. Worst case: tests fail, an orphan sha-tagged image lands on
+    # GHCR and gets garbage-collected later. It is NOT reachable by the
+    # deploy: only the `promote` job moves :latest, and it requires the same
+    # green test results the deploy does (incident 2026-08-31).
     #
     # `should-deploy` (Track J8) is in `needs:` so a release-please-only
     # push skips the build entirely. `skip != 'true'` keeps the original
@@ -768,6 +797,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # Digest of the manifest this job pushed. `promote` retags BY DIGEST
+      # rather than by the sha tag: the digest is what was actually pushed,
+      # it cannot be re-pointed by a later run, and it survives any change
+      # to metadata-action's tag formatting. Empty on pull_request events
+      # (push: false below) — `promote` never runs on those.
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
@@ -788,11 +824,16 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # sha tag ONLY. `type=raw,value=latest` was removed 2026-08-31:
+          # a build job moving :latest is exactly how a cancelled run got to
+          # change what the NEXT run's deploy consumed. :latest is now moved
+          # solely by the `promote` job, once, for both images, at the end of
+          # a fully-green run. Read that job's header before adding a tag here.
           tags: |
             type=sha,prefix=
-            type=raw,value=latest
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
@@ -817,8 +858,9 @@ jobs:
     # Build runs in PARALLEL with test-backend (Track F CI optimization).
     # The deploy job still gates on `test-backend.result == success` so a
     # red test never reaches prod — but the build doesn't have to WAIT
-    # for tests. Worst case: tests fail, an unused :latest image lands on
-    # GHCR and gets garbage-collected by the next green build.
+    # for tests. Worst case: tests fail, an orphan sha-tagged image lands on
+    # GHCR and gets garbage-collected later. It is NOT reachable by the
+    # deploy: only the `promote` job moves :latest (incident 2026-08-31).
     #
     # `lint-cardinality-map` is added to needs so a P1 violation blocks the
     # backend image build too — pairs with the same dependency on
@@ -831,6 +873,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # See the identical output on build-frontend for why this is a digest
+      # and not a tag.
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
@@ -851,11 +897,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          # sha tag ONLY — see the equivalent comment in build-frontend.
+          # :latest is moved exclusively by the `promote` job.
           tags: |
             type=sha,prefix=
-            type=raw,value=latest
 
       - name: Build and push backend
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: ./hotel-backend
@@ -869,9 +917,232 @@ jobs:
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
+  # ===========================================================================
+  # promote — the single writer of :latest  (incident 2026-08-31)
+  # ===========================================================================
+  #
+  # ## The incident
+  #
+  # Push A (large feature) and push B (workflow + compose only) landed minutes
+  # apart. The workflow-level concurrency group cancelled A's run in favour of
+  # B's (runs 33441012355 vs 33441186346). By cancel time A's build-frontend
+  # had ALREADY pushed a new web image to :latest; A's build-backend was
+  # cancelled before pushing. B's own path filters skipped both builds, so B
+  # deployed — pulling A's brand-new :latest web image next to a 3-hour-old
+  # :latest backend image. Production served a frontend calling routes the
+  # backend did not have.
+  #
+  # ## The invariant this job enforces
+  #
+  #   A cancelled or failed run must not be able to change what a subsequent
+  #   deploy consumes.
+  #
+  # Build jobs no longer tag :latest at all — they push an immutable
+  # sha-tagged manifest and report its digest. Nothing a deploy reads moves
+  # while a build is in flight. This job is the ONLY writer of :latest, it
+  # runs after every build the run set out to do has SUCCEEDED, and it moves
+  # both tags back to back in one step with nothing between them. So the
+  # promoted pair is always "what some fully-green run intended", never a
+  # half of one run stitched to a half of another.
+  #
+  # It gates on the same green test / lint / drift results the deploy does,
+  # which is a second (deliberate) tightening: before this job existed, a run
+  # whose tests went RED still pushed :latest, and the next deploy-only push
+  # would happily ship it. Now a red run leaves an orphan sha tag and nothing
+  # else.
+  #
+  # ## Why the tags are moved by digest
+  #
+  # `docker buildx imagetools create` copies a manifest registry-side (no
+  # layer pull), and the source is the exact digest build-push-action reported.
+  # A sha TAG would be a second mutable name that a concurrent run could in
+  # principle re-point; the digest cannot be.
+  #
+  # ## Why cancel-in-progress stays TRUE at workflow level
+  #
+  # Tempting fix: stop cancelling master runs, so nothing is ever interrupted.
+  # Rejected — it trades a sub-second hazard for a likelier one. Without
+  # cancellation, a SLOW older run finishes after a FAST newer one and its
+  # promote + deploy land last, reverting production to the older commit's
+  # images. Cancellation is what makes "newest push wins" true. With this job
+  # in place, being cancelled is simply harmless.
+  #
+  # ## Why not a separate workflow_run workflow
+  #
+  # Also rejected: the post-push CI-watch hook watches the run of the pushed
+  # sha. A workflow_run-triggered promote/deploy is a DIFFERENT run, so the
+  # hook would report green before production had been touched at all.
+  #
+  # ## Interleavings this survives
+  #
+  # 1. The incident itself. A builds web (sha only), is cancelled mid-backend.
+  #    :latest never moved. B skips both builds, promote no-ops, B deploys the
+  #    previous coherent pair. A's work is simply not shipped — correct, since
+  #    A never finished.
+  # 2. A fully promotes, THEN cancellation lands. :latest holds A's coherent
+  #    pair. B promotes nothing and deploys A's pair. Coherent.
+  # 3. Only backend changed. build-frontend is `skipped`, promote moves only
+  #    the backend tag, web:latest stays on the previously promoted digest.
+  #    Coherent by requirement — unchanged source, unchanged behaviour.
+  # 4. force_deploy with nothing built. Both builds `skipped`, promote moves
+  #    nothing, deploy re-rolls exactly the promoted pair. This is what the
+  #    force_deploy input's own comment at the top of the file promises.
+  # 5. force_deploy racing a push. `promote-prod-evergreen` serialises the two
+  #    promotes and `deploy-prod-evergreen` serialises the two deploys, so the
+  #    worst ordering is "the dispatch deploys the push's pair a moment early,
+  #    then the push deploys the same pair again" — idempotent and coherent.
+  # 6. One build succeeds, the other FAILS (not cancelled). promote's `if`
+  #    requires success-or-skipped on BOTH, so nothing is promoted and the
+  #    deploy is blocked by `needs.promote.result == 'success'`. Before this
+  #    job, deploy's `build-frontend.result == 'success' || ...` disjunct
+  #    would have shipped the half that worked.
+  #
+  # ## Residual risk (accepted, documented)
+  #
+  # The two `imagetools create` calls are adjacent but not one registry
+  # operation — two tags in two repositories cannot be moved atomically by any
+  # registry API, and pinning the deploy to digests instead would require
+  # editing docker-compose.yml, which hardcodes both :latest refs. A run
+  # cancelled in the sub-second gap between the two calls would still leave a
+  # torn pair. That window is ~1s at the very end of a run instead of the
+  # entire backend build (minutes), and it requires a push to land inside it.
+  # If it ever does happen, the repair is a workflow_dispatch of the last good
+  # commit or a fresh push — same as any bad deploy.
+  promote:
+    runs-on: ubuntu-latest
+    needs:
+      - should-deploy
+      - lint-cardinality-map
+      - lint-write-pool-routing
+      - test-frontend
+      - test-backend
+      - init-db-migrations-drift-check
+      - build-frontend
+      - build-backend
+    # packages: write is what moves a tag in GHCR. No checkout, so no
+    # contents scope is needed beyond the default read.
+    permissions:
+      contents: read
+      packages: write
+    # Serialise promotion the same way deploys are serialised, and for the
+    # same reason: two runs must never interleave their tag moves and leave
+    # web from one run beside backend from another. Its OWN group, not
+    # `deploy-prod-evergreen` — sharing that group would make this job and the
+    # deploy job of the SAME run queue against each other.
+    concurrency:
+      group: promote-prod-evergreen
+      cancel-in-progress: false
+    # Mirrors the deploy gate exactly, minus deploy's "is there anything to
+    # do" disjunct, PLUS the load-bearing new clause: every build must have
+    # ended in success or been legitimately skipped. `failure` or `cancelled`
+    # on either half promotes NOTHING.
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/master' &&
+      needs.should-deploy.outputs.skip != 'true' &&
+      needs.lint-cardinality-map.result == 'success' &&
+      needs.lint-write-pool-routing.result == 'success' &&
+      (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
+      (needs.build-frontend.result == 'success' || needs.build-frontend.result == 'skipped') &&
+      (needs.build-backend.result == 'success' || needs.build-backend.result == 'skipped')
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote this run's images to :latest
+        env:
+          WEB_IMAGE:      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BACKEND_IMAGE:  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          WEB_RESULT:     ${{ needs.build-frontend.result }}
+          BACKEND_RESULT: ${{ needs.build-backend.result }}
+          # Empty unless that half actually built in THIS run. The `&& ... ||`
+          # form is GitHub's ternary; both arms are strings.
+          WEB_DIGEST:     ${{ needs.build-frontend.result == 'success' && needs.build-frontend.outputs.digest || '' }}
+          BACKEND_DIGEST: ${{ needs.build-backend.result == 'success' && needs.build-backend.outputs.digest || '' }}
+        run: |
+          set -euo pipefail
+
+          # --- phase 1: validate. NOTHING is written to the registry here, so
+          # a bad input aborts before either tag has moved. ---------------
+          check() {
+            case "$2" in
+              success)
+                if [ -z "$3" ]; then
+                  echo "::error::$1 build reported success but no image digest — refusing to promote a pair we cannot name"
+                  exit 1
+                fi
+                ;;
+              skipped)
+                # Not built by this run: its :latest stays where the last
+                # green run put it. This is the "unchanged source implies
+                # unchanged behaviour" case.
+                ;;
+              *)
+                # Unreachable: the job `if` already excluded failure/cancelled.
+                # Kept as a tripwire in case that condition is ever loosened.
+                echo "::error::$1 build result '$2' reached promote — the job \`if\` is wrong"
+                exit 1
+                ;;
+            esac
+          }
+          check build-frontend "$WEB_RESULT"     "$WEB_DIGEST"
+          check build-backend  "$BACKEND_RESULT" "$BACKEND_DIGEST"
+
+          # --- phase 2: move the tags, back to back, nothing in between. ---
+          # `imagetools create` is a registry-side manifest copy: no layer
+          # pull, so each call is a single round trip.
+          if [ -n "$WEB_DIGEST" ]; then
+            docker buildx imagetools create --tag "${WEB_IMAGE}:latest" "${WEB_IMAGE}@${WEB_DIGEST}"
+          fi
+          if [ -n "$BACKEND_DIGEST" ]; then
+            docker buildx imagetools create --tag "${BACKEND_IMAGE}:latest" "${BACKEND_IMAGE}@${BACKEND_DIGEST}"
+          fi
+
+          echo "[promote] web:     ${WEB_RESULT}${WEB_DIGEST:+ -> ${WEB_DIGEST}}"
+          echo "[promote] backend: ${BACKEND_RESULT}${BACKEND_DIGEST:+ -> ${BACKEND_DIGEST}}"
+
+      - name: Verify the promoted pair is resolvable
+        env:
+          WEB_IMAGE:     ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BACKEND_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+        # Both :latest refs must resolve BEFORE the deploy tries to pull them,
+        # and run-deploy.sh additionally `docker run`s the backend :latest for
+        # its pre-worker CT gate. A tag that does not resolve here would fail
+        # the deploy on evergreen instead, mid-roll — much worse place to find
+        # out. Digests are recorded in the job summary for post-mortems.
+        run: |
+          set -euo pipefail
+          fail=0
+          for image in "$WEB_IMAGE" "$BACKEND_IMAGE"; do
+            if ! digest=$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+              # Fall back to a plain inspect: older buildx may not know the
+              # --format field, and that must not be mistaken for a missing tag.
+              if docker buildx imagetools inspect "${image}:latest" >/dev/null 2>&1; then
+                digest="(unreported)"
+              else
+                echo "::error::${image}:latest does not resolve — the deploy would fail on evergreen"
+                fail=1
+                continue
+              fi
+            fi
+            echo "- \`${image}:latest\` -> \`${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "[promote] ${image}:latest -> ${digest}"
+          done
+          exit "$fail"
+
   deploy:
     runs-on: ubuntu-latest
-    needs: [changes, lint-cardinality-map, lint-write-pool-routing, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, should-deploy]
+    needs: [changes, lint-cardinality-map, lint-write-pool-routing, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, promote, should-deploy]
     # Least-privilege: the deploy step only needs to pull images from GHCR
     # (read on packages) and read the working tree.
     permissions:
@@ -908,11 +1179,25 @@ jobs:
     # affect normal pushes. Read the input's own comment at the top of this
     # file before using it; in particular, an empty commit is NOT an
     # alternative — it produces a green run that deploys nothing.
+    #
+    # `needs.promote.result == 'success'` (incident 2026-08-31) is the clause
+    # that makes everything below trustworthy. `:latest` is what evergreen
+    # pulls (docker-compose.yml hardcodes both refs, and run-deploy.sh's
+    # pre-worker CT gate `docker run`s the backend :latest), and `promote` is
+    # now the only job that moves it. Requiring promote to have SUCCEEDED
+    # means the deploy can only ever consume a pair that a fully-green run
+    # published on purpose:
+    #   - a build that failed or was cancelled => promote skipped => no deploy,
+    #     where the old `build-frontend.result == 'success' || ...` disjunct
+    #     alone would have shipped the half that worked;
+    #   - a run that built nothing => promote succeeded having moved nothing
+    #     => the disjuncts below decide, and the pair on :latest is untouched.
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/master' &&
       needs.should-deploy.outputs.skip != 'true' &&
+      needs.promote.result == 'success' &&
       needs.lint-cardinality-map.result == 'success' &&
       needs.lint-write-pool-routing.result == 'success' &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
