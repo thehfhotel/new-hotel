@@ -37,9 +37,13 @@
 //!
 //! ## Running
 //! Needs `DATABASE_URL`; SKIPS cleanly when PG is unreachable.
+//!
+//! Every test owns its OWN marker room (see [`claim_room_no`]) and scopes every
+//! cleanup to it, so the suite is safe under full `cargo test` parallelism — no
+//! `--test-threads=1`, no serial harness.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -53,9 +57,44 @@ use hotel_backend::service::ids::{aggregate_uuid, AggregateKind};
 use sqlx::PgPool;
 use tower::ServiceExt; // for `oneshot`
 
-/// Marker room number, distinct from every other suite's (the `--test-threads=1`
-/// shared-schema convention).
-const ROOM_NO: &str = "ZT-D1W";
+/// Marker room-number PREFIX, distinct from every other suite's. Every test
+/// appends its OWN slug to it (see [`claim_room_no`]) so the suite is safe
+/// under full `cargo test` parallelism.
+const ROOM_PREFIX: &str = "ZT-D1W";
+
+/// This test's private marker room number: `ZT-D1W` + a one-letter slug.
+///
+/// `ht_rooms_new.room_no` is `VARCHAR(10) NOT NULL UNIQUE`, so when every test
+/// seeded the same marker two concurrent tests raced on that unique index
+/// (23505 on the seed) and deleted each other's rows on cleanup. The slug is a
+/// literal chosen per test — not a clock reading, not a hash — so a given test
+/// seeds the SAME row on every run and a crashed run still self-heals; it
+/// simply never shares that row with a sibling on another thread.
+fn claim_room_no(slug: &str) -> String {
+    let room_no = format!("{ROOM_PREFIX}{slug}");
+    assert!(
+        room_no.len() <= 10,
+        "ht_rooms_new.room_no is VARCHAR(10), got {room_no:?}"
+    );
+    claim(&room_no);
+    room_no
+}
+
+/// Fails the run if two tests ever claim the same marker — the copy-paste that
+/// would silently reintroduce the collision this suite was fixed for. This is a
+/// registry, not a serialisation device: the lock is held for one set insert and
+/// no test waits on another.
+fn claim(id: &str) {
+    static CLAIMED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    assert!(
+        CLAIMED
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .expect("marker registry")
+            .insert(id.to_string()),
+        "two tests claim the fixture marker {id:?} — they would collide in parallel"
+    );
+}
 
 #[derive(Debug)]
 struct ScriptedIhotel(RoomFlagsOutcome);
@@ -70,10 +109,10 @@ impl RoomFlagsSource for ScriptedIhotel {
 /// The CLEANLINESS fact only — `Room_Use` is left UNKNOWN, so this suite
 /// keeps proving that the D1 write guard decides on cleanliness alone and the
 /// widened CR-1 read gave it no new input.
-fn ihotel_says(is_clean: bool) -> RoomFlagsOutcome {
+fn ihotel_says(room_no: &str, is_clean: bool) -> RoomFlagsOutcome {
     let mut map = HashMap::new();
     map.insert(
-        ROOM_NO.to_string(),
+        room_no.to_string(),
         LegacyRoomFlags {
             is_clean: Some(is_clean),
             occupied: None,
@@ -128,14 +167,15 @@ async fn post_cleaning(app: axum::Router, room_id: i32, status: &str) -> (Status
     (status_code, json)
 }
 
-/// Seed ONE active room with an explicit canonical `room_clean`.
-async fn seed_room(pool: &PgPool, canonical_clean: bool) -> i32 {
-    cleanup(pool).await;
+/// Seed ONE active room with an explicit canonical `room_clean`, under THIS
+/// test's own marker.
+async fn seed_room(pool: &PgPool, room_no: &str, canonical_clean: bool) -> i32 {
+    cleanup(pool, room_no).await;
     sqlx::query_scalar(
         "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
          VALUES ($1, $2, true) RETURNING room_id",
     )
-    .bind(ROOM_NO)
+    .bind(room_no)
     .bind(canonical_clean)
     .fetch_one(pool)
     .await
@@ -159,9 +199,12 @@ async fn canonical_clean(pool: &PgPool, room_id: i32) -> Option<bool> {
         .expect("room row")
 }
 
-async fn cleanup(pool: &PgPool) {
+/// Every DELETE here is scoped to THIS test's marker room — by `room_no`, or by
+/// the ids/aggregate uuids derived from it — so a cleanup can never reach a
+/// sibling test's rows.
+async fn cleanup(pool: &PgPool, room_no: &str) {
     let ids: Vec<i32> = sqlx::query_scalar("SELECT room_id FROM ht_rooms_new WHERE room_no = $1")
-        .bind(ROOM_NO)
+        .bind(room_no)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -181,7 +224,7 @@ async fn cleanup(pool: &PgPool) {
             .await;
     }
     let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
-        .bind(ROOM_NO)
+        .bind(room_no)
         .execute(pool)
         .await;
 }
@@ -195,11 +238,12 @@ async fn a_tap_on_a_room_ihotel_calls_dirty_reaches_ihotel() {
         eprintln!("skipping a_tap_on_a_room_ihotel_calls_dirty_reaches_ihotel — PG not reachable");
         return;
     };
-    let room_id = seed_room(&pool, true).await;
+    let room_no = claim_room_no("A");
+    let room_id = seed_room(&pool, &room_no, true).await;
     let state = AppState::new(pool.clone());
 
     let (status, body) = post_cleaning(
-        app(state, ihotel_says(false), false),
+        app(state, ihotel_says(&room_no, false), false),
         room_id,
         "done",
     )
@@ -222,7 +266,7 @@ async fn a_tap_on_a_room_ihotel_calls_dirty_reaches_ihotel() {
         "canonical already matched the tap — a repair flips nothing"
     );
 
-    cleanup(&pool).await;
+    cleanup(&pool, &room_no).await;
 }
 
 /// The fallback, end to end: iHOTEL unreachable ⇒ canonical-only judgement,
@@ -235,7 +279,8 @@ async fn an_unreachable_ihotel_degrades_to_todays_behaviour_and_never_fails_the_
         eprintln!("skipping an_unreachable_ihotel_degrades_to_todays_behaviour — PG not reachable");
         return;
     };
-    let room_id = seed_room(&pool, true).await;
+    let room_no = claim_room_no("B");
+    let room_id = seed_room(&pool, &room_no, true).await;
     let state = AppState::new(pool.clone());
 
     let (status, body) = post_cleaning(
@@ -258,7 +303,7 @@ async fn an_unreachable_ihotel_degrades_to_todays_behaviour_and_never_fails_the_
     );
     assert_eq!(job_count(&pool, room_id, "mark_room_clean").await, 0);
 
-    cleanup(&pool).await;
+    cleanup(&pool, &room_no).await;
 }
 
 /// Invariant #4 under the NEW logic: iHOTEL keeps answering "dirty" until our
@@ -270,12 +315,13 @@ async fn a_double_tap_under_a_lagging_mirror_still_enqueues_exactly_one_job() {
         eprintln!("skipping a_double_tap_under_a_lagging_mirror — PG not reachable");
         return;
     };
-    let room_id = seed_room(&pool, true).await;
+    let room_no = claim_room_no("C");
+    let room_id = seed_room(&pool, &room_no, true).await;
     let state = AppState::new(pool.clone());
 
     for tap in 1..=4 {
         let (status, body) = post_cleaning(
-            app(state.clone(), ihotel_says(false), false),
+            app(state.clone(), ihotel_says(&room_no, false), false),
             room_id,
             "done",
         )
@@ -303,7 +349,7 @@ async fn a_double_tap_under_a_lagging_mirror_still_enqueues_exactly_one_job() {
             .expect("event count");
     assert_eq!(events, 4, "all four taps stay in the maid's own audit trail");
 
-    cleanup(&pool).await;
+    cleanup(&pool, &room_no).await;
 }
 
 /// The ordinary path must be untouched: a genuinely dirty room still
@@ -315,17 +361,23 @@ async fn a_genuinely_dirty_room_still_transitions_and_mirrors() {
         eprintln!("skipping a_genuinely_dirty_room_still_transitions — PG not reachable");
         return;
     };
-    let room_id = seed_room(&pool, false).await;
+    let room_no = claim_room_no("D");
+    let room_id = seed_room(&pool, &room_no, false).await;
     let state = AppState::new(pool.clone());
 
-    let (status, body) = post_cleaning(app(state, ihotel_says(true), false), room_id, "done").await;
+    let (status, body) = post_cleaning(
+        app(state, ihotel_says(&room_no, true), false),
+        room_id,
+        "done",
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["writebackEnqueued"], serde_json::json!(true), "{body}");
     assert_eq!(job_count(&pool, room_id, "mark_room_clean").await, 1);
     assert_eq!(canonical_clean(&pool, room_id).await, Some(true));
 
-    cleanup(&pool).await;
+    cleanup(&pool, &room_no).await;
 }
 
 /// The symmetric pole, end to end. Canonical already DIRTY, iHOTEL still shows
@@ -338,12 +390,13 @@ async fn the_dirty_pole_is_repaired_symmetrically_and_stays_behind_its_flag() {
         eprintln!("skipping the_dirty_pole_is_repaired_symmetrically — PG not reachable");
         return;
     };
-    let room_id = seed_room(&pool, false).await;
+    let room_no = claim_room_no("E");
+    let room_id = seed_room(&pool, &room_no, false).await;
     let state = AppState::new(pool.clone());
 
     // Flag OFF ⇒ 403 before any of this logic is reached, unchanged by D1.
     let (status, body) = post_cleaning(
-        app(state.clone(), ihotel_says(true), false),
+        app(state.clone(), ihotel_says(&room_no, true), false),
         room_id,
         "dirty",
     )
@@ -357,7 +410,7 @@ async fn the_dirty_pole_is_repaired_symmetrically_and_stays_behind_its_flag() {
 
     // Flag ON ⇒ the mirror-image repair fires.
     let (status, body) = post_cleaning(
-        app(state.clone(), ihotel_says(true), true),
+        app(state.clone(), ihotel_says(&room_no, true), true),
         room_id,
         "dirty",
     )
@@ -372,9 +425,14 @@ async fn the_dirty_pole_is_repaired_symmetrically_and_stays_behind_its_flag() {
     assert_eq!(canonical_clean(&pool, room_id).await, Some(false));
 
     // And it is idempotent on the same double-tap argument.
-    let (_, body) = post_cleaning(app(state, ihotel_says(true), true), room_id, "dirty").await;
+    let (_, body) = post_cleaning(
+        app(state, ihotel_says(&room_no, true), true),
+        room_id,
+        "dirty",
+    )
+    .await;
     assert_eq!(body["writebackEnqueued"], serde_json::json!(false), "{body}");
     assert_eq!(job_count(&pool, room_id, "mark_room_dirty").await, 1);
 
-    cleanup(&pool).await;
+    cleanup(&pool, &room_no).await;
 }

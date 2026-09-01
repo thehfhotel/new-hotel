@@ -57,7 +57,8 @@ use crate::outbox::event::EventSource;
 // twins: identical shapes on both surfaces is a CONTRACT of this feature, and
 // two structs with the same fields is exactly how it would quietly stop being
 // true.
-use crate::routes::hk::{RaiseSignalBody, SignalListResponse, SignalResponse};
+use crate::domain::hk_signal::RoomSignal;
+use crate::routes::hk::{RaiseSignalBody, SignalResponse};
 use crate::service::{
     ActOnSignalCommand, HkSignalService, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,
     MarkMaintenanceCommand, RaiseSignalCommand,
@@ -240,18 +241,72 @@ pub async fn set_maintenance(
 /// question with one answer, not two.
 const DESK_SIGNAL_BADGE: &str = DEFAULT_BY;
 
+/// `GET /api/housekeeping/signals?branch=` — reception's live signal board,
+/// plus today's ANSWERED room checks.
+///
+/// The DESK's own envelope, not `routes::hk`'s
+/// [`SignalListResponse`](crate::routes::hk::SignalListResponse). Every
+/// other desk signal endpoint reuses the `/hk` wire type verbatim and must keep
+/// doing so — identical shapes on both surfaces is a contract of this feature —
+/// but this ONE read genuinely has a third field the maid tree does not, so it
+/// gets its own struct rather than an `Option` bolted onto the shared one.
+///
+/// `signals` is byte-for-byte what it always was: `open` + `acked`, oldest
+/// first, the same `RoomSignal` DTO.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeskSignalListResponse {
+    pub success: bool,
+    /// `open` + `acked`, oldest first — `HkSignalService::list_live`, unchanged.
+    pub signals: Vec<RoomSignal>,
+    /// Today's answered ขอเช็คห้อง: the NEWEST answered check per room for the
+    /// Bangkok civil day, `doneAt` descending, at most one entry per room.
+    /// Cancelled checks never appear. Same `RoomSignal` serialization as
+    /// `signals`, with `outcome` and `doneBy`/`doneAt` populated — which is the
+    /// whole point of the field.
+    ///
+    /// ADDITIVE and ALWAYS serialized (`[]` on a quiet morning), so a client
+    /// branches on the VALUE. `components/v2/signals/RoomCheckPanel` treats an
+    /// ABSENT key as an older backend and falls back to its module-memory
+    /// inference exactly as before — so a rollback loses the reload-survival,
+    /// never paints a wrong state.
+    pub answered_room_checks: Vec<RoomSignal>,
+}
+
 /// `GET /api/housekeeping/signals?branch=` — reception's live signal board.
 ///
-/// Same payload as `GET /api/hk/signals`: `open` + `acked`, oldest first,
-/// `{success, signals:[RoomSignal]}`.
+/// ## `answeredRoomChecks` — the documented v1 gap (ADR 0008)
+///
+/// `signals` is `open` + `acked` by contract, so a maid's เคลียร์ answer
+/// removes the check and leaves nothing behind: `RoomCheckPanel` could only
+/// infer it from a transition its own tab watched, and a desk-tab reload showed
+/// "not requested" for a room already cleared. That panel's header names this
+/// exact fix — "let the desk read the room's last `room_check` including its
+/// `outcome`" — and this field is it.
+///
+/// ## The maid tree is deliberately UNCHANGED
+///
+/// `GET /api/hk/signals` keeps its two-field body. The maid does not need it:
+/// she is the one who ANSWERED the check, the answer's own response already
+/// carried the outcome back to her, and a `problems` answer leaves standing
+/// children on her board anyway. Adding it there would grow every maid poll on
+/// a phone over hotel wifi to serve a fact her surface never renders — and the
+/// `/hk` response shape is pinned as a cross-language contract with
+/// `app/hk/signal-vocab.ts`.
 pub async fn list_signals(
     State(state): State<AppState>,
     Query(query): Query<HousekeepingQuery>,
-) -> ApiResult<Json<SignalListResponse>> {
-    let signals = signal_service_for(&state, query.branch)?.list_live().await?;
-    Ok(Json(SignalListResponse {
+) -> ApiResult<Json<DeskSignalListResponse>> {
+    // ONE service, so both reads land on the same `?branch=`-resolved pool —
+    // an answered check from the other site is not a thing this endpoint can
+    // ever return.
+    let svc = signal_service_for(&state, query.branch)?;
+    let signals = svc.list_live().await?;
+    let answered_room_checks = svc.list_answered_room_checks_today().await?;
+    Ok(Json(DeskSignalListResponse {
         success: true,
         signals,
+        answered_room_checks,
     }))
 }
 
@@ -940,6 +995,115 @@ mod tests {
         assert!(body.contains("\"legacyClean\""), "{body}");
         assert!(body.contains("\"hkStatus\":\"cleaning\""), "{body}");
         assert!(body.contains("\"divergent\":false"), "{body}");
+    }
+
+    // ---------------------------------------------------------------
+    // The desk signal envelope — `answeredRoomChecks` (ADR 0008 v1 gap)
+    // ---------------------------------------------------------------
+
+    /// A room_check as it comes back once a maid answered เคลียร์.
+    fn answered_check(signal_id: i64, room_id: i32, done_at: &str) -> RoomSignal {
+        use crate::domain::hk_signal::{
+            RoomCheckOutcome, SignalActor, SignalDirection, SignalDoneSource, SignalStatus,
+            ROOM_CHECK,
+        };
+        RoomSignal {
+            signal_id,
+            room_id,
+            room_no: "104".to_string(),
+            direction: SignalDirection::DeskToMaid,
+            signal_type: ROOM_CHECK.to_string(),
+            status: SignalStatus::Done,
+            outcome: Some(RoomCheckOutcome::Clear),
+            parent_id: None,
+            created_by: SignalActor {
+                badge: "Front Desk".to_string(),
+                name: None,
+            },
+            created_at: "2026-09-01T03:00:00Z".to_string(),
+            acked_by: None,
+            acked_at: None,
+            done_by: Some(SignalActor {
+                badge: "Q1001".to_string(),
+                name: Some("นก".to_string()),
+            }),
+            done_at: Some(done_at.to_string()),
+            done_source: Some(SignalDoneSource::RoomCheckAnswer),
+        }
+    }
+
+    /// The third field is ADDITIVE and ALWAYS serialized, in the agreed
+    /// camelCase spelling, and the existing two are untouched. A client must be
+    /// able to branch on the VALUE — an omitted key is the OLDER-backend signal
+    /// `RoomCheckPanel` reads as "infer from module memory", so emitting no key
+    /// on a quiet morning would silently disable the fix.
+    #[test]
+    fn the_desk_envelope_always_carries_answered_room_checks() {
+        let empty = serde_json::to_value(DeskSignalListResponse {
+            success: true,
+            signals: vec![],
+            answered_room_checks: vec![],
+        })
+        .expect("response serializes");
+        let obj = empty.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["answeredRoomChecks", "signals", "success"],
+            "exactly three fields, camelCase"
+        );
+        assert_eq!(
+            obj["answeredRoomChecks"],
+            serde_json::json!([]),
+            "an empty day is [], never a missing key"
+        );
+    }
+
+    /// An entry is the SAME `RoomSignal` DTO as everything else on the wire,
+    /// with the two facts the desk actually needs — `outcome` and who/when —
+    /// populated. Pinned key-by-key because this is a cross-language contract
+    /// with `app/hk/signal-vocab.ts`, which the panel reads through
+    /// `components/v2/signals/signal-lib`.
+    #[test]
+    fn an_answered_check_serializes_as_the_room_signal_dto() {
+        let body = serde_json::to_value(DeskSignalListResponse {
+            success: true,
+            signals: vec![],
+            answered_room_checks: vec![answered_check(7, 42, "2026-09-01T04:30:00Z")],
+        })
+        .expect("response serializes");
+        let entry = &body["answeredRoomChecks"][0];
+        assert_eq!(entry["signalId"], 7);
+        assert_eq!(entry["roomId"], 42);
+        assert_eq!(entry["type"], "room_check");
+        assert_eq!(entry["status"], "done");
+        assert_eq!(entry["outcome"], "clear", "the ANSWER is the payload");
+        assert_eq!(entry["doneSource"], "room_check_answer");
+        assert_eq!(entry["doneBy"]["badge"], "Q1001");
+        assert_eq!(entry["doneAt"], "2026-09-01T04:30:00Z");
+        // …and it round-trips, like every other RoomSignal on this wire.
+        let back: RoomSignal =
+            serde_json::from_value(entry.clone()).expect("the DTO deserializes");
+        assert_eq!(back.signal_id, 7);
+    }
+
+    /// `signals` keeps its published meaning: an answered (terminal) check is
+    /// served ONLY on the new field, never folded into the live board — three
+    /// surfaces render that list as "still to do".
+    #[test]
+    fn the_live_list_is_not_widened_by_the_new_field() {
+        let body = serde_json::to_value(DeskSignalListResponse {
+            success: true,
+            signals: vec![],
+            answered_room_checks: vec![answered_check(7, 42, "2026-09-01T04:30:00Z")],
+        })
+        .expect("response serializes");
+        assert_eq!(
+            body["signals"],
+            serde_json::json!([]),
+            "a done room_check must not appear on the live board"
+        );
     }
 
     #[test]

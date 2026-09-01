@@ -35,6 +35,19 @@ import {
  *    nothing and reports `enabled: false` so callers can hide the UI instead
  *    of showing empty panels.
  *
+ * The read also carries `answeredRoomChecks`: for each room, the NEWEST
+ * `room_check` ANSWERED today (Bangkok civil day) — `status = done` with
+ * `doneSource = room_check_answer` and an `outcome`. It is what lets a surface
+ * render a เคลียร์ answer it never watched happen (a reloaded tab), because an
+ * answered check is by contract absent from `signals` itself. Cancelled checks
+ * never appear in it, so it can never manufacture a green state.
+ *
+ * That field is served by a NEWER BACKEND than this bundle may be talking to,
+ * so absence is a first-class value: `answeredRoomChecks` is `null` when the
+ * field was not in the payload at all (callers then fall back to whatever they
+ * did before it existed) and an ARRAY — possibly empty — when it was. Never
+ * collapse the two; an empty array is the server saying "no answer today".
+ *
  * `useDeskSignalsCore` does NOT open an event stream. Use it on a surface that
  * already runs `useLiveRefresh` and can fold `SIGNAL_LIVE_EVENTS` into its own
  * event list — one EventSource per tab instead of two. `useDeskSignals` is the
@@ -58,6 +71,10 @@ export interface DeskSignalsOptions {
 export interface DeskSignalsClient {
   /** Open + acked signals for the active branch, urgent-first. */
   signals: RoomSignal[]
+  /** Per room, today's newest ANSWERED `room_check` (newest `doneAt` first), or
+   *  `null` when the backend did not send the field — see the file header:
+   *  `null` is "older backend", `[]` is "no answers today". */
+  answeredRoomChecks: RoomSignal[] | null
   /** False in the aggregate (`all`) view — nothing was read, nothing can be sent. */
   enabled: boolean
   loading: boolean
@@ -82,6 +99,7 @@ export function useDeskSignalsCore(options: DeskSignalsOptions = {}): DeskSignal
   const enabled = branch !== 'all'
 
   const [signals, setSignals] = useState<RoomSignal[]>([])
+  const [answeredRoomChecks, setAnsweredRoomChecks] = useState<RoomSignal[] | null>(null)
   const [loading, setLoading] = useState(enabled)
   const [error, setError] = useState<string | null>(null)
   const [busySignalId, setBusySignalId] = useState<number | null>(null)
@@ -95,6 +113,7 @@ export function useDeskSignalsCore(options: DeskSignalsOptions = {}): DeskSignal
   const refresh = useCallback(async () => {
     if (!enabled) {
       setSignals([])
+      setAnsweredRoomChecks(null)
       setLoading(false)
       return
     }
@@ -107,6 +126,12 @@ export function useDeskSignalsCore(options: DeskSignalsOptions = {}): DeskSignal
       if (token !== reqRef.current) return
       if (!payload?.success) throw new Error(LOAD_ERROR)
       setSignals(Array.isArray(payload.signals) ? payload.signals : [])
+      // Absent field ⇒ null (older backend), present ⇒ the array as sent. An
+      // empty array is a real answer ("nothing answered today") and must not
+      // be confused with the skew case.
+      setAnsweredRoomChecks(
+        Array.isArray(payload.answeredRoomChecks) ? payload.answeredRoomChecks : null,
+      )
       setError(null)
     } catch {
       // The previous list is deliberately LEFT ON SCREEN (the /hk rule): a
@@ -178,6 +203,7 @@ export function useDeskSignalsCore(options: DeskSignalsOptions = {}): DeskSignal
 
   return {
     signals: ordered,
+    answeredRoomChecks,
     enabled,
     loading,
     error,

@@ -1230,3 +1230,262 @@ async fn shipped_router_answers_401_for_every_signal_endpoint() {
         );
     }
 }
+
+// ============================================================================
+// The DESK read — `answeredRoomChecks` (the documented v1 gap, ADR 0008)
+// ============================================================================
+//
+// `GET /api/housekeeping/signals` is reception's twin of `GET /api/hk/signals`
+// and lives in this suite for the same reason the `/hk` signal rows do: it is
+// the other half of one feature, and the two must not drift.
+//
+// The gap being closed (`components/v2/signals/RoomCheckPanel`'s header): the
+// live list is `open` + `acked` by contract, so a maid's เคลียร์ answer leaves
+// NOTHING behind — the panel could only infer it from a transition its own tab
+// watched, and a tab reload showed "not requested" for a room already cleared.
+// The desk response now carries a THIRD field: the newest ANSWERED room_check
+// per room for the Bangkok civil day.
+//
+// The maid tree is deliberately untouched — `GET /api/hk/signals` keeps its
+// two-field body, which `shipped_router_answers_401_for_every_signal_endpoint`
+// and the `/hk` rows above still describe.
+
+/// The desk handler mounted on its shipped path. Reception's surface has no
+/// Access layer (its auth is the cookie session in `main.rs`, a no-op while
+/// `AUTH_ENABLED=false`), so unlike [`inner`] there is no identity to inject —
+/// the role is constantly `SignalRole::Desk` inside the handler.
+fn desk(state: AppState) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/housekeeping/signals",
+            axum::routing::get(hotel_backend::routes::housekeeping::list_signals),
+        )
+        .with_state(state)
+}
+
+/// The field is ADDITIVE and ALWAYS serialized, in the agreed camelCase
+/// spelling — DB-free, so it runs everywhere.
+///
+/// The VALUE is what the client branches on: `RoomCheckPanel` reads an ABSENT
+/// key as an older backend and falls back to its module-memory inference, so a
+/// build that emitted no key on a quiet morning would silently ship the bug
+/// this change fixes while every other test still passed.
+#[test]
+fn the_desk_envelope_always_carries_answered_room_checks() {
+    let body = serde_json::to_string(
+        &hotel_backend::routes::housekeeping::DeskSignalListResponse {
+            success: true,
+            signals: vec![],
+            answered_room_checks: vec![],
+        },
+    )
+    .expect("the desk envelope serializes");
+    assert!(body.contains(r#""answeredRoomChecks":[]"#), "{body}");
+    assert!(body.contains(r#""signals":[]"#), "{body}");
+    assert!(body.contains(r#""success":true"#), "{body}");
+}
+
+/// The answered read rides the SAME per-site chokepoint as the live list.
+///
+/// With no `hotelville` pool wired, `?branch=hfville` must FAIL rather than
+/// answer from the HF Hotel pool — otherwise reception's checkout screen could
+/// show a Ville room as เคลียร์ on the strength of an HF Hotel maid's answer,
+/// which is the two-site bug this whole suite exists to pin. DB-free: the
+/// chokepoint answers before any pool is touched.
+#[tokio::test]
+async fn the_desk_answered_read_is_branch_routed_not_defaulted() {
+    let app = desk(AppState::new(clamped_lazy_pool()));
+    let (status, body) = call(app, "GET", "/api/housekeeping/signals?branch=hfville", "").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unwired HF Ville must be an error, never the primary site's rows: {body}"
+    );
+    assert_ne!(status, StatusCode::OK, "body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+    assert_eq!(json.get("success").and_then(|v| v.as_bool()), Some(false));
+    assert!(
+        json.get("answeredRoomChecks").is_none(),
+        "a refused branch carries no signals at all: {body}"
+    );
+}
+
+/// The live path, end to end against PG: today's answered ขอเช็คห้อง comes back
+/// on the new field, newest-per-room, while the cancelled one and the still-open
+/// one do not. Skips gracefully without a local database, same convention as
+/// [`branch_selects_the_right_site_pool`].
+#[tokio::test]
+async fn desk_signals_serve_todays_newest_answered_room_check_per_room() {
+    let Some(pool) = live_pool().await else {
+        eprintln!("skipping desk_signals_serve_todays_newest_answered_room_check — PG not reachable");
+        return;
+    };
+
+    // Marker rooms, torn down first in case a previous run died mid-test.
+    // Deleting the room CASCADEs its signals (migration 089's FK).
+    for marker in ["ZT-HKA1", "ZT-HKA2"] {
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+            .bind(marker)
+            .execute(&pool)
+            .await;
+    }
+    let mut rooms = Vec::new();
+    for marker in ["ZT-HKA1", "ZT-HKA2"] {
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+             VALUES ($1, true, true) RETURNING room_id",
+        )
+        .bind(marker)
+        .fetch_one(&pool)
+        .await
+        .expect("seed marker room");
+        rooms.push(room_id);
+    }
+    let (room_a, room_b) = (rooms[0], rooms[1]);
+
+    // Seeded directly rather than through the service: this row is about what
+    // the READ serves, and the write paths are pinned by their own suites.
+    //
+    // `sig_done_at` is built as an offset from TODAY'S BANGKOK MIDNIGHT, not
+    // from `NOW()`: the fixture must land inside the same civil day the query
+    // filters on no matter which UTC hour CI runs in — which is the very
+    // property `TODAY_BKK_SIGNAL_DONE` exists to get right.
+    let seed = |room_id: i32,
+                status: &'static str,
+                outcome: Option<&'static str>,
+                done_source: Option<&'static str>,
+                since_bkk_midnight: Option<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO ht_hk_room_signals \
+                     (sig_room_id, sig_direction, sig_type, sig_status, sig_outcome, \
+                      sig_created_badge, sig_done_badge, sig_done_source, sig_done_at) \
+                 VALUES ($1, 'desk_to_maid', 'room_check', $2, $3, 'Front Desk', \
+                         CASE WHEN $4::text IS NULL THEN NULL ELSE 'Q1001' END, $4, \
+                         CASE WHEN $5::text IS NULL THEN NULL ELSE \
+                              ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Bangkok') \
+                                + $5::interval) AT TIME ZONE 'Asia/Bangkok') END) \
+                 RETURNING sig_id",
+            )
+            .bind(room_id)
+            .bind(status)
+            .bind(outcome)
+            .bind(done_source)
+            .bind(since_bkk_midnight)
+            .fetch_one(&pool)
+            .await
+            .expect("seed signal");
+            id
+        }
+    };
+
+    // Room A: an early เคลียร์, then a later มีของหาย answer today — only the
+    // LATER one may appear (one entry per room, newest wins).
+    let early = seed(
+        room_a,
+        "done",
+        Some("clear"),
+        Some("room_check_answer"),
+        Some("1 hour"),
+    )
+    .await;
+    let latest_a = seed(
+        room_a,
+        "done",
+        Some("problems"),
+        Some("room_check_answer"),
+        Some("9 hours"),
+    )
+    .await;
+    // Room A also has a CANCELLED check — a withdrawn ขอเช็คห้อง must never
+    // read as an answer.
+    let cancelled = seed(room_a, "cancelled", None, None, None).await;
+    // Room B: a เคลียร์ answered today, plus a still-open check that belongs on
+    // the LIVE list only.
+    let latest_b = seed(
+        room_b,
+        "done",
+        Some("clear"),
+        Some("room_check_answer"),
+        Some("8 hours"),
+    )
+    .await;
+    let open_b = seed(room_b, "open", None, None, None).await;
+
+    let app = desk(AppState::new(pool.clone()));
+    let (status, body) = call(app, "GET", "/api/housekeeping/signals?branch=hfhotel", "").await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+    let answered = json["answeredRoomChecks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("answeredRoomChecks must be an array: {body}"));
+
+    let ids: Vec<i64> = answered
+        .iter()
+        .filter_map(|s| s["signalId"].as_i64())
+        .collect();
+    assert!(
+        ids.contains(&latest_a) && ids.contains(&latest_b),
+        "today's answered checks for both marker rooms must appear: {body}"
+    );
+    assert!(
+        !ids.contains(&early),
+        "one entry per room: the EARLIER answer must be superseded, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cancelled),
+        "a cancelled check must never be served as an answer: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&open_b),
+        "a still-open check belongs to `signals`, not `answeredRoomChecks`: {ids:?}"
+    );
+
+    // The DTO carries the ANSWER — the fact the panel could not recover.
+    let entry = answered
+        .iter()
+        .find(|s| s["signalId"].as_i64() == Some(latest_b))
+        .expect("room B's answered check");
+    assert_eq!(entry["outcome"], "clear");
+    assert_eq!(entry["status"], "done");
+    assert_eq!(entry["doneSource"], "room_check_answer");
+    assert_eq!(entry["roomNo"], "ZT-HKA2");
+    assert_eq!(entry["doneBy"]["badge"], "Q1001");
+    assert!(entry["doneAt"].is_string(), "doneAt must be populated: {entry}");
+
+    // Ordering is doneAt DESCENDING across rooms — 09:00 (room A) before 08:00.
+    let marker_order: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|id| *id == latest_a || *id == latest_b)
+        .collect();
+    assert_eq!(
+        marker_order,
+        vec![latest_a, latest_b],
+        "newest answer first: {body}"
+    );
+
+    // …and the live list is untouched: the open check is still there and no
+    // terminal row leaked into it.
+    let live: Vec<i64> = json["signals"]
+        .as_array()
+        .expect("signals array")
+        .iter()
+        .filter_map(|s| s["signalId"].as_i64())
+        .collect();
+    assert!(live.contains(&open_b), "the open check stays on the board: {body}");
+    for terminal in [latest_a, latest_b, cancelled, early] {
+        assert!(
+            !live.contains(&terminal),
+            "signal {terminal} is terminal and must not be on the live board: {body}"
+        );
+    }
+
+    for marker in ["ZT-HKA1", "ZT-HKA2"] {
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+            .bind(marker)
+            .execute(&pool)
+            .await;
+    }
+}

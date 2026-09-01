@@ -69,7 +69,7 @@ use uuid::Uuid;
 use crate::domain::hk_signal::{
     direction_for_role_type, next_status, parse_problems, RoomCheckOutcome, RoomSignal,
     SignalAction, SignalActor, SignalDirection, SignalDoneSource, SignalRole, SignalRuleError,
-    SignalStatus, CLEAN_REPORT_AUTO_COMPLETE_TYPES,
+    SignalStatus, CLEAN_REPORT_AUTO_COMPLETE_TYPES, ROOM_CHECK,
 };
 use crate::outbox::event::{DomainEvent, EventSource};
 use crate::outbox::EventBus;
@@ -91,6 +91,69 @@ const SIGNAL_SELECT: &str = "SELECT s.sig_id, s.sig_room_id, r.room_no, s.sig_di
                              s.sig_done_badge, s.sig_done_name, s.sig_done_at, s.sig_done_source \
                              FROM ht_hk_room_signals s \
                              JOIN ht_rooms_new r ON r.room_id = s.sig_room_id";
+
+/// The Bangkok civil-day boundary for a signal's COMPLETION timestamp.
+///
+/// Character-for-character `routes::hk::TODAY_BKK`, on `sig_done_at` instead of
+/// `hkev_created_at` — exactly the construction `TODAY_BKK_LINEN` (migration
+/// 088) made for `hklr_created_at`, and pinned to the canonical boundary by
+/// `today_bkk_signal_done_is_the_cleaning_day_boundary` below. The column is
+/// spelled bare, not `s.sig_done_at`, because `sig_done_at` exists on exactly
+/// one of [`SIGNAL_SELECT`]'s two tables — the same way `TODAY_BKK` is dropped
+/// unqualified into a join with `ht_rooms_new`.
+///
+/// `CURRENT_DATE` is BANNED here for `TODAY_BKK`'s reason: it is the SERVER's
+/// date, and between 17:00 and 24:00 UTC it names YESTERDAY in Bangkok. Using
+/// it would blank reception's answered-check row for the seven hours a night
+/// that straddle the busiest late checkouts.
+pub(crate) const TODAY_BKK_SIGNAL_DONE: &str =
+    "(sig_done_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date";
+
+/// The newest ANSWERED ขอเช็คห้อง per room, for the Bangkok civil day.
+///
+/// A function rather than a `const` because it composes [`SIGNAL_SELECT`] (so
+/// there is still ONE projection, and an answered check deserializes through
+/// the same [`signal_from_row`] as every other read) with the
+/// `DISTINCT ON (s.sig_room_id)` de-duplication — same "SQL you can read at the
+/// call site, pinned by a unit test" idiom as `routes::hk`'s
+/// `linen_shortage_today_sql`.
+///
+/// Why each clause is here:
+///
+/// * `sig_type = 'room_check'` + `sig_status = 'done'` +
+///   `sig_done_source = 'room_check_answer'` — an answered check, specifically.
+///   `cancelled` is excluded by the status predicate alone (a withdrawn check
+///   was never answered and must never read as เคลียร์), and so is a check
+///   still open on the board, which the live list already carries.
+/// * `sig_outcome IS NOT NULL` — belt and braces with `room_check_answer`: the
+///   whole point of this read is the ANSWER, and a done row without one would
+///   serialize as `outcome: null` and tell the desk nothing.
+/// * [`TODAY_BKK_SIGNAL_DONE`] — yesterday's เคลียร์ is not a fact about the
+///   guest standing at the counter this morning.
+///
+/// The `DISTINCT ON` inner ORDER BY must lead with the distinct expression, so
+/// the newest-first ordering the contract promises is applied by the wrapping
+/// SELECT: one entry per room, `doneAt` descending, `sig_id` breaking a tie.
+fn answered_room_checks_today_sql() -> String {
+    // ONE `SELECT ` prefix, and it is the first six characters of the shared
+    // projection — asserted by `the_answered_query_reuses_the_one_projection`.
+    let newest_per_room = format!(
+        "{distinct} \
+          WHERE s.sig_type = '{ROOM_CHECK}' \
+            AND s.sig_status = '{done}' \
+            AND s.sig_done_source = '{answer}' \
+            AND s.sig_outcome IS NOT NULL \
+            AND {TODAY_BKK_SIGNAL_DONE} \
+          ORDER BY s.sig_room_id, s.sig_done_at DESC, s.sig_id DESC",
+        distinct = SIGNAL_SELECT.replacen("SELECT ", "SELECT DISTINCT ON (s.sig_room_id) ", 1),
+        done = SignalStatus::Done.as_str(),
+        answer = SignalDoneSource::RoomCheckAnswer.as_str(),
+    );
+    format!(
+        "SELECT * FROM ({newest_per_room}) answered \
+          ORDER BY answered.sig_done_at DESC, answered.sig_id DESC"
+    )
+}
 
 /// Command for [`HkSignalService::raise`].
 #[derive(Debug, Clone)]
@@ -185,6 +248,38 @@ impl HkSignalService {
             "{SIGNAL_SELECT} WHERE s.sig_status IN ('open', 'acked') \
              ORDER BY s.sig_created_at ASC, s.sig_id ASC"
         );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql)).fetch_all(&self.pg).await?;
+        rows.iter().map(signal_from_row).collect()
+    }
+
+    /// Today's ANSWERED ขอเช็คห้อง — the newest per room, newest room first.
+    ///
+    /// ## The gap this closes
+    ///
+    /// [`list_live`](Self::list_live) is `open` + `acked` by contract, so the
+    /// instant a maid answers a check it leaves that list. A `problems` answer
+    /// leaves its standing child signals behind and stays fully visible; a
+    /// เคลียร์ answer leaves NOTHING, so `components/v2/signals/RoomCheckPanel`
+    /// could only infer it from a transition its own tab watched — and a desk
+    /// tab reload (or a second receptionist's tab) lost that inference and
+    /// showed "not requested" for a room the maid had already cleared. The
+    /// panel's header documents the gap and names this exact fix: "let the desk
+    /// read the room's last `room_check` including its `outcome`".
+    ///
+    /// ## Scope, and why it is not just "the last check"
+    ///
+    /// One row per room, `status='done'` with `sig_done_source =
+    /// 'room_check_answer'` and an `outcome`, bounded to the Bangkok civil day
+    /// ([`TODAY_BKK_SIGNAL_DONE`]) — the same TODAY the maid's cleaning and
+    /// linen reads use. A cancelled check can never appear (it is not `done`),
+    /// which is what keeps a withdrawn ขอเช็คห้อง from ever rendering green.
+    ///
+    /// Read-only, no transaction, and deliberately a SECOND query rather than a
+    /// widening of the live list: the live board's predicate is a published
+    /// contract (`open` + `acked`) that three surfaces render, and folding
+    /// terminal rows into it would change what every one of them shows.
+    pub async fn list_answered_room_checks_today(&self) -> ServiceResult<Vec<RoomSignal>> {
+        let sql = answered_room_checks_today_sql();
         let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql)).fetch_all(&self.pg).await?;
         rows.iter().map(signal_from_row).collect()
     }
@@ -917,5 +1012,121 @@ mod tests {
                 "{column} missing from SIGNAL_SELECT"
             );
         }
+    }
+
+    // ---- today's answered room checks ------------------------------------
+
+    /// The day boundary is the CLEANING one with the column swapped — exactly
+    /// how `TODAY_BKK_LINEN` was built from `TODAY_BKK`, and pinned for the
+    /// same reason: reception's "answered today" and the maid's "cleaned today"
+    /// must roll over at the same instant, or the desk's green เคลียร์ outlives
+    /// (or predates) the housekeeping day that explains it.
+    #[test]
+    fn today_bkk_signal_done_is_the_cleaning_day_boundary() {
+        use crate::routes::hk::{TODAY_BKK, TODAY_BKK_DATE};
+        assert_eq!(
+            TODAY_BKK_SIGNAL_DONE,
+            TODAY_BKK.replace("hkev_created_at", "sig_done_at"),
+            "the answered-check day boundary must be the cleaning one, column swapped"
+        );
+        assert!(TODAY_BKK_SIGNAL_DONE.contains(TODAY_BKK_DATE));
+        assert!(
+            !TODAY_BKK_SIGNAL_DONE.contains("CURRENT_DATE"),
+            "CURRENT_DATE is the SERVER's date and names yesterday in Bangkok \
+             between 17:00 and 24:00 UTC"
+        );
+        assert!(answered_room_checks_today_sql().contains(TODAY_BKK_SIGNAL_DONE));
+    }
+
+    /// The answered read serves the SAME DTO as every other read — it goes
+    /// through `signal_from_row`, so a projection that dropped a column would
+    /// hand reception a signal with silently missing fields.
+    #[test]
+    fn the_answered_query_reuses_the_one_projection() {
+        let sql = answered_room_checks_today_sql();
+        assert!(
+            SIGNAL_SELECT.starts_with("SELECT "),
+            "the DISTINCT ON is spliced after this exact prefix"
+        );
+        for column in [
+            "s.sig_id",
+            "s.sig_room_id",
+            "r.room_no",
+            "s.sig_direction",
+            "s.sig_type",
+            "s.sig_status",
+            "s.sig_outcome",
+            "s.sig_parent_id",
+            "s.sig_created_badge",
+            "s.sig_created_name",
+            "s.sig_created_at",
+            "s.sig_acked_badge",
+            "s.sig_acked_name",
+            "s.sig_acked_at",
+            "s.sig_done_badge",
+            "s.sig_done_name",
+            "s.sig_done_at",
+            "s.sig_done_source",
+        ] {
+            assert!(sql.contains(column), "{column} missing from the answered read");
+        }
+        assert_eq!(
+            sql.matches("FROM ht_hk_room_signals s").count(),
+            1,
+            "one scan of the signal table, not a self-join: {sql}"
+        );
+    }
+
+    /// Every clause of the contract, pinned as SQL.
+    ///
+    /// The literals are read off `domain::hk_signal` in the builder, so this
+    /// test is what proves the SQL and the enums agree: a rename of the
+    /// `room_check_answer` code would fail HERE rather than quietly returning
+    /// an empty list forever.
+    #[test]
+    fn the_answered_query_is_one_answered_room_check_per_room_today() {
+        let sql = answered_room_checks_today_sql();
+        assert!(
+            sql.contains("SELECT DISTINCT ON (s.sig_room_id)"),
+            "one entry per room max: {sql}"
+        );
+        assert!(sql.contains("s.sig_type = 'room_check'"), "{sql}");
+        assert!(sql.contains("s.sig_status = 'done'"), "{sql}");
+        assert!(sql.contains("s.sig_done_source = 'room_check_answer'"), "{sql}");
+        assert!(sql.contains("s.sig_outcome IS NOT NULL"), "{sql}");
+        // The DISTINCT ON tie-break picks the NEWEST answer for a room…
+        assert!(
+            sql.contains("ORDER BY s.sig_room_id, s.sig_done_at DESC, s.sig_id DESC"),
+            "{sql}"
+        );
+        // …and the wrapper orders the rooms themselves newest-answer first.
+        assert!(
+            sql.trim_end()
+                .ends_with("ORDER BY answered.sig_done_at DESC, answered.sig_id DESC"),
+            "{sql}"
+        );
+    }
+
+    /// A cancelled check must be UNREACHABLE by this query — the desk reading
+    /// a withdrawn ขอเช็คห้อง as เคลียร์ is the one failure this feature must
+    /// never produce, and `status = 'done'` is what excludes it.
+    #[test]
+    fn a_cancelled_check_can_never_be_served_as_an_answer() {
+        let sql = answered_room_checks_today_sql();
+        assert!(
+            !sql.contains(SignalStatus::Cancelled.as_str()),
+            "'cancelled' must not appear anywhere in the answered read: {sql}"
+        );
+        assert!(
+            !sql.contains("sig_status IN"),
+            "the status predicate is EQUALITY on 'done', never a set that could \
+             be widened by accident: {sql}"
+        );
+        // The other two done-sources are equally excluded: a `clean_report`
+        // sweep never touches a room_check, and a `tap` on one is refused
+        // outright by the domain — so a row with either source on a room_check
+        // is corruption, not an answer.
+        assert!(!sql.contains(SignalDoneSource::Tap.as_str()));
+        assert!(!sql.contains(SignalDoneSource::CleanReport.as_str()));
     }
 }

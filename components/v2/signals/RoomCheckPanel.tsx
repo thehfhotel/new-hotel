@@ -31,7 +31,7 @@ import {
  * button: an unresolved problem is rendered loudly, but whether to settle
  * anyway stays reception's judgment (iHOTEL never gated the settle either).
  *
- * ── Reading the answer, and the one gap ────────────────────────────────────
+ * ── Reading the answer ─────────────────────────────────────────────────────
  * `GET /api/housekeeping/signals` returns `status IN (open, acked)` by
  * contract, so the moment a maid answers, the check leaves the list:
  *
@@ -41,25 +41,51 @@ import {
  *   what this panel shows in red, and they are shown whether or not this tab
  *   ever saw the parent — a guest-accountability signal reaching the settle
  *   screen is the point of the whole feature.
- * - A **เคลียร์** answer leaves nothing behind. It is therefore inferred from
- *   the transition this tab watched: a check this panel was tracking left the
- *   open/acked list and spawned no problem children. A desk cancel clears the
- *   tracking first, so a cancelled check is never read as เคลียร์.
+ * - A **เคลียร์** answer leaves nothing behind in `signals`. It is read from
+ *   the read's SECOND list, `answeredRoomChecks`: today's newest answered
+ *   `room_check` per room, `outcome` included. That is server state, so it
+ *   survives a reload — which is what closed the v1 gap this file used to
+ *   document ("เคลียร์ invisible after desk tab reload"). Cancelled checks are
+ *   excluded from that list by contract, so it cannot manufacture a green.
  *
- * The gap that leaves: reload the tab (or open the modal for the first time)
- * after a เคลียร์ answer and the panel shows "not requested" rather than the
- * green state. It fails toward asking again, never toward a false green, and
- * it costs one extra signal at worst. Closing it properly is a BACKEND
- * change — let the desk read the room's last `room_check` including its
- * `outcome` — not more client-side inference.
+ * TWO safety rules sit on top of the server list, because "the newest answer
+ * today" is not the same question as "the answer to the check this desk is
+ * waiting on":
+ *
+ * - A LIVE `room_check` for this room always wins. While one is open or acked
+ *   the panel shows รอผลตรวจ, never the older answer underneath it.
+ * - A brand-new ขอเช็คห้อง, or a desk CANCEL, raises a per-room floor on which
+ *   answer ids may still be displayed (`ANSWER_FLOOR`). Otherwise a desk that
+ *   asked again and cancelled would drop straight back onto this morning's
+ *   green — a false clear on the exact screen where money changes hands.
+ *
+ * ── Older backend (field absent) ───────────────────────────────────────────
+ * `answeredRoomChecks === null` means the payload had no such field: this
+ * bundle is talking to a backend that predates it. The panel then behaves
+ * EXACTLY as it did before — เคลียร์ inferred from the transition this tab
+ * watched (a tracked check left the open/acked list and spawned no problem
+ * children), remembered module-level for the life of the tab, forgotten on
+ * reload. That path fails toward asking again, never toward a false green.
  */
 
 /** Observed เคลียร์ answers, keyed by room id, for the life of the tab.
- *  Module-level on purpose: a receptionist fires ขอเช็คห้อง, CLOSES the modal
- *  while the maid walks up, and reopens it — which unmounts and remounts this
- *  component. React state would forget across that; this does not. Reset on a
- *  page reload, which is exactly the boundary documented above. */
+ *  The FALLBACK display path (older backend); with `answeredRoomChecks`
+ *  present the server list is authoritative and this is only recorded, not
+ *  read. Module-level on purpose: a receptionist fires ขอเช็คห้อง, CLOSES the
+ *  modal while the maid walks up, and reopens it — which unmounts and remounts
+ *  this component. React state would forget across that; this does not. */
 const OBSERVED_CLEAR = new Map<number, number>()
+
+/** Per room, the lowest answered-check id this panel may still display.
+ *  Raised when the desk asks again or cancels, so a superseded answer can
+ *  never paint over a fresh request. Module-level for the same
+ *  close-and-reopen reason as `OBSERVED_CLEAR`. */
+const ANSWER_FLOOR = new Map<number, number>()
+
+function raiseAnswerFloor(roomId: number, minVisibleId: number) {
+  const current = ANSWER_FLOOR.get(roomId) ?? 0
+  if (minVisibleId > current) ANSWER_FLOOR.set(roomId, minVisibleId)
+}
 
 export const REQUEST_LABEL = 'ขอเช็คห้อง'
 export const PENDING_TEXT = 'รอผลตรวจห้องจากแม่บ้าน'
@@ -103,10 +129,30 @@ export default function RoomCheckPanel({
   // own, and the guest is waiting, so the safety poll is tighter than the
   // board's 60s.
   const client = useDeskSignals({ pollMs: 15000 })
-  const { signals, enabled, loading, error, busySignalId, sendingRoomId, send, act } = client
+  const {
+    signals,
+    answeredRoomChecks,
+    enabled,
+    loading,
+    error,
+    busySignalId,
+    sendingRoomId,
+    send,
+    act,
+  } = client
 
   const [clearedSignalId, setClearedSignalId] = useState<number | null>(
     () => OBSERVED_CLEAR.get(roomId) ?? null,
+  )
+  const [answerFloor, setAnswerFloor] = useState<number>(() => ANSWER_FLOOR.get(roomId) ?? 0)
+
+  /** Raise the floor in the module map AND in render state, together. */
+  const bumpAnswerFloor = useCallback(
+    (minVisibleId: number) => {
+      raiseAnswerFloor(roomId, minVisibleId)
+      setAnswerFloor((current) => (minVisibleId > current ? minVisibleId : current))
+    },
+    [roomId],
   )
 
   const roomSignals = useMemo(
@@ -126,6 +172,15 @@ export default function RoomCheckPanel({
     () => roomSignals.filter((s) => s.direction === 'maid_to_desk' && isGuestAccountability(s)),
     [roomSignals],
   )
+
+  /** Today's answer for THIS room, once the floor has had its say. `null` both
+   *  when the backend sent no field and when it sent nothing for this room. */
+  const answeredCheck: RoomSignal | null = useMemo(() => {
+    if (!answeredRoomChecks) return null
+    return (
+      answeredRoomChecks.find((s) => s.roomId === roomId && s.signalId >= answerFloor) ?? null
+    )
+  }, [answeredRoomChecks, roomId, answerFloor])
 
   // Which check this panel is watching, so its disappearance can be read.
   const trackedRef = useRef<number | null>(null)
@@ -149,30 +204,49 @@ export default function RoomCheckPanel({
   const request = useCallback(async () => {
     OBSERVED_CLEAR.delete(roomId)
     setClearedSignalId(null)
-    await send(roomId, 'room_check')
-  }, [send, roomId])
+    // Asking again retires whatever was answered before this tap — including
+    // an answer still sitting in `answeredRoomChecks`. Raise the floor BEFORE
+    // the write so the old green cannot flash while the send is in flight.
+    if (answeredCheck) bumpAnswerFloor(answeredCheck.signalId + 1)
+    const created = await send(roomId, 'room_check')
+    // The new check's own id is the exact floor: only ITS answer counts now.
+    if (created) bumpAnswerFloor(created.signalId)
+  }, [send, roomId, answeredCheck, bumpAnswerFloor])
 
   const cancel = useCallback(
     async (signalId: number) => {
       // Drop the tracking BEFORE the write: a cancelled check disappears from
       // the list exactly like an answered one, and must not read as เคลียร์.
       trackedRef.current = null
+      // Same for the server list: a cancelled check is never IN it, so without
+      // this the panel would fall back onto an earlier answer for this room.
+      bumpAnswerFloor(signalId)
       await act(signalId, 'cancel')
     },
-    [act],
+    [act, bumpAnswerFloor],
   )
 
   // Aggregate ("ทั้งหมด") view: a signal is always about one room at one
   // property and the endpoints require a real ?branch=. Nothing to offer.
   if (!enabled) return null
 
-  const showClear = clearedSignalId != null && !pendingCheck && problems.length === 0
+  // Server list present ⇒ it is authoritative. Absent ⇒ the module-memory
+  // inference this file used before the field existed.
+  const answerKnown = answeredRoomChecks != null
+  const clearAnswered = answerKnown ? answeredCheck?.outcome === 'clear' : clearedSignalId != null
+  const showClear = clearAnswered && !pendingCheck && problems.length === 0
+
+  // A `problems` answer with every child already completed still must not read
+  // as "nothing to see" on the settle screen; the children themselves arrive
+  // through the ordinary signals list and render below the heading.
+  const showProblems =
+    problems.length > 0 || (!pendingCheck && answeredCheck?.outcome === 'problems')
 
   return (
     <div className="border-t border-gray-200 pt-3 space-y-2">
       <div className="text-xs font-semibold text-gray-500">{SECTION_TITLE}</div>
 
-      {problems.length > 0 && (
+      {showProblems && (
         <div className="rounded border border-red-300 bg-red-50 p-3 space-y-2">
           <div className="flex items-center gap-2 text-sm font-bold text-red-700">
             <AlertTriangle size={16} className="shrink-0" />

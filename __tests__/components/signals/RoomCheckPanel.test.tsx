@@ -11,8 +11,15 @@
  * it takes the money.
  *
  * Every test uses a distinct room id on purpose: the panel remembers observed
- * เคลียร์ answers for the life of the tab (so closing and reopening the modal
- * while the maid walks up does not forget), and that memory is module-level.
+ * เคลียร์ answers — and the floor under which an answer is superseded — for
+ * the life of the tab (so closing and reopening the modal while the maid walks
+ * up does not forget), and both memories are module-level.
+ *
+ * The read has TWO lists. `signals` is open+acked only, so an answered check is
+ * never in it; `answeredRoomChecks` carries today's newest ANSWERED room_check
+ * per room, which is what makes a เคลียร์ survive a tab reload. A payload with
+ * NO `answeredRoomChecks` key at all is the older-backend skew case, and the
+ * panel must then behave exactly as it did before the field existed.
  */
 
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -46,6 +53,10 @@ let mockBranch = 'hfhotel'
 
 /** The list `GET /api/housekeeping/signals` currently answers with. */
 let currentSignals: RoomSignal[] = []
+/** Today's answered room-checks the same read carries. `null` means the key is
+ *  OMITTED from the payload entirely — the older-backend skew case, which is a
+ *  different thing from an empty array. */
+let currentAnswered: RoomSignal[] | null = null
 /** Every request the panel made, in order. */
 let calls: { url: string; init?: RequestInit }[] = []
 
@@ -62,6 +73,26 @@ function signal(partial: Partial<RoomSignal> & { signalId: number }): RoomSignal
   }
 }
 
+/** An ANSWERED room_check as the read's second list serializes it. */
+function answered(
+  signalId: number,
+  roomId: number,
+  outcome: 'clear' | 'problems',
+  doneAt = '2026-09-01T04:00:00Z',
+): RoomSignal {
+  return signal({
+    signalId,
+    roomId,
+    direction: 'desk_to_maid',
+    type: 'room_check',
+    status: 'done',
+    outcome,
+    doneBy: { badge: 'Q1001', name: 'สมหญิง' },
+    doneAt,
+    doneSource: 'room_check_answer',
+  })
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body }
 }
@@ -70,12 +101,18 @@ beforeEach(() => {
   jest.clearAllMocks()
   mockBranch = 'hfhotel'
   currentSignals = []
+  currentAnswered = null
   calls = []
   useLiveRefreshMock.mockReturnValue(true)
   branchFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     calls.push({ url, init })
     if (url.startsWith('/api/housekeeping/signals?') || url === '/api/housekeeping/signals') {
-      return jsonResponse({ success: true, signals: currentSignals })
+      return jsonResponse({
+        success: true,
+        signals: currentSignals,
+        // The key is present only when the backend has the field at all.
+        ...(currentAnswered ? { answeredRoomChecks: currentAnswered } : {}),
+      })
     }
     if (/\/api\/housekeeping\/rooms\/\d+\/signals$/.test(url)) {
       return jsonResponse({ success: true, signal: signal({ signalId: 900 }) })
@@ -96,8 +133,9 @@ async function renderPanel(roomId: number, roomNo = '101') {
 
 /** Push a new server list and fire the live-refresh callback the hook handed
  *  to `useLiveRefresh` — the real SSE path. */
-async function pushSignals(next: RoomSignal[]) {
+async function pushSignals(next: RoomSignal[], nextAnswered?: RoomSignal[] | null) {
   currentSignals = next
+  if (nextAnswered !== undefined) currentAnswered = nextAnswered
   const lastCall = useLiveRefreshMock.mock.calls.at(-1) as [string, string[], () => void]
   await act(async () => {
     lastCall[2]()
@@ -189,7 +227,10 @@ describe('RoomCheckPanel — waiting for the answer', () => {
   })
 })
 
-describe('RoomCheckPanel — เคลียร์', () => {
+// Every test in this block runs with `currentAnswered = null` — the payload
+// carries no `answeredRoomChecks` key, so the panel is on its module-memory
+// fallback. That is the older-backend contract, pinned deliberately.
+describe('RoomCheckPanel — เคลียร์ inferred from the watched transition (older backend)', () => {
   it('goes green when the tracked check resolves with no problems', async () => {
     currentSignals = [
       signal({ signalId: 6, roomId: 20, direction: 'desk_to_maid', type: 'room_check' }),
@@ -229,6 +270,124 @@ describe('RoomCheckPanel — เคลียร์', () => {
     await renderPanel(23)
     expect(await screen.findByText(REQUEST_LABEL)).toBeInTheDocument()
     expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+  })
+
+  it('keeps inferring when the field is genuinely absent, not merely empty', async () => {
+    // The skew case end to end: an OLD backend answers this read, so the panel
+    // has nothing but the transition it watched — and must still go green.
+    currentAnswered = null
+    currentSignals = [
+      signal({ signalId: 9, roomId: 90, direction: 'desk_to_maid', type: 'room_check' }),
+    ]
+    await renderPanel(90)
+    await screen.findByText(PENDING_TEXT)
+    await pushSignals([], null)
+    expect(await screen.findByText(CLEAR_TEXT)).toBeInTheDocument()
+  })
+})
+
+describe('RoomCheckPanel — the answer read back from the server', () => {
+  it('shows เคลียร์ on a first open, with no transition ever watched', async () => {
+    // The reload case: this tab was never open when the maid answered.
+    currentAnswered = [answered(60, 50, 'clear')]
+    await renderPanel(50)
+    expect(await screen.findByText(CLEAR_TEXT)).toBeInTheDocument()
+    expect(screen.queryByText(PENDING_TEXT)).not.toBeInTheDocument()
+  })
+
+  it('still offers ขอเช็คห้อง alongside the read-back green', async () => {
+    currentAnswered = [answered(60, 51, 'clear')]
+    await renderPanel(51)
+    await screen.findByText(CLEAR_TEXT)
+    expect(screen.getByText(REQUEST_LABEL)).toBeInTheDocument()
+  })
+
+  it('shows the problems state for a problems answer, children or not', async () => {
+    // The desk may already have completed every spawned child; the settle
+    // screen must still not read as "clear".
+    currentAnswered = [answered(61, 52, 'problems')]
+    await renderPanel(52)
+    expect(await screen.findByText(PROBLEMS_TEXT)).toBeInTheDocument()
+    expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+  })
+
+  it('renders the standing children under a problems answer', async () => {
+    currentAnswered = [answered(62, 53, 'problems')]
+    currentSignals = [signal({ signalId: 63, roomId: 53, type: 'item_missing', parentId: 62 })]
+    await renderPanel(53)
+    expect(await screen.findByText(PROBLEMS_TEXT)).toBeInTheDocument()
+    expect(screen.getByText('มีของหาย')).toBeInTheDocument()
+  })
+
+  it('lets a live check win over an earlier answer for the same room', async () => {
+    currentAnswered = [answered(64, 54, 'clear')]
+    currentSignals = [
+      signal({ signalId: 65, roomId: 54, direction: 'desk_to_maid', type: 'room_check' }),
+    ]
+    await renderPanel(54)
+    expect(await screen.findByText(PENDING_TEXT)).toBeInTheDocument()
+    expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+  })
+
+  it('ignores another room’s answer', async () => {
+    currentAnswered = [answered(66, 999, 'clear')]
+    await renderPanel(55)
+    expect(await screen.findByText(REQUEST_LABEL)).toBeInTheDocument()
+    expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+  })
+
+  it('treats an EMPTY list as "nothing answered today", never as the skew case', async () => {
+    // Same transition the fallback reads as เคลียร์ — but here the server has
+    // spoken and says there is no answer, so the server wins.
+    currentAnswered = []
+    currentSignals = [
+      signal({ signalId: 67, roomId: 56, direction: 'desk_to_maid', type: 'room_check' }),
+    ]
+    await renderPanel(56)
+    await screen.findByText(PENDING_TEXT)
+    await pushSignals([], [])
+    expect(await screen.findByText(REQUEST_LABEL)).toBeInTheDocument()
+    expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+  })
+})
+
+describe('RoomCheckPanel — an answer the desk has superseded', () => {
+  it('does NOT fall back to this morning’s green after cancelling a new check', async () => {
+    currentAnswered = [answered(70, 57, 'clear', '2026-09-01T02:00:00Z')]
+    currentSignals = [
+      signal({ signalId: 71, roomId: 57, direction: 'desk_to_maid', type: 'room_check' }),
+    ]
+    await renderPanel(57)
+    fireEvent.click(await screen.findByText('ยกเลิก'))
+    await waitFor(() => expect(postCalls()).toHaveLength(1))
+    // The cancelled check is never in `answeredRoomChecks`; the stale answer is.
+    await pushSignals([], [answered(70, 57, 'clear', '2026-09-01T02:00:00Z')])
+    expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument()
+    expect(screen.getByText(REQUEST_LABEL)).toBeInTheDocument()
+  })
+
+  it('drops the green the moment the desk asks again, before any answer lands', async () => {
+    currentAnswered = [answered(72, 58, 'clear', '2026-09-01T02:00:00Z')]
+    await renderPanel(58)
+    await screen.findByText(CLEAR_TEXT)
+
+    fireEvent.click(screen.getByText(REQUEST_LABEL))
+    await waitFor(() => expect(postCalls()).toHaveLength(1))
+    await waitFor(() => expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument())
+  })
+
+  it('goes green again once the NEW check is the one that was answered', async () => {
+    currentAnswered = [answered(73, 59, 'clear', '2026-09-01T02:00:00Z')]
+    await renderPanel(59)
+    await screen.findByText(CLEAR_TEXT)
+
+    fireEvent.click(screen.getByText(REQUEST_LABEL))
+    await waitFor(() => expect(postCalls()).toHaveLength(1))
+    await waitFor(() => expect(screen.queryByText(CLEAR_TEXT)).not.toBeInTheDocument())
+
+    // 900 is the id the send endpoint handed back for the fresh request.
+    await pushSignals([], [answered(900, 59, 'clear', '2026-09-01T05:00:00Z')])
+    expect(await screen.findByText(CLEAR_TEXT)).toBeInTheDocument()
   })
 })
 
