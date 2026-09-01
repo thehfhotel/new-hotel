@@ -338,7 +338,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -348,19 +348,28 @@ use axum::{
     Extension, Json, Router,
 };
 use futures_util::Stream;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 
 use super::mode::{AppState, Branch};
 use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
+use crate::domain::hk_report::{
+    parse_item, parse_problem, parse_return_reason, parse_room_status, PhotoSide, ReportRuleError,
+    RoomReport, RoomReportRow, MAX_ITEM_QTY, MAX_REPORT_ITEMS, MIN_ITEM_QTY, REPORT_MAX_PHOTOS,
+    REPORT_MIN_PHOTOS,
+};
 use crate::domain::hk_signal::{RoomCheckOutcome, RoomSignal, SignalAction, SignalRole};
 use crate::error::{ApiError, ApiResult};
 use crate::hfid_location::{EmployeeLocation, HfidLocationClient, LocationOutcome};
 use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
+use crate::service::hk_reports::{
+    HkReportService, ReportItemInput, ReturnReportCommand, StorePhotoCommand, SubmitReportCommand,
+    VerifyReportCommand,
+};
 use crate::service::hk_signals::{
     ActOnSignalCommand, AnswerRoomCheckCommand, HkSignalService, RaiseSignalCommand,
 };
@@ -471,6 +480,74 @@ pub const SIGNAL_STREAM_UNAVAILABLE_ERROR: &str =
 
 /// 400 body for an unrecognised `outcome` on the ขอเช็คห้อง answer.
 pub const OUTCOME_INVALID_ERROR: &str = "invalid outcome (expected 'clear' or 'problems')";
+
+// ---------------------------------------------------------------------------
+// Report HK (migration 091)
+// ---------------------------------------------------------------------------
+
+/// 403 body when a MAID identity tries to verify or return a room report.
+///
+/// The mirror image of [`REPORT_NOT_PERMITTED_ERROR`], and it exists as its own
+/// constant because it is a DIFFERENT rule, not the same one from the other
+/// side: reception's countersignature is what makes a report an attestation
+/// with two parties, so a maid signing off her own work would empty the feature
+/// of its meaning. Applies even to a maid who ALSO holds the `reception` grant
+/// — `can_report` is the maid side, and CONTEXT.md §Housekeeping says so
+/// explicitly ("A maid never verifies, including one who also holds the
+/// reception grant").
+///
+/// Thai, in [`REPORT_NOT_PERMITTED_ERROR`]'s class: a real person reads it, and
+/// reaches it only from a stale bundle (the maid UI renders no verify controls)
+/// or a hand-rolled request.
+pub const VERIFY_NOT_PERMITTED_ERROR: &str =
+    "การตรวจรับรายงานเป็นหน้าที่ของแผนกต้อนรับ บัญชีแม่บ้านตรวจรับรายงานของตนเองไม่ได้";
+
+/// 400 body for a `?date=` that is not a `YYYY-MM-DD` civil date.
+pub const REPORT_DATE_INVALID_ERROR: &str =
+    "invalid date (expected YYYY-MM-DD, the Bangkok civil day)";
+
+/// The multipart field the photo must arrive in — `POST /api/hk/report-photos`.
+pub const REPORT_PHOTO_FIELD: &str = "photo";
+
+/// Per-file cap on an uploaded report photo, enforced in the handler.
+///
+/// 5 MB is a phone photo with room to spare. It is checked AFTER the field is
+/// read, with [`REPORT_PHOTO_BODY_LIMIT`] as the hard outer bound that stops a
+/// hostile body from ever being buffered — two limits, deliberately: the inner
+/// one answers a real maid a 400 she can act on ("the picture is too big"), the
+/// outer one answers a garbage request axum's own 413 without our handler
+/// running at all.
+pub const MAX_REPORT_PHOTO_BYTES: usize = 5 * 1024 * 1024;
+
+/// Body limit on the photo route only, replacing the router-wide 8 MB for this
+/// one path: [`MAX_REPORT_PHOTO_BYTES`] plus 64 KB of multipart framing (the
+/// boundary lines, the `Content-Disposition` headers, the trailing boundary).
+///
+/// Slack rather than an exact figure because the framing size depends on the
+/// client's boundary string and filename; 64 KB is far more than any of them
+/// and still far less than a second photo.
+pub const REPORT_PHOTO_BODY_LIMIT: usize = MAX_REPORT_PHOTO_BYTES + 64 * 1024;
+
+/// Image types a report photo may be. A phone camera produces the first two;
+/// modern Android share-sheets produce the third.
+///
+/// An ALLOWLIST, not a sniff: the bytes go into `BYTEA` and come back out with
+/// this exact `Content-Type`, so accepting `text/html` here would make
+/// `GET /api/hk/report-photos/{id}` a stored-XSS vector on our own origin.
+/// Compared after trimming the `; charset=…` suffix some clients append and
+/// lower-casing.
+pub const VALID_REPORT_PHOTO_MIMES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
+
+/// 400 body when the multipart form carried no [`REPORT_PHOTO_FIELD`] part.
+pub const PHOTO_FIELD_MISSING_ERROR: &str =
+    "expected one multipart field named 'photo' carrying the image";
+
+/// 400 body for a photo over [`MAX_REPORT_PHOTO_BYTES`]. Thai — a maid reads it
+/// on her phone, and the action (retake / pick a smaller picture) is hers.
+pub const PHOTO_TOO_LARGE_ERROR: &str = "รูปมีขนาดใหญ่เกินไป (สูงสุด 5 MB) กรุณาถ่ายใหม่";
+
+/// 400 body for a content type outside [`VALID_REPORT_PHOTO_MIMES`].
+pub const PHOTO_TYPE_ERROR: &str = "รองรับเฉพาะไฟล์รูปภาพ JPEG / PNG / WEBP เท่านั้น";
 
 /// 503 body when the location lookup could not answer (HF ID unreachable,
 /// non-2xx, undecodable, or `HFID_LOCATION_URL`/`HFID_RESOLVE_SECRET` unset).
@@ -928,6 +1005,63 @@ fn signal_service_for(state: &AppState, branch: Branch) -> ApiResult<HkSignalSer
     Ok(HkSignalService::new(state.write_pool(Some(branch))?.clone()))
 }
 
+/// Build an [`HkReportService`] bound to the branch's pool — same construction
+/// shape as [`service_for`] / [`signal_service_for`], through the SAME
+/// `write_pool` chokepoint, so a `branch=hfville` report can never land in the
+/// HF Hotel database.
+fn report_service_for(state: &AppState, branch: Branch) -> ApiResult<HkReportService> {
+    Ok(HkReportService::new(state.write_pool(Some(branch))?.clone()))
+}
+
+/// The VERIFY-capability gate — [`require_report_capability`]'s mirror image,
+/// and the enforcement point for "a maid never verifies".
+///
+/// It reads the SAME boolean the middleware already resolved
+/// ([`HkIdentity::can_report`]) and inverts it, so there is still exactly one
+/// place in the codebase where an HF ID grant becomes a permission. An identity
+/// holding BOTH grants is `can_report == true` and is therefore the MAID here —
+/// which is the rule, not a side effect (CONTEXT.md §Housekeeping).
+///
+/// Called FIRST by both judging endpoints, ahead of [`require_branch`] and
+/// therefore ahead of [`require_location`], for [`require_report_capability`]'s
+/// reasons: "you may not verify anywhere" outranks "that branch is not
+/// offered", and a refused maid never triggers the HF ID location lookup.
+///
+/// PURE — unit-tested below.
+fn require_verify_capability(identity: &HkIdentity) -> ApiResult<()> {
+    if !identity.can_report {
+        return Ok(());
+    }
+    tracing::warn!(
+        badge = %identity.badge,
+        "/hk refused a report verdict from a housekeeping identity"
+    );
+    Err(ApiError::Forbidden(VERIFY_NOT_PERMITTED_ERROR.to_string()))
+}
+
+/// Which side's evidence this identity's uploads are. The SINGLE derivation,
+/// reading the SAME boolean [`require_report_capability`] and
+/// [`require_verify_capability`] read. PURE.
+fn report_photo_side(identity: &HkIdentity) -> PhotoSide {
+    PhotoSide::from_can_report(identity.can_report)
+}
+
+/// A report-domain rule refusal → the HTTP error, honouring the domain's own
+/// 403-vs-400 split so a route can never re-decide it. Mirrors
+/// [`signal_rule_error`].
+///
+/// Note the conflict class collapses to 400 here exactly as it does in
+/// `service::hk_reports` — `ApiError::Conflict` (409) is reserved in this repo
+/// for a ship-dark FLAG refusing a request.
+fn report_rule_error(err: ReportRuleError) -> ApiError {
+    let message = err.message();
+    if err.is_forbidden() {
+        ApiError::Forbidden(message)
+    } else {
+        ApiError::BadRequest(message)
+    }
+}
+
 /// Which side of the ADR 0008 conversation this `/hk` identity is on.
 ///
 /// The SINGLE derivation on this surface, and it reads the SAME boolean
@@ -1090,6 +1224,28 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
         // a read of this branch's data, and showing a maid the other
         // property's signals is the wrong-hotel bug one tap earlier.
         .route("/api/hk/events", get(signal_events))
+        // Report HK (migration 091). Three path shapes, each chosen the way the
+        // signal routes were: the SUBMISSION is about a room, so it hangs off
+        // `/rooms/{id}`, alongside the other maid reports; a VERDICT addresses
+        // the report, which already knows its room; and a PHOTO belongs to
+        // neither yet — it is uploaded BEFORE the report exists, so it is its
+        // own collection. `middleware::ville_guard` exempts all three write
+        // shapes (they are PG-only).
+        .route("/api/hk/reports", get(list_reports))
+        .route("/api/hk/reports/{report_id}", get(report_detail))
+        .route("/api/hk/rooms/{room_id}/report", post(submit_report))
+        .route("/api/hk/reports/{report_id}/verify", post(verify_report))
+        .route("/api/hk/reports/{report_id}/return", post(return_report))
+        // The photo intake carries its OWN body limit in place of the
+        // router-wide 8 MB below — see `REPORT_PHOTO_BODY_LIMIT`. A
+        // `MethodRouter` layer applies to this path only, so no other endpoint
+        // inherits it.
+        .route(
+            "/api/hk/report-photos",
+            post(upload_report_photo)
+                .layer(axum::extract::DefaultBodyLimit::max(REPORT_PHOTO_BODY_LIMIT)),
+        )
+        .route("/api/hk/report-photos/{photo_id}", get(report_photo))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(Extension(policy))
         .with_state(state)
@@ -1539,6 +1695,134 @@ pub struct AnswerSignalResponse {
     pub spawned: Vec<RoomSignal>,
 }
 
+// ---------------------------------------------------------------------------
+// Report HK wire shapes (migration 091)
+// ---------------------------------------------------------------------------
+
+/// Query for `GET /api/hk/reports` — the required branch plus an OPTIONAL day.
+///
+/// `date` is a raw `String` for [`HkBranchQuery::branch`]'s reason: serde would
+/// reject a malformed `NaiveDate` with its OWN body shape, and the client
+/// cannot parse that. Absent ⇒ TODAY in Bangkok
+/// ([`parse_report_date`]).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HkReportsQuery {
+    pub branch: Option<String>,
+    /// `YYYY-MM-DD`, the Bangkok civil day.
+    pub date: Option<String>,
+}
+
+/// `GET /api/hk/reports` — the day overview, the paper sheet's heir.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportsOverviewResponse {
+    pub success: bool,
+    /// The day actually served, echoed back as `YYYY-MM-DD`. ALWAYS present,
+    /// even when the client sent no `?date=`: a client that asked for "today"
+    /// must be able to tell WHICH today the server meant without re-deriving
+    /// Bangkok's date itself.
+    pub date: String,
+    /// EVERY active room of the branch, in room-number order, each with its
+    /// LATEST report for `date` or `null`. A room with no report is the most
+    /// important row here — this list is each side's work queue.
+    pub rooms: Vec<RoomReportRow>,
+}
+
+/// The single-report envelope shared by the detail read and all three
+/// mutations, so a client parses ONE shape however it got here.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportResponse {
+    pub success: bool,
+    /// The FULL DTO — `domain::hk_report::RoomReport`, mirroring the
+    /// `report-vocab.ts` vocabulary the frontend imports.
+    pub report: RoomReport,
+}
+
+/// `POST /api/hk/report-photos` — the id to name in a later submit/verify.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadPhotoResponse {
+    pub success: bool,
+    /// `ht_hk_room_report_photos.rrp_id`. The row is UNATTACHED until a
+    /// submit/verify names it; fetch the bytes back from
+    /// `GET /api/hk/report-photos/{id}`.
+    pub photo_id: i64,
+}
+
+/// Body for `POST /api/hk/rooms/{id}/report`.
+///
+/// **Every field is an `Option`** — the same discipline
+/// [`ReportLinenShortageBody`] follows and for the same reason: a required
+/// field would be rejected by serde inside axum's `Json` extractor, which
+/// renders its own plain-text shape the maid's client cannot parse. Making them
+/// optional moves every rejection into this module's pure parsers, where the
+/// `{success:false,error}` envelope is ours.
+///
+/// There is deliberately NO `parentReportId` field. A returned report is fixed
+/// by a new submission that references it, but the LINK IS DERIVED server-side
+/// (`service::hk_reports::returned_parent_id`): a client-supplied parent could
+/// point at another room's report, at a verified one, or at nothing, and every
+/// one of those would be a lie recorded in the audit chain.
+///
+/// And no reporter field, no free-text remark, no `status` — identity comes
+/// from the verified assertion, remarks are ruled out everywhere on this
+/// surface, and a submission is `submitted` by definition.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitReportBody {
+    /// `YYYY-MM-DD`; absent ⇒ today in Bangkok. Present so a maid finishing a
+    /// floor at 00:10 can still file against the sheet she was working.
+    pub date: Option<String>,
+    /// `vc` | `co` | `oo` | `so` — prefilled client-side from known room facts,
+    /// overridable, and stored as SHE reported it.
+    pub room_status: Option<String>,
+    /// ครบทุกรายการ. Must be `true` exactly when `items` is empty.
+    pub all_items_ok: Option<bool>,
+    /// The exceptions; omit or send `[]` alongside `allItemsOk: true`.
+    pub items: Option<Vec<ReportItemEntry>>,
+    /// 1..=4 ids from `POST /api/hk/report-photos`, this caller's own.
+    pub photo_ids: Option<Vec<serde_json::Value>>,
+}
+
+/// One `{item, problem, qty}` exception as it arrives on the wire.
+///
+/// `qty` is a raw [`serde_json::Value`], NOT an `i32`, for exactly
+/// [`LinenShortageEntry::qty`](LinenShortageEntry)'s reason: `{"qty": 1.5}`,
+/// `{"qty": "3"}` and `{"qty": null}` are all things a hand-rolled or
+/// half-broken client sends, and each would otherwise be a serde rejection with
+/// a foreign body shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportItemEntry {
+    pub item: String,
+    pub problem: String,
+    pub qty: serde_json::Value,
+}
+
+/// Body for `POST /api/hk/reports/{id}/verify` — reception's own photos and
+/// nothing else. A verify is a walk-up, so the evidence IS the request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyReportBody {
+    /// 1..=4 ids from `POST /api/hk/report-photos`, this receptionist's own.
+    pub photo_ids: Option<Vec<serde_json::Value>>,
+}
+
+/// Body for `POST /api/hk/reports/{id}/return` — a CANNED reason and nothing
+/// else.
+///
+/// No photos (a return says "do it again", which the reason states in full) and
+/// no free-text note: canned rejection is the decision, not an omission
+/// (CONTEXT.md §Housekeeping — _Avoid_: free-text rejection notes).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnReportBody {
+    /// `not_clean` | `items_mismatch` | `photos_unclear`.
+    pub reason: Option<String>,
+}
+
 /// Body of a `410 Gone` answer from a retired endpoint. Same
 /// `{success:false, error}` shape the frontend's `hkFetch` already expects.
 #[derive(Debug, Serialize)]
@@ -1643,6 +1927,176 @@ fn parse_linen_items(
     }
 
     Ok(parsed)
+}
+
+// ---------------------------------------------------------------------------
+// Report HK parsers (migration 091) — pure, unit-tested below
+// ---------------------------------------------------------------------------
+
+/// The Bangkok civil day a report is FOR: the client's `date`, or TODAY in
+/// Bangkok when it sent none.
+///
+/// `chrono_tz::Asia::Bangkok`, never `Utc::now().date_naive()`: the server's
+/// date names YESTERDAY in Bangkok between 17:00 and 24:00 UTC, which is
+/// exactly when the late shift is filing. That is `TODAY_BKK`'s ban on
+/// `CURRENT_DATE`, restated on the Rust side of the same boundary — and pinned
+/// against it by a unit test.
+///
+/// Strict, ZERO-PADDED `YYYY-MM-DD`: no `2026-9-2`, no `02/09/2026`, no
+/// timestamp suffix. A forgiving parser here would silently accept a client's
+/// local-format date and file the report against the wrong day.
+///
+/// The padded shape is checked BEFORE `chrono`, because
+/// `NaiveDate::parse_from_str` with `%Y-%m-%d` accepts unpadded components
+/// (`2026-9-2`) — and the `date` this function returns is echoed back in the
+/// response and stored in `rr_date`, so exactly one spelling of a day may be
+/// accepted or two clients will disagree about which sheet they are on.
+fn parse_report_date(raw: Option<&str>) -> ApiResult<NaiveDate> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Utc::now()
+            .with_timezone(&chrono_tz::Asia::Bangkok)
+            .date_naive());
+    };
+    let refuse = || ApiError::BadRequest(format!("{REPORT_DATE_INVALID_ERROR}, got '{raw}'"));
+    let bytes = raw.as_bytes();
+    let padded = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    if !padded {
+        return Err(refuse());
+    }
+    // chrono still owns the CALENDAR verdict — 2026-02-30 and 2026-13-01 are
+    // well-shaped strings that are not days.
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| refuse())
+}
+
+/// Normalize + validate the equipment-checklist exceptions.
+///
+/// Order of checks per entry mirrors [`parse_linen_items`]: the CODES first
+/// (they name the entry in every later message), then the DUPLICATE test on the
+/// NORMALIZED pair — otherwise `"TV_Remote"` and `"tv_remote"` would slip past
+/// as two lines and land as two rows for one exception — and only then the
+/// quantity.
+///
+/// The duplicate key is the (item, PROBLEM) PAIR, not the item: "two glasses
+/// missing AND one glass damaged" is a real report of one room, and collapsing
+/// it onto the item would force the maid to choose which half to tell the desk.
+///
+/// It does NOT check the empty-vs-`allItemsOk` biconditional — that is
+/// [`crate::domain::hk_report::check_attestation`]'s, because it spans two
+/// fields and must hold for any caller of the service.
+fn parse_report_items(items: Option<Vec<ReportItemEntry>>) -> ApiResult<Vec<ReportItemInput>> {
+    let items = items.unwrap_or_default();
+    if items.len() > MAX_REPORT_ITEMS {
+        return Err(ApiError::BadRequest(format!(
+            "too many item exceptions ({}); at most {MAX_REPORT_ITEMS} are accepted",
+            items.len()
+        )));
+    }
+
+    let mut parsed: Vec<ReportItemInput> = Vec::with_capacity(items.len());
+    for entry in items {
+        let item = parse_item(&entry.item).map_err(report_rule_error)?;
+        let problem = parse_problem(&entry.problem).map_err(report_rule_error)?;
+
+        if parsed
+            .iter()
+            .any(|done| done.item == *item && done.problem == problem)
+        {
+            return Err(report_rule_error(ReportRuleError::DuplicateItem {
+                item: item.to_string(),
+                problem: problem.as_str(),
+            }));
+        }
+
+        // `as_i64` is the whole integer test: it says None for `1.5`, for
+        // `"3"`, for `null` and for `true`, and Some only for a JSON integer.
+        // The i32 narrowing then rejects anything beyond i32 before the range
+        // check, so a 2^40 quantity cannot wrap into an accepted value.
+        let qty = entry
+            .qty
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|n| (MIN_ITEM_QTY..=MAX_ITEM_QTY).contains(n))
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "invalid qty {} for item '{item}' (expected an integer \
+                     {MIN_ITEM_QTY}..={MAX_ITEM_QTY})",
+                    entry.qty
+                ))
+            })?;
+
+        parsed.push(ReportItemInput {
+            item: item.to_string(),
+            problem,
+            qty,
+        });
+    }
+
+    Ok(parsed)
+}
+
+/// Normalize + validate a `photoIds` list: 1..=4 distinct positive integers.
+///
+/// The COUNT bound is `domain::hk_report`'s ([`REPORT_MIN_PHOTOS`] ..=
+/// [`REPORT_MAX_PHOTOS`]) and is re-stated by the service, so a body the route
+/// admits can never be refused deeper down for the same reason. Ownership —
+/// "your own photo, not already attached" — is deliberately NOT checked here:
+/// it is a fact about rows, and the service's attach statement decides it
+/// atomically.
+///
+/// A raw [`serde_json::Value`] per entry, for [`ReportItemEntry::qty`]'s
+/// reason: `["3"]` and `[1.5]` are things a broken client sends and must answer
+/// in this module's envelope.
+fn parse_photo_ids(photo_ids: Option<Vec<serde_json::Value>>) -> ApiResult<Vec<i64>> {
+    let raw = photo_ids.unwrap_or_default();
+    if !(REPORT_MIN_PHOTOS..=REPORT_MAX_PHOTOS).contains(&raw.len()) {
+        return Err(ApiError::BadRequest(format!(
+            "expected {REPORT_MIN_PHOTOS}..={REPORT_MAX_PHOTOS} photoIds, got {}",
+            raw.len()
+        )));
+    }
+
+    let mut parsed: Vec<i64> = Vec::with_capacity(raw.len());
+    for value in raw {
+        let id = value
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| ApiError::BadRequest(format!("invalid photoId {value}")))?;
+        if parsed.contains(&id) {
+            return Err(ApiError::BadRequest(format!(
+                "photoId {id} was listed more than once"
+            )));
+        }
+        parsed.push(id);
+    }
+    Ok(parsed)
+}
+
+/// Normalize + validate an uploaded photo's declared content type against
+/// [`VALID_REPORT_PHOTO_MIMES`]. Returns the CANONICAL spelling, which is what
+/// gets stored and what `GET /api/hk/report-photos/{id}` later serves.
+///
+/// Trims the `; charset=…` / `; boundary=…` suffix some clients append and
+/// lower-cases, so `IMAGE/JPEG; charset=binary` is accepted as `image/jpeg`.
+/// An ALLOWLIST, never a sniff — see [`VALID_REPORT_PHOTO_MIMES`].
+fn parse_photo_mime(raw: Option<&str>) -> ApiResult<&'static str> {
+    let declared = raw
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    VALID_REPORT_PHOTO_MIMES
+        .iter()
+        .find(|valid| ***valid == *declared)
+        .copied()
+        .ok_or_else(|| ApiError::BadRequest(PHOTO_TYPE_ERROR.to_string()))
 }
 
 // ============================================================================
@@ -2871,6 +3325,337 @@ pub async fn signal_events(
     Ok(crate::routes::events::sse_from_frames(
         crate::routes::events::hk_signal_frames(receiver),
     ))
+}
+
+// ============================================================================
+// Report HK (migration 091)
+// ============================================================================
+
+/// `GET /api/hk/reports?branch=[&date=YYYY-MM-DD]` — the day overview.
+///
+/// EVERY active room of the branch, in room-number order, each carrying its
+/// LATEST report for that day or `null`. The absent reports are the point: this
+/// screen is the paper Report HK sheet's heir and each side's work queue, so a
+/// room nobody has filed for must be as visible as one that is done.
+///
+/// Gated exactly like the room reads — required `?branch=` (400/403) then the
+/// per-employee location gate (403/503, a no-op for a viewer and while the flag
+/// is dark). **NOT** gated on [`require_report_capability`]: both sides read
+/// this list, which is the whole point of a two-party attestation. What a
+/// viewer may not do is SUBMIT, and what a maid may not do is JUDGE; those
+/// gates live on the write endpoints.
+///
+/// The served day is echoed back in `date`, so a client that sent no `?date=`
+/// can tell WHICH today the server meant without re-deriving Bangkok's date.
+pub async fn list_reports(
+    State(state): State<AppState>,
+    Query(query): Query<HkReportsQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<ReportsOverviewResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let date = parse_report_date(query.date.as_deref())?;
+
+    let rooms = report_service_for(&state, branch)?.day_overview(date).await?;
+    Ok(Json(ReportsOverviewResponse {
+        success: true,
+        date: date.to_string(),
+        rooms,
+    }))
+}
+
+/// `GET /api/hk/reports/{report_id}?branch=` — one report in FULL.
+///
+/// The summary the overview carries is deliberately not enough to judge a
+/// report: the exceptions and the photo ids live here, and reception fetches
+/// this before verifying. Readable by BOTH sides — reception must see the
+/// maid's evidence, and the maid must see what came back with a return.
+///
+/// An unknown id is a 404 from the service, matching the room routes' shape.
+pub async fn report_detail(
+    State(state): State<AppState>,
+    Path(report_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<ReportResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    let report = report_service_for(&state, branch)?.get(report_id).await?;
+    Ok(Json(ReportResponse {
+        success: true,
+        report,
+    }))
+}
+
+/// `POST /api/hk/report-photos?branch=` — store ONE image, unattached, and
+/// return its id.
+///
+/// `multipart/form-data` with a single [`REPORT_PHOTO_FIELD`] part. One photo
+/// per request on purpose: a phone uploads as the maid takes each picture, so
+/// the ids come back one at a time and the form holds them until she submits.
+///
+/// **The side is DERIVED from the role** ([`report_photo_side`]), never sent:
+/// a maid's upload is `maid` evidence and a receptionist's is `reception`, so
+/// neither can manufacture the other's. That is why BOTH roles may call this
+/// endpoint and neither capability gate applies here — the gate is on what the
+/// photo can later be attached to.
+///
+/// Two size limits, deliberately (see [`MAX_REPORT_PHOTO_BYTES`]): the
+/// route-local body limit stops a hostile body from ever being buffered
+/// (axum's own 413), and the explicit check below answers a real maid a Thai
+/// 400 she can act on. The content type is an ALLOWLIST, never a sniff — the
+/// bytes come back out with this exact `Content-Type`, so accepting
+/// `text/html` would make the read endpoint a stored-XSS vector on our origin.
+///
+/// ## One ordering caveat, unlike every other handler here
+///
+/// [`Multipart`] is an EXTRACTOR, so axum rejects a request whose content type
+/// is not `multipart/form-data` BEFORE any handler code runs — including
+/// [`require_branch`]. A non-multipart probe therefore gets axum's own 400
+/// rather than this module's `{success:false,error}` envelope. That is
+/// acceptable and not a leak: the whole surface sits inside the Access gate
+/// (`tests/test_hk_branch_required.rs` pins 401 through the SHIPPED router with
+/// a real multipart body), and a request that is not multipart at all is
+/// malformed for this endpoint under every branch. For a WELL-FORMED multipart
+/// request the gates run in the usual order — which the same suite asserts,
+/// from both roles, with real multipart probes.
+///
+/// PG-only: one INSERT, no writeback, no event.
+pub async fn upload_report_photo(
+    State(state): State<AppState>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    mut multipart: Multipart,
+) -> ApiResult<Json<UploadPhotoResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    // Walk the parts rather than assuming the photo is first: browsers order
+    // form fields as the DOM does, and a client that adds a hidden field later
+    // must not break the upload.
+    let mut found: Option<(&'static str, Vec<u8>)> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("malformed multipart body: {e}")))?
+    {
+        if field.name() != Some(REPORT_PHOTO_FIELD) {
+            continue;
+        }
+        let mime = parse_photo_mime(field.content_type())?;
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("could not read the photo: {e}")))?;
+        if bytes.len() > MAX_REPORT_PHOTO_BYTES {
+            return Err(ApiError::BadRequest(PHOTO_TOO_LARGE_ERROR.to_string()));
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::BadRequest(PHOTO_FIELD_MISSING_ERROR.to_string()));
+        }
+        found = Some((mime, bytes.to_vec()));
+        break;
+    }
+
+    let Some((mime, bytes)) = found else {
+        return Err(ApiError::BadRequest(PHOTO_FIELD_MISSING_ERROR.to_string()));
+    };
+
+    let photo_id = report_service_for(&state, branch)?
+        .store_photo(StorePhotoCommand {
+            bytes,
+            mime: mime.to_string(),
+            side: report_photo_side(&identity),
+            badge: identity.badge.clone(),
+        })
+        .await?;
+
+    Ok(Json(UploadPhotoResponse {
+        success: true,
+        photo_id,
+    }))
+}
+
+/// `GET /api/hk/report-photos/{photo_id}?branch=` — stream a photo's bytes.
+///
+/// Readable by BOTH roles, exactly like [`report_detail`] and for the same
+/// reason: the evidence is what each side judges the other on. Same response
+/// construction as [`broken_item_photo`], including the `private` cache header
+/// — these are pictures of guest rooms and must never land in a shared cache.
+pub async fn report_photo(
+    State(state): State<AppState>,
+    Path(photo_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Response> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    let photo = report_service_for(&state, branch)?.load_photo(photo_id).await?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, photo.mime)
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(Body::from(photo.bytes))
+        .map_err(|e| ApiError::Internal(format!("failed to build photo response: {e}")))
+}
+
+/// `POST /api/hk/rooms/{room_id}/report` — the maid's attestation.
+///
+/// **Maid-only.** [`require_report_capability`] runs FIRST, so a read-only
+/// reception viewer gets the same 403 [`REPORT_NOT_PERMITTED_ERROR`] it gets on
+/// the other maid mutations.
+///
+/// Gate order, identical to [`report_linen_shortage`]'s and for the same
+/// reasons: report capability (403) → required `?branch=` (400/403) → location
+/// gate (403/503) → body validation (400) → room existence (404) → the service.
+/// Body before room means a misspelled item code is answered without a database
+/// round-trip.
+///
+/// What the SERVICE then does in ONE transaction: the header, the exception
+/// rows, the ATTACHMENT of these photo ids (which is also the check that they
+/// are hers and unattached), and one standing `item_missing` / `item_damaged`
+/// room signal per excepted PROBLEM KIND. A guest may be settling while this
+/// runs, so "the report says the remote is gone but the desk never heard" is
+/// not an observable state.
+///
+/// A second submission while one is still `submitted` for this room+day is
+/// refused as a CONFLICT — which this repo renders 400, not 409
+/// (`ApiError::Conflict` is reserved for ship-dark flags; see
+/// `service::hk_reports`'s module header).
+pub async fn submit_report(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<SubmitReportBody>,
+) -> ApiResult<Json<ReportResponse>> {
+    require_report_capability(&identity)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    let date = parse_report_date(body.date.as_deref())?;
+    let room_status = parse_room_status(body.room_status.as_deref().unwrap_or_default())
+        .map_err(report_rule_error)?;
+    // Absent is NOT "true": a client that forgot the field has not attested
+    // anything, and defaulting it would silently sign off a room.
+    let all_items_ok = body.all_items_ok.ok_or_else(|| {
+        ApiError::BadRequest("allItemsOk is required (true = ครบทุกรายการ)".to_string())
+    })?;
+    let items = parse_report_items(body.items)?;
+    crate::domain::hk_report::check_attestation(all_items_ok, items.len())
+        .map_err(report_rule_error)?;
+    let photo_ids = parse_photo_ids(body.photo_ids)?;
+
+    let pool = resolve_pool(&state, branch)?;
+    require_room(pool, room_id).await?;
+
+    let report = report_service_for(&state, branch)?
+        .submit(SubmitReportCommand {
+            room_id,
+            date,
+            room_status: room_status.to_string(),
+            all_items_ok,
+            items,
+            photo_ids,
+            can_report: identity.can_report,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+            source: hk_source(),
+        })
+        .await?;
+
+    Ok(Json(ReportResponse {
+        success: true,
+        report,
+    }))
+}
+
+/// `POST /api/hk/reports/{report_id}/verify` — reception's countersignature.
+///
+/// **Reception-side only, and a maid may never call it** — including a maid who
+/// also holds the `reception` grant ([`require_verify_capability`], 403
+/// [`VERIFY_NOT_PERMITTED_ERROR`]). Signing off one's own work would empty the
+/// two-party attestation of its meaning.
+///
+/// 1..=4 of the VERIFIER's own `reception`-side photos are required: a verify is
+/// a walk-up, not a desk stamp, and the second set of pictures is the evidence
+/// that it happened.
+///
+/// `submitted` → `verified` only. A report that already has a verdict answers
+/// the repo's conflict shape (400, naming the status it is in).
+pub async fn verify_report(
+    State(state): State<AppState>,
+    Path(report_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<VerifyReportBody>,
+) -> ApiResult<Json<ReportResponse>> {
+    require_verify_capability(&identity)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let photo_ids = parse_photo_ids(body.photo_ids)?;
+
+    let report = report_service_for(&state, branch)?
+        .verify(VerifyReportCommand {
+            report_id,
+            photo_ids,
+            can_report: identity.can_report,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+        })
+        .await?;
+
+    Ok(Json(ReportResponse {
+        success: true,
+        report,
+    }))
+}
+
+/// `POST /api/hk/reports/{report_id}/return` — reception sending it back.
+///
+/// **Reception-side only**, on [`verify_report`]'s terms and with the same 403.
+///
+/// A CANNED `reason` and nothing else — no photos (the reason states the
+/// refusal in full) and no free text, which is ruled out everywhere on this
+/// surface. The report stays `returned` forever; a NEW submission supersedes it
+/// and carries `parentReportId`, which the server derives.
+pub async fn return_report(
+    State(state): State<AppState>,
+    Path(report_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+    Json(body): Json<ReturnReportBody>,
+) -> ApiResult<Json<ReportResponse>> {
+    require_verify_capability(&identity)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+    let reason = parse_return_reason(body.reason.as_deref().unwrap_or_default())
+        .map_err(report_rule_error)?;
+
+    let report = report_service_for(&state, branch)?
+        .return_report(ReturnReportCommand {
+            report_id,
+            reason: reason.to_string(),
+            can_report: identity.can_report,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+        })
+        .await?;
+
+    Ok(Json(ReportResponse {
+        success: true,
+        report,
+    }))
 }
 
 /// POST /api/hk/rooms/{id}/broken-items — **RETIRED (410 Gone)**.
@@ -4980,5 +5765,505 @@ mod tests {
             .bind(room_id)
             .execute(&pool)
             .await;
+    }
+
+    // ====================================================================
+    // Report HK (migration 091)
+    // ====================================================================
+
+    use crate::domain::hk_report::{ItemProblem, REPORT_ITEMS, RETURN_REASONS, ROOM_STATUS_CODES};
+
+    /// Build a wire item entry with an integer quantity.
+    fn report_entry(item: &str, problem: &str, qty: i64) -> ReportItemEntry {
+        ReportItemEntry {
+            item: item.to_string(),
+            problem: problem.to_string(),
+            qty: serde_json::json!(qty),
+        }
+    }
+
+    fn photo_ids(ids: &[i64]) -> Option<Vec<serde_json::Value>> {
+        Some(ids.iter().map(|id| serde_json::json!(id)).collect())
+    }
+
+    // ---- the date -------------------------------------------------------
+
+    /// An absent `date` means TODAY IN BANGKOK, never the server's date.
+    ///
+    /// The same ban `TODAY_BKK` states for `CURRENT_DATE`, restated on the Rust
+    /// side of the boundary: between 17:00 and 24:00 UTC the two answers differ
+    /// by a day, and that is exactly when the late shift is filing.
+    #[test]
+    fn an_absent_date_is_todays_bangkok_civil_day() {
+        let expected = Utc::now()
+            .with_timezone(&chrono_tz::Asia::Bangkok)
+            .date_naive();
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_report_date(absent).expect("an absent date defaults"),
+                expected
+            );
+        }
+        // And it is NOT simply the server's UTC date whenever the two differ —
+        // asserted as an implication so the test is stable at every hour.
+        let utc_today = Utc::now().date_naive();
+        if utc_today != expected {
+            assert_ne!(
+                parse_report_date(None).unwrap(),
+                utc_today,
+                "the default must be Bangkok's day, not the server's"
+            );
+        }
+    }
+
+    /// Strict `YYYY-MM-DD`. A forgiving parser would silently file a report
+    /// against the wrong day when a client sent its own locale's format.
+    #[test]
+    fn the_date_parser_is_strict() {
+        assert_eq!(
+            parse_report_date(Some("2026-09-02")).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 2).unwrap()
+        );
+        assert_eq!(
+            parse_report_date(Some(" 2026-09-02 ")).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+            "surrounding whitespace is trimmed, like every other code here"
+        );
+        for bad in [
+            "2026-9-2",
+            "02/09/2026",
+            "2026-09-02T00:00:00Z",
+            "2026-13-01",
+            "2026-02-30",
+            "yesterday",
+            "2569-09-02x",
+        ] {
+            let err = parse_report_date(Some(bad)).expect_err("'{bad}' must be refused");
+            assert!(
+                matches!(err, ApiError::BadRequest(ref m) if m.contains(REPORT_DATE_INVALID_ERROR)),
+                "'{bad}' must be a 400 in the repo envelope"
+            );
+        }
+    }
+
+    // ---- the checklist body ---------------------------------------------
+
+    #[test]
+    fn report_items_accept_every_vocabulary_pair_and_normalize() {
+        let parsed = parse_report_items(Some(vec![
+            report_entry(" TV_Remote ", " MISSING ", 1),
+            report_entry("kettle", "damaged", 99),
+        ]))
+        .expect("valid entries parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].item, "tv_remote", "the NORMALIZED code is stored");
+        assert_eq!(parsed[0].problem, ItemProblem::Missing);
+        assert_eq!(parsed[1].qty, 99, "the ceiling is inclusive");
+
+        // Every item code in the vocabulary is accepted, with both problems.
+        for item in REPORT_ITEMS {
+            for problem in ItemProblem::ALL {
+                assert!(
+                    parse_report_items(Some(vec![report_entry(item, problem.as_str(), 1)])).is_ok(),
+                    "'{item}' / '{}' must be accepted",
+                    problem.as_str()
+                );
+            }
+        }
+    }
+
+    /// The validation matrix, one row per way a body can be wrong. Every row is
+    /// a 400 in the repo's envelope — never a 500 from a DB CHECK.
+    #[test]
+    fn report_items_reject_every_malformed_shape() {
+        // Unknown codes.
+        assert!(parse_report_items(Some(vec![report_entry("remote", "missing", 1)])).is_err());
+        assert!(parse_report_items(Some(vec![report_entry("tv_remote", "broken", 1)])).is_err());
+        // `stolen` is the near-miss that matters: it is the word an author
+        // reaches for instead of `missing`.
+        assert!(parse_report_items(Some(vec![report_entry("tv_remote", "stolen", 1)])).is_err());
+
+        // Quantities: the range, and the non-integer shapes a broken client
+        // sends. Each must be OURS to answer, not serde's.
+        for bad_qty in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(100),
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(1_099_511_627_776i64),
+        ] {
+            let entry = ReportItemEntry {
+                item: "tv_remote".to_string(),
+                problem: "missing".to_string(),
+                qty: bad_qty.clone(),
+            };
+            let err = parse_report_items(Some(vec![entry]))
+                .expect_err("qty {bad_qty} must be refused");
+            assert!(matches!(err, ApiError::BadRequest(_)), "qty {bad_qty}");
+        }
+
+        // A repeated (item, problem) PAIR.
+        let err = parse_report_items(Some(vec![
+            report_entry("tv_remote", "missing", 1),
+            report_entry("TV_REMOTE", "Missing", 2),
+        ]))
+        .expect_err("a duplicate pair must be refused after normalisation");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+
+        // …but the SAME ITEM with the OTHER problem is a real report of one
+        // room and must be accepted.
+        assert!(parse_report_items(Some(vec![
+            report_entry("water_glass", "missing", 2),
+            report_entry("water_glass", "damaged", 1),
+        ]))
+        .is_ok());
+
+        // Too many lines.
+        let flood: Vec<ReportItemEntry> = (0..=MAX_REPORT_ITEMS)
+            .map(|_| report_entry("tv_remote", "missing", 1))
+            .collect();
+        assert!(parse_report_items(Some(flood)).is_err());
+    }
+
+    /// An empty / absent `items` is NOT an error by itself — it is exactly what
+    /// a ครบทุกรายการ report sends. The contradiction test lives in the domain
+    /// and is applied by the handler.
+    #[test]
+    fn an_empty_checklist_is_parsed_and_judged_by_the_attestation_rule() {
+        assert!(parse_report_items(None).unwrap().is_empty());
+        assert!(parse_report_items(Some(Vec::new())).unwrap().is_empty());
+
+        // The biconditional, as the handler applies it.
+        assert!(crate::domain::hk_report::check_attestation(true, 0).is_ok());
+        let err = crate::domain::hk_report::check_attestation(true, 1)
+            .expect_err("ครบทุกรายการ with exceptions is a contradiction");
+        assert!(matches!(report_rule_error(err), ApiError::BadRequest(_)));
+        let err = crate::domain::hk_report::check_attestation(false, 0)
+            .expect_err("not-ok with nothing named is a contradiction");
+        assert!(matches!(report_rule_error(err), ApiError::BadRequest(_)));
+    }
+
+    // ---- photos ---------------------------------------------------------
+
+    #[test]
+    fn photo_ids_must_be_one_to_four_distinct_positive_integers() {
+        assert_eq!(parse_photo_ids(photo_ids(&[7])).unwrap(), vec![7]);
+        assert_eq!(
+            parse_photo_ids(photo_ids(&[1, 2, 3, 4])).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+
+        // Count bounds, both ends — the vocabulary file's own constants.
+        for bad in [Vec::new(), vec![1, 2, 3, 4, 5]] {
+            let err = parse_photo_ids(photo_ids(&bad)).expect_err("count must be refused");
+            assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("photoIds")));
+        }
+        assert!(parse_photo_ids(None).is_err(), "an absent list is 0 photos");
+
+        // Non-integer / non-positive ids answer in OUR envelope.
+        for bad in [
+            serde_json::json!("3"),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!(-4),
+        ] {
+            let err = parse_photo_ids(Some(vec![bad.clone()]))
+                .expect_err("photoId {bad} must be refused");
+            assert!(matches!(err, ApiError::BadRequest(_)), "photoId {bad}");
+        }
+
+        // A repeat is named as a repeat, not as "not yours" — that message
+        // would send a maid looking for the wrong problem.
+        let err = parse_photo_ids(photo_ids(&[5, 5])).expect_err("a repeat must be refused");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("more than once")));
+    }
+
+    /// The photo count bound is the VOCABULARY FILE's, shared with the domain
+    /// and re-stated by the service. If these three ever disagree, a body the
+    /// route admits is refused deeper down for the same reason.
+    #[test]
+    fn the_photo_bounds_are_the_vocabularys_own() {
+        assert_eq!(REPORT_MIN_PHOTOS, 1);
+        assert_eq!(REPORT_MAX_PHOTOS, 4);
+        for count in REPORT_MIN_PHOTOS..=REPORT_MAX_PHOTOS {
+            let ids: Vec<i64> = (1..=count as i64).collect();
+            assert!(parse_photo_ids(photo_ids(&ids)).is_ok());
+            assert!(crate::domain::hk_report::check_photo_count(count).is_ok());
+        }
+    }
+
+    /// The mime check is an ALLOWLIST, and it returns the CANONICAL spelling —
+    /// which is what gets stored and what the read endpoint later serves. A
+    /// sniff or a pass-through here would make `GET /api/hk/report-photos/{id}`
+    /// a stored-XSS vector on our own origin.
+    #[test]
+    fn the_photo_mime_is_an_allowlist_returning_the_canonical_spelling() {
+        assert_eq!(parse_photo_mime(Some("image/jpeg")).unwrap(), "image/jpeg");
+        assert_eq!(
+            parse_photo_mime(Some("IMAGE/JPEG; charset=binary")).unwrap(),
+            "image/jpeg",
+            "the parameter suffix is trimmed and the type lower-cased"
+        );
+        assert_eq!(parse_photo_mime(Some(" image/webp ")).unwrap(), "image/webp");
+        assert_eq!(parse_photo_mime(Some("image/png")).unwrap(), "image/png");
+
+        for bad in [
+            None,
+            Some(""),
+            Some("text/html"),
+            Some("image/svg+xml"),
+            Some("application/pdf"),
+            Some("image/jpeg2000"),
+            Some("image/gif"),
+        ] {
+            let err = parse_photo_mime(bad).expect_err("{bad:?} must be refused");
+            assert!(
+                matches!(err, ApiError::BadRequest(ref m) if m == PHOTO_TYPE_ERROR),
+                "{bad:?} must answer the Thai type error"
+            );
+        }
+    }
+
+    /// The per-file cap and the route body limit must stay ordered: the inner
+    /// check can only ever fire for a body the outer limit already admitted.
+    #[test]
+    fn the_photo_body_limit_is_above_the_per_file_cap() {
+        assert!(REPORT_PHOTO_BODY_LIMIT > MAX_REPORT_PHOTO_BYTES);
+        assert_eq!(MAX_REPORT_PHOTO_BYTES, 5 * 1024 * 1024);
+        // …and both stay inside the router-wide 8 MB, so this route narrows the
+        // limit rather than widening it.
+        assert!(REPORT_PHOTO_BODY_LIMIT < 8 * 1024 * 1024);
+    }
+
+    // ---- the two role gates ---------------------------------------------
+
+    fn hk_identity(can_report: bool) -> HkIdentity {
+        HkIdentity {
+            badge: "Q1001".to_string(),
+            display_name: None,
+            email: None,
+            can_report,
+        }
+    }
+
+    /// The two capability gates are MIRROR IMAGES over the same boolean, and
+    /// they carry DIFFERENT messages — a maid told "you may only view" would be
+    /// looking for the wrong problem.
+    ///
+    /// This is the "a maid never verifies (even one who also holds reception)"
+    /// rule at the route: `can_report` is the maid side, full stop.
+    #[test]
+    fn the_report_and_verify_gates_are_mirror_images() {
+        let maid = hk_identity(true);
+        let viewer = hk_identity(false);
+
+        assert!(require_report_capability(&maid).is_ok());
+        assert!(require_verify_capability(&viewer).is_ok());
+
+        let refused_viewer = require_report_capability(&viewer)
+            .expect_err("a viewer may not submit a report");
+        assert!(
+            matches!(refused_viewer, ApiError::Forbidden(ref m) if m == REPORT_NOT_PERMITTED_ERROR)
+        );
+
+        let refused_maid =
+            require_verify_capability(&maid).expect_err("a maid may not verify a report");
+        assert!(
+            matches!(refused_maid, ApiError::Forbidden(ref m) if m == VERIFY_NOT_PERMITTED_ERROR)
+        );
+
+        assert_ne!(
+            REPORT_NOT_PERMITTED_ERROR, VERIFY_NOT_PERMITTED_ERROR,
+            "the two refusals must not read as the same problem"
+        );
+    }
+
+    /// The photo side is DERIVED from the same boolean, in one place. A maid's
+    /// upload can never become reception evidence.
+    #[test]
+    fn the_photo_side_is_derived_from_the_role() {
+        assert_eq!(report_photo_side(&hk_identity(true)), PhotoSide::Maid);
+        assert_eq!(
+            report_photo_side(&hk_identity(false)),
+            PhotoSide::Reception
+        );
+        // The signal role reads the SAME boolean, so the two derivations can
+        // never disagree about who this identity is.
+        assert_eq!(hk_role(&hk_identity(true)), SignalRole::Maid);
+    }
+
+    /// A domain refusal keeps its own class on the way to HTTP: 403 for a role
+    /// refusal, 400 for everything else (including the conflict class — see
+    /// `service::hk_reports`'s header for why this repo does not use 409 here).
+    #[test]
+    fn report_rule_errors_keep_the_domains_own_status_class() {
+        assert!(matches!(
+            report_rule_error(ReportRuleError::WrongSide { action: "verify" }),
+            ApiError::Forbidden(_)
+        ));
+        assert!(matches!(
+            report_rule_error(ReportRuleError::UnknownCode {
+                field: "roomStatus",
+                got: "vacant".to_string()
+            }),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            report_rule_error(ReportRuleError::PhotoCountOutOfRange { got: 9 }),
+            ApiError::BadRequest(_)
+        ));
+    }
+
+    // ---- the wire vocabulary --------------------------------------------
+
+    /// The room-status and return-reason parsers are the 400 source for the two
+    /// codes the handlers read straight off the body.
+    #[test]
+    fn the_room_status_and_return_reason_vocabularies_are_enforced() {
+        for code in ROOM_STATUS_CODES {
+            assert_eq!(parse_room_status(code).unwrap(), code);
+        }
+        assert_eq!(parse_room_status(" VC ").unwrap(), "vc");
+        for bad in ["", "vacant", "dirty", "v", "vcc"] {
+            assert!(
+                matches!(
+                    parse_room_status(bad).map_err(report_rule_error),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "'{bad}' must be a 400"
+            );
+        }
+
+        for reason in RETURN_REASONS {
+            assert_eq!(parse_return_reason(reason).unwrap(), reason);
+        }
+        for bad in ["", "dirty", "ยังไม่สะอาด", "not clean"] {
+            assert!(
+                matches!(
+                    parse_return_reason(bad).map_err(report_rule_error),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "'{bad}' must be a 400"
+            );
+        }
+    }
+
+    /// The REQUEST bodies deserialize from the contracted camelCase keys. A
+    /// rename here silently drops a field to its `None` default, which the
+    /// handler would then answer as "required" — a confusing 400 rather than a
+    /// loud failure. So it is pinned.
+    #[test]
+    fn the_request_bodies_read_the_contracted_camel_case_keys() {
+        let body: SubmitReportBody = serde_json::from_str(
+            r#"{"date":"2026-09-02","roomStatus":"vc","allItemsOk":false,
+                 "items":[{"item":"tv_remote","problem":"missing","qty":1}],
+                 "photoIds":[3,4]}"#,
+        )
+        .expect("the submit body parses");
+        assert_eq!(body.date.as_deref(), Some("2026-09-02"));
+        assert_eq!(body.room_status.as_deref(), Some("vc"));
+        assert_eq!(body.all_items_ok, Some(false));
+        assert_eq!(body.items.as_ref().map(Vec::len), Some(1));
+        assert_eq!(parse_photo_ids(body.photo_ids).unwrap(), vec![3, 4]);
+
+        // A body of `{}` must reach OUR validators, not serde's rejection.
+        let empty: SubmitReportBody = serde_json::from_str("{}").expect("an empty body parses");
+        assert!(empty.room_status.is_none() && empty.all_items_ok.is_none());
+
+        let verify: VerifyReportBody =
+            serde_json::from_str(r#"{"photoIds":[9]}"#).expect("the verify body parses");
+        assert_eq!(parse_photo_ids(verify.photo_ids).unwrap(), vec![9]);
+        let verify_empty: VerifyReportBody = serde_json::from_str("{}").expect("parses");
+        assert!(parse_photo_ids(verify_empty.photo_ids).is_err());
+
+        let returned: ReturnReportBody =
+            serde_json::from_str(r#"{"reason":"photos_unclear"}"#).expect("the return body parses");
+        assert_eq!(returned.reason.as_deref(), Some("photos_unclear"));
+        let return_empty: ReturnReportBody = serde_json::from_str("{}").expect("parses");
+        assert!(return_empty.reason.is_none());
+    }
+
+    /// The RESPONSE envelopes carry the contracted keys.
+    #[test]
+    fn the_response_envelopes_serialize_the_contracted_keys() {
+        let overview = ReportsOverviewResponse {
+            success: true,
+            date: "2026-09-02".to_string(),
+            rooms: vec![RoomReportRow {
+                room_id: 1,
+                room_no: "101".to_string(),
+                floor: Some(1),
+                building: None,
+                report: None,
+            }],
+        };
+        let json = serde_json::to_value(&overview).expect("serializes");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["date", "rooms", "success"]);
+        assert!(
+            json["rooms"][0]["report"].is_null(),
+            "a room with no report is still listed"
+        );
+        assert!(json["rooms"][0]["building"].is_null());
+
+        let upload = UploadPhotoResponse {
+            success: true,
+            photo_id: 12,
+        };
+        assert_eq!(
+            serde_json::to_string(&upload).unwrap(),
+            r#"{"success":true,"photoId":12}"#
+        );
+    }
+
+    /// The overview query type takes BOTH parameters as RAW STRINGS, so an
+    /// unknown branch and a malformed date are answered in this module's
+    /// envelope rather than by serde inside axum's `Query` extractor — which
+    /// would render a plain-text shape the client cannot parse. Same reasoning
+    /// as [`HkBranchQuery::branch`](HkBranchQuery).
+    #[test]
+    fn the_overview_query_validates_in_our_own_envelope() {
+        // The junk a stale or hand-rolled client sends REACHES the handler…
+        let junk = HkReportsQuery {
+            branch: Some("all".to_string()),
+            date: Some("yesterday".to_string()),
+        };
+        // …and both fields are then refused by OUR validators, with the repo's
+        // `{success:false,error}` envelope.
+        assert!(matches!(
+            require_branch(&HkPolicy::default(), junk.branch.as_deref()),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            parse_report_date(junk.date.as_deref()),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        // No `date` at all is legal and means today in Bangkok — the field is
+        // optional in a way `branch` deliberately is not.
+        let bare = HkReportsQuery {
+            branch: Some("hfhotel".to_string()),
+            date: None,
+        };
+        assert!(require_branch(&HkPolicy::default(), bare.branch.as_deref()).is_ok());
+        assert!(parse_report_date(bare.date.as_deref()).is_ok());
+
+        // A default-constructed query (no parameters at all) is a 400, never a
+        // silent fall-through to the primary property.
+        let empty = HkReportsQuery::default();
+        assert!(matches!(
+            require_branch(&HkPolicy::default(), empty.branch.as_deref()),
+            Err(ApiError::BadRequest(ref m)) if m == BRANCH_REQUIRED_ERROR
+        ));
     }
 }

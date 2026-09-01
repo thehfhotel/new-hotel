@@ -10,7 +10,7 @@
 //! `tests/test_hk_ville_guard.rs`.
 //!
 //! ## The exemptions (housekeeping-ops, 2026-08-11; linen 2026-08-31;
-//! room signals 2026-09-01; linen resolve 2026-09-01)
+//! room signals 2026-09-01; linen resolve 2026-09-01; Report HK 2026-09-02)
 //!
 //! [`is_ville_exempt_path`] admits, regardless of the flag, exactly the maid
 //! surface's own write routes — and nothing else:
@@ -47,6 +47,30 @@
 //!   deliberately NOT exempt. The exemption exists so a MAID's work is not
 //!   collateral damage of a front-desk write-policy toggle; a front-desk
 //!   mutation is exactly what that toggle governs.
+//! * `POST /api/hk/rooms/{id}/report`, `POST /api/hk/reports/{id}/verify`,
+//!   `POST /api/hk/reports/{id}/return` and `POST /api/hk/report-photos` — the
+//!   Report HK sheet of migration 091. **PG-ONLY on the same absolute terms as
+//!   the room signals**: `ht_hk_room_reports` / `_items` / `_photos` have no
+//!   legacy counterpart at all — iHOTEL knows nothing about the Report HK
+//!   sheet — so there is no writeback recipe to write, no intent to allowlist,
+//!   and no dark flag waiting to enable one. The submit publishes domain events
+//!   only through the `item_missing` / `item_damaged` room signals it raises,
+//!   which are already exempt on their own path; an event is not a legacy
+//!   write.
+//!
+//!   The VERDICTS are exempt too, unlike every other reception-side write on
+//!   this estate, and that is deliberate rather than an oversight: they are
+//!   served from the MAID surface's own router (`/api/hk/*`) by a receptionist
+//!   standing in the room with her phone, not from the desk tree. A 403 there
+//!   would strand a maid's submitted report unjudged for as long as the toggle
+//!   is off — exactly the collateral damage the exemption exists to prevent.
+//!   The desk tree (`/api/housekeeping/*`) has no report routes at all.
+//!
+//!   `POST /api/hk/report-photos` is the ONE exempt path with **no id**: a
+//!   photo is uploaded BEFORE the report it will belong to exists, so there is
+//!   nothing to address yet. It is matched as a whole-path equality, never as
+//!   a prefix — `/api/hk/report-photos/9` (the READ) and
+//!   `/api/hk/report-photosX` both fall through.
 //!
 //! ### Current production state
 //!
@@ -97,7 +121,15 @@ use crate::routes::mode::AppState;
 /// iHOTEL knows nothing about room signals — so there is no writeback recipe,
 /// no intent, and no future one to gate. It raises one row and publishes a
 /// domain event for the SSE fan-out; an event is not a legacy write.
-const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 3] = ["cleaning", "linen-shortage", "signals"];
+///
+/// `report` (migration 091, Report HK) is PG-only in the same absolute sense:
+/// `ht_hk_room_reports` + its item and photo tables have no legacy counterpart
+/// — iHOTEL knows nothing about the Report HK sheet — so there is no writeback
+/// recipe, no intent, and no future one to gate. The submit DOES publish
+/// domain events, but only via the `item_missing` / `item_damaged` room signals
+/// it raises, which were already exempt on their own path; an event is not a
+/// legacy write, and the writeback worker dispatches `WritebackIntent`s.
+const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 4] = ["cleaning", "linen-shortage", "signals", "report"];
 
 /// The exempt leaf segments under `/api/hk/signals/{signal_id}/` — ADR 0008's
 /// lifecycle actions. A closed list, matched by exact equality.
@@ -114,6 +146,43 @@ const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 3] = ["cleaning", "linen-shortage", "sig
 /// at the counter — the exact "housekeeping is not collateral damage of a
 /// front-desk write-policy toggle" case the exemption exists for.
 const VILLE_EXEMPT_SIGNAL_ACTIONS: [&str; 4] = ["ack", "done", "cancel", "answer"];
+
+/// The exempt leaf segments under `/api/hk/reports/{report_id}/` — Report HK's
+/// two verdicts (migration 091). A closed list, matched by exact equality.
+///
+/// These are NOT under `/rooms/`, for exactly [`VILLE_EXEMPT_SIGNAL_ACTIONS`]'s
+/// reason: a verdict addresses the report, which already knows its room, so
+/// repeating the room id in the path would only be a second thing that can
+/// disagree with the row. Hence a THIRD collection rather than an entry in
+/// [`VILLE_EXEMPT_ROOM_ACTIONS`] — and, deliberately, a third LIST rather than
+/// a shared one, so `ack` can never become a report verdict nor `verify` a
+/// signal action.
+///
+/// PG-only on the same terms as everything else here: each one flips
+/// `rr_status`, stamps the countersignature, and (for `verify`) attaches the
+/// verifier's photo rows. No writeback intent, no outbox row, and no domain
+/// event of its own.
+///
+/// `verify` is included deliberately: without it a HF Ville receptionist could
+/// open a maid's report and be 403'd at the moment she is standing in the room
+/// with her phone out — the exact "housekeeping is not collateral damage of a
+/// front-desk write-policy toggle" case the exemption exists for.
+const VILLE_EXEMPT_REPORT_ACTIONS: [&str; 2] = ["verify", "return"];
+
+/// The ONE exempt FOUR-segment path: `POST /api/hk/report-photos` (migration
+/// 091), the Report HK photo intake.
+///
+/// Matched as a WHOLE PATH by exact equality — it carries no id at all, because
+/// a photo is uploaded BEFORE the report it will belong to exists, so there is
+/// nothing yet to address. That makes it the only exemption on this surface
+/// that the segment matcher below cannot express, and giving it its own
+/// constant keeps the segment matcher from having to grow an "id optional"
+/// mode that would loosen every other shape.
+///
+/// PG-only, and about as narrowly as anything here: one INSERT of an
+/// UNATTACHED row. It cannot even reach a report until a submit/verify names
+/// it, and those are separately exempt on their own merits.
+const VILLE_EXEMPT_REPORT_PHOTOS: &str = "/api/hk/report-photos";
 
 /// The ONE exempt SIX-segment shape: `/api/hk/rooms/{id}/{action}/{sub}`, as a
 /// closed list of `(action, sub)` PAIRS — migration 090's
@@ -135,30 +204,48 @@ const VILLE_EXEMPT_ROOM_SUBACTIONS: [(&str, &str); 1] = [("linen-shortage", "res
 
 /// Is this request path one of the Ville-exempt routes? PURE.
 ///
-/// THREE shapes, each requiring a numeric id and nothing after the leaf:
+/// FIVE shapes. Four require a numeric id and nothing after the leaf; the fifth
+/// is a whole-path equality with no id at all:
 ///
 /// * `/api/hk/rooms/{room_id}/{action}` with `action` in
 ///   [`VILLE_EXEMPT_ROOM_ACTIONS`] (five segments);
 /// * `/api/hk/signals/{signal_id}/{action}` with `action` in
 ///   [`VILLE_EXEMPT_SIGNAL_ACTIONS`] (five segments);
+/// * `/api/hk/reports/{report_id}/{action}` with `action` in
+///   [`VILLE_EXEMPT_REPORT_ACTIONS`] (five segments — migration 091's verdicts);
 /// * `/api/hk/rooms/{room_id}/{action}/{sub}` with `(action, sub)` in
 ///   [`VILLE_EXEMPT_ROOM_SUBACTIONS`] (SIX segments — migration 090's linen
-///   resolve, and nothing else).
+///   resolve, and nothing else);
+/// * exactly [`VILLE_EXEMPT_REPORT_PHOTOS`] (four segments, no id — migration
+///   091's photo intake, which is uploaded before any report exists).
+///
+/// The three collections keep SEPARATE action lists on purpose: a leaf is
+/// exempt under the collection it belongs to and nowhere else, so
+/// `/api/hk/rooms/1/verify` and `/api/hk/reports/1/cleaning` are both refused.
 ///
 /// The sixth segment is OPTIONAL and, when present, is matched as a pair with
-/// the fifth against a closed list — so the widening admits exactly one more
-/// path. A six-segment path under `/signals/` matches nothing, and neither does
-/// an exempt five-segment leaf with an arbitrary sixth segment appended.
+/// the fifth against a closed list — so that widening admits exactly one more
+/// path. A six-segment path under `/signals/` or `/reports/` matches nothing,
+/// and neither does an exempt five-segment leaf with an arbitrary sixth segment
+/// appended.
 ///
 /// A trailing slash yields a trailing empty segment and therefore does NOT
 /// match, and no prefix/substring test is used, so
 /// `/api/hk/rooms/1/cleaning/anything`, `/api/hk/rooms/1/linen-shortageX`,
-/// `/api/hk/signals/1/ackX` and `/api/hk/rooms/1/broken-items` all fall through
-/// to the normal gate.
+/// `/api/hk/signals/1/ackX`, `/api/hk/report-photosX` and
+/// `/api/hk/rooms/1/broken-items` all fall through to the normal gate.
 ///
-/// `GET /api/hk/signals` and `GET /api/hk/events` need no entry at all — the
-/// gate only ever fires on mutating methods.
+/// `GET /api/hk/signals`, `GET /api/hk/events`, `GET /api/hk/reports` and
+/// `GET /api/hk/report-photos/{id}` need no entry at all — the gate only ever
+/// fires on mutating methods.
 pub fn is_ville_exempt_path(path: &str) -> bool {
+    // The one shape with no id: an exact whole-path match, so
+    // `/api/hk/report-photos/9` (the READ) and `/api/hk/report-photosX` both
+    // fall through to the segment matcher and then to the normal gate.
+    if path == VILLE_EXEMPT_REPORT_PHOTOS {
+        return true;
+    }
+
     let mut segments = path.split('/');
     // A path starts with '/', so the first split segment is empty.
     if segments.next() != Some("") {
@@ -190,6 +277,7 @@ pub fn is_ville_exempt_path(path: &str) -> bool {
     match (collection, sub_action) {
         ("rooms", None) => VILLE_EXEMPT_ROOM_ACTIONS.contains(&action),
         ("signals", None) => VILLE_EXEMPT_SIGNAL_ACTIONS.contains(&action),
+        ("reports", None) => VILLE_EXEMPT_REPORT_ACTIONS.contains(&action),
         // The one six-segment exemption, matched as a PAIR: `resolve` is exempt
         // only under `linen-shortage`, never as a leaf under another action.
         ("rooms", Some(sub)) => VILLE_EXEMPT_ROOM_SUBACTIONS.contains(&(action, sub)),
@@ -271,6 +359,11 @@ mod tests {
     const SIGNAL_DONE: &str = "/api/hk/signals/7/done";
     const SIGNAL_CANCEL: &str = "/api/hk/signals/7/cancel";
     const SIGNAL_ANSWER: &str = "/api/hk/signals/7/answer";
+    // Report HK (migration 091).
+    const REPORT_SUBMIT: &str = "/api/hk/rooms/42/report";
+    const REPORT_VERIFY: &str = "/api/hk/reports/9/verify";
+    const REPORT_RETURN: &str = "/api/hk/reports/9/return";
+    const REPORT_PHOTOS: &str = "/api/hk/report-photos";
     const BROKEN: &str = "/api/hk/rooms/42/broken-items";
     const BOOKING: &str = "/api/new/bookings";
     const VILLE_Q: Option<&str> = Some("branch=hfville");
@@ -293,6 +386,15 @@ mod tests {
         for action in [SIGNAL_ACK, SIGNAL_DONE, SIGNAL_CANCEL, SIGNAL_ANSWER] {
             assert!(is_ville_exempt_path(action), "{action} must be exempt");
         }
+        // Report HK (migration 091): the submission hangs off /rooms/, the two
+        // verdicts off /reports/, and the photo intake is the one shape with no
+        // id at all.
+        for report_path in [REPORT_SUBMIT, REPORT_VERIFY, REPORT_RETURN, REPORT_PHOTOS] {
+            assert!(is_ville_exempt_path(report_path), "{report_path} must be exempt");
+        }
+        assert!(is_ville_exempt_path("/api/hk/rooms/1/report"));
+        assert!(is_ville_exempt_path("/api/hk/reports/1/verify"));
+        assert!(is_ville_exempt_path("/api/hk/reports/1/return"));
 
         for not_exempt in [
             BROKEN,
@@ -317,6 +419,49 @@ mod tests {
             "/api/hk/rooms/42/signalsX",
             "/api/hk/rooms/42/signals/",
             "/api/hk/rooms/42/signals/extra",
+            // ---- Report HK: the three collections' action lists are NOT
+            // interchangeable, and the widening must admit exactly the four
+            // paths above rather than a shape.
+            "/api/hk/rooms/42/verify",
+            "/api/hk/rooms/42/return",
+            "/api/hk/reports/9/cleaning",
+            "/api/hk/reports/9/signals",
+            "/api/hk/reports/9/linen-shortage",
+            "/api/hk/reports/9/ack",
+            "/api/hk/reports/9/done",
+            "/api/hk/reports/9/cancel",
+            "/api/hk/reports/9/answer",
+            "/api/hk/signals/7/verify",
+            "/api/hk/signals/7/return",
+            "/api/hk/signals/7/report",
+            // Near-misses and malformed ids on the report shapes.
+            "/api/hk/rooms/42/reportX",
+            "/api/hk/rooms/42/reports",
+            "/api/hk/rooms/42/report/",
+            "/api/hk/rooms/42/report/extra",
+            "/api/hk/rooms//report",
+            "/api/hk/rooms/4a2/report",
+            "/api/hk/reports/9/verifyX",
+            "/api/hk/reports/9/verify/",
+            "/api/hk/reports/9/verify/extra",
+            "/api/hk/reports//verify",
+            "/api/hk/reports/9a/verify",
+            "/api/hk/reports/9",
+            "/api/hk/reports",
+            "/x/api/hk/reports/9/verify",
+            "api/hk/reports/9/verify",
+            "/api/housekeeping/reports/9/verify",
+            // The photo intake is a WHOLE-PATH equality, never a prefix — so
+            // the READ endpoint and every near-miss fall through. This is the
+            // half that matters: a `starts_with` here would exempt every
+            // `/api/hk/report-photos*` path including a future mutation.
+            "/api/hk/report-photos/9",
+            "/api/hk/report-photos/",
+            "/api/hk/report-photosX",
+            "/api/hk/report-photos/9/delete",
+            "/x/api/hk/report-photos",
+            "api/hk/report-photos",
+            "/api/housekeeping/report-photos",
             // A collection this matcher does not know must never be exempt,
             // however plausible its leaf looks.
             "/api/hk/notes/7/ack",
@@ -414,6 +559,19 @@ mod tests {
                 "hfville {signal_path} must be admitted while Ville writes are disabled"
             );
         }
+        // Report HK (migration 091) is PG-only in the strongest sense too: the
+        // three tables have no legacy counterpart, so there is no recipe a
+        // narrowed HFVILLE_WRITEBACK_INTENTS could park. The VERDICTS are
+        // included because they are served from the MAID surface's own router
+        // by a receptionist standing in the room — a 403 there strands a
+        // submitted report unjudged.
+        for report_path in [REPORT_SUBMIT, REPORT_VERIFY, REPORT_RETURN, REPORT_PHOTOS] {
+            assert!(
+                !ville_write_blocked(&Method::POST, report_path, VILLE_Q, false),
+                "hfville {report_path} must be admitted while Ville writes are disabled"
+            );
+        }
+
         // The DESK half of the same feature is NOT exempt: an exemption exists
         // so a maid's report is not collateral damage of a FRONT-DESK write
         // policy toggle, and a front-desk mutation is what that toggle is for.
@@ -452,6 +610,10 @@ mod tests {
             SIGNAL_DONE,
             SIGNAL_CANCEL,
             SIGNAL_ANSWER,
+            REPORT_SUBMIT,
+            REPORT_VERIFY,
+            REPORT_RETURN,
+            REPORT_PHOTOS,
         ] {
             for method in [Method::PUT, Method::PATCH, Method::DELETE] {
                 assert!(
@@ -488,6 +650,10 @@ mod tests {
             SIGNAL_DONE,
             SIGNAL_CANCEL,
             SIGNAL_ANSWER,
+            REPORT_SUBMIT,
+            REPORT_VERIFY,
+            REPORT_RETURN,
+            REPORT_PHOTOS,
             BROKEN,
             BOOKING,
         ] {

@@ -8,6 +8,18 @@
 
 import { HK_STATUS_LABELS } from '@/lib/v2/status'
 import {
+  ITEM_PROBLEMS,
+  REPORT_ITEMS,
+  REPORT_MAX_PHOTOS,
+  REPORT_MIN_PHOTOS,
+  reportItemLabel,
+  RETURN_REASONS,
+  ROOM_STATUS_CODES,
+  type ReportStatus,
+  type ReturnReason,
+  type RoomStatusCode,
+} from './report-vocab'
+import {
   DESK_SIGNALS,
   MAID_SIGNALS,
   ROOM_CHECK_PROBLEMS,
@@ -829,12 +841,22 @@ export function markDirtyConfirmMessage(roomNo: string): string {
   return `ยืนยันแจ้งว่า ห้อง ${roomNo} ยังไม่สะอาด?`
 }
 
-/** Group rooms by floor for the list screen; floorless rooms go last. */
-export function groupRoomsByFloor(rooms: HkRoom[]): Array<{
+/**
+ * Group rooms by floor for the list screen; floorless rooms go last.
+ *
+ * GENERIC over the row type on purpose: the Report HK day overview
+ * (`HkReportRoom`) groups by exactly the same rule and must read as the same
+ * screen, and a second copy of this function is how the two lists start
+ * disagreeing about where floor 3 ends. The constraint is the only two fields
+ * the grouping actually reads.
+ */
+export function groupRoomsByFloor<T extends { roomNo: string; floor: number | null }>(
+  rooms: T[]
+): Array<{
   floor: number | null
-  rooms: HkRoom[]
+  rooms: T[]
 }> {
-  const byFloor = new Map<number | null, HkRoom[]>()
+  const byFloor = new Map<number | null, T[]>()
   for (const room of rooms) {
     const key = room.floor ?? null
     const bucket = byFloor.get(key)
@@ -1219,5 +1241,804 @@ export function storeSignalSoundMuted(muted: boolean): void {
     localStorage.setItem(SOUND_MUTED_KEY, muted ? '1' : '0')
   } catch {
     /* nothing to do — the toggle simply forgets across reloads */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Report HK — the daily room report (CONTEXT.md §Housekeeping "Room report")
+// ---------------------------------------------------------------------------
+//
+// One maid's per-room daily attestation, digitizing the owner's paper
+// `Report HK.xlsx`: the room's status code (VC/CO/OO/SO — prefilled here from
+// facts we already hold, stored as SHE reported it), an EXCEPTION-BASED
+// equipment checklist (ครบทุกรายการ, or named items marked หาย/ชำรุด with a
+// quantity), and 1..4 photos. Reception countersigns it with photos of her own,
+// or returns it with a canned reason; a returned report is superseded by a
+// FRESH submission that references it (append-only history — nothing is ever
+// edited in place).
+//
+// The vocabulary itself lives in `report-vocab.ts` (mirrored by the backend's
+// allowlists) and is RE-EXPORTED here, exactly as the signal vocabulary is
+// above, so a page has ONE import for everything about reports. No free text
+// anywhere: the return reasons are the whole rejection vocabulary (ADR 0008's
+// canned-only discipline, carried over).
+
+export {
+  ITEM_PROBLEMS,
+  REPORT_ITEMS,
+  REPORT_MAX_PHOTOS,
+  REPORT_MIN_PHOTOS,
+  reportItemLabel,
+  RETURN_REASONS,
+  ROOM_STATUS_CODES,
+} from './report-vocab'
+export type {
+  ItemProblem,
+  ReportItemCode,
+  ReportStatus,
+  ReturnReason,
+  RoomStatusCode,
+} from './report-vocab'
+
+// --- wire shapes -----------------------------------------------------------
+//
+// EVERY field a v1 backend adds after this bundle ships is optional here, and
+// several that a current backend always sends are optional too — same skew rule
+// the room fields above follow. This surface is opened from a LINE tile whose
+// WebView caches a bundle for hours; a screen that throws because one key was
+// renamed strands a maid mid-round.
+
+/** Who filed or verified something — name when we have one, badge always. */
+export interface HkReportActor {
+  badge: string
+  name: string | null
+}
+
+/**
+ * One equipment exception. `item`/`problem` are plain `string`s in the
+ * SERVER→client direction for the same reason `HkLinenShortageTotal.kind` is:
+ * a newer backend that knows a 23rd item must render as a readable row here,
+ * not crash the screen (`reportItemLabel` falls back to the raw code). The
+ * client→server direction stays strictly typed — there we choose what to send.
+ */
+export interface HkReportItemException {
+  item: string
+  problem: string
+  qty: number
+}
+
+/** The summary DTO carried by each row of the day overview: the full report
+ *  MINUS the item and photo-id arrays, PLUS photo COUNTS. */
+export interface HkReportSummary {
+  reportId: number
+  roomId: number
+  roomNo?: string
+  date?: string
+  status: ReportStatus
+  roomStatus?: string
+  allItemsOk?: boolean
+  returnReason?: string | null
+  parentReportId?: number | null
+  submittedBy?: HkReportActor
+  submittedAt?: string
+  verifiedBy?: HkReportActor | null
+  verifiedAt?: string | null
+  photoCounts?: { maid: number; reception: number }
+}
+
+/** `GET /hk/api/reports/{reportId}` — the summary plus everything the two
+ *  detail screens render from. */
+export interface HkReport extends HkReportSummary {
+  items?: HkReportItemException[]
+  maidPhotoIds?: number[]
+  receptionPhotoIds?: number[]
+}
+
+/** One row of the day overview: every active room of the branch, with its
+ *  LATEST report for that date (or `null` — the ยังไม่ส่ง case). */
+export interface HkReportRoom {
+  roomId: number
+  roomNo: string
+  floor: number | null
+  building: string | null
+  report: HkReportSummary | null
+}
+
+/** `GET /hk/api/reports[?date=YYYY-MM-DD]`. `date` is echoed by the server —
+ *  Bangkok's today when the client did not ask for one. */
+export interface HkReportsResponse {
+  success: boolean
+  date: string
+  rooms: HkReportRoom[]
+}
+
+/** Every write endpoint answers with the report it just wrote. */
+export interface HkReportResponse {
+  success: boolean
+  report: HkReport
+}
+
+/** `POST /hk/api/report-photos` (multipart). */
+export interface HkReportPhotoResponse {
+  success: boolean
+  photoId: number
+}
+
+/** The body of `POST /hk/api/rooms/{roomId}/report`. Maid-only. */
+export interface HkReportSubmission {
+  roomStatus: RoomStatusCode
+  allItemsOk: boolean
+  items: HkReportItemException[]
+  photoIds: number[]
+  /** Omitted for today, which is the only case v1 has a screen for. */
+  date?: string
+  /** Set ONLY when this submission fixes a RETURNED report. Append-only
+   *  history: the fix is a new row that points at the one it supersedes. */
+  parentReportId?: number
+}
+
+// --- labels ----------------------------------------------------------------
+
+const ROOM_STATUS_LABELS: Record<string, string> = Object.fromEntries(
+  ROOM_STATUS_CODES.map(({ code, label }) => [code, label])
+)
+const ITEM_PROBLEM_LABELS: Record<string, string> = Object.fromEntries(
+  ITEM_PROBLEMS.map(({ problem, label }) => [problem, label])
+)
+const RETURN_REASON_LABELS: Record<string, string> = Object.fromEntries(
+  RETURN_REASONS.map(({ reason, label }) => [reason, label])
+)
+
+/** Thai label for a VC/CO/OO/SO code; the raw code for one this bundle
+ *  predates — a readable row beats a dropped one. PURE. */
+export function roomStatusLabel(code: string | null | undefined): string {
+  if (!code) return ''
+  return ROOM_STATUS_LABELS[code] ?? code
+}
+
+/** หาย / ชำรุด, falling back to the raw code. PURE. */
+export function itemProblemLabel(problem: string | null | undefined): string {
+  if (!problem) return ''
+  return ITEM_PROBLEM_LABELS[problem] ?? problem
+}
+
+/** The canned rejection's Thai label, falling back to the raw code. PURE. */
+export function returnReasonLabel(reason: string | null | undefined): string {
+  if (!reason) return ''
+  return RETURN_REASON_LABELS[reason] ?? reason
+}
+
+/**
+ * The report's date as a Thai reading ("2 ก.ย. 2569"), or the raw string when
+ * it cannot be parsed. The wire value is a plain calendar DAY (`YYYY-MM-DD`,
+ * Bangkok) rather than an instant, so there is no timezone conversion to get
+ * wrong here — and an unparseable value renders as itself rather than as
+ * "Invalid Date". PURE.
+ */
+export function reportDateLabel(date: string | null | undefined): string {
+  if (!date) return ''
+  const parsed = new Date(`${date}T00:00:00`)
+  if (Number.isNaN(parsed.getTime())) return date
+  return parsed.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+// --- state, chips and ordering ---------------------------------------------
+
+/** Where a room stands on the day overview. `unsent` is the absence of a
+ *  report, which is why this is a separate type from `ReportStatus`. */
+export type HkReportState = 'unsent' | 'submitted' | 'verified' | 'returned'
+
+/** The state of one overview row. A report whose `status` this bundle does not
+ *  know reads as `submitted` — "somebody has filed something" is the safest
+ *  thing to say about an unknown lifecycle value, and it never invites a maid
+ *  to file a duplicate. PURE. */
+export function reportState(report: HkReportSummary | null | undefined): HkReportState {
+  if (!report) return 'unsent'
+  if (report.status === 'verified') return 'verified'
+  if (report.status === 'returned') return 'returned'
+  return 'submitted'
+}
+
+/**
+ * The overview's state chip. Four states, four Thai phrases, and the RETURN
+ * REASON is part of the returned chip's label — a maid scanning her queue has
+ * to know WHY a room came back without opening it, and the reason is one of
+ * exactly three canned strings.
+ *
+ * Palette follows the /hk conventions already in this file rather than
+ * inventing a fifth vocabulary: gray = nothing yet, amber = in progress
+ * (matches กำลังทำความสะอาด), emerald = finished, red = needs work again. PURE.
+ */
+export function reportStateChip(report: HkReportSummary | null | undefined): {
+  state: HkReportState
+  label: string
+  className: string
+} {
+  const state = reportState(report)
+  switch (state) {
+    case 'submitted':
+      return {
+        state,
+        label: 'ส่งแล้ว รอตรวจ',
+        className: 'bg-amber-100 text-amber-800 border-amber-300',
+      }
+    case 'verified':
+      return {
+        state,
+        label: 'ตรวจแล้ว',
+        className: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+      }
+    case 'returned': {
+      const reason = returnReasonLabel(report?.returnReason)
+      return {
+        state,
+        label: reason ? `ส่งกลับแก้ไข: ${reason}` : 'ส่งกลับแก้ไข',
+        className: 'bg-red-100 text-red-800 border-red-300',
+      }
+    }
+    default:
+      return {
+        state,
+        label: 'ยังไม่ส่ง',
+        className: 'bg-gray-100 text-gray-600 border-gray-300',
+      }
+  }
+}
+
+/**
+ * Each role's queue order — the SAME rooms, sorted by whose move it is.
+ *
+ * A maid's queue leads with `returned` (a room she has to walk back to, and
+ * the only state that means her work was rejected), then the rooms she has not
+ * reported at all; what she has already filed sinks. Reception's leads with
+ * `submitted`, which is the only state she can act on at all, then `returned`
+ * (she sent it back and is waiting on it), then `unsent`, with `verified` — a
+ * finished room for both roles — last in both orders.
+ */
+export const REPORT_STATE_ORDER: Record<HkSignalRole, readonly HkReportState[]> = {
+  maid: ['returned', 'unsent', 'submitted', 'verified'],
+  reception: ['submitted', 'returned', 'unsent', 'verified'],
+}
+
+/** This row's rank in `role`'s queue — lower sorts first. PURE. */
+export function reportRoomPriority(row: HkReportRoom, role: HkSignalRole): number {
+  const order = REPORT_STATE_ORDER[role] ?? REPORT_STATE_ORDER.maid
+  const index = order.indexOf(reportState(row.report))
+  return index === -1 ? order.length : index
+}
+
+/**
+ * The rooms in `role`'s working order, room number breaking ties the same
+ * numeric-aware way every other /hk list sorts (104, 203, 301 — a walking
+ * order, not the order the server happened to return). Does not mutate the
+ * input. PURE.
+ */
+export function sortReportRooms(rooms: HkReportRoom[], role: HkSignalRole): HkReportRoom[] {
+  return [...rooms].sort(
+    (a, b) =>
+      reportRoomPriority(a, role) - reportRoomPriority(b, role) ||
+      a.roomNo.localeCompare(b.roomNo, undefined, { numeric: true })
+  )
+}
+
+/** How many rooms sit in each state — the overview's summary bar. PURE. */
+export function reportStateCounts(rooms: HkReportRoom[]): Record<HkReportState, number> {
+  const counts: Record<HkReportState, number> = {
+    unsent: 0,
+    submitted: 0,
+    verified: 0,
+    returned: 0,
+  }
+  for (const row of rooms) counts[reportState(row.report)] += 1
+  return counts
+}
+
+// --- room-status prefill ---------------------------------------------------
+
+/**
+ * The room-status code the form OPENS on, derived from facts we already hold
+ * about the room. The maid may tap any of the four; what she leaves selected is
+ * what the backend stores — this only decides which button starts pressed, so a
+ * wrong guess costs one tap, never a wrong record.
+ *
+ * THE MAPPING (in order; the first matching rule wins):
+ *
+ *   | room facts                                    | code | label            |
+ *   |-----------------------------------------------|------|------------------|
+ *   | `occupancy === 'occupied'`                    | `so` | พักต่อ            |
+ *   | not occupied AND `expectedDeparture === true` | `co` | เช็คเอาท์         |
+ *   | anything else (skew included)                 | `vc` | ทำความสะอาดแล้ว   |
+ *   | — never derived —                             | `oo` | รอซ่อม            |
+ *
+ * Why occupancy is read FIRST, ahead of a same-day departure: a guest still in
+ * the room when the maid is standing in it is a พักต่อ from her point of view
+ * whatever the booking says — a departure the guest has not made yet is not a
+ * checkout. Once they have actually gone, `occupancy` flips to vacant and rule
+ * 2 turns the same room into CO.
+ *
+ * Why `roomClean` is deliberately NOT read: the report is filed AFTER the work,
+ * so the room's pre-work cleanliness would prefill the wrong answer on exactly
+ * the rooms a maid spends her morning on. VC is the resting default instead.
+ *
+ * Why OO is never derived: nothing on `HkRoom` says "out of order" — แจ้งซ่อม
+ * lives in the housekeeping ops app and never reaches this surface — so OO is
+ * a judgement the maid makes and taps. Guessing it from a proxy would be
+ * inventing a maintenance record. PURE.
+ */
+export function prefillRoomStatus(
+  room: Pick<HkRoom, 'occupancy' | 'expectedDeparture'> | null | undefined
+): RoomStatusCode {
+  if (room?.occupancy === 'occupied') return 'so'
+  if (room?.expectedDeparture === true) return 'co'
+  return 'vc'
+}
+
+// --- the equipment checklist (exception-based) -----------------------------
+
+/** Quantity floor. An exception exists only when at least one is wrong, so the
+ *  stepper's bottom is 1 — dropping to zero is done by un-toggling the row,
+ *  not by stepping into a `qty: 0` the wire has no meaning for. */
+export const REPORT_MIN_QTY = 1
+
+/** Quantity ceiling. Mirrors the server's 1..=99 and, like the linen stepper's
+ *  own ceiling, keeps a stuck thumb in a pocket from turning into a 400-towel
+ *  accusation against a guest. */
+export const REPORT_MAX_QTY = 99
+
+/** Hold a stepper value inside the contract. PURE. */
+export function clampReportQty(qty: number): number {
+  if (!Number.isFinite(qty)) return REPORT_MIN_QTY
+  return Math.min(REPORT_MAX_QTY, Math.max(REPORT_MIN_QTY, Math.trunc(qty)))
+}
+
+/**
+ * The form's exception draft: `"<item>:<problem>" → qty`. Keyed by the PAIR
+ * because one item can be wrong in two ways at once (two towels หาย and a
+ * third ชำรุด is one room, two exceptions), and sparse because the wire says
+ * what is wrong and never what is fine.
+ */
+export type HkReportExceptionDraft = Record<string, number>
+
+/** The draft's key for one item+problem pair. One helper, so the toggle, the
+ *  stepper and the body builder can never spell it differently. PURE. */
+export function reportExceptionKey(item: string, problem: string): string {
+  return `${item}:${problem}`
+}
+
+/** This pair's quantity, or 0 when it is not an exception at all. PURE. */
+export function reportExceptionQty(
+  draft: HkReportExceptionDraft,
+  item: string,
+  problem: string
+): number {
+  return draft[reportExceptionKey(item, problem)] ?? 0
+}
+
+/** Turn one item+problem on (at `REPORT_MIN_QTY`) or off. Off DELETES the key
+ *  rather than storing a zero — see `HkReportExceptionDraft`. PURE. */
+export function toggleReportException(
+  draft: HkReportExceptionDraft,
+  item: string,
+  problem: string
+): HkReportExceptionDraft {
+  const key = reportExceptionKey(item, problem)
+  if (draft[key]) {
+    const next = { ...draft }
+    delete next[key]
+    return next
+  }
+  return { ...draft, [key]: REPORT_MIN_QTY }
+}
+
+/** Step one pair's quantity, clamped in the REDUCER rather than only on the
+ *  buttons' `disabled` — a bound that exists only as an attribute is one
+ *  double-tap away from not existing. A pair that is not on stays off. PURE. */
+export function stepReportException(
+  draft: HkReportExceptionDraft,
+  item: string,
+  problem: string,
+  delta: number
+): HkReportExceptionDraft {
+  const key = reportExceptionKey(item, problem)
+  const current = draft[key]
+  if (!current) return draft
+  return { ...draft, [key]: clampReportQty(current + delta) }
+}
+
+/**
+ * The request body's `items` — every selected pair, in REPORT_ITEMS ×
+ * ITEM_PROBLEMS order so the report reads the way the form did however it was
+ * tapped. PURE.
+ */
+export function reportExceptionItems(
+  draft: HkReportExceptionDraft
+): HkReportItemException[] {
+  const items: HkReportItemException[] = []
+  for (const { item } of REPORT_ITEMS) {
+    for (const { problem } of ITEM_PROBLEMS) {
+      const qty = reportExceptionQty(draft, item, problem)
+      if (qty > 0) items.push({ item, problem, qty })
+    }
+  }
+  return items
+}
+
+/**
+ * A draft rebuilt from a report's exceptions — the RETURNED-report path, where
+ * the maid's previous answers are prefilled into the fresh form so she edits
+ * what was wrong instead of re-entering twenty-two rows in a corridor. Unknown
+ * codes from a newer backend are carried through as-is; the picker simply has
+ * no row for them, and they are dropped by `reportExceptionItems` on the way
+ * back out (the form can only send what it can show). PURE.
+ */
+export function reportExceptionDraftFrom(
+  items: HkReportItemException[] | null | undefined
+): HkReportExceptionDraft {
+  const draft: HkReportExceptionDraft = {}
+  for (const { item, problem, qty } of items ?? []) {
+    draft[reportExceptionKey(item, problem)] = clampReportQty(qty)
+  }
+  return draft
+}
+
+/** The exceptions as renderable rows — Thai labels resolved once, order as
+ *  delivered (the server already orders them; re-sorting would invent a second
+ *  opinion about an order that is already agreed). PURE. */
+export function reportItemRows(
+  items: HkReportItemException[] | null | undefined
+): Array<{ key: string; item: string; problem: string; qty: number; label: string; problemLabel: string }> {
+  return (items ?? []).map(({ item, problem, qty }) => ({
+    key: reportExceptionKey(item, problem),
+    item,
+    problem,
+    qty,
+    label: reportItemLabel(item),
+    problemLabel: itemProblemLabel(problem),
+  }))
+}
+
+// --- validation ------------------------------------------------------------
+
+/** The toggle and the list must agree: `allItemsOk` means the room is fine, so
+ *  there can be no exceptions; its opposite is a claim that must NAME at least
+ *  one. Empty iff ok — the server enforces the same. PURE. */
+export function reportItemsConsistent(
+  allItemsOk: boolean,
+  items: HkReportItemException[]
+): boolean {
+  return allItemsOk ? items.length === 0 : items.length > 0
+}
+
+/** 1..=4, both sides. PURE. */
+export function reportPhotoCountValid(count: number): boolean {
+  return count >= REPORT_MIN_PHOTOS && count <= REPORT_MAX_PHOTOS
+}
+
+/** May the maid's ส่งรายงาน button fire? Every rule the server would refuse
+ *  on, checked here so she is never told "no" after the upload. PURE. */
+export function canSubmitReport(draft: {
+  roomStatus: string | null
+  allItemsOk: boolean
+  items: HkReportItemException[]
+  photoIds: number[]
+}): boolean {
+  if (!draft.roomStatus) return false
+  if (!ROOM_STATUS_CODES.some(({ code }) => code === draft.roomStatus)) return false
+  if (!reportItemsConsistent(draft.allItemsOk, draft.items)) return false
+  if (draft.items.some(({ qty }) => qty < REPORT_MIN_QTY || qty > REPORT_MAX_QTY)) return false
+  return reportPhotoCountValid(draft.photoIds.length)
+}
+
+/** A verify needs reception's OWN photos — the two-sided evidence IS the
+ *  feature (CONTEXT.md §Housekeeping). PURE. */
+export function canVerifyReport(photoIds: number[]): boolean {
+  return reportPhotoCountValid(photoIds.length)
+}
+
+/** A return needs a reason and NO photos: it is a rejection, not a walk-up.
+ *  PURE. */
+export function canReturnReport(reason: string | null): boolean {
+  return Boolean(reason) && RETURN_REASONS.some(({ reason: r }) => r === reason)
+}
+
+/** Who may FILE a report / who may VERIFY one. Two helpers rather than one
+ *  negation, because they are two different rules that happen to be opposites
+ *  today: a maid never verifies — including one who also holds the reception
+ *  grant, which `canReport` already resolves to the maid side. UX only; the
+ *  server enforces both. PURE. */
+export function canFileReport(role: HkSignalRole): boolean {
+  return role === 'maid'
+}
+
+export function canVerifyReports(role: HkSignalRole): boolean {
+  return role === 'reception'
+}
+
+// --- photos ----------------------------------------------------------------
+
+/** The longest edge a maid's photo is uploaded at. A phone camera's 12MP JPEG
+ *  is ~4MB of nothing useful for "is this room clean"; 1600px is legible on
+ *  reception's screen and uploads over hotel wifi in a corridor. */
+export const REPORT_PHOTO_MAX_PX = 1600
+
+/** JPEG quality for the downscale. High enough that a stain is still a stain. */
+export const REPORT_PHOTO_QUALITY = 0.82
+
+/** The server's own cap, mirrored so an oversized upload is refused HERE with
+ *  Thai copy rather than as a bare 413 after a slow upload. */
+export const REPORT_PHOTO_MAX_BYTES = 5 * 1024 * 1024
+
+/**
+ * The dimensions a photo is drawn at: unchanged when it already fits, scaled
+ * by its LONGEST edge otherwise (aspect ratio preserved, both edges at least
+ * 1px). Nonsense input (a zero-height image, a NaN from a broken decoder)
+ * returns `{0, 0}`, which the caller reads as "don't touch this file". PURE —
+ * this is the whole testable part of the downscale.
+ */
+export function downscaleDimensions(
+  width: number,
+  height: number,
+  max: number = REPORT_PHOTO_MAX_PX
+): { width: number; height: number } {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return { width: 0, height: 0 }
+  }
+  const longest = Math.max(width, height)
+  if (longest <= max) return { width: Math.round(width), height: Math.round(height) }
+  const scale = max / longest
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  }
+}
+
+/**
+ * Downscale a captured photo to a ≤`REPORT_PHOTO_MAX_PX` JPEG before it goes
+ * up. DOM-dependent by nature (canvas), so the arithmetic lives in
+ * `downscaleDimensions` above, which is what the tests own.
+ *
+ * EVERY failure path returns the ORIGINAL file rather than throwing: no
+ * `createImageBitmap` (an ancient WebView, or jsdom), no 2D context, a decoder
+ * that gives up, a `toBlob` that hands back nothing. A maid standing in a room
+ * she has just cleaned must be able to file her report; a 4MB upload is a slow
+ * report, while a thrown error is no report at all — and the server's 5MB cap
+ * is still the backstop underneath.
+ */
+export async function downscalePhoto(
+  file: File | Blob,
+  max: number = REPORT_PHOTO_MAX_PX
+): Promise<Blob> {
+  // Checked FIRST, before anything is decoded: this is the one call that is
+  // simply absent outside a real browser, and bailing here keeps the fallback
+  // silent instead of noisy.
+  if (typeof createImageBitmap !== 'function') return file
+  try {
+    const bitmap = await createImageBitmap(file)
+    const { width, height } = downscaleDimensions(bitmap.width, bitmap.height, max)
+    if (width === 0 || height === 0) {
+      bitmap.close?.()
+      return file
+    }
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const ctx = canvas.getContext('2d')
+    if (!ctx) {
+      bitmap.close?.()
+      return file
+    }
+    ctx.drawImage(bitmap, 0, 0, width, height)
+    bitmap.close?.()
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, 'image/jpeg', REPORT_PHOTO_QUALITY)
+    })
+    return blob && blob.size > 0 ? blob : file
+  } catch {
+    return file
+  }
+}
+
+/**
+ * `<img src>` for one stored photo. Branch-scoped like every other /hk call —
+ * `hkFetch` cannot append the query string for us here, because the browser
+ * issues this request itself.
+ *
+ * Returns `''` for a missing branch, and the caller renders nothing: a
+ * wrong-hotel image URL is the same class of bug as a wrong-hotel report, and
+ * an empty `src` is a bug that shows rather than one that misleads. PURE.
+ */
+export function hkReportPhotoUrl(photoId: number, branch: Branch | null): string {
+  if (!branch) return ''
+  return `${HK_API_BASE}/report-photos/${photoId}?branch=${encodeURIComponent(branch)}`
+}
+
+// --- fetch helpers ---------------------------------------------------------
+
+const REPORT_READ_ERROR = 'ไม่สามารถดึงรายงานได้ กรุณาลองใหม่'
+const REPORT_WRITE_ERROR = 'บันทึกไม่สำเร็จ กรุณาลองใหม่'
+const REPORT_CONFLICT_ERROR = 'ห้องนี้ส่งรายงานของวันนี้ไปแล้ว'
+const PHOTO_UPLOAD_ERROR = 'อัปโหลดรูปไม่สำเร็จ กรุณาลองใหม่'
+const PHOTO_TOO_LARGE_ERROR = 'รูปใหญ่เกินไป กรุณาถ่ายใหม่'
+
+/** Success copy, as constants: the overview and the report screen both show
+ *  them, and two spellings of "ส่งรายงานแล้ว" is how a maid learns to distrust
+ *  the banner. */
+export const REPORT_SUBMITTED_NOTICE = 'ส่งรายงานแล้ว'
+export const REPORT_VERIFIED_NOTICE = 'บันทึกแล้ว: ตรวจแล้ว'
+export const REPORT_RETURNED_NOTICE = 'ส่งกลับให้แม่บ้านแก้ไขแล้ว'
+
+/** POST JSON through `hkFetch`, treating a 200 that carries `success: false`
+ *  as a failure — the standing /hk rule (a green banner over a write that never
+ *  landed is worse than an error). 409 gets its own copy: "already reported" is
+ *  not a retry, it is an answer. */
+async function postReportJson<T extends { success: boolean }>(
+  path: string,
+  branch: Branch | null,
+  body: unknown
+): Promise<T> {
+  const res = await hkFetch(path, branch, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (res.status === 409) throw new Error(REPORT_CONFLICT_ERROR)
+  const parsed: T | null = res.ok ? await res.json().catch(() => null) : null
+  if (!res.ok || !parsed?.success) throw new Error(REPORT_WRITE_ERROR)
+  return parsed
+}
+
+/**
+ * The day overview: every active room of the branch with its LATEST report for
+ * that date. `date` is omitted for today — v1 has no date picker, and the
+ * server's Bangkok "today" is the one answer both roles must be looking at.
+ *
+ * Returns the server's echoed `date` so the screen renders the day it actually
+ * got, never the day it assumed.
+ */
+export async function fetchHkReports(
+  branch: Branch | null,
+  date?: string
+): Promise<{ date: string; rooms: HkReportRoom[] }> {
+  const path = date ? `/reports?date=${encodeURIComponent(date)}` : '/reports'
+  const res = await hkFetch(path, branch)
+  if (!res.ok) throw new Error(REPORT_READ_ERROR)
+  const body: HkReportsResponse | null = await res.json().catch(() => null)
+  if (!body?.success) throw new Error(REPORT_READ_ERROR)
+  return {
+    date: typeof body.date === 'string' ? body.date : '',
+    rooms: Array.isArray(body.rooms) ? body.rooms : [],
+  }
+}
+
+/** One report in full — items and photo ids, which the overview's summary DTO
+ *  deliberately does not carry. */
+export async function fetchHkReport(
+  branch: Branch | null,
+  reportId: number
+): Promise<HkReport> {
+  const res = await hkFetch(`/reports/${reportId}`, branch)
+  if (!res.ok) throw new Error(REPORT_READ_ERROR)
+  const body: { success: boolean; report: HkReport } | null = await res.json().catch(() => null)
+  if (!body?.success || !body.report) throw new Error(REPORT_READ_ERROR)
+  return body.report
+}
+
+/**
+ * Everything the per-room report screen needs about the DAY: the room's row
+ * from the overview and, when it has a report, that report in full.
+ *
+ * Composed here rather than in the page because there is no "latest report for
+ * this room" endpoint — the day list IS that index — and a screen that
+ * open-coded the two-step would be one refactor away from rendering a summary
+ * DTO's absent `items` as "no exceptions".
+ */
+export async function fetchHkRoomReport(
+  branch: Branch | null,
+  roomId: number,
+  date?: string
+): Promise<{ date: string; room: HkReportRoom | null; report: HkReport | null }> {
+  const { date: day, rooms } = await fetchHkReports(branch, date)
+  const room = rooms.find((r) => r.roomId === roomId) ?? null
+  const summary = room?.report ?? null
+  const report = summary ? await fetchHkReport(branch, summary.reportId) : null
+  return { date: day, room, report }
+}
+
+/**
+ * Upload ONE photo and get its id back. Multipart, field name `photo`.
+ *
+ * NO `Content-Type` header — the browser must set it itself so the multipart
+ * boundary matches the body. Setting it by hand is the classic way to make
+ * every upload fail with a 400 that looks like a server bug.
+ *
+ * The `photoId` is the whole result: photos are uploaded as they are taken and
+ * ATTACHED later by the submit/verify body, so an abandoned form leaves
+ * unattached rows behind. That is accepted debt in v1 (no GC) — the alternative
+ * is holding four full-size images in a WebView's memory until the maid taps
+ * submit, which is how a phone kills the tab mid-report.
+ */
+export async function uploadHkReportPhoto(
+  branch: Branch | null,
+  photo: Blob,
+  filename = 'photo.jpg'
+): Promise<number> {
+  if (photo.size > REPORT_PHOTO_MAX_BYTES) throw new Error(PHOTO_TOO_LARGE_ERROR)
+  const form = new FormData()
+  form.append('photo', photo, filename)
+  const res = await hkFetch('/report-photos', branch, { method: 'POST', body: form })
+  if (res.status === 413) throw new Error(PHOTO_TOO_LARGE_ERROR)
+  const body: HkReportPhotoResponse | null = res.ok ? await res.json().catch(() => null) : null
+  if (!res.ok || !body?.success || typeof body.photoId !== 'number') {
+    throw new Error(PHOTO_UPLOAD_ERROR)
+  }
+  return body.photoId
+}
+
+/** File a room's daily report. Maid-only; a viewer's POST is refused with 403
+ *  whatever the UI offered. */
+export async function submitHkReport(
+  branch: Branch | null,
+  roomId: number,
+  submission: HkReportSubmission
+): Promise<HkReport> {
+  const body = await postReportJson<HkReportResponse>(
+    `/rooms/${roomId}/report`,
+    branch,
+    submission
+  )
+  return body.report
+}
+
+/** Reception's countersignature — submitted → verified, with her OWN photos. */
+export async function verifyHkReport(
+  branch: Branch | null,
+  reportId: number,
+  photoIds: number[]
+): Promise<HkReport> {
+  const body = await postReportJson<HkReportResponse>(`/reports/${reportId}/verify`, branch, {
+    photoIds,
+  })
+  return body.report
+}
+
+/** Reception's rejection — submitted → returned, canned reason, no photos. */
+export async function returnHkReport(
+  branch: Branch | null,
+  reportId: number,
+  reason: ReturnReason
+): Promise<HkReport> {
+  const body = await postReportJson<HkReportResponse>(`/reports/${reportId}/return`, branch, {
+    reason,
+  })
+  return body.report
+}
+
+// --- the cross-screen success banner ---------------------------------------
+//
+// A landed submit/verify/return sends the user BACK to the day overview, and
+// the confirmation has to survive that navigation. Same defensive idiom as the
+// branch storage above — one key, read in a try/catch, a storage failure
+// degrades to "no banner" rather than throwing. sessionStorage, not local: a
+// banner is about the tap that just happened, and must not reappear tomorrow.
+
+const REPORT_NOTICE_KEY = 'hk.reportNotice'
+
+export function stashHkReportNotice(message: string): void {
+  try {
+    sessionStorage.setItem(REPORT_NOTICE_KEY, message)
+  } catch {
+    /* nothing to do — the destination simply renders no banner */
+  }
+}
+
+/** Read the pending banner and CLEAR it in one move: it is a one-shot, and a
+ *  banner that survives a reload is a banner about nothing. */
+export function takeHkReportNotice(): string | null {
+  try {
+    const stored = sessionStorage.getItem(REPORT_NOTICE_KEY)
+    if (stored) sessionStorage.removeItem(REPORT_NOTICE_KEY)
+    return stored || null
+  } catch {
+    return null
   }
 }

@@ -76,7 +76,15 @@ path = "src/bin/repair_room_legacy_keys.rs"
 # Web framework (matches Tauri middleware).
 # 0.8 migration (2026-05-01): path param syntax changed from `/:id` to `/{id}`
 # (matchit 0.8 upgrade — old syntax now panics at startup, see CHANGELOG).
-axum = "0.8"
+# `multipart` (2026-09-02, Report HK / migration 091): `POST
+# /api/hk/report-photos` takes ONE image per request as `multipart/form-data`
+# — a phone camera upload, not a JSON payload. The feature pulls in `multer`
+# (the parser axum itself uses) and nothing else. It is NOT default-on, and the
+# repo had no multipart route before this one: the retired broken-item intake
+# took a base64 `imageBase64` field, the pattern `routes::guest_documents`
+# still uses. Base64 was rejected here because four 5 MB photos would be ~27 MB
+# of JSON string per report on a 4G phone.
+axum = { version = "0.8", features = ["multipart"] }
 # Promoted from transitive (already in the dep tree via `url`) to direct so the
 # ville-write guard middleware can robustly URL-decode the `branch` query param.
 form_urlencoded = "1.2"

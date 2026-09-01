@@ -7,10 +7,11 @@
 //! is inert. These tests pin the DISABLED posture — the one an operator can
 //! return to — because that is where the exemption has teeth:
 //!
-//! - the maid's report routes — `cleaning`, `linen-shortage` (migration 088)
-//!   and, since migration 090, `linen-shortage/resolve` — must still be
-//!   admitted, so a housekeeping report is not collateral damage of a
-//!   front-desk write-policy toggle;
+//! - the maid's report routes — `cleaning`, `linen-shortage` (migration 088),
+//!   `linen-shortage/resolve` (migration 090) and, since migration 091, the
+//!   whole Report HK set (`rooms/{id}/report`, `reports/{id}/verify|return`,
+//!   `report-photos`) — must still be admitted, so a housekeeping report is not
+//!   collateral damage of a front-desk write-policy toggle;
 //! - nothing else may be, so an admitted mutation can never outrun a narrowed
 //!   `HFVILLE_WRITEBACK_INTENTS`, which would leave canonical PG ahead of
 //!   Ville's iHOTEL. (`linen-shortage` cannot outrun anything even in
@@ -273,6 +274,114 @@ async fn linen_exemption_does_not_widen_on_the_shipped_router() {
             StatusCode::FORBIDDEN,
             "{method} on the linen path must NOT be exempt"
         );
+    }
+}
+
+/// Report HK (migration 091) must be admitted for `branch=hfville` on all FOUR
+/// of its write shapes — the maid's submission, reception's two verdicts, and
+/// the photo intake.
+///
+/// The safety argument is the room signals', not the cleaning report's: the
+/// three `ht_hk_room_report*` tables have no legacy counterpart AT ALL, so
+/// there is no writeback recipe to write, no intent for a narrowed
+/// `HFVILLE_WRITEBACK_INTENTS` to park as `'skipped'`, and no dark flag waiting
+/// to enable one. Canonical PG cannot run ahead of Ville's iHOTEL because
+/// nothing here has an iHOTEL side.
+///
+/// The two VERDICTS are the notable inclusion: they are reception-side writes,
+/// and every other reception-side write on this estate follows front-desk write
+/// policy. These do not, because they are served from the MAID surface's own
+/// router by a receptionist standing in the room — a 403 there strands a maid's
+/// submitted report unjudged for as long as the toggle is off.
+///
+/// Needs no database: both layers answer before a pool is touched.
+#[tokio::test]
+async fn hfville_report_hk_is_admitted_while_ville_writes_are_disabled() {
+    for (uri, body) in [
+        (
+            "/api/hk/rooms/1/report?branch=hfville",
+            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+        ),
+        ("/api/hk/reports/9/verify?branch=hfville", r#"{"photoIds":[1]}"#),
+        (
+            "/api/hk/reports/9/return?branch=hfville",
+            r#"{"reason":"not_clean"}"#,
+        ),
+        ("/api/hk/report-photos?branch=hfville", ""),
+    ] {
+        let status = probe_with_body(lazy_pool(), "POST", uri, false, body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "expected the Ville guard to ADMIT {uri} (leaving the Access gate to \
+             answer 401); a 403 means Ville housekeeping cannot file or judge a \
+             room report whenever front-desk Ville writes are turned off"
+        );
+    }
+}
+
+/// The Report HK widening admits FOUR paths, not four shapes. The three
+/// collections' action lists are separate, the photo intake is a whole-path
+/// equality (so its READ endpoint is NOT exempt), and no near-miss inherits an
+/// exemption.
+///
+/// This is the half that matters: a matcher that shared one action list across
+/// collections, or that used `starts_with` for the photo path, would pass the
+/// admit test above while silently exempting a much larger surface.
+#[tokio::test]
+async fn the_report_hk_exemption_does_not_widen_on_the_shipped_router() {
+    for uri in [
+        // A verdict leaf under the wrong collection, and vice versa.
+        "/api/hk/rooms/1/verify?branch=hfville",
+        "/api/hk/rooms/1/return?branch=hfville",
+        "/api/hk/reports/9/cleaning?branch=hfville",
+        "/api/hk/reports/9/signals?branch=hfville",
+        "/api/hk/reports/9/ack?branch=hfville",
+        "/api/hk/signals/7/verify?branch=hfville",
+        "/api/hk/signals/7/report?branch=hfville",
+        // Near-misses on the submission path.
+        "/api/hk/rooms/1/reportX?branch=hfville",
+        "/api/hk/rooms/1/reports?branch=hfville",
+        "/api/hk/rooms/1/report/extra?branch=hfville",
+        "/api/hk/rooms/1a/report?branch=hfville",
+        // Near-misses on the verdict paths.
+        "/api/hk/reports/9/verifyX?branch=hfville",
+        "/api/hk/reports/9/verify/extra?branch=hfville",
+        "/api/hk/reports/9a/verify?branch=hfville",
+        "/api/hk/reports/9?branch=hfville",
+        // The photo intake is an EXACT path: its READ endpoint and every
+        // near-miss must fall through to the normal gate.
+        "/api/hk/report-photos/9?branch=hfville",
+        "/api/hk/report-photosX?branch=hfville",
+        "/api/hk/report-photos/9/delete?branch=hfville",
+        // The desk tree follows front-desk write policy at every depth.
+        "/api/housekeeping/reports/9/verify?branch=hfville",
+        "/api/housekeeping/report-photos?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "POST", uri, false, "{}").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{uri} must be refused by the Ville guard; 401 would mean the Report \
+             HK exemption is matching a shape rather than four paths"
+        );
+    }
+
+    // The exempt paths with a mutating non-POST method.
+    for path in [
+        "/api/hk/rooms/1/report?branch=hfville",
+        "/api/hk/reports/9/verify?branch=hfville",
+        "/api/hk/reports/9/return?branch=hfville",
+        "/api/hk/report-photos?branch=hfville",
+    ] {
+        for method in ["PUT", "PATCH", "DELETE"] {
+            let status = probe_with_body(lazy_pool(), method, path, false, "{}").await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} on {path} must NOT be exempt"
+            );
+        }
     }
 }
 

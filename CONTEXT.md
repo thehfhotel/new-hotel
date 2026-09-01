@@ -88,6 +88,25 @@ signals for the desk to act on before settling. The answer completes the check.
 _Avoid_: "inspection checklist" (no per-item checklist exists — the answer is the maid's
 judgment), auto-firing on checkout open (many checkouts settle without an inspection)
 
+**Room report (Report HK)**:
+One maid's per-room daily attestation, digitizing the paper Report HK sheet: the room's
+status code (VC/CO/OO/SO, prefilled from known room facts but stored as SHE reported it),
+an exception-based equipment checklist (ครบทุกรายการ, or named items marked หาย/ชำรุด — an
+excepted item also raises the matching guest-accountability signal immediately), and photo
+evidence. Filled per ROOM, not per day-sheet; the day overview screen is the sheet's heir
+and each side's work queue.
+_Avoid_: "day sheet" as the submission unit (a paper artifact, not the domain), "inspection"
+(that's the verification, below), free-text remarks (ruled out everywhere on this surface)
+
+**Report verification**:
+Reception's countersignature on a room report: any receptionist of the branch verifies —
+with their OWN photo evidence, so a verify is a walk-up, not a desk stamp — or returns it
+with a canned reason (ยังไม่สะอาด / อุปกรณ์ไม่ตรงกับที่รายงาน / รูปไม่ชัดเจน). A returned
+report is superseded by a fresh submission that references it; history is append-only. A
+maid never verifies, including one who also holds the reception grant.
+_Avoid_: "approve" without photos (the two-sided evidence IS the feature), free-text
+rejection notes
+
 **On-duty maid**:
 A maid who clocked in today at a given branch's fingerprint device and has not clocked out —
 the attendance system's answer to "who is physically working here right now." The day's punch

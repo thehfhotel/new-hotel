@@ -23,6 +23,7 @@ import Link from 'next/link'
 import {
   AlertCircle,
   ChevronRight,
+  ClipboardList,
   Info,
   Loader2,
   RefreshCw,
@@ -315,6 +316,26 @@ export default function HkRoomListPage() {
 
       {!showPicker && !showUnavailable && !meError && (
         <>
+          {/* ------------------------------------------------------------- *
+           * Report HK entry point. The daily room report has its own LINE
+           * tile, but a maid already standing on this screen must not have to
+           * go back to the rich menu to reach it — and a reception viewer has
+           * no rich menu at all, so this is her ONLY way in.
+           *
+           * TEAL, a hue nothing on this surface has claimed: red = dirty,
+           * emerald = done, amber = in progress, sky = ขาดผ้า, indigo =
+           * signals, violet/orange = today's movement. The report is a
+           * different KIND of thing again, and reads as one.
+           * ------------------------------------------------------------- */}
+          <Link
+            href="/hk/report"
+            data-testid="hk-report-entry"
+            className="mb-4 flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-xl border border-teal-300 bg-teal-50 px-3 py-3 text-sm font-semibold text-teal-800 active:bg-teal-100"
+          >
+            <ClipboardList className="h-4 w-4" />
+            รายงานประจำวัน
+          </Link>
+
           {/* Room-list error notice */}
           {error && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">

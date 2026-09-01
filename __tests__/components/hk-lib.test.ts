@@ -11,8 +11,53 @@
 
 import {
   branchesUnavailableMessage,
+  canFileReport,
   canReport,
+  canReturnReport,
+  canSubmitReport,
+  canVerifyReport,
+  canVerifyReports,
+  clampReportQty,
   countRoomsNeedingClean,
+  downscaleDimensions,
+  fetchHkReport,
+  fetchHkReports,
+  fetchHkRoomReport,
+  hkReportPhotoUrl,
+  itemProblemLabel,
+  ITEM_PROBLEMS,
+  prefillRoomStatus,
+  REPORT_ITEMS,
+  REPORT_MAX_PHOTOS,
+  REPORT_MAX_QTY,
+  REPORT_MIN_QTY,
+  reportDateLabel,
+  reportExceptionDraftFrom,
+  reportExceptionItems,
+  reportExceptionKey,
+  reportExceptionQty,
+  reportItemRows,
+  reportItemsConsistent,
+  reportPhotoCountValid,
+  reportRoomPriority,
+  reportState,
+  reportStateChip,
+  reportStateCounts,
+  returnHkReport,
+  returnReasonLabel,
+  RETURN_REASONS,
+  ROOM_STATUS_CODES,
+  roomStatusLabel,
+  sortReportRooms,
+  stashHkReportNotice,
+  stepReportException,
+  submitHkReport,
+  takeHkReportNotice,
+  toggleReportException,
+  uploadHkReportPhoto,
+  verifyHkReport,
+  type HkReportRoom,
+  type HkReportSummary,
   emptyLinenCounts,
   groupRoomsByFloor,
   hasOpenLinenShortage,
@@ -1281,5 +1326,864 @@ describe('signal sound mute (localStorage)', () => {
     expect(readSignalSoundMuted()).toBe(true)
     storeSignalSoundMuted(false)
     expect(readSignalSoundMuted()).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Report HK — the daily room report (CONTEXT.md §Housekeeping "Room report").
+//
+// These are the helpers that decide what a maid is SHOWN before she taps, and
+// what leaves the phone afterwards: the status prefill, the day overview's
+// state chips and queue order, the exception draft the checklist is built from,
+// the validation that keeps a report from being filed without evidence, and the
+// exact bodies of the three writes.
+// ---------------------------------------------------------------------------
+
+function reportRow(overrides: Partial<HkReportRoom> = {}): HkReportRoom {
+  return {
+    roomId: 1,
+    roomNo: '101',
+    floor: 1,
+    building: null,
+    report: null,
+    ...overrides,
+  }
+}
+
+function summary(overrides: Partial<HkReportSummary> = {}): HkReportSummary {
+  return {
+    reportId: 11,
+    roomId: 1,
+    status: 'submitted',
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The room-status prefill — the mapping table, asserted as a table.
+//
+// This decides which of VC/CO/OO/SO starts pressed on a form the maid can
+// override with one tap, so a wrong answer is cheap; getting it right is what
+// keeps the common room a single tap away from filed.
+// ---------------------------------------------------------------------------
+
+describe('prefillRoomStatus (the mapping table)', () => {
+  it.each([
+    ['occupied ⇒ SO (พักต่อ)', { occupancy: 'occupied' as const }, 'so'],
+    [
+      'occupied AND due out today ⇒ still SO — a departure the guest has not made is not a checkout',
+      { occupancy: 'occupied' as const, expectedDeparture: true },
+      'so',
+    ],
+    [
+      'vacant AND due out today ⇒ CO (เช็คเอาท์)',
+      { occupancy: 'vacant' as const, expectedDeparture: true },
+      'co',
+    ],
+    ['vacant, nobody due out ⇒ VC', { occupancy: 'vacant' as const }, 'vc'],
+    [
+      'departure flag alone (occupancy absent — deploy skew) ⇒ CO',
+      { expectedDeparture: true },
+      'co',
+    ],
+    ['nothing known at all (deploy skew) ⇒ VC, never a guess', {}, 'vc'],
+    [
+      'a DIRTY vacant room still prefills VC — roomClean is deliberately not read, the report is filed after the work',
+      { occupancy: 'vacant' as const, roomClean: false },
+      'vc',
+    ],
+    [
+      'an arrival due today changes nothing on its own',
+      { occupancy: 'vacant' as const, expectedArrival: true },
+      'vc',
+    ],
+  ])('%s', (_name, facts, expected) => {
+    expect(prefillRoomStatus(room(facts as Partial<HkRoom>))).toBe(expected)
+  })
+
+  it('never prefills OO — nothing on a room says "out of order", so it stays a judgement the maid taps', () => {
+    const derived = [
+      { occupancy: 'occupied' as const },
+      { occupancy: 'vacant' as const, expectedDeparture: true },
+      { occupancy: 'vacant' as const, roomClean: false },
+      {},
+    ].map((facts) => prefillRoomStatus(room(facts as Partial<HkRoom>)))
+    expect(derived).not.toContain('oo')
+  })
+
+  // A null room (the detail read has not answered yet) must not crash the form.
+  it('falls back to VC for a room it has not been given', () => {
+    expect(prefillRoomStatus(null)).toBe('vc')
+    expect(prefillRoomStatus(undefined)).toBe('vc')
+  })
+
+  it('only ever returns a code the vocabulary knows', () => {
+    const codes = ROOM_STATUS_CODES.map(({ code }) => code as string)
+    expect(codes).toContain(prefillRoomStatus(room({ occupancy: 'occupied' })))
+    expect(codes).toContain(prefillRoomStatus(room({})))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The day overview's state chip.
+// ---------------------------------------------------------------------------
+
+describe('reportState / reportStateChip', () => {
+  it('reads a missing report as ยังไม่ส่ง', () => {
+    expect(reportState(null)).toBe('unsent')
+    expect(reportStateChip(null).label).toBe('ยังไม่ส่ง')
+  })
+
+  it('labels a submitted report ส่งแล้ว รอตรวจ', () => {
+    expect(reportStateChip(summary({ status: 'submitted' })).label).toBe('ส่งแล้ว รอตรวจ')
+  })
+
+  it('labels a verified report ตรวจแล้ว', () => {
+    expect(reportStateChip(summary({ status: 'verified' })).label).toBe('ตรวจแล้ว')
+  })
+
+  // The reason is PART of the chip: a maid scanning her queue has to know why
+  // a room came back without opening it.
+  it('names the canned reason on a returned report', () => {
+    expect(
+      reportStateChip(summary({ status: 'returned', returnReason: 'photos_unclear' })).label
+    ).toBe('ส่งกลับแก้ไข: รูปไม่ชัดเจน')
+  })
+
+  it('still says ส่งกลับแก้ไข when the reason is missing', () => {
+    expect(reportStateChip(summary({ status: 'returned', returnReason: null })).label).toBe(
+      'ส่งกลับแก้ไข'
+    )
+  })
+
+  // Deploy skew: a lifecycle value this bundle predates. "Somebody has filed
+  // something" is the safe reading — it never invites a duplicate.
+  it('reads an unknown status as submitted rather than as nothing filed', () => {
+    const unknown = { ...summary(), status: 'escalated' } as unknown as HkReportSummary
+    expect(reportState(unknown)).toBe('submitted')
+  })
+
+  it('gives each state its own colour vocabulary', () => {
+    const classes = [
+      reportStateChip(null).className,
+      reportStateChip(summary({ status: 'submitted' })).className,
+      reportStateChip(summary({ status: 'verified' })).className,
+      reportStateChip(summary({ status: 'returned' })).className,
+    ]
+    expect(new Set(classes).size).toBe(4)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Each role's queue order — the same rooms, sorted by whose move it is.
+// ---------------------------------------------------------------------------
+
+describe('sortReportRooms / reportRoomPriority', () => {
+  const unsent = reportRow({ roomId: 1, roomNo: '101' })
+  const submitted = reportRow({ roomId: 2, roomNo: '102', report: summary({ status: 'submitted' }) })
+  const verified = reportRow({ roomId: 3, roomNo: '103', report: summary({ status: 'verified' }) })
+  const returned = reportRow({ roomId: 4, roomNo: '104', report: summary({ status: 'returned' }) })
+
+  it("leads a maid's queue with the rooms that came back, then the ones she has not filed", () => {
+    expect(
+      sortReportRooms([verified, submitted, unsent, returned], 'maid').map((r) => r.roomNo)
+    ).toEqual(['104', '101', '102', '103'])
+  })
+
+  it("leads reception's queue with what is waiting to be checked", () => {
+    expect(
+      sortReportRooms([verified, unsent, submitted, returned], 'reception').map((r) => r.roomNo)
+    ).toEqual(['102', '104', '101', '103'])
+  })
+
+  // A finished room is finished for both roles.
+  it('sinks verified rooms to the bottom for both roles', () => {
+    for (const role of ['maid', 'reception'] as const) {
+      const sorted = sortReportRooms([verified, unsent, submitted, returned], role)
+      expect(sorted[sorted.length - 1].roomNo).toBe('103')
+    }
+  })
+
+  // Walking order inside a state, the same numeric-aware compare every /hk
+  // list uses — 95 before 104, not after it.
+  it('breaks ties by room number, numerically', () => {
+    const rows = [
+      reportRow({ roomId: 1, roomNo: '301' }),
+      reportRow({ roomId: 2, roomNo: '104' }),
+      reportRow({ roomId: 3, roomNo: '95' }),
+    ]
+    expect(sortReportRooms(rows, 'maid').map((r) => r.roomNo)).toEqual(['95', '104', '301'])
+  })
+
+  it('does not mutate the list it was given', () => {
+    const rows = [verified, unsent]
+    sortReportRooms(rows, 'maid')
+    expect(rows.map((r) => r.roomNo)).toEqual(['103', '101'])
+  })
+
+  it('ranks by state, not by position', () => {
+    expect(reportRoomPriority(returned, 'maid')).toBeLessThan(reportRoomPriority(unsent, 'maid'))
+    expect(reportRoomPriority(submitted, 'reception')).toBeLessThan(
+      reportRoomPriority(returned, 'reception')
+    )
+  })
+})
+
+describe('reportStateCounts', () => {
+  it('counts every room into exactly one state', () => {
+    const counts = reportStateCounts([
+      reportRow(),
+      reportRow({ roomId: 2, roomNo: '102', report: summary({ status: 'submitted' }) }),
+      reportRow({ roomId: 3, roomNo: '103', report: summary({ status: 'submitted' }) }),
+      reportRow({ roomId: 4, roomNo: '104', report: summary({ status: 'verified' }) }),
+      reportRow({ roomId: 5, roomNo: '105', report: summary({ status: 'returned' }) }),
+    ])
+    expect(counts).toEqual({ unsent: 1, submitted: 2, verified: 1, returned: 1 })
+  })
+
+  it('is all zeroes for an empty branch', () => {
+    expect(reportStateCounts([])).toEqual({ unsent: 0, submitted: 0, verified: 0, returned: 0 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Labels — every server→client code falls back to itself rather than being
+// dropped, the same rule `linenKindLabel` follows.
+// ---------------------------------------------------------------------------
+
+describe('report labels', () => {
+  it('spells the room-status codes the way the paper form does', () => {
+    expect(roomStatusLabel('vc')).toBe('VC ห้องทำความสะอาดแล้ว')
+    expect(roomStatusLabel('so')).toBe('SO พักต่อ')
+  })
+
+  it('falls back to the raw code for a status a newer backend knows', () => {
+    expect(roomStatusLabel('xx')).toBe('xx')
+    expect(itemProblemLabel('soiled')).toBe('soiled')
+    expect(returnReasonLabel('smells')).toBe('smells')
+  })
+
+  it('renders nothing at all for an absent code', () => {
+    expect(roomStatusLabel(null)).toBe('')
+    expect(itemProblemLabel(undefined)).toBe('')
+    expect(returnReasonLabel(null)).toBe('')
+  })
+
+  it('spells หาย / ชำรุด and the three canned reasons', () => {
+    expect(itemProblemLabel('missing')).toBe('หาย')
+    expect(itemProblemLabel('damaged')).toBe('ชำรุด')
+    expect(returnReasonLabel('not_clean')).toBe('ยังไม่สะอาด')
+  })
+
+  // A calendar DAY, not an instant — nothing to convert, and nothing to get
+  // wrong. An unparseable value renders as itself, never as "Invalid Date".
+  it('renders an unparseable date as itself', () => {
+    expect(reportDateLabel('not-a-date')).toBe('not-a-date')
+    expect(reportDateLabel(null)).toBe('')
+  })
+
+  it('renders a real date as something Thai', () => {
+    expect(reportDateLabel('2026-09-02')).not.toBe('')
+    expect(reportDateLabel('2026-09-02')).not.toMatch(/Invalid/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The exception draft — the sparse `"<item>:<problem>" → qty` record the
+// checklist is built from. Keyed by the PAIR because one item can be wrong two
+// ways at once (two towels gone, a third torn).
+// ---------------------------------------------------------------------------
+
+describe('the exception draft', () => {
+  it('turns a pair on at qty 1 and off again', () => {
+    let draft = toggleReportException({}, 'bath_towel', 'missing')
+    expect(reportExceptionQty(draft, 'bath_towel', 'missing')).toBe(REPORT_MIN_QTY)
+    draft = toggleReportException(draft, 'bath_towel', 'missing')
+    expect(reportExceptionQty(draft, 'bath_towel', 'missing')).toBe(0)
+  })
+
+  // Off DELETES the key. A zero left behind would ship as `qty: 0`, which the
+  // wire has no meaning for.
+  it('deletes the key on the way off rather than storing a zero', () => {
+    const draft = toggleReportException(
+      toggleReportException({}, 'kettle', 'damaged'),
+      'kettle',
+      'damaged'
+    )
+    expect(Object.keys(draft)).toEqual([])
+  })
+
+  it('keeps หาย and ชำรุด for one item as two independent exceptions', () => {
+    let draft = toggleReportException({}, 'bath_towel', 'missing')
+    draft = toggleReportException(draft, 'bath_towel', 'damaged')
+    expect(reportExceptionItems(draft)).toEqual([
+      { item: 'bath_towel', problem: 'missing', qty: 1 },
+      { item: 'bath_towel', problem: 'damaged', qty: 1 },
+    ])
+  })
+
+  it('steps a selected pair and clamps in the REDUCER, not just on the buttons', () => {
+    let draft = toggleReportException({}, 'pillow', 'missing')
+    draft = stepReportException(draft, 'pillow', 'missing', 4)
+    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(5)
+    draft = stepReportException(draft, 'pillow', 'missing', -99)
+    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MIN_QTY)
+    draft = stepReportException(draft, 'pillow', 'missing', 500)
+    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MAX_QTY)
+  })
+
+  it('will not step a pair that is not an exception at all', () => {
+    expect(stepReportException({}, 'pillow', 'missing', 1)).toEqual({})
+  })
+
+  it('clamps a nonsense quantity to the floor rather than shipping NaN', () => {
+    expect(clampReportQty(Number.NaN)).toBe(REPORT_MIN_QTY)
+    expect(clampReportQty(2.7)).toBe(2)
+  })
+
+  // Order is the vocabulary's, not the tapping order: the report reads the way
+  // the paper form does however she filled it in.
+  it('emits items in REPORT_ITEMS × ITEM_PROBLEMS order however they were tapped', () => {
+    let draft = toggleReportException({}, 'pillow', 'damaged')
+    draft = toggleReportException(draft, 'water_glass', 'missing')
+    draft = toggleReportException(draft, 'kettle', 'missing')
+    expect(reportExceptionItems(draft).map((i) => i.item)).toEqual([
+      'water_glass',
+      'kettle',
+      'pillow',
+    ])
+    expect(REPORT_ITEMS.map(({ item }) => item).indexOf('water_glass')).toBeLessThan(
+      REPORT_ITEMS.map(({ item }) => item).indexOf('kettle')
+    )
+  })
+
+  it('emits nothing for an empty draft', () => {
+    expect(reportExceptionItems({})).toEqual([])
+  })
+
+  // The RETURNED-report path: her previous answers come back into the fresh
+  // form so she fixes what was wrong instead of re-entering 22 rows.
+  it('round-trips a filed report back into a draft', () => {
+    const items = [
+      { item: 'bath_towel', problem: 'missing', qty: 2 },
+      { item: 'tv_remote', problem: 'damaged', qty: 1 },
+    ]
+    expect(reportExceptionItems(reportExceptionDraftFrom(items))).toEqual([
+      { item: 'tv_remote', problem: 'damaged', qty: 1 },
+      { item: 'bath_towel', problem: 'missing', qty: 2 },
+    ])
+  })
+
+  it('clamps an out-of-range quantity coming back from the server', () => {
+    const draft = reportExceptionDraftFrom([{ item: 'pillow', problem: 'missing', qty: 9999 }])
+    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MAX_QTY)
+  })
+
+  it('reads an absent item list as an empty draft', () => {
+    expect(reportExceptionDraftFrom(null)).toEqual({})
+    expect(reportExceptionDraftFrom(undefined)).toEqual({})
+  })
+
+  it('spells one key for a pair, everywhere', () => {
+    expect(reportExceptionKey('kettle', 'missing')).toBe('kettle:missing')
+  })
+})
+
+describe('reportItemRows', () => {
+  it('resolves Thai labels and keeps the delivered order', () => {
+    expect(
+      reportItemRows([
+        { item: 'tv_remote', problem: 'damaged', qty: 1 },
+        { item: 'bath_towel', problem: 'missing', qty: 2 },
+      ])
+    ).toEqual([
+      {
+        key: 'tv_remote:damaged',
+        item: 'tv_remote',
+        problem: 'damaged',
+        qty: 1,
+        label: 'รีโมทโทรทัศน์',
+        problemLabel: 'ชำรุด',
+      },
+      {
+        key: 'bath_towel:missing',
+        item: 'bath_towel',
+        problem: 'missing',
+        qty: 2,
+        label: 'ผ้าขนหนู (รวมสีฟ้า)',
+        problemLabel: 'หาย',
+      },
+    ])
+  })
+
+  // A readable row beats a dropped one — a newer backend's 23rd item must
+  // still render on an older bundle.
+  it('renders an item this bundle predates as its raw code', () => {
+    expect(reportItemRows([{ item: 'minibar', problem: 'missing', qty: 1 }])[0].label).toBe(
+      'minibar'
+    )
+  })
+
+  it('reads an absent list as no rows', () => {
+    expect(reportItemRows(null)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Validation — every rule the server would refuse on, checked before the maid
+// is told "no" on a screen she has already left.
+// ---------------------------------------------------------------------------
+
+describe('canSubmitReport', () => {
+  const ok = {
+    roomStatus: 'vc',
+    allItemsOk: true,
+    items: [] as Array<{ item: string; problem: string; qty: number }>,
+    photoIds: [1],
+  }
+
+  it('accepts a clean, photographed report', () => {
+    expect(canSubmitReport(ok)).toBe(true)
+  })
+
+  // THE rule: evidence is not optional.
+  it('refuses a report with no photo at all', () => {
+    expect(canSubmitReport({ ...ok, photoIds: [] })).toBe(false)
+  })
+
+  it('refuses more than four photos', () => {
+    expect(canSubmitReport({ ...ok, photoIds: [1, 2, 3, 4, 5] })).toBe(false)
+    expect(canSubmitReport({ ...ok, photoIds: [1, 2, 3, 4] })).toBe(true)
+    expect(REPORT_MAX_PHOTOS).toBe(4)
+  })
+
+  it('refuses a report with no room status chosen', () => {
+    expect(canSubmitReport({ ...ok, roomStatus: null })).toBe(false)
+  })
+
+  it('refuses a room-status code the vocabulary does not carry', () => {
+    expect(canSubmitReport({ ...ok, roomStatus: 'zz' })).toBe(false)
+  })
+
+  // The toggle and the list are one claim, and they must agree.
+  it('refuses ครบทุกรายการ carrying exceptions', () => {
+    expect(
+      canSubmitReport({
+        ...ok,
+        allItemsOk: true,
+        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
+      })
+    ).toBe(false)
+  })
+
+  it('refuses มีรายการผิดปกติ that names nothing', () => {
+    expect(canSubmitReport({ ...ok, allItemsOk: false, items: [] })).toBe(false)
+  })
+
+  it('accepts มีรายการผิดปกติ that names something', () => {
+    expect(
+      canSubmitReport({
+        ...ok,
+        allItemsOk: false,
+        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
+      })
+    ).toBe(true)
+  })
+
+  it('refuses a quantity outside 1..99', () => {
+    expect(
+      canSubmitReport({
+        ...ok,
+        allItemsOk: false,
+        items: [{ item: 'kettle', problem: 'missing', qty: 0 }],
+      })
+    ).toBe(false)
+    expect(
+      canSubmitReport({
+        ...ok,
+        allItemsOk: false,
+        items: [{ item: 'kettle', problem: 'missing', qty: 100 }],
+      })
+    ).toBe(false)
+  })
+})
+
+describe('reportItemsConsistent / reportPhotoCountValid', () => {
+  it('is empty iff ok', () => {
+    expect(reportItemsConsistent(true, [])).toBe(true)
+    expect(reportItemsConsistent(true, [{ item: 'kettle', problem: 'missing', qty: 1 }])).toBe(false)
+    expect(reportItemsConsistent(false, [])).toBe(false)
+    expect(reportItemsConsistent(false, [{ item: 'kettle', problem: 'missing', qty: 1 }])).toBe(true)
+  })
+
+  it('bounds photos at 1..4 on both sides', () => {
+    expect(reportPhotoCountValid(0)).toBe(false)
+    expect(reportPhotoCountValid(1)).toBe(true)
+    expect(reportPhotoCountValid(4)).toBe(true)
+    expect(reportPhotoCountValid(5)).toBe(false)
+  })
+})
+
+describe('canVerifyReport / canReturnReport', () => {
+  // Reception's OWN photos are what make a verify a walk-up rather than a desk
+  // stamp — the two-sided evidence IS the feature.
+  it('refuses a verify with no photo of its own', () => {
+    expect(canVerifyReport([])).toBe(false)
+    expect(canVerifyReport([9])).toBe(true)
+    expect(canVerifyReport([1, 2, 3, 4, 5])).toBe(false)
+  })
+
+  // A return is a rejection, not a walk-up: a reason, no photos, and the
+  // reason must be one of exactly three.
+  it('refuses a return with no reason, or one outside the vocabulary', () => {
+    expect(canReturnReport(null)).toBe(false)
+    expect(canReturnReport('too dirty')).toBe(false)
+    expect(canReturnReport('not_clean')).toBe(true)
+  })
+
+  it('accepts every canned reason and nothing else', () => {
+    for (const { reason } of RETURN_REASONS) expect(canReturnReport(reason)).toBe(true)
+    expect(RETURN_REASONS).toHaveLength(3)
+  })
+})
+
+// A maid NEVER verifies — including one who also holds the reception grant,
+// which `canReport` has already resolved to the maid side.
+describe('canFileReport / canVerifyReports', () => {
+  it('gives filing to the maid side and verifying to the desk side, never both', () => {
+    expect(canFileReport('maid')).toBe(true)
+    expect(canVerifyReports('maid')).toBe(false)
+    expect(canFileReport('reception')).toBe(false)
+    expect(canVerifyReports('reception')).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Photo plumbing.
+// ---------------------------------------------------------------------------
+
+describe('downscaleDimensions', () => {
+  it('leaves a photo that already fits alone', () => {
+    expect(downscaleDimensions(800, 600, 1600)).toEqual({ width: 800, height: 600 })
+  })
+
+  it('scales by the LONGEST edge, keeping the aspect ratio', () => {
+    expect(downscaleDimensions(4000, 3000, 1600)).toEqual({ width: 1600, height: 1200 })
+    expect(downscaleDimensions(3000, 4000, 1600)).toEqual({ width: 1200, height: 1600 })
+  })
+
+  it('never rounds an edge down to zero', () => {
+    expect(downscaleDimensions(4000, 3, 1600).height).toBeGreaterThanOrEqual(1)
+  })
+
+  // A broken decoder must read as "don't touch this file", not as a 0×0 canvas.
+  it('returns 0×0 for nonsense the caller should refuse to redraw', () => {
+    expect(downscaleDimensions(0, 100)).toEqual({ width: 0, height: 0 })
+    expect(downscaleDimensions(Number.NaN, 100)).toEqual({ width: 0, height: 0 })
+    expect(downscaleDimensions(-4, -4)).toEqual({ width: 0, height: 0 })
+  })
+})
+
+describe('hkReportPhotoUrl', () => {
+  it('is branch-scoped — the browser issues this one itself, so hkFetch cannot scope it for us', () => {
+    expect(hkReportPhotoUrl(42, 'hfville')).toBe(`${HK_API_BASE}/report-photos/42?branch=hfville`)
+  })
+
+  // A wrong-hotel image URL is the same class of bug as a wrong-hotel report.
+  it('renders nothing rather than an unscoped URL when no branch is chosen', () => {
+    expect(hkReportPhotoUrl(42, null)).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The wire — what the three writes and the two reads actually send.
+// ---------------------------------------------------------------------------
+
+describe('report fetch helpers', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { success: true }))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  function lastCall() {
+    const calls = (global.fetch as jest.Mock).mock.calls
+    const [url, init] = calls[calls.length - 1]
+    return { url: url as string, init: (init ?? {}) as RequestInit }
+  }
+
+  function body() {
+    return JSON.parse(String(lastCall().init.body))
+  }
+
+  describe('fetchHkReports', () => {
+    it('asks for the branch’s day sheet, with no date — the server owns "today"', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, date: '2026-09-02', rooms: [] })
+      )
+      const result = await fetchHkReports('hfhotel')
+      expect(lastCall().url).toBe(`${HK_API_BASE}/reports?branch=hfhotel`)
+      expect(result.date).toBe('2026-09-02')
+    })
+
+    it('passes an explicit date through as a query parameter', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, date: '2026-09-01', rooms: [] })
+      )
+      await fetchHkReports('hfhotel', '2026-09-01')
+      expect(lastCall().url).toBe(`${HK_API_BASE}/reports?date=2026-09-01&branch=hfhotel`)
+    })
+
+    // A page must be able to render the list unconditionally.
+    it('returns [] for a backend that answers without a rooms array', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+      await expect(fetchHkReports('hfhotel')).resolves.toEqual({ date: '', rooms: [] })
+    })
+
+    it('throws on a 200 carrying success: false', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+      await expect(fetchHkReports('hfhotel')).rejects.toThrow(/ไม่สามารถดึงรายงานได้/)
+    })
+
+    it('refuses to fire at all without a branch', async () => {
+      await expect(fetchHkReports(null)).rejects.toThrow()
+      expect(global.fetch).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('fetchHkRoomReport', () => {
+    const day = {
+      success: true,
+      date: '2026-09-02',
+      rooms: [
+        { roomId: 7, roomNo: '104', floor: 1, building: null, report: { reportId: 55, roomId: 7, status: 'submitted' } },
+        { roomId: 8, roomNo: '105', floor: 1, building: null, report: null },
+      ],
+    }
+
+    // The day list IS the "latest report for this room" index — there is no
+    // per-room endpoint — and the summary DTO carries no items, so the full
+    // report has to be fetched behind it.
+    it('finds the room in the day sheet and fetches its report IN FULL', async () => {
+      ;(global.fetch as jest.Mock)
+        .mockResolvedValueOnce(jsonResponse(200, day))
+        .mockResolvedValueOnce(
+          jsonResponse(200, {
+            success: true,
+            report: { reportId: 55, roomId: 7, status: 'submitted', items: [], maidPhotoIds: [3] },
+          })
+        )
+      const result = await fetchHkRoomReport('hfhotel', 7)
+      expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
+        `${HK_API_BASE}/reports/55?branch=hfhotel`
+      )
+      expect(result.report?.maidPhotoIds).toEqual([3])
+      expect(result.room?.roomNo).toBe('104')
+      expect(result.date).toBe('2026-09-02')
+    })
+
+    // The ยังไม่ส่ง case: one request, and no report to go looking for.
+    it('issues no second request for a room that has filed nothing', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, day))
+      const result = await fetchHkRoomReport('hfhotel', 8)
+      expect((global.fetch as jest.Mock).mock.calls).toHaveLength(1)
+      expect(result.report).toBeNull()
+      expect(result.room?.roomNo).toBe('105')
+    })
+
+    it('returns a null room for one the branch does not serve', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, day))
+      await expect(fetchHkRoomReport('hfhotel', 999)).resolves.toMatchObject({
+        room: null,
+        report: null,
+      })
+    })
+  })
+
+  describe('fetchHkReport', () => {
+    it('reads one report by id', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, report: { reportId: 9, roomId: 1, status: 'verified' } })
+      )
+      await expect(fetchHkReport('hfhotel', 9)).resolves.toMatchObject({ reportId: 9 })
+      expect(lastCall().url).toBe(`${HK_API_BASE}/reports/9?branch=hfhotel`)
+    })
+
+    it('throws when the answer carries no report', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+      await expect(fetchHkReport('hfhotel', 9)).rejects.toThrow(/ไม่สามารถดึงรายงานได้/)
+    })
+  })
+
+  describe('submitHkReport', () => {
+    beforeEach(() => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, report: { reportId: 77, roomId: 7, status: 'submitted' } })
+      )
+    })
+
+    it('posts the exact body the contract names, to the room-scoped path', async () => {
+      await submitHkReport('hfhotel', 7, {
+        roomStatus: 'co',
+        allItemsOk: false,
+        items: [{ item: 'bath_towel', problem: 'missing', qty: 2 }],
+        photoIds: [11, 12],
+      })
+      expect(lastCall().url).toBe(`${HK_API_BASE}/rooms/7/report?branch=hfhotel`)
+      expect(lastCall().init.method).toBe('POST')
+      expect(body()).toEqual({
+        roomStatus: 'co',
+        allItemsOk: false,
+        items: [{ item: 'bath_towel', problem: 'missing', qty: 2 }],
+        photoIds: [11, 12],
+      })
+    })
+
+    // Append-only history: a fix POINTS AT what it supersedes.
+    it('carries parentReportId when it is fixing a returned report', async () => {
+      await submitHkReport('hfhotel', 7, {
+        roomStatus: 'vc',
+        allItemsOk: true,
+        items: [],
+        photoIds: [11],
+        parentReportId: 55,
+      })
+      expect(body().parentReportId).toBe(55)
+    })
+
+    // 409 is an ANSWER, not a retry: the room already has a report today.
+    it('turns a 409 into its own Thai copy, distinct from a write failure', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(409, { success: false }))
+      await expect(
+        submitHkReport('hfhotel', 7, {
+          roomStatus: 'vc',
+          allItemsOk: true,
+          items: [],
+          photoIds: [1],
+        })
+      ).rejects.toThrow(/ส่งรายงานของวันนี้ไปแล้ว/)
+    })
+
+    it('treats a 200 carrying success: false as a failed write', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+      await expect(
+        submitHkReport('hfhotel', 7, {
+          roomStatus: 'vc',
+          allItemsOk: true,
+          items: [],
+          photoIds: [1],
+        })
+      ).rejects.toThrow(/บันทึกไม่สำเร็จ/)
+    })
+  })
+
+  describe('verifyHkReport / returnHkReport', () => {
+    beforeEach(() => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, report: { reportId: 55, roomId: 7, status: 'verified' } })
+      )
+    })
+
+    it('verifies with reception’s own photo ids and nothing else', async () => {
+      await verifyHkReport('hfhotel', 55, [21, 22])
+      expect(lastCall().url).toBe(`${HK_API_BASE}/reports/55/verify?branch=hfhotel`)
+      expect(body()).toEqual({ photoIds: [21, 22] })
+    })
+
+    it('returns with a canned reason and NO photos', async () => {
+      await returnHkReport('hfhotel', 55, 'photos_unclear')
+      expect(lastCall().url).toBe(`${HK_API_BASE}/reports/55/return?branch=hfhotel`)
+      expect(body()).toEqual({ reason: 'photos_unclear' })
+    })
+
+    it('refuses to fire either without a branch', async () => {
+      await expect(verifyHkReport(null, 55, [1])).rejects.toThrow()
+      await expect(returnHkReport(null, 55, 'not_clean')).rejects.toThrow()
+      expect(global.fetch).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('uploadHkReportPhoto', () => {
+    it('posts multipart under the field name "photo" and returns the id', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, photoId: 31 })
+      )
+      const blob = new Blob(['x'], { type: 'image/jpeg' })
+      await expect(uploadHkReportPhoto('hfhotel', blob)).resolves.toBe(31)
+      expect(lastCall().url).toBe(`${HK_API_BASE}/report-photos?branch=hfhotel`)
+      const form = lastCall().init.body as FormData
+      expect(form).toBeInstanceOf(FormData)
+      expect(form.get('photo')).toBeTruthy()
+    })
+
+    // Setting Content-Type by hand is the classic way to break every multipart
+    // upload: the boundary the browser generates would no longer match.
+    it('sets NO Content-Type header — the browser owns the multipart boundary', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, photoId: 31 })
+      )
+      await uploadHkReportPhoto('hfhotel', new Blob(['x'], { type: 'image/jpeg' }))
+      expect(lastCall().init.headers).toBeUndefined()
+    })
+
+    // Refused HERE, before a slow upload over hotel wifi ends in a bare 413.
+    it('refuses an oversized photo without issuing a request at all', async () => {
+      const huge = { size: 6 * 1024 * 1024, type: 'image/jpeg' } as Blob
+      await expect(uploadHkReportPhoto('hfhotel', huge)).rejects.toThrow(/รูปใหญ่เกินไป/)
+      expect(global.fetch).not.toHaveBeenCalled()
+    })
+
+    it('turns the server’s own 413 into the same Thai copy', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(413, {}))
+      await expect(
+        uploadHkReportPhoto('hfhotel', new Blob(['x'], { type: 'image/jpeg' }))
+      ).rejects.toThrow(/รูปใหญ่เกินไป/)
+    })
+
+    it('throws when the answer carries no photoId', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+      await expect(
+        uploadHkReportPhoto('hfhotel', new Blob(['x'], { type: 'image/jpeg' }))
+      ).rejects.toThrow(/อัปโหลดรูปไม่สำเร็จ/)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The cross-screen banner — a landed write sends the user back to the day
+// overview, and the confirmation has to survive that navigation.
+// ---------------------------------------------------------------------------
+
+describe('the report notice hand-off', () => {
+  beforeEach(() => sessionStorage.clear())
+
+  it('hands one message across a navigation and clears it', () => {
+    stashHkReportNotice('ส่งรายงานแล้ว')
+    expect(takeHkReportNotice()).toBe('ส่งรายงานแล้ว')
+    // A banner that survives a reload is a banner about nothing.
+    expect(takeHkReportNotice()).toBeNull()
+  })
+
+  it('is null when nothing was stashed', () => {
+    expect(takeHkReportNotice()).toBeNull()
+  })
+})
+
+// The checklist vocabulary itself is `report-vocab.ts`'s, and the /hk client
+// re-exports it so a page has ONE import — the same arrangement the signal
+// vocabulary has. Asserted here because a broken re-export is invisible until
+// a screen renders an empty picker.
+describe('the re-exported report vocabulary', () => {
+  it('carries the paper form’s items, problems, statuses and reasons', () => {
+    expect(REPORT_ITEMS.length).toBeGreaterThan(0)
+    expect(ITEM_PROBLEMS.map(({ problem }) => problem)).toEqual(['missing', 'damaged'])
+    expect(ROOM_STATUS_CODES.map(({ code }) => code)).toEqual(['vc', 'co', 'oo', 'so'])
+    expect(RETURN_REASONS.map(({ reason }) => reason)).toEqual([
+      'not_clean',
+      'items_mismatch',
+      'photos_unclear',
+    ])
   })
 })

@@ -532,6 +532,94 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_live
 CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_room_created
     ON ht_hk_room_signals (sig_room_id, sig_created_at DESC);
 
+-- ht_hk_room_reports / ht_hk_room_report_items / ht_hk_room_report_photos -
+-- Report HK, the maid's per-room daily attestation and reception's
+-- countersignature (migration 091; owner's Report HK.xlsx digitized, vocabulary
+-- in app/hk/report-vocab.ts and CONTEXT.md Housekeeping).
+-- The header carries the room-status code as SHE reported it (vc|co|oo|so,
+-- prefilled client-side from known room facts but overridable), the
+-- exception-based checklist flag, and the identities of both transitions.
+-- Lifecycle submitted -> verified | returned; a RETURNED report is never edited
+-- but superseded by a NEW submission carrying rr_parent_id, so history is
+-- append-only. There is NO free-text column anywhere in these three tables --
+-- the return reason is canned, the same discipline ADR 0008 records for signals.
+-- rr_date is the Bangkok civil day the report is FOR, stored (not derived):
+-- a maid finishing a floor at 00:10 is still on yesterday's sheet, and
+-- CURRENT_DATE is banned because it is the SERVER's date.
+-- rr_room_status, rr_return_reason and rri_item are TEXT with NO CHECK on
+-- purpose -- the vocabulary lives in domain::hk_report (mirroring
+-- app/hk/report-vocab.ts) so extending it needs no migration (the 088
+-- rationale). rr_status and rri_problem ARE checked because they are
+-- structural: every transition is written over the first, and the second is the
+-- pair the item_missing / item_damaged room signals are built on.
+-- Items are EXCEPTIONS ONLY: a ครบทุกรายการ report has zero item rows.
+-- Photos are BYTEA + mime (the 077 ht_hk_broken_reports pattern), 1..=4 per
+-- side; rrp_side is DERIVED from the uploader's role, never client-sent, and
+-- rrp_report_id is NULLABLE because a phone uploads BEFORE the form is
+-- submitted -- the submit/verify transaction binds them (WHERE rrp_report_id IS
+-- NULL AND rrp_badge = the caller), which makes "your own, not already
+-- attached" one atomic check. ACCEPTED DEBT: unattached rows linger forever;
+-- there is no GC in v1, deliberately.
+-- PG-CANONICAL ONLY: iHOTEL has no Report HK counterpart at all, so no sync
+-- mapper, no writeback, no WritebackIntent, and no domain event of its own --
+-- but a submission with item exceptions raises the EXISTING item_missing /
+-- item_damaged room signals (089) in the SAME transaction, one per problem
+-- kind, so reception hears about chargeable items immediately.
+-- Identity = verified HF ID badge (Cloudflare Access claims) on every side, no
+-- FK to ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_room_reports (
+    rr_id              BIGSERIAL   PRIMARY KEY,
+    rr_room_id         INTEGER     NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    rr_date            DATE        NOT NULL,
+    rr_status          TEXT        NOT NULL DEFAULT 'submitted'
+                                   CHECK (rr_status IN ('submitted', 'verified', 'returned')),
+    rr_room_status     TEXT        NOT NULL,
+    rr_all_items_ok    BOOLEAN     NOT NULL,
+    rr_return_reason   TEXT        NULL,
+    rr_parent_id       BIGINT      NULL REFERENCES ht_hk_room_reports(rr_id),
+    rr_submitted_badge TEXT        NOT NULL,
+    rr_submitted_name  TEXT,
+    rr_submitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    rr_verified_badge  TEXT,
+    rr_verified_name   TEXT,
+    rr_verified_at     TIMESTAMPTZ
+);
+-- The day overview's hot path: the LATEST report per room for one date.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_reports_room_date
+    ON ht_hk_room_reports (rr_room_id, rr_date, rr_id DESC);
+-- The submit guard and reception's queue. PARTIAL, for
+-- ix_ht_hk_room_signals_live's reason: judged rows are unbounded history.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_reports_open
+    ON ht_hk_room_reports (rr_room_id, rr_date)
+    WHERE rr_status = 'submitted';
+
+CREATE TABLE IF NOT EXISTS ht_hk_room_report_items (
+    rri_id        BIGSERIAL PRIMARY KEY,
+    rri_report_id BIGINT    NOT NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
+    rri_item      TEXT      NOT NULL,
+    rri_problem   TEXT      NOT NULL CHECK (rri_problem IN ('missing', 'damaged')),
+    rri_qty       INTEGER   NOT NULL CHECK (rri_qty >= 1 AND rri_qty <= 99)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_report
+    ON ht_hk_room_report_items (rri_report_id, rri_id);
+
+CREATE TABLE IF NOT EXISTS ht_hk_room_report_photos (
+    rrp_id         BIGSERIAL   PRIMARY KEY,
+    rrp_report_id  BIGINT      NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
+    rrp_side       TEXT        NOT NULL CHECK (rrp_side IN ('maid', 'reception')),
+    rrp_photo      BYTEA       NOT NULL,
+    rrp_photo_mime TEXT        NOT NULL,
+    rrp_badge      TEXT        NOT NULL,
+    rrp_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_report
+    ON ht_hk_room_report_photos (rrp_report_id, rrp_side, rrp_id)
+    WHERE rrp_report_id IS NOT NULL;
+-- "My unattached photos" -- the attach predicate's own index.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_open
+    ON ht_hk_room_report_photos (rrp_badge, rrp_id)
+    WHERE rrp_report_id IS NULL;
+
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
 -- folio. The existing ht_checkins.cin_room_id stays in place until the
@@ -2799,6 +2887,19 @@ ON CONFLICT (version) DO NOTHING;
 -- records the migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('090', '090_hk_linen_reports_resolution.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 091 - Report HK: ht_hk_room_reports + ht_hk_room_report_items +
+-- ht_hk_room_report_photos (tables + all five indexes inlined above, after the
+-- ht_hk_room_signals block). One maid's per-room daily attestation, verified or
+-- returned by reception with a canned reason; exception-based checklist,
+-- two-sided photo evidence, append-only history via rr_parent_id.
+-- PG-canonical only: no legacy counterpart, no sync mapper, no writeback, no
+-- domain event of its own -- item exceptions raise the existing item_missing /
+-- item_damaged room signals (089) in the submit's own transaction. This seed
+-- row records the migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('091', '091_create_ht_hk_room_reports.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

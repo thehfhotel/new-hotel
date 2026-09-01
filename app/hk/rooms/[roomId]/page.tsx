@@ -36,6 +36,7 @@ import {
   Bell,
   Check,
   ChevronLeft,
+  ClipboardList,
   Info,
   Loader2,
   Minus,
@@ -669,6 +670,28 @@ export default function HkRoomPage() {
               {room.building ? ` · ${room.building}` : ''}
             </p>
           </header>
+
+          {/* ------------------------------------------------------------- *
+           * Report HK — this room's daily report (Report HK.xlsx digitized).
+           * A different artifact from everything else on this screen: the
+           * progress buttons and the signals are about work in flight, while
+           * the report is the day's ATTESTATION about this room, filed once
+           * and countersigned by reception.
+           *
+           * Rendered for BOTH roles and placed directly under the header,
+           * above the signals: it is the one control here whose destination
+           * depends on who is looking (a maid files, reception verifies), and
+           * it must not be something either of them has to scroll for. Teal,
+           * the hue this feature owns across /hk.
+           * ------------------------------------------------------------- */}
+          <Link
+            href={`/hk/rooms/${roomId}/report`}
+            data-testid="hk-room-report-entry"
+            className="mb-6 flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-xl border border-teal-300 bg-teal-50 px-3 py-3 text-sm font-semibold text-teal-800 active:bg-teal-100"
+          >
+            <ClipboardList className="h-4 w-4" />
+            รายงานประจำวัน
+          </Link>
 
           {/* ------------------------------------------------------------- *
            * ROOM SIGNALS (ADR 0008). Canned, one-room notices between the

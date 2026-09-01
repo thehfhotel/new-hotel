@@ -510,6 +510,63 @@ pub async fn auto_complete_clean_report(
 }
 
 // ============================================================================
+// The Report HK hook
+// ============================================================================
+
+/// Raise ONE maid→desk signal **inside the caller's transaction** — migration
+/// 091's bridge from a Report HK item exception to the standing
+/// guest-accountability signal.
+///
+/// Called from
+/// [`crate::service::hk_reports::HkReportService::submit`] so the report, its
+/// exception rows and the มีของหาย / มีของเสียหาย the desk must act on before
+/// the guest settles are ONE commit, or none of them. Takes
+/// `&mut Transaction` for exactly [`auto_complete_clean_report`]'s reason: a
+/// version of this that opened its own transaction would leave a signal
+/// standing against a report that rolled back — a room accused of a missing
+/// remote by an attestation that does not exist.
+///
+/// The role is fixed at [`SignalRole::Maid`] and is NOT a parameter: an item
+/// exception is a maid telling the desk something the guest may owe for, which
+/// is the definition of a maid→desk signal. Passing a role in would make it
+/// expressible for the desk to raise one on a maid's behalf, which no caller
+/// should be able to say.
+///
+/// `parent_id` stays `None`: a report is not a `ht_hk_room_signals` row, so
+/// there is nothing in that table for the child to point at (unlike a
+/// `room_check` answer's problems, whose parent IS the check). The report is
+/// recoverable from the room and the timestamp; inventing a cross-table parent
+/// column to hold a report id would be a schema change with one reader.
+pub async fn raise_from_report(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+    signal_type: &str,
+    badge: &str,
+    name: Option<&str>,
+    source: EventSource,
+) -> ServiceResult<RoomSignal> {
+    let normalized = crate::domain::hk_signal::normalize_type(signal_type);
+    // Judged, not assumed: this is the same rule the raise endpoint applies, so
+    // a caller that passed a desk→maid type is refused here rather than writing
+    // a row whose direction contradicts its type.
+    let direction = direction_for_role_type(SignalRole::Maid, &normalized).map_err(rule_error)?;
+    let signal = insert_signal(
+        tx,
+        InsertSignal {
+            room_id,
+            direction,
+            signal_type: &normalized,
+            parent_id: None,
+            badge,
+            name,
+        },
+    )
+    .await?;
+    publish(tx, raised(&signal, source)).await?;
+    Ok(signal)
+}
+
+// ============================================================================
 // Row plumbing
 // ============================================================================
 
