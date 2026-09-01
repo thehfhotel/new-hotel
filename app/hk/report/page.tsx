@@ -42,6 +42,7 @@ import {
   hkFetchMe,
   readStoredBranch,
   reportDateLabel,
+  reportProblemCount,
   reportStateChip,
   reportStateCounts,
   resolveInitialBranch,
@@ -264,6 +265,11 @@ export default function HkReportOverviewPage() {
                 <ul className="space-y-2">
                   {sortReportRooms(floorRooms, role).map((row) => {
                     const chip = reportStateChip(row.report)
+                    // How many ticks came back หาย/ชำรุด. Shown on the ROW
+                    // because a room with three missing towels is the one
+                    // reception should open first, and the state chip alone
+                    // ("ส่งแล้ว รอตรวจ") cannot say so.
+                    const problems = reportProblemCount(row.report)
                     return (
                       <li key={row.roomId}>
                         <Link
@@ -278,6 +284,14 @@ export default function HkReportOverviewPage() {
                             >
                               {chip.label}
                             </span>
+                            {problems > 0 && (
+                              <span
+                                data-testid={`hk-report-problems-${row.roomId}`}
+                                className="inline-block rounded-full border border-red-300 bg-red-100 px-2 py-0.5 text-xs font-bold text-red-800"
+                              >
+                                ผิดปกติ {problems}
+                              </span>
+                            )}
                           </span>
                           <ChevronRight className="h-5 w-5 shrink-0 text-gray-400" />
                         </Link>

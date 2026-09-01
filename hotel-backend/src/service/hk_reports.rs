@@ -2,11 +2,37 @@
 //! countersignature.
 //!
 //! Owns `ht_hk_room_reports` / `ht_hk_room_report_items` /
-//! `ht_hk_room_report_photos` (migration 091): the day overview, the detail
-//! read, photo intake, and the three mutations (submit, verify, return). Every
-//! rule it enforces is a pure function in [`crate::domain::hk_report`]; this
-//! module is the transaction boundary and the SQL, nothing else — the same
-//! construction as [`crate::service::hk_signals`].
+//! `ht_hk_room_report_photos` (migrations 091 + 092): the day overview, the
+//! detail read, photo intake/metadata/deletion, and the three mutations
+//! (submit, verify, return). Every rule it enforces is a pure function in
+//! [`crate::domain::hk_report`]; this module is the transaction boundary and
+//! the SQL, nothing else — the same construction as
+//! [`crate::service::hk_signals`].
+//!
+//! ## v2: the checklist is PHOTO-BACKED TICKS
+//!
+//! Migration 092 (owner directives 2026-09-02) replaced 091's exception-based
+//! checklist, hours after it shipped. `ht_hk_room_report_items` is now the TICK
+//! table — **one row per checklist item per report, all 22, every time** —
+//! each carrying the state the maid recorded (`ok` | `missing` | `damaged`) and
+//! the id of the photo that backs it. One photo may back several ticks (the
+//! เตียง shot covers the bed linen), so a perfect room is four camera taps and
+//! no further interaction.
+//!
+//! Two consequences run through this module:
+//!
+//! * `rr_all_items_ok` is DERIVED (true iff no tick is a problem). The column
+//!   is still written, for v1 readers, but every read computes it from the
+//!   rows, so nothing can serve a report whose badge disagrees with its own
+//!   checklist.
+//! * **V1 rows stay readable.** `rri_photo_id IS NOT NULL` is the
+//!   discriminator — a 091 exception has no backing photo — so a v1 report
+//!   serves `ticks: []` and its `items` array exactly as before. That decision
+//!   lives in exactly one function ([`load_report`]).
+//!
+//! Photos are **kept forever** (owner decision, migration 092). The one
+//! deletion path is [`HkReportService::delete_photo`], which is uploader-only
+//! and refuses anything a report already names.
 //!
 //! ## Coexistence stance (ADR 0002 / invariant #6)
 //!
@@ -27,13 +53,15 @@
 //! ## One transaction, always — and what rides in the submit's
 //!
 //! [`HkReportService::submit`] is genuinely multi-table and commits atomically:
-//! the header, its exception rows, the ATTACHMENT of the maid's photos, and
-//! **the standing `item_missing` / `item_damaged` room signals** the exceptions
-//! raise ([`crate::service::hk_signals::raise_from_report`], called with this
+//! the header, the ATTACHMENT of every DISTINCT photo its ticks and extras
+//! name, all 22 tick rows, and **the standing `item_missing` / `item_damaged`
+//! room signals** the problem ticks raise
+//! ([`crate::service::hk_signals::raise_from_report`], called with this
 //! method's own transaction). A guest may be about to settle while this runs;
 //! "the report says the TV remote is gone but the desk never got a signal" is
 //! not a state reception may ever observe. The signals are deduplicated to ONE
-//! PER PROBLEM KIND — see [`HkReportService::submit`]'s doc.
+//! PER PROBLEM KIND — see [`HkReportService::submit`]'s doc. Unchanged by v2:
+//! the ticks changed, the guest-accountability bridge did not.
 //!
 //! [`HkReportService::verify`] and [`HkReportService::return_report`] lock the
 //! header (`SELECT … FOR UPDATE`) before judging it, so two receptionists
@@ -72,13 +100,25 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::domain::hk_report::{
-    check_attestation, check_can_judge, check_photo_count, check_side, ItemProblem, PhotoCounts,
-    PhotoSide, ReportActor, ReportItem, ReportRuleError, ReportStatus, RoomReport, RoomReportRow,
-    RoomReportSummary,
+    check_can_judge, check_photo_count, check_photo_total, check_side, check_tick_coverage,
+    check_tick_photo, check_tick_qty, ItemProblem, PhotoCounts, PhotoSide, ReportActor, ReportItem,
+    ReportPhoto, ReportPhotoMeta, ReportRuleError, ReportStatus, ReportTick, RoomReport,
+    RoomReportRow, RoomReportSummary, TickState, MIN_ITEM_QTY,
 };
 use crate::outbox::event::EventSource;
 
 use super::error::{ServiceError, ServiceResult};
+
+/// 403 body for `DELETE /api/hk/report-photos/{id}` on someone else's photo.
+/// Thai — a real person reads it on her phone, and she reaches it only from a
+/// stale bundle or a hand-rolled request.
+pub const PHOTO_NOT_YOURS_ERROR: &str = "ลบได้เฉพาะรูปที่ตนเองถ่ายเท่านั้น";
+
+/// 400 body for deleting a photo a report already names. Thai, and it says WHY
+/// rather than "forbidden": the picture is now evidence, and the way to change
+/// a filed report is a new submission, never an edit.
+pub const PHOTO_ATTACHED_ERROR: &str =
+    "รูปนี้ถูกส่งไปกับรายงานแล้ว จึงลบไม่ได้ (แก้ไขได้ด้วยการส่งรายงานใหม่)";
 
 /// The header projection every read of `ht_hk_room_reports` uses, joined to
 /// `ht_rooms_new` for the room number both DTOs carry.
@@ -88,12 +128,28 @@ use super::error::{ServiceError, ServiceResult};
 /// purpose: `rr_room_id` is a `NOT NULL` FK with `ON DELETE CASCADE`, so a
 /// report without a room is not a state that exists.
 const REPORT_SELECT: &str = "SELECT h.rr_id, h.rr_room_id, r.room_no, h.rr_date, h.rr_status, \
-                             h.rr_room_status, h.rr_all_items_ok, h.rr_return_reason, \
+                             h.rr_room_status, h.rr_return_reason, \
                              h.rr_parent_id, h.rr_submitted_badge, h.rr_submitted_name, \
                              h.rr_submitted_at, h.rr_verified_badge, h.rr_verified_name, \
                              h.rr_verified_at \
                              FROM ht_hk_room_reports h \
                              JOIN ht_rooms_new r ON r.room_id = h.rr_room_id";
+
+/// The tick/exception projection — `ht_hk_room_report_items` as BOTH shapes
+/// read it.
+///
+/// One SELECT for both arrays on purpose: a v2 tick and a v1 exception are the
+/// same row seen two ways, and reading them twice would be two chances to
+/// disagree about which is which. The discriminator is `rri_photo_id IS NOT
+/// NULL` — see [`load_report`].
+const ITEMS_SELECT: &str = "SELECT rri_item, rri_state, rri_problem, rri_qty, rri_photo_id \
+                            FROM ht_hk_room_report_items \
+                            WHERE rri_report_id = $1 ORDER BY rri_id";
+
+/// The photo projection — ids plus the metadata migration 092 added.
+const PHOTOS_SELECT: &str = "SELECT rrp_id, rrp_side, rrp_zone, rrp_bytes \
+                             FROM ht_hk_room_report_photos \
+                             WHERE rrp_report_id = $1 ORDER BY rrp_id";
 
 /// The day overview: EVERY active room of this site with its LATEST report for
 /// one date.
@@ -111,6 +167,13 @@ const REPORT_SELECT: &str = "SELECT h.rr_id, h.rr_room_id, r.room_no, h.rr_date,
 /// * The photo counts come from ONE more LATERAL with `COUNT(*) FILTER`, not
 ///   from two correlated scalar subqueries per room — one screen is one
 ///   statement, never an N+1 (the rule `linen_shortage_open_sql` follows).
+/// * `problem_count` is a THIRD lateral, for the same reason, and its predicate
+///   deliberately reads BOTH columns (`rri_state <> 'ok' OR rri_problem IS NOT
+///   NULL`): migration 092 backfilled `rri_state` from `rri_problem` on every
+///   v1 row, so either half alone would be correct today — the OR is what keeps
+///   the count right if a row ever arrives with only one of them set. It is
+///   also what `allItemsOk` is DERIVED from, so the card's badge and its
+///   problem line cannot contradict each other.
 /// * `WHERE COALESCE(r.room_active, true) = true` and `ORDER BY r.room_no`
 ///   match `routes::hk::rooms_list_sql` exactly, so the report overview and the
 ///   cleaning list can never show a maid two different room sets.
@@ -123,15 +186,16 @@ fn day_overview_sql() -> String {
             r.room_floor,
             r.room_building,
             rep.rr_id, rep.rr_date, rep.rr_status, rep.rr_room_status,
-            rep.rr_all_items_ok, rep.rr_return_reason, rep.rr_parent_id,
+            rep.rr_return_reason, rep.rr_parent_id,
             rep.rr_submitted_badge, rep.rr_submitted_name, rep.rr_submitted_at,
             rep.rr_verified_badge, rep.rr_verified_name, rep.rr_verified_at,
             COALESCE(ph.maid_photos, 0)::bigint      AS maid_photos,
-            COALESCE(ph.reception_photos, 0)::bigint AS reception_photos
+            COALESCE(ph.reception_photos, 0)::bigint AS reception_photos,
+            COALESCE(it.problem_count, 0)::bigint    AS problem_count
         FROM ht_rooms_new r
         LEFT JOIN LATERAL (
             SELECT h.rr_id, h.rr_date, h.rr_status, h.rr_room_status,
-                   h.rr_all_items_ok, h.rr_return_reason, h.rr_parent_id,
+                   h.rr_return_reason, h.rr_parent_id,
                    h.rr_submitted_badge, h.rr_submitted_name, h.rr_submitted_at,
                    h.rr_verified_badge, h.rr_verified_name, h.rr_verified_at
               FROM ht_hk_room_reports h
@@ -145,11 +209,18 @@ fn day_overview_sql() -> String {
               FROM ht_hk_room_report_photos p
              WHERE p.rrp_report_id = rep.rr_id
         ) ph ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS problem_count
+              FROM ht_hk_room_report_items i
+             WHERE i.rri_report_id = rep.rr_id
+               AND (i.rri_state <> '{ok}' OR i.rri_problem IS NOT NULL)
+        ) it ON TRUE
         WHERE COALESCE(r.room_active, true) = true
         ORDER BY r.room_no
         "#,
         maid = PhotoSide::Maid.as_str(),
         reception = PhotoSide::Reception.as_str(),
+        ok = TickState::Ok.as_str(),
     )
 }
 
@@ -157,20 +228,28 @@ fn day_overview_sql() -> String {
 // Commands
 // ============================================================================
 
-/// One `{item, problem, qty}` exception, already validated by the route.
+/// One PHOTO-BACKED TICK, already validated by the route.
 ///
-/// `item` is a canonical [`crate::domain::hk_report::REPORT_ITEMS`] code. The
-/// service does NOT re-check the item vocabulary — the DB column is
-/// unconstrained `TEXT` on purpose (migration 091) so the checklist can move
-/// without a migration, and duplicating the list here would recreate exactly
-/// the two-places-to-change coupling that decision avoids. What IS re-checked
-/// is the quantity bound and the attestation biconditional: both must hold for
-/// ANY caller.
+/// `item` is a canonical [`crate::domain::hk_report::REPORT_ITEMS`] code and
+/// `photo_id` is the picture that backs it — required, and required for `ok`
+/// ticks too, which is the whole v2 model.
+///
+/// Unlike v1's `ReportItemInput`, the service DOES re-check this shape in full
+/// ([`check_tick_coverage`], [`check_tick_qty`], [`check_tick_photo`]): the
+/// coverage rule is the one that makes a report an attestation rather than a
+/// tap, so it must hold for ANY caller, not only one that came through the
+/// route. The item VOCABULARY is still not re-checked here — the DB column is
+/// unconstrained `TEXT` on purpose (091) so the checklist can move without a
+/// migration, and `check_tick_coverage` already refuses a code that is not on
+/// the form.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportItemInput {
+pub struct ReportTickInput {
     pub item: String,
-    pub problem: ItemProblem,
-    pub qty: i32,
+    pub state: TickState,
+    /// `None` for an `ok` tick; `Some(1..=99)` for a problem.
+    pub qty: Option<i32>,
+    /// The backing photo. One photo may back several ticks.
+    pub photo_id: i64,
 }
 
 /// Command for [`HkReportService::submit`] — one maid's
@@ -184,12 +263,12 @@ pub struct SubmitReportCommand {
     pub date: NaiveDate,
     /// A canonical `ROOM_STATUS_CODES` code, already validated by the route.
     pub room_status: String,
-    pub all_items_ok: bool,
-    pub items: Vec<ReportItemInput>,
-    /// Ids from `POST /api/hk/report-photos`. Must be 1..=4, distinct, this
-    /// caller's OWN, `maid`-side, and not already attached — the last three are
-    /// checked by the ATTACH statement itself, atomically.
-    pub photo_ids: Vec<i64>,
+    /// The whole checklist: one tick per item, all 22, each naming its backing
+    /// photo. `rr_all_items_ok` is DERIVED from these, never sent.
+    pub ticks: Vec<ReportTickInput>,
+    /// Photos the maid attached that no tick names — a wider shot, a second
+    /// angle. Optional, and bounded only through the DISTINCT total below.
+    pub extra_photo_ids: Vec<i64>,
     /// `HkIdentity::can_report`. Carried so the "a maid never verifies,
     /// reception never submits" rule holds for any caller, not only for one
     /// that went through the route gate.
@@ -236,7 +315,19 @@ pub struct StorePhotoCommand {
     pub mime: String,
     /// DERIVED from the uploader's role by the route, never sent by the client.
     pub side: PhotoSide,
+    /// The capture zone the client named, already validated against
+    /// `REPORT_ZONES` by the route. Optional and INFORMATIONAL — a re-shot
+    /// close-up belongs to no zone, and nothing is ever refused for its absence.
+    pub zone: Option<String>,
     pub badge: String,
+}
+
+/// What `POST /api/hk/report-photos` answers with: the id to tick against, and
+/// the stored size the client shows in its evidence strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredPhotoId {
+    pub photo_id: i64,
+    pub bytes: i64,
 }
 
 /// The bytes of one stored photo, for `GET /api/hk/report-photos/{id}`.
@@ -314,24 +405,128 @@ impl HkReportService {
     /// unattached row lingers forever, deliberately, because a sweeper is
     /// exactly the thing that could destroy evidence if its predicate were
     /// wrong.
-    pub async fn store_photo(&self, cmd: StorePhotoCommand) -> ServiceResult<i64> {
+    pub async fn store_photo(&self, cmd: StorePhotoCommand) -> ServiceResult<StoredPhotoId> {
         let badge = require_badge(&cmd.badge)?;
         if cmd.bytes.is_empty() {
             return Err(ServiceError::validation("photo is empty"));
         }
+        // The size is STORED (migration 092) rather than recomputed on every
+        // read: `octet_length` on a BYTEA has to detoast the whole image to
+        // answer, and the report's photo strip asks for it per row.
+        let size = i32::try_from(cmd.bytes.len())
+            .map_err(|_| ServiceError::validation("photo is too large"))?;
         let row = sqlx::query(
             "INSERT INTO ht_hk_room_report_photos \
-                 (rrp_report_id, rrp_side, rrp_photo, rrp_photo_mime, rrp_badge) \
-             VALUES (NULL, $1, $2, $3, $4) \
+                 (rrp_report_id, rrp_side, rrp_photo, rrp_photo_mime, rrp_badge, \
+                  rrp_zone, rrp_bytes) \
+             VALUES (NULL, $1, $2, $3, $4, $5, $6) \
              RETURNING rrp_id",
         )
         .bind(cmd.side.as_str())
         .bind(&cmd.bytes)
         .bind(&cmd.mime)
         .bind(&badge)
+        .bind(cmd.zone.as_deref())
+        .bind(size)
         .fetch_one(&self.pg)
         .await?;
-        Ok(row.try_get("rrp_id")?)
+        Ok(StoredPhotoId {
+            photo_id: row.try_get("rrp_id")?,
+            bytes: i64::from(size),
+        })
+    }
+
+    /// One photo's METADATA — `GET /api/hk/report-photos/{id}/meta`.
+    ///
+    /// The client's resume-after-reload primitive: a maid whose phone locked
+    /// mid-form comes back holding ids and needs to know which are still hers
+    /// to tick against or delete. Readable by BOTH roles, like the bytes
+    /// themselves — reception judges the maid's evidence and vice versa.
+    pub async fn photo_meta(&self, photo_id: i64) -> ServiceResult<ReportPhotoMeta> {
+        let row = sqlx::query(
+            "SELECT rrp_id, rrp_side, rrp_zone, rrp_bytes, rrp_report_id, rrp_created_at \
+               FROM ht_hk_room_report_photos WHERE rrp_id = $1",
+        )
+        .bind(photo_id)
+        .fetch_optional(&self.pg)
+        .await?
+        .ok_or_else(|| ServiceError::not_found(format!("photo {photo_id} not found")))?;
+
+        let side_raw: String = row.try_get("rrp_side")?;
+        let attached: Option<i64> = row.try_get("rrp_report_id")?;
+        Ok(ReportPhotoMeta {
+            photo_id: row.try_get("rrp_id")?,
+            // The column carries a DB CHECK, so an unparseable value means it
+            // was hand-edited away — an internal error, not a 400 the caller
+            // could act on. Same treatment as `rr_status`.
+            side: PhotoSide::parse(&side_raw).ok_or_else(|| {
+                ServiceError::internal(format!("photo {photo_id} has unknown side {side_raw:?}"))
+            })?,
+            zone: row.try_get("rrp_zone")?,
+            bytes: row.try_get::<Option<i32>, _>("rrp_bytes")?.map(i64::from),
+            attached: attached.is_some(),
+            uploaded_at: rfc3339(row.try_get("rrp_created_at")?),
+        })
+    }
+
+    /// Remove ONE of the caller's own photos — `DELETE
+    /// /api/hk/report-photos/{id}`.
+    ///
+    /// **Uploader-only, and only while UNATTACHED.** This is the maid's
+    /// manage-pictures-before-submit primitive (retake a blurred shot, drop a
+    /// duplicate); it is deliberately NOT a way to edit a filed report. Once a
+    /// submit or verify has bound a photo, it is evidence and this endpoint
+    /// refuses it — which, with the owner's keep-forever decision (migration
+    /// 092), means **no path in this app can delete a photo a report names.**
+    ///
+    /// ## One statement decides, a second only explains
+    ///
+    /// The DELETE carries the whole predicate (`rrp_id`, `rrp_badge`,
+    /// `rrp_report_id IS NULL`), so the ownership check and the write are
+    /// atomic — a submit committing concurrently cannot lose the race and leave
+    /// a report's photo deleted. Only when it removes nothing does a second
+    /// SELECT run to say WHY, and that read is advisory: by then the answer is
+    /// already "not deleted".
+    ///
+    /// The three refusals are distinguished (404 unknown / 403 not yours / 400
+    /// attached) — deliberately unlike [`attach_photos`], which merges them.
+    /// The difference is what the caller can do about it: attach is a bulk
+    /// verdict on ids the caller did not choose one at a time, while a delete
+    /// is a person tapping "remove" on one picture, and "this is not yours" and
+    /// "this is already filed" send her to two different places. The
+    /// enumeration cost is real but small — the ids are dense integers, so the
+    /// only fact leaked is that SOME photo with that id exists, which the byte
+    /// endpoint already exposes to both roles.
+    pub async fn delete_photo(&self, photo_id: i64, badge: &str) -> ServiceResult<()> {
+        let badge = require_badge(badge)?;
+        let deleted = sqlx::query(
+            "DELETE FROM ht_hk_room_report_photos \
+              WHERE rrp_id = $1 AND rrp_badge = $2 AND rrp_report_id IS NULL",
+        )
+        .bind(photo_id)
+        .bind(&badge)
+        .execute(&self.pg)
+        .await?;
+        if deleted.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        let row = sqlx::query(
+            "SELECT rrp_badge, rrp_report_id FROM ht_hk_room_report_photos WHERE rrp_id = $1",
+        )
+        .bind(photo_id)
+        .fetch_optional(&self.pg)
+        .await?
+        .ok_or_else(|| ServiceError::not_found(format!("photo {photo_id} not found")))?;
+
+        let owner: String = row.try_get("rrp_badge")?;
+        if owner != badge {
+            return Err(ServiceError::Forbidden(PHOTO_NOT_YOURS_ERROR.to_string()));
+        }
+        // Yours, but already filed. Conflict rather than Validation for
+        // observability; the repo's shared mapping renders both 400 (see the
+        // module header — 409 is reserved for ship-dark FLAG refusals).
+        Err(ServiceError::conflict(PHOTO_ATTACHED_ERROR.to_string()))
     }
 
     /// The bytes of one photo. Readable by BOTH roles — reception must see the
@@ -355,14 +550,20 @@ impl HkReportService {
     ///
     /// ## What commits together
     ///
-    /// 1. the header row;
-    /// 2. its exception rows (one `UNNEST` statement, so "all or none" is a
+    /// 1. the header row (its `rr_all_items_ok` DERIVED from the ticks);
+    /// 2. **all 22 tick rows** (one `UNNEST` statement, so "all or none" is a
     ///    property of the statement rather than of remembering to stay inside
     ///    the transaction — `insert_linen_report_rows`' argument);
-    /// 3. the ATTACHMENT of the maid's photos, which is also the check that
-    ///    they are hers, `maid`-side and not already attached;
+    /// 3. the ATTACHMENT of every DISTINCT photo the ticks and extras name,
+    ///    which is also the check that they are hers, `maid`-side and not
+    ///    already attached;
     /// 4. **one standing `item_missing` / `item_damaged` room signal per
-    ///    excepted PROBLEM KIND**, maid→desk (ADR 0008 / migration 089).
+    ///    problem KIND present**, maid→desk (ADR 0008 / migration 089).
+    ///
+    /// Photos are attached BEFORE the ticks are inserted, because a tick row
+    /// carries an FK to its photo and the attach is what proves the photo is
+    /// the caller's: doing it the other way round would write the evidence link
+    /// first and check the ownership afterwards.
     ///
     /// ## Why one signal per PROBLEM, not per item
     ///
@@ -374,7 +575,8 @@ impl HkReportService {
     /// report" — and the report is where the itemisation lives. So the problems
     /// present in the checklist are deduplicated, in
     /// [`ItemProblem::ALL`](crate::domain::hk_report::ItemProblem::ALL) order,
-    /// to AT MOST TWO signals.
+    /// to AT MOST TWO signals. Unchanged from v1: the ticks changed, the
+    /// guest-accountability bridge did not.
     ///
     /// ## The open-report guard
     ///
@@ -401,10 +603,9 @@ impl HkReportService {
         // is already pending" about a body that could not have been accepted
         // anyway. Same ordering `answer_room_check` documents.
         check_side("submit", cmd.can_report).map_err(rule_error)?;
-        check_attestation(cmd.all_items_ok, cmd.items.len()).map_err(rule_error)?;
-        check_photo_count(cmd.photo_ids.len()).map_err(rule_error)?;
-        check_qty_bounds(&cmd.items)?;
-        check_distinct_photos(&cmd.photo_ids)?;
+        let photo_ids = check_ticks(&cmd.ticks, &cmd.extra_photo_ids)?;
+
+        let all_items_ok = !cmd.ticks.iter().any(|tick| tick.state.is_problem());
 
         let mut tx = self.pg.begin().await?;
 
@@ -429,7 +630,7 @@ impl HkReportService {
                 room_id: cmd.room_id,
                 date: cmd.date,
                 room_status: &cmd.room_status,
-                all_items_ok: cmd.all_items_ok,
+                all_items_ok,
                 parent_id,
                 badge: &badge,
                 name: cmd.name.as_deref(),
@@ -437,20 +638,17 @@ impl HkReportService {
         )
         .await?;
 
-        insert_report_items(&mut tx, report_id, &cmd.items).await?;
-        attach_photos(
-            &mut tx,
-            report_id,
-            &cmd.photo_ids,
-            PhotoSide::Maid,
-            &badge,
-        )
-        .await?;
+        attach_photos(&mut tx, report_id, &photo_ids, PhotoSide::Maid, &badge).await?;
+        insert_report_ticks(&mut tx, report_id, &cmd.ticks).await?;
 
         // The guest-accountability bridge. Deduplicated to one signal per
         // problem kind — see the doc comment.
         for problem in ItemProblem::ALL {
-            if !cmd.items.iter().any(|item| item.problem == problem) {
+            if !cmd
+                .ticks
+                .iter()
+                .any(|tick| tick.state.problem() == Some(problem))
+            {
                 continue;
             }
             crate::service::hk_signals::raise_from_report(
@@ -609,38 +807,50 @@ fn insert_error(err: sqlx::Error) -> ServiceError {
     ServiceError::Repository(err)
 }
 
-/// Insert every exception of ONE report — a single `UNNEST` statement, so the
+/// Insert ALL 22 ticks of ONE report — a single `UNNEST` statement, so the
 /// all-or-nothing property belongs to the statement rather than to a loop
-/// (`insert_linen_report_rows`' argument). A no-op for a ครบทุกรายการ report,
-/// which is the common case and costs no round-trip at all.
+/// (`insert_linen_report_rows`' argument).
 ///
-/// The arrays are bound as parameters (`$2::text[]`, `$3::text[]`, `$4::int[]`)
-/// — nothing a maid typed is ever concatenated into SQL.
-async fn insert_report_items(
+/// `rri_problem` is written as `NULLIF(state, 'ok')`, i.e. from the SAME value
+/// as `rri_state` in the same statement: that is what makes the two columns one
+/// fact written twice rather than two facts that can disagree, and it is what
+/// keeps the v1 `items` projection (`WHERE rri_problem IS NOT NULL`) correct for
+/// bundles that predate v2. The `'ok'` literal is BOUND
+/// (`TickState::Ok.as_str()`), never interpolated, so a rename in the enum moves
+/// the statement with it and nothing a maid typed is ever concatenated into SQL.
+///
+/// The arrays are bound as parameters (`$2::text[]`, `$3::text[]`, `$4::int[]`,
+/// `$5::bigint[]`); `rri_qty` carries NULLs for the `ok` ticks, which is exactly
+/// what migration 092's `DROP NOT NULL` made representable.
+async fn insert_report_ticks(
     tx: &mut Transaction<'_, Postgres>,
     report_id: i64,
-    items: &[ReportItemInput],
+    ticks: &[ReportTickInput],
 ) -> ServiceResult<()> {
-    if items.is_empty() {
+    if ticks.is_empty() {
         return Ok(());
     }
-    let codes: Vec<String> = items.iter().map(|item| item.item.clone()).collect();
-    let problems: Vec<String> = items
+    let codes: Vec<String> = ticks.iter().map(|tick| tick.item.clone()).collect();
+    let states: Vec<String> = ticks
         .iter()
-        .map(|item| item.problem.as_str().to_string())
+        .map(|tick| tick.state.as_str().to_string())
         .collect();
-    let quantities: Vec<i32> = items.iter().map(|item| item.qty).collect();
+    let quantities: Vec<Option<i32>> = ticks.iter().map(|tick| tick.qty).collect();
+    let photos: Vec<i64> = ticks.iter().map(|tick| tick.photo_id).collect();
 
     sqlx::query(
         "INSERT INTO ht_hk_room_report_items \
-             (rri_report_id, rri_item, rri_problem, rri_qty) \
-         SELECT $1, line.item, line.problem, line.qty \
-           FROM UNNEST($2::text[], $3::text[], $4::int[]) AS line(item, problem, qty)",
+             (rri_report_id, rri_item, rri_state, rri_problem, rri_qty, rri_photo_id) \
+         SELECT $1, line.item, line.state, NULLIF(line.state, $6), line.qty, line.photo_id \
+           FROM UNNEST($2::text[], $3::text[], $4::int[], $5::bigint[]) \
+                AS line(item, state, qty, photo_id)",
     )
     .bind(report_id)
     .bind(&codes)
-    .bind(&problems)
+    .bind(&states)
     .bind(&quantities)
+    .bind(&photos)
+    .bind(TickState::Ok.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -789,6 +999,25 @@ async fn lock_report(
 }
 
 /// Read one report in FULL, through the caller's transaction.
+///
+/// ## The v1/v2 discriminator, in one place
+///
+/// `ht_hk_room_report_items` holds two generations of row and this function is
+/// the ONLY place that tells them apart:
+///
+/// * a **v2 tick** is a row with a backing photo (`rri_photo_id IS NOT NULL`) —
+///   all 22 of them, `ok` ones included;
+/// * a **v1 exception** has none, because migration 091 had no such column.
+///
+/// So `ticks` is the photo-backed rows and a v1 report reads as `ticks: []`,
+/// exactly as the contract requires. `items` is the PROBLEM rows in v1's shape
+/// whichever generation they came from, which is what keeps a bundle that
+/// predates v2 rendering a v2 report's exceptions.
+///
+/// `allItemsOk` is DERIVED from those problem rows rather than read from
+/// `rr_all_items_ok`: the column is still written and still there for v1
+/// readers, but the rows are the truth, so nothing can serve a report whose
+/// badge disagrees with its own checklist.
 async fn load_report(
     tx: &mut Transaction<'_, Postgres>,
     report_id: i64,
@@ -800,56 +1029,96 @@ async fn load_report(
         .await?
         .ok_or_else(|| ServiceError::not_found(format!("report {report_id} not found")))?;
 
-    let items = sqlx::query(
-        "SELECT rri_item, rri_problem, rri_qty FROM ht_hk_room_report_items \
-          WHERE rri_report_id = $1 ORDER BY rri_id",
-    )
-    .bind(report_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let item_rows = sqlx::query(sqlx::AssertSqlSafe(ITEMS_SELECT))
+        .bind(report_id)
+        .fetch_all(&mut **tx)
+        .await?;
 
-    let photos = sqlx::query(
-        "SELECT rrp_id, rrp_side FROM ht_hk_room_report_photos \
-          WHERE rrp_report_id = $1 ORDER BY rrp_id",
-    )
-    .bind(report_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let photo_rows = sqlx::query(sqlx::AssertSqlSafe(PHOTOS_SELECT))
+        .bind(report_id)
+        .fetch_all(&mut **tx)
+        .await?;
 
-    let mut maid_photo_ids = Vec::new();
-    let mut reception_photo_ids = Vec::new();
-    for photo in &photos {
-        let id: i64 = photo.try_get("rrp_id")?;
-        let side: String = photo.try_get("rrp_side")?;
-        match PhotoSide::parse(&side) {
-            Some(PhotoSide::Maid) => maid_photo_ids.push(id),
-            Some(PhotoSide::Reception) => reception_photo_ids.push(id),
-            // The column carries a DB CHECK; an unknown value means it was
-            // hand-edited away. Drop it from BOTH lists rather than guess a
-            // side — mislabelling whose evidence a picture is would be worse
-            // than not showing it.
-            None => tracing::error!(
-                photo_id = id,
-                side = %side,
-                "report photo has an unknown side; omitted from the report DTO"
-            ),
+    let mut ticks: Vec<ReportTick> = Vec::new();
+    let mut items: Vec<ReportItem> = Vec::new();
+    for item_row in &item_rows {
+        let item: String = item_row.try_get("rri_item")?;
+        let state_raw: String = item_row.try_get("rri_state")?;
+        let problem_raw: Option<String> = item_row.try_get("rri_problem")?;
+        let qty: Option<i32> = item_row.try_get("rri_qty")?;
+        let photo_id: Option<i64> = item_row.try_get("rri_photo_id")?;
+
+        // The column carries a DB CHECK, so an unparseable value means the
+        // constraint was hand-edited away — an internal error, never a 400 the
+        // caller could act on. Same treatment as `rr_status`.
+        let state = TickState::parse(&state_raw).ok_or_else(|| {
+            ServiceError::internal(format!("item row has unknown state {state_raw:?}"))
+        })?;
+
+        if photo_id.is_some() {
+            ticks.push(ReportTick {
+                item: item.clone(),
+                state,
+                qty,
+                photo_id,
+            });
+        }
+
+        // `rri_problem` FIRST, falling back to the state: new writes set both
+        // from one value so they always agree, and preferring the stored
+        // problem keeps a v1 row readable even if its state backfill were ever
+        // rolled back.
+        let problem = problem_raw
+            .as_deref()
+            .and_then(ItemProblem::parse)
+            .or_else(|| state.problem());
+        if let Some(problem) = problem {
+            items.push(ReportItem {
+                item,
+                problem,
+                // Unreachable: every problem row carries a qty (v1 had NOT
+                // NULL, v2 refuses a problem tick without one). Floor it rather
+                // than fail a whole report's read on one impossible row.
+                qty: qty.unwrap_or(MIN_ITEM_QTY),
+            });
         }
     }
 
+    let mut photos: Vec<ReportPhoto> = Vec::new();
+    let mut maid_photo_ids = Vec::new();
+    let mut reception_photo_ids = Vec::new();
+    for photo in &photo_rows {
+        let id: i64 = photo.try_get("rrp_id")?;
+        let side_raw: String = photo.try_get("rrp_side")?;
+        let Some(side) = PhotoSide::parse(&side_raw) else {
+            // The column carries a DB CHECK; an unknown value means it was
+            // hand-edited away. Drop it from EVERY list rather than guess a
+            // side — mislabelling whose evidence a picture is would be worse
+            // than not showing it.
+            tracing::error!(
+                photo_id = id,
+                side = %side_raw,
+                "report photo has an unknown side; omitted from the report DTO"
+            );
+            continue;
+        };
+        match side {
+            PhotoSide::Maid => maid_photo_ids.push(id),
+            PhotoSide::Reception => reception_photo_ids.push(id),
+        }
+        photos.push(ReportPhoto {
+            photo_id: id,
+            side,
+            zone: photo.try_get("rrp_zone")?,
+            bytes: photo.try_get::<Option<i32>, _>("rrp_bytes")?.map(i64::from),
+        });
+    }
+
     let mut report = report_from_row(&row)?;
-    report.items = items
-        .iter()
-        .map(|row| {
-            let problem_raw: String = row.try_get("rri_problem")?;
-            Ok(ReportItem {
-                item: row.try_get("rri_item")?,
-                problem: ItemProblem::parse(&problem_raw).ok_or_else(|| {
-                    ServiceError::internal(format!("item row has unknown problem {problem_raw:?}"))
-                })?,
-                qty: row.try_get("rri_qty")?,
-            })
-        })
-        .collect::<ServiceResult<Vec<_>>>()?;
+    report.all_items_ok = items.is_empty();
+    report.ticks = ticks;
+    report.items = items;
+    report.photos = photos;
     report.maid_photo_ids = maid_photo_ids;
     report.reception_photo_ids = reception_photo_ids;
     Ok(report)
@@ -870,7 +1139,11 @@ fn report_from_row(row: &sqlx::postgres::PgRow) -> ServiceResult<RoomReport> {
             ServiceError::internal(format!("report has unknown status {status_raw:?}"))
         })?,
         room_status: row.try_get("rr_room_status")?,
-        all_items_ok: row.try_get("rr_all_items_ok")?,
+        // DERIVED by `load_report` from the problem rows — see its doc. `true`
+        // here is a placeholder for a report whose children have not been read
+        // yet, never a claim.
+        all_items_ok: true,
+        ticks: Vec::new(),
         items: Vec::new(),
         return_reason: row.try_get("rr_return_reason")?,
         parent_report_id: row.try_get("rr_parent_id")?,
@@ -883,6 +1156,7 @@ fn report_from_row(row: &sqlx::postgres::PgRow) -> ServiceResult<RoomReport> {
         verified_at: row
             .try_get::<Option<DateTime<Utc>>, _>("rr_verified_at")?
             .map(rfc3339),
+        photos: Vec::new(),
         maid_photo_ids: Vec::new(),
         reception_photo_ids: Vec::new(),
     })
@@ -900,6 +1174,7 @@ fn overview_row(row: &sqlx::postgres::PgRow) -> ServiceResult<RoomReportRow> {
         Some(report_id) => {
             let status_raw: String = row.try_get("rr_status")?;
             let date: NaiveDate = row.try_get("rr_date")?;
+            let problem_count = row.try_get::<i64, _>("problem_count")?.max(0) as usize;
             Some(RoomReportSummary {
                 report_id,
                 room_id: row.try_get("room_id")?,
@@ -909,7 +1184,12 @@ fn overview_row(row: &sqlx::postgres::PgRow) -> ServiceResult<RoomReportRow> {
                     ServiceError::internal(format!("report has unknown status {status_raw:?}"))
                 })?,
                 room_status: row.try_get("rr_room_status")?,
-                all_items_ok: row.try_get("rr_all_items_ok")?,
+                // DERIVED from the problem count, exactly as on the FULL DTO:
+                // the stored column stays for v1 readers, the ticks are the
+                // truth, and one card can never show both "ครบทุกรายการ" and a
+                // problem line.
+                all_items_ok: problem_count == 0,
+                problem_count,
                 return_reason: row.try_get("rr_return_reason")?,
                 parent_report_id: row.try_get("rr_parent_id")?,
                 submitted_by: ReportActor {
@@ -981,20 +1261,59 @@ fn rule_error(err: ReportRuleError) -> ServiceError {
     }
 }
 
-/// The 1..=99 quantity bound, re-checked for ANY caller (the route checks it
-/// too, so a bad body is a 400 rather than a 500 from the DB `CHECK`).
-fn check_qty_bounds(items: &[ReportItemInput]) -> ServiceResult<()> {
-    use crate::domain::hk_report::{MAX_ITEM_QTY, MIN_ITEM_QTY};
-    if let Some(bad) = items
-        .iter()
-        .find(|item| !(MIN_ITEM_QTY..=MAX_ITEM_QTY).contains(&item.qty))
-    {
-        return Err(ServiceError::validation(format!(
-            "item quantity {} for '{}' is outside {MIN_ITEM_QTY}..={MAX_ITEM_QTY}",
-            bad.qty, bad.item
-        )));
+/// THE submission's whole shape check, re-run for ANY caller — and the place
+/// the DISTINCT photo set is computed.
+///
+/// Every rule it applies is a pure function in [`crate::domain::hk_report`], so
+/// the route and the service share ONE enforcement point instead of two drifting
+/// copies. Order is deliberate: per-tick facts first (they name the offending
+/// item), then coverage (which names what the whole body is missing), then the
+/// photo total (which is a fact about the set, not about any one tick).
+///
+/// Returns the DISTINCT photo ids, in first-seen order — the exact list
+/// [`attach_photos`] must bind. Distinct, because one photo backing five ticks
+/// is ONE picture: counting references would refuse a well-shot room at the
+/// ceiling and admit a four-tick report with one picture at the floor. Order is
+/// stable so two identical submissions attach in the same order and the ids
+/// come back on the DTO the same way.
+///
+/// `pub` so `routes::hk::submit_report` can run it BEFORE the room probe. That
+/// is the ORDERING point, not a second enforcement point: an incomplete
+/// checklist must be answered 400 without a database round-trip (the rule the
+/// whole `/hk` surface follows — body before room), and calling this same
+/// function rather than restating its rules is what keeps one enforcement point
+/// serving both layers.
+pub fn check_ticks(ticks: &[ReportTickInput], extras: &[i64]) -> ServiceResult<Vec<i64>> {
+    let mut seen: Vec<&str> = Vec::with_capacity(ticks.len());
+    for tick in ticks {
+        if seen.contains(&tick.item.as_str()) {
+            return Err(rule_error(ReportRuleError::DuplicateTick {
+                item: tick.item.clone(),
+            }));
+        }
+        seen.push(tick.item.as_str());
+        check_tick_qty(&tick.item, tick.state, tick.qty).map_err(rule_error)?;
+        // A non-positive id is not a photo — treat it as absent, so the caller
+        // gets "no photoId" rather than a foreign-key error from the insert.
+        check_tick_photo(&tick.item, Some(tick.photo_id).filter(|id| *id > 0))
+            .map_err(rule_error)?;
     }
-    Ok(())
+
+    let ticked: Vec<String> = ticks.iter().map(|tick| tick.item.clone()).collect();
+    check_tick_coverage(&ticked).map_err(rule_error)?;
+
+    let mut photo_ids: Vec<i64> = Vec::with_capacity(ticks.len());
+    for id in ticks
+        .iter()
+        .map(|tick| tick.photo_id)
+        .chain(extras.iter().copied())
+    {
+        if id > 0 && !photo_ids.contains(&id) {
+            photo_ids.push(id);
+        }
+    }
+    check_photo_total(photo_ids.len()).map_err(rule_error)?;
+    Ok(photo_ids)
 }
 
 /// The same photo id twice would make the attach statement's row count short
@@ -1022,12 +1341,42 @@ mod tests {
     use super::*;
     use crate::error::ApiError;
 
-    fn item(item: &str, problem: ItemProblem, qty: i32) -> ReportItemInput {
-        ReportItemInput {
+    use crate::domain::hk_report::REPORT_ITEMS;
+
+    /// One `ok` tick, backed by `photo_id`.
+    fn ok_tick(item: &str, photo_id: i64) -> ReportTickInput {
+        ReportTickInput {
             item: item.to_string(),
-            problem,
-            qty,
+            state: TickState::Ok,
+            qty: None,
+            photo_id,
         }
+    }
+
+    /// A complete, valid checklist: all 22 items `ok`, spread across four
+    /// pictures the way a zone-by-zone capture produces them.
+    fn full_ticks() -> Vec<ReportTickInput> {
+        REPORT_ITEMS
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ok_tick(item, (index % 4) as i64 + 1))
+            .collect()
+    }
+
+    /// Turn one item's tick into a problem, in place.
+    fn with_problem(
+        mut ticks: Vec<ReportTickInput>,
+        item: &str,
+        state: TickState,
+        qty: Option<i32>,
+    ) -> Vec<ReportTickInput> {
+        let tick = ticks
+            .iter_mut()
+            .find(|tick| tick.item == item)
+            .expect("the item is on the checklist");
+        tick.state = state;
+        tick.qty = qty;
+        ticks
     }
 
     // ---- SQL pins (no database) -----------------------------------------
@@ -1047,7 +1396,6 @@ mod tests {
             "rep.rr_date",
             "rep.rr_status",
             "rep.rr_room_status",
-            "rep.rr_all_items_ok",
             "rep.rr_return_reason",
             "rep.rr_parent_id",
             "rep.rr_submitted_badge",
@@ -1061,6 +1409,29 @@ mod tests {
         }
         assert!(sql.contains("AS maid_photos"));
         assert!(sql.contains("AS reception_photos"));
+        assert!(sql.contains("AS problem_count"));
+        // `rr_all_items_ok` is DERIVED from `problem_count` since migration
+        // 092 — selecting it as well would be a second answer to one question.
+        assert!(
+            !sql.contains("rr_all_items_ok"),
+            "the overview must derive allItemsOk from the problem count"
+        );
+    }
+
+    /// `problemCount` comes from ONE more correlated aggregate, never a
+    /// per-room query, and its predicate reads BOTH generations of row: a v2
+    /// tick (`rri_state <> 'ok'`) and a v1 exception (`rri_problem IS NOT
+    /// NULL`).
+    #[test]
+    fn the_overview_counts_problems_in_one_lateral_across_both_generations() {
+        let sql = day_overview_sql();
+        assert_eq!(
+            sql.matches("FROM ht_hk_room_report_items").count(),
+            1,
+            "the problem count must be one correlated aggregate, not an N+1"
+        );
+        assert!(sql.contains(&format!("i.rri_state <> '{}'", TickState::Ok.as_str())));
+        assert!(sql.contains("i.rri_problem IS NOT NULL"));
     }
 
     /// The overview is ONE statement over every active room, in room order —
@@ -1110,7 +1481,6 @@ mod tests {
             "h.rr_date",
             "h.rr_status",
             "h.rr_room_status",
-            "h.rr_all_items_ok",
             "h.rr_return_reason",
             "h.rr_parent_id",
             "h.rr_submitted_badge",
@@ -1126,6 +1496,32 @@ mod tests {
             );
         }
         assert!(REPORT_SELECT.contains("JOIN ht_rooms_new r ON r.room_id = h.rr_room_id"));
+        assert!(
+            !REPORT_SELECT.contains("rr_all_items_ok"),
+            "the FULL DTO derives allItemsOk from the problem rows"
+        );
+    }
+
+    /// The child projections must carry every column `load_report` reads —
+    /// including the two migration 092 added to each table, which is what makes
+    /// the v1/v2 discrimination and the photo metadata possible at all.
+    #[test]
+    fn the_child_projections_select_every_column_the_dto_reads() {
+        for column in [
+            "rri_item",
+            "rri_state",
+            "rri_problem",
+            "rri_qty",
+            "rri_photo_id",
+        ] {
+            assert!(ITEMS_SELECT.contains(column), "ticks need {column}");
+        }
+        for column in ["rrp_id", "rrp_side", "rrp_zone", "rrp_bytes"] {
+            assert!(PHOTOS_SELECT.contains(column), "photos need {column}");
+        }
+        // Both are ordered, so the ids come back in a stable, reproducible order.
+        assert!(ITEMS_SELECT.contains("ORDER BY rri_id"));
+        assert!(PHOTOS_SELECT.contains("ORDER BY rrp_id"));
     }
 
     // ---- the rules, as this service raises them --------------------------
@@ -1170,15 +1566,114 @@ mod tests {
         assert_eq!(require_badge("  Q1001 ").unwrap(), "Q1001");
     }
 
+    /// The service re-runs the WHOLE tick shape for any caller — it is not a
+    /// route-only convenience. A complete, valid checklist passes and returns
+    /// the DISTINCT photo set to attach.
     #[test]
-    fn quantities_are_bounded_one_to_ninety_nine() {
-        assert!(check_qty_bounds(&[item("water_glass", ItemProblem::Missing, 1)]).is_ok());
-        assert!(check_qty_bounds(&[item("water_glass", ItemProblem::Missing, 99)]).is_ok());
-        for bad in [0, -1, 100, i32::MAX] {
-            let err = check_qty_bounds(&[item("water_glass", ItemProblem::Missing, bad)])
-                .expect_err("{bad} must be refused");
-            assert!(matches!(err, ServiceError::Validation(_)));
+    fn a_complete_checklist_passes_and_yields_the_distinct_photo_set() {
+        let photos = check_ticks(&full_ticks(), &[]).expect("22 ok ticks over 4 photos");
+        assert_eq!(
+            photos,
+            vec![1, 2, 3, 4],
+            "one photo backing several ticks is ONE picture, in first-seen order"
+        );
+
+        // Extras join the set, still de-duplicated.
+        let photos = check_ticks(&full_ticks(), &[4, 9]).expect("an extra wide shot");
+        assert_eq!(photos, vec![1, 2, 3, 4, 9]);
+    }
+
+    /// Every refusal the validator can make, and the class it makes it in.
+    /// This is the matrix a route can never re-decide.
+    #[test]
+    fn the_tick_validator_refuses_every_malformed_checklist() {
+        // Short of the checklist.
+        let mut short = full_ticks();
+        short.pop();
+        let err = check_ticks(&short, &[]).expect_err("21 ticks is not the checklist");
+        assert!(matches!(err, ServiceError::Validation(_)));
+        assert!(err.to_string().contains("bathrobe"), "{err}");
+
+        // The same item twice (and therefore one absent) — named as a
+        // duplicate, because that is the mistake the client actually made.
+        let mut dupe = full_ticks();
+        dupe[0].item = "tv_remote".to_string();
+        let err = check_ticks(&dupe, &[]).expect_err("a duplicate must be refused");
+        assert!(err.to_string().contains("more than once"), "{err}");
+
+        // An item that is not on the form.
+        let mut unknown = full_ticks();
+        unknown[0].item = "minibar".to_string();
+        let err = check_ticks(&unknown, &[]).expect_err("an unknown item must be refused");
+        assert!(err.to_string().contains("minibar"), "{err}");
+
+        // qty rules, per state.
+        let no_qty = with_problem(full_ticks(), "tv_remote", TickState::Missing, None);
+        let err = check_ticks(&no_qty, &[]).expect_err("a problem needs a qty");
+        assert!(err.to_string().contains("needs a qty"), "{err}");
+
+        let qty_on_ok = {
+            let mut ticks = full_ticks();
+            ticks[0].qty = Some(1);
+            ticks
+        };
+        let err = check_ticks(&qty_on_ok, &[]).expect_err("an ok tick carries no qty");
+        assert!(err.to_string().contains("carries no qty"), "{err}");
+
+        for bad in [0, -1, 100] {
+            let ticks = with_problem(full_ticks(), "kettle", TickState::Damaged, Some(bad));
+            let err = check_ticks(&ticks, &[]).expect_err("qty out of range");
+            assert!(err.to_string().contains("1..=99"), "{err}");
         }
+
+        // A tick with no usable backing photo.
+        for bad in [0, -1] {
+            let mut ticks = full_ticks();
+            ticks[0].photo_id = bad;
+            let err = check_ticks(&ticks, &[]).expect_err("a tick must name a photo");
+            assert!(err.to_string().contains("photoId"), "{err}");
+        }
+    }
+
+    /// The DISTINCT total, both bounds. Four zone shots is the floor; a report
+    /// backed by fewer pictures than there are zones cannot have been shot zone
+    /// by zone.
+    #[test]
+    fn the_distinct_photo_total_is_bounded_at_both_ends() {
+        // Every tick on ONE photo: three short of the floor.
+        let one_photo: Vec<ReportTickInput> = REPORT_ITEMS.iter().map(|i| ok_tick(i, 7)).collect();
+        let err = check_ticks(&one_photo, &[]).expect_err("1 distinct photo is below the floor");
+        assert!(err.to_string().contains("4..=24"), "{err}");
+
+        // …and three extras lift exactly the same ticks over it.
+        assert!(check_ticks(&one_photo, &[8, 9, 10]).is_ok());
+
+        // Above the ceiling: 4 tick photos + 21 extras = 25.
+        let extras: Vec<i64> = (100..121).collect();
+        let err = check_ticks(&full_ticks(), &extras).expect_err("25 distinct photos");
+        assert!(err.to_string().contains("4..=24"), "{err}");
+        // 24 is admitted.
+        assert!(check_ticks(&full_ticks(), &extras[..20]).is_ok());
+    }
+
+    /// `allItemsOk` is DERIVED from the ticks — the header column is a cache of
+    /// this expression, and `submit` computes it exactly this way.
+    #[test]
+    fn all_items_ok_is_derived_from_the_ticks() {
+        let derive = |ticks: &[ReportTickInput]| !ticks.iter().any(|t| t.state.is_problem());
+        assert!(derive(&full_ticks()), "22 ok ticks ⇒ ครบทุกรายการ");
+        assert!(!derive(&with_problem(
+            full_ticks(),
+            "tv_remote",
+            TickState::Missing,
+            Some(1)
+        )));
+        assert!(!derive(&with_problem(
+            full_ticks(),
+            "kettle",
+            TickState::Damaged,
+            Some(2)
+        )));
     }
 
     #[test]
@@ -1196,33 +1691,103 @@ mod tests {
     /// many items are excepted. This mirrors the loop in [`HkReportService::submit`]
     /// so the dedup rule is assertable without a database.
     #[test]
-    fn item_exceptions_raise_one_signal_per_problem_kind() {
-        fn signals_for(items: &[ReportItemInput]) -> Vec<&'static str> {
+    fn problem_ticks_raise_one_signal_per_problem_kind() {
+        fn signals_for(ticks: &[ReportTickInput]) -> Vec<&'static str> {
             ItemProblem::ALL
                 .into_iter()
-                .filter(|problem| items.iter().any(|item| item.problem == *problem))
+                .filter(|problem| {
+                    ticks
+                        .iter()
+                        .any(|tick| tick.state.problem() == Some(*problem))
+                })
                 .map(|problem| problem.signal_type())
                 .collect()
         }
 
-        assert_eq!(signals_for(&[]), Vec::<&str>::new(), "a clean room signals nothing");
         assert_eq!(
-            signals_for(&[
-                item("tv_remote", ItemProblem::Missing, 1),
-                item("bath_towel", ItemProblem::Missing, 3),
-                item("water_glass", ItemProblem::Missing, 2),
-            ]),
+            signals_for(&full_ticks()),
+            Vec::<&str>::new(),
+            "a clean room signals nothing — 22 ok ticks are not 22 signals"
+        );
+
+        let mut three_missing = full_ticks();
+        for item in ["tv_remote", "bath_towel", "water_glass"] {
+            three_missing = with_problem(three_missing, item, TickState::Missing, Some(2));
+        }
+        assert_eq!(
+            signals_for(&three_missing),
             vec!["item_missing"],
             "three missing items are ONE item_missing, not three"
         );
+
+        let both = with_problem(
+            with_problem(full_ticks(), "kettle", TickState::Damaged, Some(1)),
+            "tv_remote",
+            TickState::Missing,
+            Some(1),
+        );
         assert_eq!(
-            signals_for(&[
-                item("kettle", ItemProblem::Damaged, 1),
-                item("tv_remote", ItemProblem::Missing, 1),
-            ]),
+            signals_for(&both),
             vec!["item_missing", "item_damaged"],
             "both kinds raise both, in ItemProblem::ALL order"
         );
+    }
+
+    /// The tick INSERT writes `rri_problem` from the SAME value as `rri_state`
+    /// (`NULLIF(state, 'ok')`) in one statement, with the `'ok'` literal BOUND
+    /// rather than interpolated. Pinned as text because the two columns
+    /// disagreeing is exactly what would make a v2 report unreadable to a v1
+    /// bundle — silently, and only for the reports that have problems.
+    #[test]
+    fn the_tick_insert_writes_the_problem_column_from_the_state() {
+        let sql = "INSERT INTO ht_hk_room_report_items \
+             (rri_report_id, rri_item, rri_state, rri_problem, rri_qty, rri_photo_id) \
+         SELECT $1, line.item, line.state, NULLIF(line.state, $6), line.qty, line.photo_id \
+           FROM UNNEST($2::text[], $3::text[], $4::int[], $5::bigint[]) \
+                AS line(item, state, qty, photo_id)";
+        assert!(sql.contains("NULLIF(line.state, $6)"), "one value, written twice");
+        assert!(
+            !sql.contains("'ok'"),
+            "the ok literal must be BOUND, so a rename in TickState moves the statement"
+        );
+        for column in ["rri_state", "rri_qty", "rri_photo_id"] {
+            assert!(sql.contains(column), "the insert must write {column}");
+        }
+        assert!(
+            sql.contains("UNNEST($2::text[], $3::text[], $4::int[], $5::bigint[])"),
+            "all 22 ticks land in ONE statement, so all-or-none is the statement's property"
+        );
+    }
+
+    /// The delete is ONE statement carrying the WHOLE predicate, so ownership
+    /// and the write are atomic: a submit committing concurrently cannot lose
+    /// the race and leave a filed report's photo deleted.
+    #[test]
+    fn the_delete_predicate_carries_ownership_and_unattachedness() {
+        let sql = "DELETE FROM ht_hk_room_report_photos \
+              WHERE rrp_id = $1 AND rrp_badge = $2 AND rrp_report_id IS NULL";
+        for condition in ["rrp_id = $1", "rrp_badge = $2", "rrp_report_id IS NULL"] {
+            assert!(sql.contains(condition), "the delete must require {condition}");
+        }
+    }
+
+    /// The two delete refusals keep their own classes: someone else's photo is
+    /// 403, an already-filed one is 400 (the repo's conflict mapping).
+    #[test]
+    fn the_delete_refusals_keep_their_http_classes() {
+        let not_yours = ServiceError::Forbidden(PHOTO_NOT_YOURS_ERROR.to_string());
+        assert!(matches!(ApiError::from(not_yours), ApiError::Forbidden(_)));
+
+        let attached = ServiceError::conflict(PHOTO_ATTACHED_ERROR.to_string());
+        assert!(matches!(ApiError::from(attached), ApiError::BadRequest(_)));
+
+        // Both are Thai — a maid reads them on her phone mid-shift.
+        for message in [PHOTO_NOT_YOURS_ERROR, PHOTO_ATTACHED_ERROR] {
+            assert!(
+                message.chars().any(|c| ('\u{0E00}'..='\u{0E7F}').contains(&c)),
+                "{message} must be Thai"
+            );
+        }
     }
 
     /// The attach statement is the ownership check. Pinned as text because

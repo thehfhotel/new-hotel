@@ -11,6 +11,9 @@
 
 import {
   branchesUnavailableMessage,
+  applyZoneCapture,
+  bindTickPhoto,
+  buildReportTicks,
   canFileReport,
   canReport,
   canReturnReport,
@@ -18,31 +21,55 @@ import {
   canVerifyReport,
   canVerifyReports,
   clampReportQty,
+  clearReportDraft,
   countRoomsNeedingClean,
+  cycleTickPhoto,
+  cycleTickState,
+  deleteHkReportPhoto,
   downscaleDimensions,
   fetchHkReport,
+  fetchHkReportPhotoMeta,
   fetchHkReports,
   fetchHkRoomReport,
   hkReportPhotoUrl,
   itemProblemLabel,
   ITEM_PROBLEMS,
+  nextUploadPhoto,
+  nextUploadWakeMs,
+  photoChipLabel,
   prefillRoomStatus,
+  readReportDraft,
+  reconcileReportDraft,
+  reduceUploadQueue,
   REPORT_ITEMS,
   REPORT_MAX_PHOTOS,
+  REPORT_MAX_PHOTOS_TOTAL,
   REPORT_MAX_QTY,
+  REPORT_MIN_PHOTOS_TOTAL,
   REPORT_MIN_QTY,
+  REPORT_UPLOAD_MAX_ATTEMPTS,
+  REPORT_ZONES,
+  reportAllOk,
   reportDateLabel,
-  reportExceptionDraftFrom,
-  reportExceptionItems,
-  reportExceptionKey,
-  reportExceptionQty,
+  reportDraftKey,
+  reportExtraPhotoIds,
   reportItemRows,
-  reportItemsConsistent,
+  reportItemZone,
   reportPhotoCountValid,
+  reportPhotoGroups,
+  reportPhotoIds,
+  reportPhotoTotalValid,
+  reportProblemCount,
   reportRoomPriority,
+  reportSidePhotoIds,
   reportState,
   reportStateChip,
   reportStateCounts,
+  reportTickRows,
+  reportTicksByZone,
+  reportTicksSubmission,
+  reportZoneItems,
+  reportZoneProgress,
   returnHkReport,
   returnReasonLabel,
   RETURN_REASONS,
@@ -50,14 +77,24 @@ import {
   roomStatusLabel,
   sortReportRooms,
   stashHkReportNotice,
-  stepReportException,
+  stepTickQty,
   submitHkReport,
   takeHkReportNotice,
-  toggleReportException,
+  tickDraftFromReport,
+  ticksBackedBy,
+  unbindPhotoTicks,
+  uploadBackoffMs,
+  uploadCounts,
   uploadHkReportPhoto,
+  uploadProgressLabel,
+  uploadsSettled,
   verifyHkReport,
+  writeReportDraft,
+  type HkLocalPhoto,
   type HkReportRoom,
   type HkReportSummary,
+  type HkTickDraft,
+  type RoomStatusCode,
   emptyLinenCounts,
   groupRoomsByFloor,
   hasOpenLinenShortage,
@@ -1589,103 +1626,333 @@ describe('report labels', () => {
 })
 
 // ---------------------------------------------------------------------------
-// The exception draft — the sparse `"<item>:<problem>" → qty` record the
-// checklist is built from. Keyed by the PAIR because one item can be wrong two
-// ways at once (two towels gone, a third torn).
+// THE TICK MODEL — v2's replacement for the exception draft.
+//
+// The maid's working state is two plain records: item → tick, and the list of
+// shots she has taken. What these pin is the behaviour that makes a perfect
+// room four taps: a zone's photo PRE-TICKS its items ครบ, a tap cycles one item
+// through the three states, and removing a photo unbinds the ticks it backed
+// WITHOUT losing them.
 // ---------------------------------------------------------------------------
 
-describe('the exception draft', () => {
-  it('turns a pair on at qty 1 and off again', () => {
-    let draft = toggleReportException({}, 'bath_towel', 'missing')
-    expect(reportExceptionQty(draft, 'bath_towel', 'missing')).toBe(REPORT_MIN_QTY)
-    draft = toggleReportException(draft, 'bath_towel', 'missing')
-    expect(reportExceptionQty(draft, 'bath_towel', 'missing')).toBe(0)
-  })
+function localPhoto(
+  key: string,
+  zone: string,
+  overrides: Partial<HkLocalPhoto> = {}
+): HkLocalPhoto {
+  return {
+    key,
+    zone,
+    photoId: null,
+    bytes: null,
+    attempts: 0,
+    status: 'queued',
+    failedAt: null,
+    ...overrides,
+  }
+}
 
-  // Off DELETES the key. A zero left behind would ship as `qty: 0`, which the
-  // wire has no meaning for.
-  it('deletes the key on the way off rather than storing a zero', () => {
-    const draft = toggleReportException(
-      toggleReportException({}, 'kettle', 'damaged'),
-      'kettle',
-      'damaged'
-    )
-    expect(Object.keys(draft)).toEqual([])
-  })
+function uploadedPhoto(key: string, zone: string, photoId: number): HkLocalPhoto {
+  return localPhoto(key, zone, { photoId, status: 'uploaded', attempts: 1, bytes: 2048 })
+}
 
-  it('keeps หาย and ชำรุด for one item as two independent exceptions', () => {
-    let draft = toggleReportException({}, 'bath_towel', 'missing')
-    draft = toggleReportException(draft, 'bath_towel', 'damaged')
-    expect(reportExceptionItems(draft)).toEqual([
-      { item: 'bath_towel', problem: 'missing', qty: 1 },
-      { item: 'bath_towel', problem: 'damaged', qty: 1 },
+/** A whole perfect room: one landed shot per zone, every item pre-ticked ครบ
+ *  against it. The shape the submit path is asserted against. */
+function perfectRoom(): { ticks: HkTickDraft; photos: HkLocalPhoto[] } {
+  let ticks: HkTickDraft = {}
+  const photos: HkLocalPhoto[] = []
+  REPORT_ZONES.forEach((zone, index) => {
+    const key = 'photo-' + index
+    photos.push(uploadedPhoto(key, zone.zone, 100 + index))
+    ticks = applyZoneCapture(ticks, zone.zone, key)
+  })
+  return { ticks, photos }
+}
+
+describe('the capture zones', () => {
+  // The zones ARE the shooting order, and the stepper walks them in this
+  // sequence — bed first because it is the biggest surface in the room.
+  it('shoots เตียง → โต๊ะและมินิบาร์ → ห้องน้ำ → ทั่วไป', () => {
+    expect(REPORT_ZONES.map(({ zone }) => zone)).toEqual(['bed', 'desk', 'bathroom', 'general'])
+    expect(REPORT_ZONES.map(({ label }) => label)).toEqual([
+      'เตียง',
+      'โต๊ะและมินิบาร์',
+      'ห้องน้ำ',
+      'ทั่วไป',
     ])
   })
 
-  it('steps a selected pair and clamps in the REDUCER, not just on the buttons', () => {
-    let draft = toggleReportException({}, 'pillow', 'missing')
-    draft = stepReportException(draft, 'pillow', 'missing', 4)
-    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(5)
-    draft = stepReportException(draft, 'pillow', 'missing', -99)
-    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MIN_QTY)
-    draft = stepReportException(draft, 'pillow', 'missing', 500)
-    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MAX_QTY)
+  // Load-bearing: an item in two zones would be pre-ticked twice and an item in
+  // none could never be ticked at all.
+  it('puts every one of the 22 items in exactly ONE zone', () => {
+    const zoned = REPORT_ZONES.flatMap(({ items }) => items as readonly string[])
+    expect(zoned).toHaveLength(REPORT_ITEMS.length)
+    expect(new Set(zoned).size).toBe(REPORT_ITEMS.length)
+    for (const { item } of REPORT_ITEMS) expect(reportItemZone(item)).not.toBeNull()
   })
 
-  it('will not step a pair that is not an exception at all', () => {
-    expect(stepReportException({}, 'pillow', 'missing', 1)).toEqual({})
+  it('answers null for an item code this bundle predates', () => {
+    expect(reportItemZone('minibar')).toBeNull()
+  })
+})
+
+describe('applyZoneCapture (the pre-tick)', () => {
+  it('ticks every item of the zone ครบ against the shot, and nothing else', () => {
+    const ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    expect(Object.keys(ticks).sort()).toEqual([...reportZoneItems('bed')].sort())
+    expect(ticks.pillow).toEqual({ state: 'ok', qty: null, photo: 'photo-0' })
+    expect(ticks.kettle).toBeUndefined()
   })
 
-  it('clamps a nonsense quantity to the floor rather than shipping NaN', () => {
-    expect(clampReportQty(Number.NaN)).toBe(REPORT_MIN_QTY)
-    expect(clampReportQty(2.7)).toBe(2)
+  // A second shot of the same zone is an EXTRA, not a reset: it must not undo a
+  // หาย she has already tapped.
+  it('leaves a decision she has already made alone', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = cycleTickState(ticks, 'pillow')
+    ticks = applyZoneCapture(ticks, 'bed', 'photo-1')
+    expect(ticks.pillow).toEqual({ state: 'missing', qty: 1, photo: 'photo-0' })
   })
 
-  // Order is the vocabulary's, not the tapping order: the report reads the way
-  // the paper form does however she filled it in.
-  it('emits items in REPORT_ITEMS × ITEM_PROBLEMS order however they were tapped', () => {
-    let draft = toggleReportException({}, 'pillow', 'damaged')
-    draft = toggleReportException(draft, 'water_glass', 'missing')
-    draft = toggleReportException(draft, 'kettle', 'missing')
-    expect(reportExceptionItems(draft).map((i) => i.item)).toEqual([
-      'water_glass',
-      'kettle',
+  // ...but a tick whose photo she REMOVED is repaired by the retake, which is
+  // the whole reason remove unbinds instead of deleting.
+  it('re-binds a tick left without a photo', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = unbindPhotoTicks(ticks, 'photo-0')
+    expect(ticks.pillow.photo).toBeNull()
+    ticks = applyZoneCapture(ticks, 'bed', 'photo-9')
+    expect(ticks.pillow).toEqual({ state: 'ok', qty: null, photo: 'photo-9' })
+  })
+})
+
+describe('cycling a tick', () => {
+  it('goes ครบ → หาย → ชำรุด → ครบ', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'p')
+    expect(ticks.duvet.state).toBe('ok')
+    ticks = cycleTickState(ticks, 'duvet')
+    expect(ticks.duvet.state).toBe('missing')
+    ticks = cycleTickState(ticks, 'duvet')
+    expect(ticks.duvet.state).toBe('damaged')
+    ticks = cycleTickState(ticks, 'duvet')
+    expect(ticks.duvet.state).toBe('ok')
+  })
+
+  it('opens a problem at qty 1 and drops the quantity on the way back to ครบ', () => {
+    let ticks = cycleTickState(applyZoneCapture({}, 'bed', 'p'), 'pillow')
+    expect(ticks.pillow.qty).toBe(REPORT_MIN_QTY)
+    ticks = stepTickQty(ticks, 'pillow', 2)
+    expect(ticks.pillow.qty).toBe(3)
+    // หาย → ชำรุด keeps the count: three towels gone and three torn is the
+    // same three she already counted.
+    ticks = cycleTickState(ticks, 'pillow')
+    expect(ticks.pillow).toMatchObject({ state: 'damaged', qty: 3 })
+    ticks = cycleTickState(ticks, 'pillow')
+    expect(ticks.pillow).toMatchObject({ state: 'ok', qty: null })
+  })
+
+  it('clamps the quantity in the REDUCER, not just on the buttons', () => {
+    let ticks = cycleTickState(applyZoneCapture({}, 'bed', 'p'), 'pillow')
+    ticks = stepTickQty(ticks, 'pillow', 500)
+    expect(ticks.pillow.qty).toBe(REPORT_MAX_QTY)
+    ticks = stepTickQty(ticks, 'pillow', -500)
+    expect(ticks.pillow.qty).toBe(REPORT_MIN_QTY)
+  })
+
+  it('will not step an ok tick, and will not cycle an item the zone has not shot', () => {
+    const ticks = applyZoneCapture({}, 'bed', 'p')
+    expect(stepTickQty(ticks, 'pillow', 1)).toBe(ticks)
+    expect(cycleTickState(ticks, 'kettle')).toBe(ticks)
+  })
+})
+
+describe('binding a tick to a photo', () => {
+  // The close-up: a second shot that backs ONE tick instead of the zone.
+  it('rebinds one tick to a close-up without touching its neighbours', () => {
+    let ticks = applyZoneCapture({}, 'bathroom', 'zone-shot')
+    ticks = cycleTickState(ticks, 'bath_towel')
+    ticks = bindTickPhoto(ticks, 'bath_towel', 'close-up')
+    expect(ticks.bath_towel.photo).toBe('close-up')
+    expect(ticks.hairdryer.photo).toBe('zone-shot')
+  })
+
+  it('cycles through the zone’s own shots and wraps', () => {
+    const photos = [
+      uploadedPhoto('a', 'bed', 1),
+      uploadedPhoto('b', 'bed', 2),
+      uploadedPhoto('c', 'desk', 3),
+    ]
+    let ticks = applyZoneCapture({}, 'bed', 'a')
+    ticks = cycleTickPhoto(ticks, 'pillow', photos)
+    expect(ticks.pillow.photo).toBe('b')
+    // 'c' belongs to another zone and is never offered.
+    ticks = cycleTickPhoto(ticks, 'pillow', photos)
+    expect(ticks.pillow.photo).toBe('a')
+  })
+
+  it('labels which of the zone’s shots backs a tick', () => {
+    const photos = [uploadedPhoto('a', 'bed', 1), uploadedPhoto('b', 'bed', 2)]
+    expect(photoChipLabel(photos, 'a')).toBe('รูปที่ 1/2')
+    expect(photoChipLabel(photos, 'b')).toBe('รูปที่ 2/2')
+    expect(photoChipLabel(photos, null)).toBe('')
+  })
+})
+
+// Removing a photo is the one action that could silently un-attest a room, and
+// it must not.
+describe('removing a photo unbinds, never deletes', () => {
+  it('keeps every tick and only takes their evidence away', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = cycleTickState(ticks, 'pillow')
+    ticks = stepTickQty(ticks, 'pillow', 1)
+    const after = unbindPhotoTicks(ticks, 'photo-0')
+    expect(Object.keys(after).sort()).toEqual(Object.keys(ticks).sort())
+    expect(after.pillow).toEqual({ state: 'missing', qty: 2, photo: null })
+  })
+
+  it('leaves ticks backed by another photo alone', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = bindTickPhoto(ticks, 'pillow', 'photo-1')
+    const after = unbindPhotoTicks(ticks, 'photo-0')
+    expect(after.pillow.photo).toBe('photo-1')
+    expect(after.duvet.photo).toBeNull()
+  })
+
+  // The caption of the full-screen viewer, and what makes the cost of a
+  // removal visible before she taps it.
+  it('names what one photo backs, in the paper form’s order', () => {
+    const ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    expect(ticksBackedBy(ticks, 'photo-0')).toEqual([
+      'duvet',
+      'bed_sheet',
+      'pillowcase',
+      'duvet_cover',
       'pillow',
     ])
-    expect(REPORT_ITEMS.map(({ item }) => item).indexOf('water_glass')).toBeLessThan(
-      REPORT_ITEMS.map(({ item }) => item).indexOf('kettle')
+    expect(ticksBackedBy(ticks, 'nothing')).toEqual([])
+  })
+})
+
+describe('zone progress', () => {
+  it('reports each zone’s shots, ticks and problems in shooting order', () => {
+    const { ticks, photos } = perfectRoom()
+    const progress = reportZoneProgress(ticks, photos)
+    expect(progress.map((p) => p.zone)).toEqual(['bed', 'desk', 'bathroom', 'general'])
+    expect(progress.every((p) => p.done)).toBe(true)
+    expect(progress[0].photoCount).toBe(1)
+    expect(progress[0].backedCount).toBe(progress[0].itemCount)
+    expect(progress.reduce((n, p) => n + p.itemCount, 0)).toBe(REPORT_ITEMS.length)
+  })
+
+  it('counts a problem and an unbacked tick separately', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = cycleTickState(ticks, 'pillow')
+    ticks = unbindPhotoTicks(ticks, 'photo-0')
+    const [bed] = reportZoneProgress(ticks, [])
+    expect(bed).toMatchObject({ problemCount: 1, backedCount: 0, done: false })
+    expect(bed.unbackedCount).toBe(bed.itemCount)
+  })
+})
+
+describe('building the submit body', () => {
+  it('emits all 22 ticks in the paper form’s order, photo-backed', () => {
+    const { ticks, photos } = perfectRoom()
+    const drafts = buildReportTicks(ticks, photos)
+    expect(drafts.map((t) => t.item)).toEqual(REPORT_ITEMS.map(({ item }) => item))
+    const body = reportTicksSubmission(drafts)
+    expect(body).toHaveLength(REPORT_ITEMS.length)
+    expect(body?.every((tick) => tick.state === 'ok')).toBe(true)
+    // An ok tick carries NO quantity — the server refuses one that does.
+    expect(body?.every((tick) => !('qty' in tick))).toBe(true)
+    expect(body?.[0]).toEqual({ item: 'water_glass', state: 'ok', photoId: 101 })
+  })
+
+  it('carries a quantity on problems only', () => {
+    const { photos } = perfectRoom()
+    let { ticks } = perfectRoom()
+    ticks = stepTickQty(cycleTickState(ticks, 'bath_towel'), 'bath_towel', 1)
+    const body = reportTicksSubmission(buildReportTicks(ticks, photos))
+    expect(body?.find((tick) => tick.item === 'bath_towel')).toEqual({
+      item: 'bath_towel',
+      state: 'missing',
+      qty: 2,
+      photoId: 102,
+    })
+  })
+
+  // Null, not a partial body: a tick with no photo is exactly what the server
+  // refuses, and she must be told here rather than after she leaves the room.
+  it('refuses a body while one tick has no photo', () => {
+    const { ticks, photos } = perfectRoom()
+    const drafts = buildReportTicks(unbindPhotoTicks(ticks, 'photo-0'), photos)
+    expect(reportTicksSubmission(drafts)).toBeNull()
+  })
+
+  it('refuses a body while a photo has not finished uploading', () => {
+    const { ticks } = perfectRoom()
+    const photos = REPORT_ZONES.map((zone, index) =>
+      index === 0
+        ? localPhoto('photo-0', zone.zone)
+        : uploadedPhoto('photo-' + index, zone.zone, 100 + index)
     )
+    expect(reportTicksSubmission(buildReportTicks(ticks, photos))).toBeNull()
   })
 
-  it('emits nothing for an empty draft', () => {
-    expect(reportExceptionItems({})).toEqual([])
+  it('refuses a body that is short of the 22', () => {
+    const ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    const photos = [uploadedPhoto('photo-0', 'bed', 1)]
+    expect(reportTicksSubmission(buildReportTicks(ticks, photos))).toBeNull()
   })
 
-  // The RETURNED-report path: her previous answers come back into the fresh
-  // form so she fixes what was wrong instead of re-entering 22 rows.
-  it('round-trips a filed report back into a draft', () => {
-    const items = [
-      { item: 'bath_towel', problem: 'missing', qty: 2 },
-      { item: 'tv_remote', problem: 'damaged', qty: 1 },
-    ]
-    expect(reportExceptionItems(reportExceptionDraftFrom(items))).toEqual([
-      { item: 'tv_remote', problem: 'damaged', qty: 1 },
-      { item: 'bath_towel', problem: 'missing', qty: 2 },
-    ])
+  // An extra shot of a zone is evidence and travels with the report.
+  it('sends photos no tick names as extras', () => {
+    const { ticks, photos } = perfectRoom()
+    const withExtra = [...photos, uploadedPhoto('extra', 'bed', 999)]
+    const drafts = buildReportTicks(ticks, withExtra)
+    expect(reportExtraPhotoIds(drafts, withExtra)).toEqual([999])
+    // First appearance order, which is REPORT_ITEMS' order: desk, bathroom,
+    // general, bed — then the extra.
+    expect(reportPhotoIds(drafts, [999])).toEqual([101, 102, 103, 100, 999])
   })
 
-  it('clamps an out-of-range quantity coming back from the server', () => {
-    const draft = reportExceptionDraftFrom([{ item: 'pillow', problem: 'missing', qty: 9999 }])
-    expect(reportExceptionQty(draft, 'pillow', 'missing')).toBe(REPORT_MAX_QTY)
+  it('counts one shared photo ONCE however many ticks name it', () => {
+    const { ticks, photos } = perfectRoom()
+    const drafts = buildReportTicks(ticks, photos)
+    expect(reportPhotoIds(drafts)).toHaveLength(REPORT_ZONES.length)
+  })
+})
+
+describe('tickDraftFromReport (the returned-report prefill)', () => {
+  it('brings her ticks back with NO photos — re-sending rejected evidence is not a fix', () => {
+    const draft = tickDraftFromReport({
+      ticks: [
+        { item: 'pillow', state: 'ok', qty: null, photoId: 5 },
+        { item: 'tv_remote', state: 'damaged', qty: 2, photoId: 6 },
+      ],
+    })
+    expect(draft.pillow).toEqual({ state: 'ok', qty: null, photo: null })
+    expect(draft.tv_remote).toEqual({ state: 'damaged', qty: 2, photo: null })
   })
 
-  it('reads an absent item list as an empty draft', () => {
-    expect(reportExceptionDraftFrom(null)).toEqual({})
-    expect(reportExceptionDraftFrom(undefined)).toEqual({})
+  // A legacy v1 report has no ticks at all: its exceptions come back, and the
+  // items it never named individually stay untouched rather than being
+  // invented as ครบ.
+  it('falls back to a v1 report’s exceptions', () => {
+    const draft = tickDraftFromReport({
+      ticks: [],
+      items: [{ item: 'kettle', problem: 'missing', qty: 3 }],
+    })
+    expect(draft.kettle).toEqual({ state: 'missing', qty: 3, photo: null })
+    expect(draft.pillow).toBeUndefined()
   })
 
-  it('spells one key for a pair, everywhere', () => {
-    expect(reportExceptionKey('kettle', 'missing')).toBe('kettle:missing')
+  it('drops codes and states this bundle does not know, and reads null as empty', () => {
+    const draft = tickDraftFromReport({
+      ticks: [
+        { item: 'minibar', state: 'ok', photoId: 1 },
+        { item: 'pillow', state: 'exploded', photoId: 1 },
+      ],
+    })
+    expect(draft).toEqual({})
+    expect(tickDraftFromReport(null)).toEqual({})
   })
 })
 
@@ -1735,92 +2002,87 @@ describe('reportItemRows', () => {
 // ---------------------------------------------------------------------------
 
 describe('canSubmitReport', () => {
-  const ok = {
-    roomStatus: 'vc',
-    allItemsOk: true,
-    items: [] as Array<{ item: string; problem: string; qty: number }>,
-    photoIds: [1],
+  function draft(overrides: Partial<{ roomStatus: string | null; extraPhotoIds: number[] }> = {}) {
+    const { ticks, photos } = perfectRoom()
+    return {
+      roomStatus: 'vc' as string | null,
+      ticks: buildReportTicks(ticks, photos),
+      ...overrides,
+    }
   }
 
-  it('accepts a clean, photographed report', () => {
-    expect(canSubmitReport(ok)).toBe(true)
-  })
-
-  // THE rule: evidence is not optional.
-  it('refuses a report with no photo at all', () => {
-    expect(canSubmitReport({ ...ok, photoIds: [] })).toBe(false)
-  })
-
-  it('refuses more than four photos', () => {
-    expect(canSubmitReport({ ...ok, photoIds: [1, 2, 3, 4, 5] })).toBe(false)
-    expect(canSubmitReport({ ...ok, photoIds: [1, 2, 3, 4] })).toBe(true)
-    expect(REPORT_MAX_PHOTOS).toBe(4)
+  it('accepts a perfect room — four shots, twenty-two ticks', () => {
+    expect(canSubmitReport(draft())).toBe(true)
   })
 
   it('refuses a report with no room status chosen', () => {
-    expect(canSubmitReport({ ...ok, roomStatus: null })).toBe(false)
+    expect(canSubmitReport(draft({ roomStatus: null }))).toBe(false)
   })
 
   it('refuses a room-status code the vocabulary does not carry', () => {
-    expect(canSubmitReport({ ...ok, roomStatus: 'zz' })).toBe(false)
+    expect(canSubmitReport(draft({ roomStatus: 'zz' }))).toBe(false)
   })
 
-  // The toggle and the list are one claim, and they must agree.
-  it('refuses ครบทุกรายการ carrying exceptions', () => {
+  // THE v2 rule: a tick without a picture is not evidence.
+  it('refuses while any tick has lost its photo', () => {
+    const { ticks, photos } = perfectRoom()
     expect(
       canSubmitReport({
-        ...ok,
-        allItemsOk: true,
-        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
+        roomStatus: 'vc',
+        ticks: buildReportTicks(unbindPhotoTicks(ticks, 'photo-2'), photos),
       })
     ).toBe(false)
   })
 
-  it('refuses มีรายการผิดปกติ that names nothing', () => {
-    expect(canSubmitReport({ ...ok, allItemsOk: false, items: [] })).toBe(false)
-  })
-
-  it('accepts มีรายการผิดปกติ that names something', () => {
+  it('refuses a checklist that is short of the 22', () => {
+    const photos = [uploadedPhoto('photo-0', 'bed', 1)]
     expect(
       canSubmitReport({
-        ...ok,
-        allItemsOk: false,
-        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
-      })
-    ).toBe(true)
-  })
-
-  it('refuses a quantity outside 1..99', () => {
-    expect(
-      canSubmitReport({
-        ...ok,
-        allItemsOk: false,
-        items: [{ item: 'kettle', problem: 'missing', qty: 0 }],
+        roomStatus: 'vc',
+        ticks: buildReportTicks(applyZoneCapture({}, 'bed', 'photo-0'), photos),
       })
     ).toBe(false)
-    expect(
-      canSubmitReport({
-        ...ok,
-        allItemsOk: false,
-        items: [{ item: 'kettle', problem: 'missing', qty: 100 }],
-      })
-    ).toBe(false)
+  })
+
+  // The server bounds the DISTINCT photo count, not the tick count: one shot
+  // per zone is the floor, and 24 is the ceiling.
+  it('bounds the report’s distinct photos at one per zone .. 24', () => {
+    expect(REPORT_MIN_PHOTOS_TOTAL).toBe(REPORT_ZONES.length)
+    expect(REPORT_MAX_PHOTOS_TOTAL).toBe(24)
+    expect(reportPhotoTotalValid(3)).toBe(false)
+    expect(reportPhotoTotalValid(4)).toBe(true)
+    expect(reportPhotoTotalValid(24)).toBe(true)
+    expect(reportPhotoTotalValid(25)).toBe(false)
+  })
+
+  // A room shot with ONE picture for all four zones is under the floor even
+  // though every tick is backed — the server would refuse it.
+  it('refuses a whole room backed by a single photo', () => {
+    let ticks: HkTickDraft = {}
+    for (const zone of REPORT_ZONES) ticks = applyZoneCapture(ticks, zone.zone, 'one')
+    const photos = [uploadedPhoto('one', 'bed', 7)]
+    expect(canSubmitReport({ roomStatus: 'vc', ticks: buildReportTicks(ticks, photos) })).toBe(
+      false
+    )
+  })
+
+  it('accepts extras up to the ceiling and refuses past it', () => {
+    const base = draft()
+    const extras = Array.from({ length: 20 }, (_, i) => 500 + i)
+    expect(canSubmitReport({ ...base, extraPhotoIds: extras })).toBe(true)
+    expect(canSubmitReport({ ...base, extraPhotoIds: [...extras, 999] })).toBe(false)
   })
 })
 
-describe('reportItemsConsistent / reportPhotoCountValid', () => {
-  it('is empty iff ok', () => {
-    expect(reportItemsConsistent(true, [])).toBe(true)
-    expect(reportItemsConsistent(true, [{ item: 'kettle', problem: 'missing', qty: 1 }])).toBe(false)
-    expect(reportItemsConsistent(false, [])).toBe(false)
-    expect(reportItemsConsistent(false, [{ item: 'kettle', problem: 'missing', qty: 1 }])).toBe(true)
-  })
-
-  it('bounds photos at 1..4 on both sides', () => {
+describe('reportPhotoCountValid', () => {
+  // Reception's own evidence is still 1..4 — the tick model is about the
+  // maid's side.
+  it('bounds a verify’s photos at 1..4', () => {
     expect(reportPhotoCountValid(0)).toBe(false)
     expect(reportPhotoCountValid(1)).toBe(true)
     expect(reportPhotoCountValid(4)).toBe(true)
     expect(reportPhotoCountValid(5)).toBe(false)
+    expect(REPORT_MAX_PHOTOS).toBe(4)
   })
 })
 
@@ -2024,20 +2286,25 @@ describe('report fetch helpers', () => {
       )
     })
 
-    it('posts the exact body the contract names, to the room-scoped path', async () => {
+    // The v2 body: TICKS, each photo-backed, and the extras that back nothing.
+    it('posts the exact v2 body the contract names, to the room-scoped path', async () => {
       await submitHkReport('hfhotel', 7, {
         roomStatus: 'co',
-        allItemsOk: false,
-        items: [{ item: 'bath_towel', problem: 'missing', qty: 2 }],
-        photoIds: [11, 12],
+        ticks: [
+          { item: 'water_glass', state: 'ok', photoId: 11 },
+          { item: 'bath_towel', state: 'missing', qty: 2, photoId: 12 },
+        ],
+        extraPhotoIds: [13],
       })
       expect(lastCall().url).toBe(`${HK_API_BASE}/rooms/7/report?branch=hfhotel`)
       expect(lastCall().init.method).toBe('POST')
       expect(body()).toEqual({
         roomStatus: 'co',
-        allItemsOk: false,
-        items: [{ item: 'bath_towel', problem: 'missing', qty: 2 }],
-        photoIds: [11, 12],
+        ticks: [
+          { item: 'water_glass', state: 'ok', photoId: 11 },
+          { item: 'bath_towel', state: 'missing', qty: 2, photoId: 12 },
+        ],
+        extraPhotoIds: [13],
       })
     })
 
@@ -2045,12 +2312,11 @@ describe('report fetch helpers', () => {
     it('carries parentReportId when it is fixing a returned report', async () => {
       await submitHkReport('hfhotel', 7, {
         roomStatus: 'vc',
-        allItemsOk: true,
-        items: [],
-        photoIds: [11],
+        ticks: [{ item: 'water_glass', state: 'ok', photoId: 11 }],
         parentReportId: 55,
       })
       expect(body().parentReportId).toBe(55)
+      expect(body()).not.toHaveProperty('extraPhotoIds')
     })
 
     // 409 is an ANSWER, not a retry: the room already has a report today.
@@ -2059,9 +2325,7 @@ describe('report fetch helpers', () => {
       await expect(
         submitHkReport('hfhotel', 7, {
           roomStatus: 'vc',
-          allItemsOk: true,
-          items: [],
-          photoIds: [1],
+          ticks: [{ item: 'water_glass', state: 'ok', photoId: 1 }],
         })
       ).rejects.toThrow(/ส่งรายงานของวันนี้ไปแล้ว/)
     })
@@ -2071,9 +2335,7 @@ describe('report fetch helpers', () => {
       await expect(
         submitHkReport('hfhotel', 7, {
           roomStatus: 'vc',
-          allItemsOk: true,
-          items: [],
-          photoIds: [1],
+          ticks: [{ item: 'water_glass', state: 'ok', photoId: 1 }],
         })
       ).rejects.toThrow(/บันทึกไม่สำเร็จ/)
     })
@@ -2106,16 +2368,30 @@ describe('report fetch helpers', () => {
   })
 
   describe('uploadHkReportPhoto', () => {
-    it('posts multipart under the field name "photo" and returns the id', async () => {
+    it('posts multipart under "photo", carries the capture zone, and returns id + size', async () => {
       ;(global.fetch as jest.Mock).mockResolvedValue(
-        jsonResponse(200, { success: true, photoId: 31 })
+        jsonResponse(200, { success: true, photoId: 31, bytes: 90_112 })
       )
       const blob = new Blob(['x'], { type: 'image/jpeg' })
-      await expect(uploadHkReportPhoto('hfhotel', blob)).resolves.toBe(31)
+      await expect(uploadHkReportPhoto('hfhotel', blob, { zone: 'bed' })).resolves.toEqual({
+        photoId: 31,
+        bytes: 90_112,
+      })
       expect(lastCall().url).toBe(`${HK_API_BASE}/report-photos?branch=hfhotel`)
       const form = lastCall().init.body as FormData
       expect(form).toBeInstanceOf(FormData)
       expect(form.get('photo')).toBeTruthy()
+      expect(form.get('zone')).toBe('bed')
+    })
+
+    it('sends no zone field at all when the caller has none', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, { success: true, photoId: 31 })
+      )
+      await expect(
+        uploadHkReportPhoto('hfhotel', new Blob(['x'], { type: 'image/jpeg' }))
+      ).resolves.toEqual({ photoId: 31, bytes: null })
+      expect((lastCall().init.body as FormData).get('zone')).toBeNull()
     })
 
     // Setting Content-Type by hand is the classic way to break every multipart
@@ -2147,6 +2423,64 @@ describe('report fetch helpers', () => {
       await expect(
         uploadHkReportPhoto('hfhotel', new Blob(['x'], { type: 'image/jpeg' }))
       ).rejects.toThrow(/อัปโหลดรูปไม่สำเร็จ/)
+    })
+  })
+
+  // The retake primitive: uploader-only, and only while the photo is still
+  // unattached — both enforced server-side.
+  describe('deleteHkReportPhoto', () => {
+    it('DELETEs the branch-scoped photo and resolves true', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+      await expect(deleteHkReportPhoto('hfhotel', 31)).resolves.toBe(true)
+      expect(lastCall().url).toBe(`${HK_API_BASE}/report-photos/31?branch=hfhotel`)
+      expect(lastCall().init.method).toBe('DELETE')
+    })
+
+    // A photo that is already part of a filed report answers 400. That is not
+    // an error the maid can act on — she has already moved on — so it resolves
+    // false and the caller shrugs.
+    it('resolves FALSE for a photo the server will not delete', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(404, { success: false }))
+      await expect(deleteHkReportPhoto('hfhotel', 31)).resolves.toBe(false)
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+      await expect(deleteHkReportPhoto('hfhotel', 31)).resolves.toBe(false)
+    })
+  })
+
+  // What a restored draft asks before it trusts a photo id it remembers.
+  describe('fetchHkReportPhotoMeta', () => {
+    it('reads one photo’s metadata', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(
+        jsonResponse(200, {
+          success: true,
+          photo: {
+            photoId: 31,
+            side: 'maid',
+            zone: 'bed',
+            bytes: 900,
+            attached: false,
+            uploadedAt: '2026-09-02T03:00:00.000Z',
+          },
+        })
+      )
+      await expect(fetchHkReportPhotoMeta('hfhotel', 31)).resolves.toMatchObject({
+        photoId: 31,
+        zone: 'bed',
+        attached: false,
+      })
+      expect(lastCall().url).toBe(`${HK_API_BASE}/report-photos/31/meta?branch=hfhotel`)
+    })
+
+    // Null means "cannot be used": the draft drops it and unbinds its ticks,
+    // which is kinder than a submit refused after she has left the room.
+    it('resolves null for anything that is not a clean answer', async () => {
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(404, { success: false }))
+      await expect(fetchHkReportPhotoMeta('hfhotel', 31)).resolves.toBeNull()
+      ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: true }))
+      await expect(fetchHkReportPhotoMeta('hfhotel', 31)).resolves.toBeNull()
+      ;(global.fetch as jest.Mock).mockRejectedValue(new Error('offline'))
+      await expect(fetchHkReportPhotoMeta('hfhotel', 31)).resolves.toBeNull()
+      await expect(fetchHkReportPhotoMeta(null, 31)).resolves.toBeNull()
     })
   })
 })
@@ -2185,5 +2519,326 @@ describe('the re-exported report vocabulary', () => {
       'items_mismatch',
       'photos_unclear',
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// THE UPLOAD QUEUE. Pure reducer, so the retry arithmetic a maid depends on in
+// a lift lobby is arithmetic a test can see.
+// ---------------------------------------------------------------------------
+
+describe('the upload queue', () => {
+  it('adds a shot as queued, once', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'add', key: 'a', zone: 'bed' })
+    expect(photos).toHaveLength(1)
+    expect(photos[0]).toMatchObject({ key: 'a', zone: 'bed', status: 'queued', attempts: 0 })
+  })
+
+  it('counts an attempt on start and lands with the id and the size', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'start', key: 'a' })
+    expect(photos[0]).toMatchObject({ status: 'uploading', attempts: 1 })
+    photos = reduceUploadQueue(photos, { type: 'uploaded', key: 'a', photoId: 42, bytes: 900 })
+    expect(photos[0]).toMatchObject({ status: 'uploaded', photoId: 42, bytes: 900 })
+  })
+
+  // One radio, one upload: four parallel 1600px JPEGs is how the whole queue
+  // stalls together.
+  it('sends one photo at a time', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'add', key: 'b', zone: 'desk' })
+    photos = reduceUploadQueue(photos, { type: 'start', key: 'a' })
+    expect(nextUploadPhoto(photos, 0)).toBeNull()
+  })
+
+  it('backs off exponentially and comes back when the wait is up', () => {
+    expect(uploadBackoffMs(1)).toBe(1000)
+    expect(uploadBackoffMs(2)).toBe(2000)
+    expect(uploadBackoffMs(5)).toBe(16000)
+    expect(uploadBackoffMs(99)).toBe(30000)
+
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'start', key: 'a' })
+    photos = reduceUploadQueue(photos, { type: 'failed', key: 'a', at: 1000 })
+    expect(nextUploadPhoto(photos, 1500)).toBeNull()
+    expect(nextUploadWakeMs(photos, 1500)).toBe(500)
+    expect(nextUploadPhoto(photos, 2000)?.key).toBe('a')
+  })
+
+  // Five attempts is where a silent loop stops eating her battery and starts
+  // waiting for a deliberate tap.
+  it('stops retrying after five attempts, and resumes on the tap', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    for (let i = 0; i < REPORT_UPLOAD_MAX_ATTEMPTS; i += 1) {
+      photos = reduceUploadQueue(photos, { type: 'start', key: 'a' })
+      photos = reduceUploadQueue(photos, { type: 'failed', key: 'a', at: 0 })
+    }
+    expect(photos[0].attempts).toBe(REPORT_UPLOAD_MAX_ATTEMPTS)
+    expect(nextUploadPhoto(photos, 10_000_000)).toBeNull()
+    expect(nextUploadWakeMs(photos, 10_000_000)).toBeNull()
+    expect(uploadCounts(photos).stuck).toBe(1)
+
+    // The tap puts it back in the queue and it goes IMMEDIATELY — making her
+    // wait out another backoff for the retry she just asked for is not a retry.
+    photos = reduceUploadQueue(photos, { type: 'resume' })
+    expect(photos[0]).toMatchObject({ status: 'queued', attempts: 0 })
+    expect(nextUploadPhoto(photos, 0)?.key).toBe('a')
+  })
+
+  it('drops a removed photo, and ignores an action for a key it no longer holds', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'remove', key: 'a' })
+    expect(photos).toEqual([])
+    expect(reduceUploadQueue(photos, { type: 'uploaded', key: 'a', photoId: 1 })).toEqual([])
+  })
+
+  it('says how far along it is, and when it is done', () => {
+    let photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    photos = reduceUploadQueue(photos, { type: 'add', key: 'b', zone: 'desk' })
+    expect(uploadProgressLabel(photos)).toBe('อัปโหลดแล้ว 0/2')
+    expect(uploadsSettled(photos)).toBe(false)
+    photos = reduceUploadQueue(photos, { type: 'uploaded', key: 'a', photoId: 1 })
+    expect(uploadProgressLabel(photos)).toBe('อัปโหลดแล้ว 1/2')
+    photos = reduceUploadQueue(photos, { type: 'uploaded', key: 'b', photoId: 2 })
+    expect(uploadsSettled(photos)).toBe(true)
+    expect(uploadCounts(photos)).toEqual({ total: 2, uploaded: 2, pending: 0, stuck: 0 })
+  })
+
+  it('never mutates the array it was given', () => {
+    const photos = reduceUploadQueue([], { type: 'add', key: 'a', zone: 'bed' })
+    const snapshot = JSON.parse(JSON.stringify(photos))
+    reduceUploadQueue(photos, { type: 'start', key: 'a' })
+    expect(photos).toEqual(snapshot)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// THE DRAFT — the phone that locks mid-room is the design case.
+// ---------------------------------------------------------------------------
+
+describe('the report draft', () => {
+  beforeEach(() => sessionStorage.clear())
+
+  it('keys by branch, room and day — 7 is a different room at each hotel', () => {
+    expect(reportDraftKey('hfhotel', 7, '2026-09-02')).toBe('hk.reportDraft.hfhotel.7.2026-09-02')
+    expect(reportDraftKey('hfville', 7, '2026-09-02')).not.toBe(
+      reportDraftKey('hfhotel', 7, '2026-09-02')
+    )
+  })
+
+  it('round-trips a half-filled room', () => {
+    const { ticks, photos } = perfectRoom()
+    writeReportDraft('hfhotel', 7, '2026-09-02', {
+      roomStatus: 'co',
+      step: 2,
+      ticks,
+      photos,
+      seq: 4,
+    })
+    const back = readReportDraft('hfhotel', 7, '2026-09-02')
+    expect(back).toMatchObject({ roomStatus: 'co', step: 2, seq: 4 })
+    expect(back?.photos).toHaveLength(4)
+    expect(back?.ticks.pillow).toEqual({ state: 'ok', qty: null, photo: 'photo-0' })
+  })
+
+  it('reads nothing, junk and another bundle’s shape as no draft', () => {
+    expect(readReportDraft('hfhotel', 7, '2026-09-02')).toBeNull()
+    sessionStorage.setItem('hk.reportDraft.hfhotel.7.2026-09-02', 'not json')
+    expect(readReportDraft('hfhotel', 7, '2026-09-02')).toBeNull()
+    sessionStorage.setItem('hk.reportDraft.hfhotel.7.2026-09-02', '{"step":1}')
+    expect(readReportDraft('hfhotel', 7, '2026-09-02')).toBeNull()
+  })
+
+  it('is cleared by a landed submit', () => {
+    const { ticks, photos } = perfectRoom()
+    writeReportDraft('hfhotel', 7, '2026-09-02', {
+      roomStatus: 'vc',
+      step: 4,
+      ticks,
+      photos,
+      seq: 4,
+    })
+    clearReportDraft('hfhotel', 7, '2026-09-02')
+    expect(readReportDraft('hfhotel', 7, '2026-09-02')).toBeNull()
+  })
+
+  // The reconciliation: a photo id she remembers is only usable while the
+  // server still says it is hers and unattached.
+  it('drops photos the server no longer offers and UNBINDS their ticks', () => {
+    const { ticks, photos } = perfectRoom()
+    const draft = { roomStatus: 'vc' as RoomStatusCode, step: 1, ticks, photos, seq: 4 }
+    const reconciled = reconcileReportDraft(draft, [101, 102, 103])
+    expect(reconciled.photos.map((p) => p.photoId)).toEqual([101, 102, 103])
+    // The bed shot (100) is gone: its five ticks survive, without evidence.
+    expect(reconciled.ticks.pillow).toEqual({ state: 'ok', qty: null, photo: null })
+    expect(reconciled.ticks.water_glass.photo).toBe('photo-1')
+    expect(Object.keys(reconciled.ticks)).toHaveLength(REPORT_ITEMS.length)
+  })
+
+  it('drops a photo that never got an id — its bytes died with the page', () => {
+    let ticks = applyZoneCapture({}, 'bed', 'photo-0')
+    ticks = cycleTickState(ticks, 'pillow')
+    const draft = {
+      roomStatus: 'vc' as RoomStatusCode,
+      step: 0,
+      ticks,
+      photos: [localPhoto('photo-0', 'bed')],
+      seq: 1,
+    }
+    const reconciled = reconcileReportDraft(draft, [])
+    expect(reconciled.photos).toEqual([])
+    // Her judgement survives; only the picture is owed.
+    expect(reconciled.ticks.pillow).toEqual({ state: 'missing', qty: 1, photo: null })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reading a filed report — v2's ticks, and v1's exceptions, from one screen.
+// ---------------------------------------------------------------------------
+
+describe('reading ticks off a filed report', () => {
+  const ticks = [
+    { item: 'pillow', state: 'ok', qty: null, photoId: 10 },
+    { item: 'bath_towel', state: 'missing', qty: 2, photoId: 12 },
+    { item: 'water_glass', state: 'ok', qty: null, photoId: 11 },
+  ]
+
+  it('renders rows in the paper form’s order with Thai labels', () => {
+    const rows = reportTickRows(ticks)
+    expect(rows.map((r) => r.item)).toEqual(['water_glass', 'bath_towel', 'pillow'])
+    expect(rows[1]).toMatchObject({
+      label: 'ผ้าขนหนู (รวมสีฟ้า)',
+      stateLabel: 'หาย',
+      qty: 2,
+      problem: true,
+      zoneLabel: 'ห้องน้ำ',
+    })
+  })
+
+  it('groups them by capture zone, dropping the zones a report does not touch', () => {
+    const groups = reportTicksByZone(ticks)
+    expect(groups.map((g) => g.zone)).toEqual(['bed', 'desk', 'bathroom'])
+    expect(groups[0].ticks.map((t) => t.item)).toEqual(['pillow'])
+  })
+
+  // A newer backend's 23rd item must render, not vanish.
+  it('keeps an unknown item under อื่น ๆ', () => {
+    const groups = reportTicksByZone([{ item: 'minibar', state: 'missing', qty: 1, photoId: 1 }])
+    expect(groups.map((g) => g.label)).toEqual(['อื่น ๆ'])
+    expect(groups[0].ticks[0].label).toBe('minibar')
+  })
+
+  it('reads an absent tick list as no rows at all', () => {
+    expect(reportTickRows(null)).toEqual([])
+    expect(reportTicksByZone(undefined)).toEqual([])
+  })
+})
+
+describe('reportPhotoGroups (the verify view’s layout)', () => {
+  const photos = [
+    { photoId: 10, side: 'maid', zone: 'bed', bytes: 900 },
+    { photoId: 12, side: 'maid', zone: 'bathroom', bytes: 800 },
+    { photoId: 20, side: 'reception', zone: null, bytes: 700 },
+  ]
+  const ticks = [
+    { item: 'pillow', state: 'ok', qty: null, photoId: 10 },
+    { item: 'duvet', state: 'ok', qty: null, photoId: 10 },
+    { item: 'bath_towel', state: 'missing', qty: 2, photoId: 12 },
+  ]
+
+  it('groups ONE side’s photos by zone, each with the items it backs', () => {
+    const groups = reportPhotoGroups(photos, ticks, 'maid')
+    expect(groups.map((g) => g.zone)).toEqual(['bed', 'bathroom'])
+    expect(groups[0].photos[0].photoId).toBe(10)
+    // One photo backing several ticks is the point of the shared-photo rule.
+    expect(groups[0].photos[0].ticks.map((t) => t.item)).toEqual(['duvet', 'pillow'])
+    expect(groups[1].photos[0].ticks[0]).toMatchObject({ problem: true, qty: 2 })
+  })
+
+  it('never shows the other side’s photos', () => {
+    expect(reportPhotoGroups(photos, ticks, 'reception').map((g) => g.label)).toEqual(['อื่น ๆ'])
+  })
+
+  it('still shows a photo that backs nothing — an extra shot is evidence', () => {
+    const groups = reportPhotoGroups(
+      [{ photoId: 31, side: 'maid', zone: 'bed', bytes: null }],
+      [],
+      'maid'
+    )
+    expect(groups[0].photos[0].ticks).toEqual([])
+  })
+})
+
+describe('reportProblemCount / reportAllOk / reportSidePhotoIds', () => {
+  it('prefers the server’s count, then the ticks, then v1’s exceptions', () => {
+    expect(reportProblemCount({ reportId: 1, roomId: 1, status: 'submitted', problemCount: 3 })).toBe(3)
+    expect(
+      reportProblemCount({
+        reportId: 1,
+        roomId: 1,
+        status: 'submitted',
+        ticks: [
+          { item: 'pillow', state: 'ok' },
+          { item: 'kettle', state: 'damaged', qty: 1 },
+        ],
+      })
+    ).toBe(1)
+    expect(
+      reportProblemCount({
+        reportId: 1,
+        roomId: 1,
+        status: 'submitted',
+        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
+      })
+    ).toBe(1)
+    expect(reportProblemCount(null)).toBe(0)
+  })
+
+  // The one failure here that could cost a guest a charge nobody can explain:
+  // "ครบทุกรายการ" printed over a list of missing things.
+  it('lets the ticks — then the rows — beat the flag', () => {
+    expect(
+      reportAllOk({
+        reportId: 1,
+        roomId: 1,
+        status: 'submitted',
+        allItemsOk: true,
+        ticks: [{ item: 'kettle', state: 'missing', qty: 1, photoId: 1 }],
+      })
+    ).toBe(false)
+    expect(
+      reportAllOk({
+        reportId: 1,
+        roomId: 1,
+        status: 'submitted',
+        allItemsOk: true,
+        items: [{ item: 'kettle', problem: 'missing', qty: 1 }],
+      })
+    ).toBe(false)
+    expect(reportAllOk({ reportId: 1, roomId: 1, status: 'submitted', allItemsOk: true })).toBe(true)
+  })
+
+  it('reads a side’s photos from the metadata, falling back to v1’s id arrays', () => {
+    expect(
+      reportSidePhotoIds(
+        {
+          reportId: 1,
+          roomId: 1,
+          status: 'submitted',
+          photos: [
+            { photoId: 5, side: 'maid' },
+            { photoId: 6, side: 'reception' },
+          ],
+        },
+        'maid'
+      )
+    ).toEqual([5])
+    expect(
+      reportSidePhotoIds(
+        { reportId: 1, roomId: 1, status: 'submitted', maidPhotoIds: [31, 32] },
+        'maid'
+      )
+    ).toEqual([31, 32])
   })
 })

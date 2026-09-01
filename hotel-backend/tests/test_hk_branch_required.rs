@@ -59,7 +59,7 @@ use hotel_backend::routes::hk::{
     REPORT_NOT_PERMITTED_ERROR, VERIFY_NOT_PERMITTED_ERROR,
 };
 use hotel_backend::routes::mode::{AppState, Branch};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tower::ServiceExt; // for `oneshot`
 
 /// A pool that never connects — rows 1-10 are answered before any SQL runs, so
@@ -1674,16 +1674,123 @@ async fn desk_signals_serve_todays_newest_answered_room_check_per_room() {
 /// runs, so it needs [`call_multipart`] rather than [`call`]. Its own rows are
 /// below.
 const REPORT_WRITES: [(&str, &str); 3] = [
-    (
-        "/api/hk/rooms/1/report",
-        r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
-    ),
+    ("/api/hk/rooms/1/report", V2_SUBMIT_BODY),
     ("/api/hk/reports/9/verify", r#"{"photoIds":[1]}"#),
     ("/api/hk/reports/9/return", r#"{"reason":"not_clean"}"#),
 ];
 
-/// The two READ endpoints.
+/// The three READ endpoints (`/meta` added by migration 092).
 const REPORT_READS: [&str; 2] = ["/api/hk/reports", "/api/hk/reports/9"];
+
+/// The 22 checklist items, in `report-vocab.ts` order — the ONLY accepted tick
+/// set. Duplicated here rather than imported so this suite pins the WIRE
+/// contract: if the backend's vocabulary moves without the frontend's, these
+/// bodies stop being accepted and this file says so.
+const REPORT_ITEM_CODES: [&str; 22] = [
+    "water_glass",
+    "coffee_tray",
+    "coffee_cup",
+    "coffee_sachet_jar",
+    "kettle",
+    "bathroom_bin",
+    "hairdryer",
+    "bath_amenity_tray",
+    "aircon_remote",
+    "tv_remote",
+    "mirror_bin",
+    "hangers",
+    "bath_towel",
+    "face_towel",
+    "foot_towel",
+    "duvet",
+    "bed_sheet",
+    "pillowcase",
+    "duvet_cover",
+    "pillow",
+    "ashtray",
+    "bathrobe",
+];
+
+/// A COMPLETE v2 submission: 22 `ok` ticks over four photos (one per capture
+/// zone), which is what a perfect room produces.
+///
+/// Built rather than spelled so the branch/role rows stay readable; the rows
+/// that are ABOUT the body shape spell their own.
+fn v2_submit_body() -> String {
+    let ticks: Vec<String> = REPORT_ITEM_CODES
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            format!(
+                r#"{{"item":"{item}","state":"ok","photoId":{}}}"#,
+                index % 4 + 1
+            )
+        })
+        .collect();
+    format!(r#"{{"roomStatus":"vc","ticks":[{}]}}"#, ticks.join(","))
+}
+
+/// A v2 submission with a caller-chosen photo per tick and an explicit extras
+/// list — the shape the photo-total rows need.
+fn submit_body_with(photo_for: impl Fn(usize) -> i64, extras: &[i64]) -> String {
+    let ticks: Vec<String> = REPORT_ITEM_CODES
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            format!(
+                r#"{{"item":"{item}","state":"ok","photoId":{}}}"#,
+                photo_for(index)
+            )
+        })
+        .collect();
+    let extras: Vec<String> = extras.iter().map(i64::to_string).collect();
+    format!(
+        r#"{{"roomStatus":"vc","ticks":[{}],"extraPhotoIds":[{}]}}"#,
+        ticks.join(","),
+        extras.join(",")
+    )
+}
+
+/// The same body as a `&'static str`, for the const tables above.
+static V2_SUBMIT_BODY: &str = concat!(
+    r#"{"roomStatus":"vc","ticks":["#,
+    r#"{"item":"water_glass","state":"ok","photoId":1},"#,
+    r#"{"item":"coffee_tray","state":"ok","photoId":2},"#,
+    r#"{"item":"coffee_cup","state":"ok","photoId":3},"#,
+    r#"{"item":"coffee_sachet_jar","state":"ok","photoId":4},"#,
+    r#"{"item":"kettle","state":"ok","photoId":1},"#,
+    r#"{"item":"bathroom_bin","state":"ok","photoId":2},"#,
+    r#"{"item":"hairdryer","state":"ok","photoId":3},"#,
+    r#"{"item":"bath_amenity_tray","state":"ok","photoId":4},"#,
+    r#"{"item":"aircon_remote","state":"ok","photoId":1},"#,
+    r#"{"item":"tv_remote","state":"ok","photoId":2},"#,
+    r#"{"item":"mirror_bin","state":"ok","photoId":3},"#,
+    r#"{"item":"hangers","state":"ok","photoId":4},"#,
+    r#"{"item":"bath_towel","state":"ok","photoId":1},"#,
+    r#"{"item":"face_towel","state":"ok","photoId":2},"#,
+    r#"{"item":"foot_towel","state":"ok","photoId":3},"#,
+    r#"{"item":"duvet","state":"ok","photoId":4},"#,
+    r#"{"item":"bed_sheet","state":"ok","photoId":1},"#,
+    r#"{"item":"pillowcase","state":"ok","photoId":2},"#,
+    r#"{"item":"duvet_cover","state":"ok","photoId":3},"#,
+    r#"{"item":"pillow","state":"ok","photoId":4},"#,
+    r#"{"item":"ashtray","state":"ok","photoId":1},"#,
+    r#"{"item":"bathrobe","state":"ok","photoId":2}"#,
+    r#"]}"#
+);
+
+/// The static table and the builder must stay the same body — otherwise a row
+/// that uses one and a row that uses the other are testing different things.
+#[test]
+fn the_static_and_built_submit_bodies_agree() {
+    assert_eq!(v2_submit_body(), V2_SUBMIT_BODY);
+    let json: serde_json::Value = serde_json::from_str(V2_SUBMIT_BODY).expect("valid JSON");
+    assert_eq!(
+        json["ticks"].as_array().map(Vec::len),
+        Some(22),
+        "the checklist is 22 items and a submission ticks all of them"
+    );
+}
 
 /// Every Report HK endpoint — read and write — 400s without a `?branch=`.
 ///
@@ -1697,10 +1804,26 @@ async fn report_endpoints_all_require_a_branch() {
         let (status, body) = get_inner(uri).await;
         assert_branch_400(status, &body, &format!("GET {uri} with no branch"));
     }
-    for uri in ["/api/hk/reports?date=2026-09-02", "/api/hk/report-photos/9"] {
+    for uri in [
+        "/api/hk/reports?date=2026-09-02",
+        "/api/hk/report-photos/9",
+        // Migration 092's metadata probe — a photo carries no room and no
+        // report, so the branch is the ONLY thing that says which site to look
+        // in.
+        "/api/hk/report-photos/9/meta",
+    ] {
         let (status, body) = get_inner(uri).await;
         assert_branch_400(status, &body, &format!("GET {uri} with no branch"));
     }
+
+    // …and migration 092's DELETE, which is a WRITE with the same problem: a
+    // default branch would let a Ville maid delete an HF Hotel photo.
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(app, "DELETE", "/api/hk/report-photos/9", "").await;
+    assert_branch_400(status, &body, "DELETE /api/hk/report-photos/9 with no branch");
     for (uri, payload) in REPORT_WRITES {
         // The MAID identity for the submission, the VIEWER for the verdicts —
         // otherwise the role gate would answer 403 first and this row would be
@@ -1744,13 +1867,7 @@ async fn report_endpoints_reject_branch_all() {
         AppState::new(lazy_pool()),
         policy(vec![Branch::Hfhotel, Branch::Hfville], false),
     );
-    let (status, body) = call(
-        app,
-        "POST",
-        "/api/hk/rooms/1/report?branch=all",
-        r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
-    )
-    .await;
+    let (status, body) = call(app, "POST", "/api/hk/rooms/1/report?branch=all", V2_SUBMIT_BODY).await;
     assert_branch_400(status, &body, "POST report?branch=all");
 }
 
@@ -1786,7 +1903,7 @@ async fn a_viewer_cannot_submit_a_report() {
         app,
         "POST",
         "/api/hk/rooms/1/report?branch=hfhotel",
-        r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+        V2_SUBMIT_BODY,
     )
     .await;
     assert_report_403(status, &body, "viewer submitting a room report");
@@ -1850,7 +1967,7 @@ async fn the_report_capability_gates_run_before_branch_and_body() {
     for (uri, payload, what) in [
         (
             "/api/hk/rooms/1/report",
-            r#"{"roomStatus":"vacant","allItemsOk":true,"items":[{"item":"nope","problem":"gone","qty":0}],"photoIds":[]}"#,
+            r#"{"roomStatus":"vacant","ticks":[{"item":"nope","state":"gone","qty":0}]}"#,
             "viewer submit: no branch, every field wrong",
         ),
         (
@@ -1860,8 +1977,15 @@ async fn the_report_capability_gates_run_before_branch_and_body() {
         ),
         (
             "/api/hk/rooms/1/report?branch=hfville",
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            V2_SUBMIT_BODY,
             "viewer submit: unoffered branch, valid body",
+        ),
+        (
+            // The RETIRED v1 body must not become a way past the role gate
+            // either: capability outranks body shape, in both directions.
+            "/api/hk/rooms/1/report?branch=hfhotel",
+            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            "viewer submit: retired v1 body",
         ),
     ] {
         let app = inner_viewer(
@@ -1947,28 +2071,40 @@ async fn the_photo_endpoints_are_open_to_both_roles() {
     }
 }
 
-/// The photo-count bound (1..=4) is enforced on BOTH sides that attach photos,
-/// with the repo's envelope — never a serde rejection and never a 500 from the
-/// attach statement coming up short.
+/// The VERIFY side keeps its 1..=4 per-transition bound, and the SUBMIT side
+/// now has a DISTINCT-photo total of 4..=24 across ticks and extras. Both
+/// answer in the repo's envelope — never a serde rejection and never a 500 from
+/// the attach statement coming up short.
 #[tokio::test]
 async fn report_photo_counts_are_400_on_both_sides() {
     let too_many = r#"[1,2,3,4,5]"#;
+
+    // Every tick on ONE photo: three short of the four-zone floor.
+    let one_photo = submit_body_with(|_| 1, &[]);
+    // …and the standard four-photo body plus 21 extras: 25 distinct, one over
+    // the ceiling.
+    let extras: Vec<i64> = (100..121).collect();
+    let over_ceiling = submit_body_with(|index| index as i64 % 4 + 1, &extras);
     for (uri, payload, what) in [
-        // The maid's submission: zero photos, then five.
         (
             "/api/hk/rooms/1/report?branch=hfhotel",
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[]}"#,
-            "submit with 0 photos",
+            one_photo.as_str(),
+            "submit backed by 1 distinct photo (below the four-zone floor)",
         ),
         (
             "/api/hk/rooms/1/report?branch=hfhotel",
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[]}"#,
-            "submit with photoIds omitted",
+            over_ceiling.as_str(),
+            "submit backed by 25 distinct photos",
         ),
         (
             "/api/hk/rooms/1/report?branch=hfhotel",
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1,2,3,4,5]}"#,
-            "submit with 5 photos",
+            r#"{"roomStatus":"vc","ticks":[]}"#,
+            "submit with no ticks at all",
+        ),
+        (
+            "/api/hk/rooms/1/report?branch=hfhotel",
+            r#"{"roomStatus":"vc"}"#,
+            "submit with ticks omitted",
         ),
     ] {
         let app = inner(
@@ -2005,71 +2141,114 @@ async fn report_photo_counts_are_400_on_both_sides() {
 /// Body validation answers in the REPO's envelope for every malformed shape —
 /// the reason each parser takes its field as an `Option`/`Value` rather than a
 /// typed field serde would reject with a foreign body shape.
+///
+/// **v2**: the checklist is a tick list, so the rows are about coverage,
+/// per-tick state/qty/photo rules, and the retired v1 shape.
 #[tokio::test]
 async fn report_body_errors_use_the_repo_envelope() {
-    for (payload, what) in [
+    // A tick body with ONE item replaced by `entry`.
+    let swap = |index: usize, entry: &str| -> String {
+        let ticks: Vec<String> = REPORT_ITEM_CODES
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                if i == index {
+                    entry.to_string()
+                } else {
+                    format!(r#"{{"item":"{item}","state":"ok","photoId":{}}}"#, i % 4 + 1)
+                }
+            })
+            .collect();
+        format!(r#"{{"roomStatus":"vc","ticks":[{}]}}"#, ticks.join(","))
+    };
+    // The full body minus its last tick — 21 of 22.
+    let short = {
+        let ticks: Vec<String> = REPORT_ITEM_CODES
+            .iter()
+            .enumerate()
+            .take(21)
+            .map(|(i, item)| format!(r#"{{"item":"{item}","state":"ok","photoId":{}}}"#, i % 4 + 1))
+            .collect();
+        format!(r#"{{"roomStatus":"vc","ticks":[{}]}}"#, ticks.join(","))
+    };
+    // 22 entries, one item ticked twice and another absent — the count alone
+    // is never the test.
+    let duplicated = swap(0, r#"{"item":"tv_remote","state":"ok","photoId":1}"#);
+
+    let rows: Vec<(String, &str)> = vec![
         (
-            r#"{"roomStatus":"vacant","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"tv_remote","state":"ok","photoId":2}"#)
+                .replace(r#""roomStatus":"vc""#, r#""roomStatus":"vacant""#),
             "unknown roomStatus",
         ),
         (
-            r#"{"allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            V2_SUBMIT_BODY.replace(r#""roomStatus":"vc","#, ""),
             "missing roomStatus",
         ),
+        (short, "21 of 22 ticks — the checklist must be complete"),
+        (duplicated, "one item ticked twice and another absent"),
         (
-            r#"{"roomStatus":"vc","items":[],"photoIds":[1]}"#,
-            "missing allItemsOk (absent must NOT default to true)",
-        ),
-        (
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[{"item":"tv_remote","problem":"missing","qty":1}],"photoIds":[1]}"#,
-            "allItemsOk true WITH exceptions",
-        ),
-        (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[],"photoIds":[1]}"#,
-            "allItemsOk false with NO exceptions",
-        ),
-        (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"remote","problem":"missing","qty":1}],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"remote","state":"ok","photoId":2}"#),
             "unknown item code",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"broken","qty":1}],"photoIds":[1]}"#,
-            "unknown problem code",
+            swap(9, r#"{"item":"tv_remote","state":"broken","qty":1,"photoId":2}"#),
+            "unknown state code (the code is 'damaged')",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"missing","qty":0}],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"tv_remote","state":"missing","photoId":2}"#),
+            "a problem tick with no qty",
+        ),
+        (
+            swap(9, r#"{"item":"tv_remote","state":"ok","qty":1,"photoId":2}"#),
+            "an ok tick carrying a qty",
+        ),
+        (
+            swap(9, r#"{"item":"tv_remote","state":"missing","qty":0,"photoId":2}"#),
             "qty below the bound",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"missing","qty":100}],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"tv_remote","state":"missing","qty":100,"photoId":2}"#),
             "qty above the bound",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"missing","qty":"2"}],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"tv_remote","state":"missing","qty":"2","photoId":2}"#),
             "qty as a string",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"missing","qty":1},{"item":"TV_REMOTE","problem":"Missing","qty":2}],"photoIds":[1]}"#,
-            "duplicate (item, problem) pair after normalisation",
+            swap(9, r#"{"item":"tv_remote","state":"ok"}"#),
+            "a tick with no photoId — every tick is photo-backed",
         ),
         (
-            r#"{"date":"2026-9-2","roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            swap(9, r#"{"item":"tv_remote","state":"ok","photoId":0}"#),
+            "a non-positive photoId",
+        ),
+        (
+            V2_SUBMIT_BODY.replace(
+                r#"{"roomStatus":"vc""#,
+                r#"{"date":"2026-9-2","roomStatus":"vc""#,
+            ),
             "unpadded date",
         ),
         (
-            r#"{"date":"02/09/2026","roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            V2_SUBMIT_BODY.replace(
+                r#"{"roomStatus":"vc""#,
+                r#"{"date":"02/09/2026","roomStatus":"vc""#,
+            ),
             "locale-format date",
         ),
         (
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1,1]}"#,
-            "the same photo twice",
+            V2_SUBMIT_BODY.replace(r#"]}"#, r#"],"extraPhotoIds":[9,9]}"#),
+            "the same extra photo twice",
         ),
-    ] {
+    ];
+
+    for (payload, what) in rows {
         let app = inner(
             AppState::new(lazy_pool()),
             policy(vec![Branch::Hfhotel], false),
         );
-        let (status, body) = call(app, "POST", "/api/hk/rooms/1/report?branch=hfhotel", payload)
+        let (status, body) = call(app, "POST", "/api/hk/rooms/1/report?branch=hfhotel", &payload)
             .await;
         assert_bad_request(status, &body, what);
     }
@@ -2092,6 +2271,61 @@ async fn report_body_errors_use_the_repo_envelope() {
         )
         .await;
         assert_bad_request(status, &body, what);
+    }
+}
+
+/// **The cross-version row.** A stale bundle sends the RETIRED v1 body —
+/// `allItemsOk` + `items` — and must get a 400 whose message NAMES `ticks`.
+///
+/// Both halves of Report HK v2 deploy as one atomic pair, so the only client
+/// that can send v1 is a cached one; the only useful thing to tell it is what
+/// the field is called now. A generic "ticks is required" would read like a
+/// client bug and send someone looking in the wrong place.
+///
+/// Every v1-shaped variant is covered, including a body that sends BOTH shapes:
+/// a client that does not know which one the server believes is a client we
+/// must not guess for.
+#[tokio::test]
+async fn a_v1_report_body_is_400_naming_ticks() {
+    let both_shapes = V2_SUBMIT_BODY.replace(
+        r#"{"roomStatus":"vc""#,
+        r#"{"allItemsOk":true,"roomStatus":"vc""#,
+    );
+    for (payload, what) in [
+        (
+            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            "the exact v1 clean-room body",
+        ),
+        (
+            r#"{"roomStatus":"vc","allItemsOk":false,"items":[{"item":"tv_remote","problem":"missing","qty":1}],"photoIds":[1]}"#,
+            "the v1 exception body",
+        ),
+        (
+            r#"{"roomStatus":"vc","allItemsOk":true}"#,
+            "allItemsOk alone",
+        ),
+        (
+            r#"{"roomStatus":"vc","items":[]}"#,
+            "items alone — either field is the v1 shape",
+        ),
+        (
+            both_shapes.as_str(),
+            "BOTH shapes at once — refused, never silently resolved",
+        ),
+    ] {
+        let app = inner(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, body) = call(app, "POST", "/api/hk/rooms/1/report?branch=hfhotel", payload)
+            .await;
+        assert_bad_request(status, &body, what);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("400 body must be JSON");
+        let error = json.get("error").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            error.contains("ticks"),
+            "{what}: the refusal must NAME the field that replaced them, got {error}"
+        );
     }
 }
 
@@ -2155,6 +2389,14 @@ async fn shipped_router_answers_401_for_every_report_endpoint() {
         "/api/hk/reports?branch=hfhotel&date=2026-09-02".to_string(),
         "",
     ));
+    // Migration 092's two new photo endpoints. The DELETE matters most: it is
+    // the first non-POST write on this surface, so it is the first that could
+    // have been mounted outside the Access layer by mistake — an
+    // unauthenticated DELETE against photographs of guest rooms.
+    for suffix in ["", "?branch=hfhotel", "?branch=hfville", "?branch=all"] {
+        probes.push(("GET", format!("/api/hk/report-photos/9/meta{suffix}"), ""));
+        probes.push(("DELETE", format!("/api/hk/report-photos/9{suffix}"), ""));
+    }
     for (uri, payload) in REPORT_WRITES {
         for suffix in ["", "?branch=hfhotel", "?branch=hfville", "?branch=all"] {
             probes.push(("POST", format!("{uri}{suffix}"), payload));
@@ -2186,4 +2428,329 @@ async fn shipped_router_answers_401_for_every_report_endpoint() {
             "POST {uri} must be refused by the Access gate; got {status} {got}"
         );
     }
+}
+
+// ============================================================================
+// Report HK v2 — the photo DELETE and /meta (migration 092)
+// ============================================================================
+
+/// Both photo endpoints are open to BOTH roles, exactly like the intake and the
+/// byte read: the SIDE is derived from the uploader, so each role can only ever
+/// reach its own pictures and neither needs refusing at the door.
+///
+/// A maid must be able to drop a blurred zone shot and a receptionist a bad
+/// verify shot; a capability gate here would refuse one of them for holding the
+/// wrong grant rather than for owning the wrong photo. Both identities must
+/// therefore clear the capability gates and be stopped by the BRANCH gate.
+///
+/// DB-free: the branch gate answers before a pool is touched.
+#[tokio::test]
+async fn the_photo_delete_and_meta_are_open_to_both_roles() {
+    for maid_side in [true, false] {
+        for (method, uri) in [
+            ("DELETE", "/api/hk/report-photos/9"),
+            ("GET", "/api/hk/report-photos/9/meta"),
+        ] {
+            let state = AppState::new(lazy_pool());
+            let pol = policy(vec![Branch::Hfhotel], false);
+            let app = if maid_side {
+                inner(state, pol)
+            } else {
+                inner_viewer(state, pol)
+            };
+            let (status, body) = call(app, method, uri, "").await;
+            assert_branch_400(
+                status,
+                &body,
+                &format!("{method} {uri} (can_report={maid_side})"),
+            );
+        }
+    }
+}
+
+/// The `HK_BRANCHES` allowlist applies to both new endpoints too — a
+/// well-formed branch this deployment does not offer is 403, not a fallback to
+/// the primary pool.
+#[tokio::test]
+async fn the_photo_delete_and_meta_respect_the_hk_branches_allowlist() {
+    for (method, uri) in [
+        ("DELETE", "/api/hk/report-photos/9?branch=hfville"),
+        ("GET", "/api/hk/report-photos/9/meta?branch=hfville"),
+    ] {
+        let app = inner(
+            AppState::new(lazy_pool()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        let (status, body) = call(app, method, uri, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: body={body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("403 body must be JSON");
+        assert_eq!(
+            json.get("error").and_then(|v| v.as_str()),
+            Some(BRANCH_NOT_ENABLED_ERROR)
+        );
+    }
+}
+
+/// **The DELETE's whole rule matrix, against a real database.**
+///
+/// `DELETE /api/hk/report-photos/{id}` is the maid's manage-pictures-before-
+/// submit primitive, and it is the ONE place in this app that removes photo
+/// evidence — so every boundary it draws is worth a row:
+///
+/// * her OWN UNATTACHED photo is deleted, and the row is really gone;
+/// * someone ELSE's photo is **403**, and survives;
+/// * an ATTACHED photo is **400**, and survives — the owner's keep-forever
+///   decision means nothing here can delete a picture a report names;
+/// * an unknown id is **404**;
+/// * a repeat of a successful delete is **404**, not a second success.
+///
+/// The reception VIEWER gets the same treatment on its own photos, which is why
+/// the `reception`-side row is here rather than in a separate test: one rule,
+/// two roles.
+///
+/// Skips when PG is unreachable, the convention this suite already follows.
+#[tokio::test]
+async fn deleting_a_report_photo_enforces_owner_and_unattached() {
+    let Some(pool) = live_pool().await else {
+        eprintln!("skipping deleting_a_report_photo_enforces_owner_and_unattached — PG not reachable");
+        return;
+    };
+
+    // Seed photos directly: the intake is multipart and this row is about the
+    // DELETE's rules, not the upload's.
+    async fn seed_photo(
+        pool: &PgPool,
+        badge: &str,
+        side: &str,
+        attached_to: Option<i64>,
+    ) -> i64 {
+        let row = sqlx::query(
+            "INSERT INTO ht_hk_room_report_photos \
+                 (rrp_report_id, rrp_side, rrp_photo, rrp_photo_mime, rrp_badge, rrp_zone, rrp_bytes) \
+             VALUES ($1, $2, $3, 'image/jpeg', $4, 'bed', 8) RETURNING rrp_id",
+        )
+        .bind(attached_to)
+        .bind(side)
+        .bind(b"fakejpeg".as_slice())
+        .bind(badge)
+        .fetch_one(pool)
+        .await
+        .expect("seed photo must insert");
+        row.try_get("rrp_id").expect("rrp_id")
+    }
+
+    async fn exists(pool: &PgPool, photo_id: i64) -> bool {
+        sqlx::query("SELECT 1 FROM ht_hk_room_report_photos WHERE rrp_id = $1")
+            .bind(photo_id)
+            .fetch_optional(pool)
+            .await
+            .expect("existence probe")
+            .is_some()
+    }
+
+    // A room and a report to attach one photo to. Cleaned up at the end; the
+    // report and its photos cascade with the room.
+    let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-RP2'")
+        .execute(&pool)
+        .await;
+    let room_row = sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+         VALUES ('ZT-RP2', true, true) RETURNING room_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("marker room must insert");
+    let room_id: i32 = room_row.try_get("room_id").expect("room_id");
+
+    let report_row = sqlx::query(
+        "INSERT INTO ht_hk_room_reports \
+             (rr_room_id, rr_date, rr_status, rr_room_status, rr_all_items_ok, rr_submitted_badge) \
+         VALUES ($1, (NOW() AT TIME ZONE 'Asia/Bangkok')::date, 'submitted', 'vc', true, 'Q1001') \
+         RETURNING rr_id",
+    )
+    .bind(room_id)
+    .fetch_one(&pool)
+    .await
+    .expect("marker report must insert");
+    let report_id: i64 = report_row.try_get("rr_id").expect("rr_id");
+
+    // `maid()` is badge Q1001; `viewer()` shares it, so the not-yours row needs
+    // a THIRD badge that neither identity holds.
+    let mine = seed_photo(&pool, "Q1001", "maid", None).await;
+    let theirs = seed_photo(&pool, "Z9999", "maid", None).await;
+    let attached = seed_photo(&pool, "Q1001", "maid", Some(report_id)).await;
+    let reception_photo = seed_photo(&pool, "Q1001", "reception", None).await;
+
+    let del = |photo_id: i64, as_maid: bool| {
+        let state = AppState::new(pool.clone());
+        let pol = policy(vec![Branch::Hfhotel], false);
+        let app = if as_maid {
+            inner(state, pol)
+        } else {
+            inner_viewer(state, pol)
+        };
+        async move {
+            call(
+                app,
+                "DELETE",
+                &format!("/api/hk/report-photos/{photo_id}?branch=hfhotel"),
+                "",
+            )
+            .await
+        }
+    };
+
+    // 1. Her own unattached photo: gone.
+    let (status, body) = del(mine, true).await;
+    assert_eq!(status, StatusCode::OK, "own unattached delete: body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+    assert_eq!(json.get("success").and_then(|v| v.as_bool()), Some(true));
+    assert!(!exists(&pool, mine).await, "the row must really be gone");
+
+    // 2. A repeat is a 404, not a second success.
+    let (status, body) = del(mine, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "repeat delete: body={body}");
+
+    // 3. Someone else's photo: 403, and it survives.
+    let (status, body) = del(theirs, true).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another badge's photo: body={body}");
+    assert!(
+        exists(&pool, theirs).await,
+        "a refused delete must not remove the row"
+    );
+
+    // 4. An ATTACHED photo: 400 (the repo's conflict mapping), and it survives.
+    //    This is the keep-forever guarantee: no path here deletes evidence.
+    let (status, body) = del(attached, true).await;
+    assert_bad_request(status, &body, "deleting a photo a report already names");
+    assert!(
+        exists(&pool, attached).await,
+        "an attached photo must survive its own delete attempt"
+    );
+
+    // 5. An unknown id: 404.
+    let (status, body) = del(-4242, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown photo: body={body}");
+
+    // 6. The reception VIEWER deletes its own photo on the same terms.
+    let (status, body) = del(reception_photo, false).await;
+    assert_eq!(status, StatusCode::OK, "viewer's own photo: body={body}");
+    assert!(!exists(&pool, reception_photo).await);
+
+    // Cleanup (the report and the attached photo cascade with the room).
+    let _ = sqlx::query("DELETE FROM ht_hk_room_report_photos WHERE rrp_badge = 'Z9999'")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+        .bind(room_id)
+        .execute(&pool)
+        .await;
+}
+
+/// `GET /api/hk/report-photos/{id}/meta` — the client's resume-after-reload
+/// probe. It must answer the one bit that decides what the maid may still do
+/// with an id she is holding: `attached`.
+///
+/// Skips when PG is unreachable.
+#[tokio::test]
+async fn report_photo_meta_reports_zone_size_and_attachment() {
+    let Some(pool) = live_pool().await else {
+        eprintln!("skipping report_photo_meta_reports_zone_size_and_attachment — PG not reachable");
+        return;
+    };
+
+    let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = 'ZT-RP3'")
+        .execute(&pool)
+        .await;
+    let room_row = sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_clean, room_active) \
+         VALUES ('ZT-RP3', true, true) RETURNING room_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("marker room must insert");
+    let room_id: i32 = room_row.try_get("room_id").expect("room_id");
+    let report_row = sqlx::query(
+        "INSERT INTO ht_hk_room_reports \
+             (rr_room_id, rr_date, rr_status, rr_room_status, rr_all_items_ok, rr_submitted_badge) \
+         VALUES ($1, (NOW() AT TIME ZONE 'Asia/Bangkok')::date, 'submitted', 'vc', true, 'Q1001') \
+         RETURNING rr_id",
+    )
+    .bind(room_id)
+    .fetch_one(&pool)
+    .await
+    .expect("marker report must insert");
+    let report_id: i64 = report_row.try_get("rr_id").expect("rr_id");
+
+    let seed = |zone: Option<&'static str>, attached_to: Option<i64>| {
+        let pool = pool.clone();
+        async move {
+            let row = sqlx::query(
+                "INSERT INTO ht_hk_room_report_photos \
+                     (rrp_report_id, rrp_side, rrp_photo, rrp_photo_mime, rrp_badge, rrp_zone, rrp_bytes) \
+                 VALUES ($1, 'maid', $2, 'image/jpeg', 'Q1001', $3, 8) RETURNING rrp_id",
+            )
+            .bind(attached_to)
+            .bind(b"fakejpeg".as_slice())
+            .bind(zone)
+            .fetch_one(&pool)
+            .await
+            .expect("seed photo must insert");
+            row.try_get::<i64, _>("rrp_id").expect("rrp_id")
+        }
+    };
+
+    let unattached = seed(Some("bathroom"), None).await;
+    let filed = seed(None, Some(report_id)).await;
+
+    let meta = |photo_id: i64| {
+        let app = inner(
+            AppState::new(pool.clone()),
+            policy(vec![Branch::Hfhotel], false),
+        );
+        async move {
+            call(
+                app,
+                "GET",
+                &format!("/api/hk/report-photos/{photo_id}/meta?branch=hfhotel"),
+                "",
+            )
+            .await
+        }
+    };
+
+    let (status, body) = meta(unattached).await;
+    assert_eq!(status, StatusCode::OK, "meta of an unattached photo: body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["photo"]["photoId"], unattached);
+    assert_eq!(json["photo"]["side"], "maid");
+    assert_eq!(json["photo"]["zone"], "bathroom");
+    assert_eq!(json["photo"]["bytes"], 8);
+    assert_eq!(
+        json["photo"]["attached"], false,
+        "an unattached photo is the one she may still delete or tick against"
+    );
+    assert!(json["photo"]["uploadedAt"].is_string());
+
+    let (status, body) = meta(filed).await;
+    assert_eq!(status, StatusCode::OK, "meta of a filed photo: body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("body must be JSON");
+    assert_eq!(json["photo"]["attached"], true);
+    assert!(
+        json["photo"]["zone"].is_null(),
+        "a photo with no zone answers an explicit null, never an omitted key"
+    );
+
+    let (status, _) = meta(-4242).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an unknown photo is a 404");
+
+    let _ = sqlx::query("DELETE FROM ht_hk_room_report_photos WHERE rrp_id = $1")
+        .bind(unattached)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+        .bind(room_id)
+        .execute(&pool)
+        .await;
 }

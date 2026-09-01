@@ -11,13 +11,17 @@ import {
   ITEM_PROBLEMS,
   REPORT_ITEMS,
   REPORT_MAX_PHOTOS,
+  REPORT_MAX_PHOTOS_TOTAL,
   REPORT_MIN_PHOTOS,
+  REPORT_ZONES,
   reportItemLabel,
   RETURN_REASONS,
   ROOM_STATUS_CODES,
+  TICK_STATES,
   type ReportStatus,
   type ReturnReason,
   type RoomStatusCode,
+  type TickState,
 } from './report-vocab'
 import {
   DESK_SIGNALS,
@@ -1250,12 +1254,36 @@ export function storeSignalSoundMuted(muted: boolean): void {
 //
 // One maid's per-room daily attestation, digitizing the owner's paper
 // `Report HK.xlsx`: the room's status code (VC/CO/OO/SO — prefilled here from
-// facts we already hold, stored as SHE reported it), an EXCEPTION-BASED
-// equipment checklist (ครบทุกรายการ, or named items marked หาย/ชำรุด with a
-// quantity), and 1..4 photos. Reception countersigns it with photos of her own,
-// or returns it with a canned reason; a returned report is superseded by a
-// FRESH submission that references it (append-only history — nothing is ever
-// edited in place).
+// facts we already hold, stored as SHE reported it), the 22-item equipment
+// checklist as PHOTO-BACKED TICKS, and the photos those ticks name. Reception
+// countersigns it with photos of her own, or returns it with a canned reason;
+// a returned report is superseded by a FRESH submission that references it
+// (append-only history — nothing is ever edited in place).
+//
+// v2 — THE CAPTURE ZONE STEPPER (owner, 2026-09-02: "1 picture for each tick",
+// "fast and easy for a maid working against the clock and physically"). v1's
+// exception-only checklist shipped that morning and was superseded the same
+// day. What replaced it:
+//
+//   * `REPORT_ZONES` is the shooting order — เตียง → โต๊ะและมินิบาร์ → ห้องน้ำ →
+//     ทั่วไป — and every item belongs to exactly ONE zone. One camera tap each.
+//   * The instant a zone's photo is captured, that zone's items are PRE-TICKED
+//     ครบ against it. She touches an item only to cycle it ครบ → หาย → ชำรุด
+//     (with a quantity), which is why a perfect room is four shots and a
+//     handful of taps and never twenty-two decisions.
+//   * EVERY tick names the photo that backs it. One photo may back several
+//     ticks (the bed shot covers the bed linen); a problem tick may take its
+//     own close-up, which the server ALLOWS but does not enforce — the UI
+//     drives that, not a 400.
+//   * Photos are KEPT FOREVER (owner decision 2026-09-02). There is no purge
+//     job here and none is coming.
+//
+// LEGACY. A report filed before this pair deployed has no tick rows: the server
+// answers `ticks: []` and keeps `items` — v1's exceptions array — populated
+// from the problem ticks so bundles that predate this one still render. That is
+// why `reportItemRows` survives below while the rest of v1's FORM helpers (the
+// exception draft, its toggle/stepper, `reportItemsConsistent`) do not: the
+// exception-only form is gone, but the reports it filed are permanent.
 //
 // The vocabulary itself lives in `report-vocab.ts` (mirrored by the backend's
 // allowlists) and is RE-EXPORTED here, exactly as the signal vocabulary is
@@ -1267,22 +1295,27 @@ export {
   ITEM_PROBLEMS,
   REPORT_ITEMS,
   REPORT_MAX_PHOTOS,
+  REPORT_MAX_PHOTOS_TOTAL,
   REPORT_MIN_PHOTOS,
+  REPORT_ZONES,
   reportItemLabel,
   RETURN_REASONS,
   ROOM_STATUS_CODES,
+  TICK_STATES,
 } from './report-vocab'
 export type {
   ItemProblem,
   ReportItemCode,
   ReportStatus,
+  ReportZone,
   ReturnReason,
   RoomStatusCode,
+  TickState,
 } from './report-vocab'
 
 // --- wire shapes -----------------------------------------------------------
 //
-// EVERY field a v1 backend adds after this bundle ships is optional here, and
+// EVERY field a backend adds after this bundle ships is optional here, and
 // several that a current backend always sends are optional too — same skew rule
 // the room fields above follow. This surface is opened from a LINE tile whose
 // WebView caches a bundle for hours; a screen that throws because one key was
@@ -1295,11 +1328,12 @@ export interface HkReportActor {
 }
 
 /**
- * One equipment exception. `item`/`problem` are plain `string`s in the
- * SERVER→client direction for the same reason `HkLinenShortageTotal.kind` is:
- * a newer backend that knows a 23rd item must render as a readable row here,
- * not crash the screen (`reportItemLabel` falls back to the raw code). The
- * client→server direction stays strictly typed — there we choose what to send.
+ * One equipment exception — v1's shape, still carried by `items` on every
+ * report so a cached bundle that predates the ticks keeps rendering. `item`
+ * and `problem` are plain `string`s in the SERVER→client direction for the same
+ * reason `HkLinenShortageTotal.kind` is: a newer backend that knows a 23rd item
+ * must render as a readable row here, not crash the screen (`reportItemLabel`
+ * falls back to the raw code).
  */
 export interface HkReportItemException {
   item: string
@@ -1307,8 +1341,43 @@ export interface HkReportItemException {
   qty: number
 }
 
+/**
+ * ONE TICK as the server tells it. Loose `string`s again in this direction, and
+ * every field but `item` optional: a v1 report has no ticks at all, and a
+ * newer backend must be able to add a fourth state without blanking a screen.
+ *
+ * `photoId` is the photo that BACKS this tick. It is null only on the v1 rows
+ * migration 092 backfilled, which had no photo to name.
+ */
+export interface HkReportTick {
+  item: string
+  state: string
+  qty?: number | null
+  photoId?: number | null
+}
+
+/** One stored photo with the metadata the verify view groups by. Both sides'
+ *  photos arrive in one array — `side` says whose it is. */
+export interface HkReportPhotoRef {
+  photoId: number
+  side: string
+  zone?: string | null
+  bytes?: number | null
+}
+
+/** `GET /hk/api/report-photos/{photoId}/meta` — what the client needs to decide
+ *  whether a photo id it stored in a draft is still usable after a reload. */
+export interface HkReportPhotoMeta {
+  photoId: number
+  side: string
+  zone?: string | null
+  bytes?: number | null
+  attached?: boolean
+  uploadedAt?: string
+}
+
 /** The summary DTO carried by each row of the day overview: the full report
- *  MINUS the item and photo-id arrays, PLUS photo COUNTS. */
+ *  MINUS the tick/photo arrays, PLUS photo COUNTS and the problem count. */
 export interface HkReportSummary {
   reportId: number
   roomId: number
@@ -1316,7 +1385,11 @@ export interface HkReportSummary {
   date?: string
   status: ReportStatus
   roomStatus?: string
+  /** DERIVED server-side from the ticks (true iff every tick is ok); kept on
+   *  the wire for v1 readers. */
   allItemsOk?: boolean
+  /** How many ticks are หาย/ชำรุด — the overview's red count. */
+  problemCount?: number
   returnReason?: string | null
   parentReportId?: number | null
   submittedBy?: HkReportActor
@@ -1327,8 +1400,11 @@ export interface HkReportSummary {
 }
 
 /** `GET /hk/api/reports/{reportId}` — the summary plus everything the two
- *  detail screens render from. */
+ *  detail screens render from. `ticks` + `photos` are v2's evidence; `items`
+ *  and the two id arrays stay for v1 readers and legacy reports. */
 export interface HkReport extends HkReportSummary {
+  ticks?: HkReportTick[]
+  photos?: HkReportPhotoRef[]
   items?: HkReportItemException[]
   maidPhotoIds?: number[]
   receptionPhotoIds?: number[]
@@ -1358,19 +1434,39 @@ export interface HkReportResponse {
   report: HkReport
 }
 
-/** `POST /hk/api/report-photos` (multipart). */
+/** `POST /hk/api/report-photos` (multipart). `bytes` is what the server
+ *  actually stored — the number the upload indicator counts. */
 export interface HkReportPhotoResponse {
   success: boolean
   photoId: number
+  bytes?: number
 }
 
-/** The body of `POST /hk/api/rooms/{roomId}/report`. Maid-only. */
+/** What one landed upload gives the form back. */
+export interface HkReportPhotoUpload {
+  photoId: number
+  bytes: number | null
+}
+
+/** ONE TICK on the way OUT. Strictly typed, unlike `HkReportTick`: here we
+ *  choose what to send, and the server refuses anything else. `qty` is present
+ *  on problems ONLY — an `ok` tick carrying a quantity is a 400. */
+export interface HkReportTickSubmission {
+  item: string
+  state: TickState
+  qty?: number
+  photoId: number
+}
+
+/** The body of `POST /hk/api/rooms/{roomId}/report`. Maid-only, v2 shape:
+ *  exactly the 22 tick rows, each photo-backed, plus any photo that backs no
+ *  tick (an extra shot of the same zone — evidence, not decoration). */
 export interface HkReportSubmission {
   roomStatus: RoomStatusCode
-  allItemsOk: boolean
-  items: HkReportItemException[]
-  photoIds: number[]
-  /** Omitted for today, which is the only case v1 has a screen for. */
+  ticks: HkReportTickSubmission[]
+  /** Uploaded photos that no tick names. Omitted when there are none. */
+  extraPhotoIds?: number[]
+  /** Omitted for today, which is the only case this bundle has a screen for. */
   date?: string
   /** Set ONLY when this submission fixes a RETURNED report. Append-only
    *  history: the fix is a new row that points at the one it supersedes. */
@@ -1388,6 +1484,17 @@ const ITEM_PROBLEM_LABELS: Record<string, string> = Object.fromEntries(
 const RETURN_REASON_LABELS: Record<string, string> = Object.fromEntries(
   RETURN_REASONS.map(({ reason, label }) => [reason, label])
 )
+const TICK_STATE_LABELS: Record<string, string> = Object.fromEntries(
+  TICK_STATES.map(({ state, label }) => [state, label])
+)
+const ZONE_LABELS: Record<string, string> = Object.fromEntries(
+  REPORT_ZONES.map(({ zone, label }) => [zone, label])
+)
+/** item code → the ONE zone it is shot in. Built from the vocabulary so the
+ *  two can never disagree. */
+const ITEM_ZONES: Record<string, string> = Object.fromEntries(
+  REPORT_ZONES.flatMap(({ zone, items }) => items.map((item) => [item, zone]))
+)
 
 /** Thai label for a VC/CO/OO/SO code; the raw code for one this bundle
  *  predates — a readable row beats a dropped one. PURE. */
@@ -1400,6 +1507,31 @@ export function roomStatusLabel(code: string | null | undefined): string {
 export function itemProblemLabel(problem: string | null | undefined): string {
   if (!problem) return ''
   return ITEM_PROBLEM_LABELS[problem] ?? problem
+}
+
+/** ครบ / หาย / ชำรุด, falling back to the raw code — a fourth state from a
+ *  newer backend renders as itself rather than as a blank cell. PURE. */
+export function tickStateLabel(state: string | null | undefined): string {
+  if (!state) return ''
+  return TICK_STATE_LABELS[state] ?? state
+}
+
+/** เตียง / โต๊ะและมินิบาร์ / ห้องน้ำ / ทั่วไป, falling back to the raw code.
+ *  PURE. */
+export function reportZoneLabel(zone: string | null | undefined): string {
+  if (!zone) return ''
+  return ZONE_LABELS[zone] ?? zone
+}
+
+/** The zone an item is shot in, or null for a code this bundle predates —
+ *  which the verify view then groups under อื่น ๆ rather than dropping. PURE. */
+export function reportItemZone(item: string): string | null {
+  return ITEM_ZONES[item] ?? null
+}
+
+/** The item codes of one zone, in the paper form's order. PURE. */
+export function reportZoneItems(zone: string): readonly string[] {
+  return REPORT_ZONES.find((z) => z.zone === zone)?.items ?? []
 }
 
 /** The canned rejection's Thai label, falling back to the raw code. PURE. */
@@ -1421,7 +1553,6 @@ export function reportDateLabel(date: string | null | undefined): string {
   if (Number.isNaN(parsed.getTime())) return date
   return parsed.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' })
 }
-
 // --- state, chips and ordering ---------------------------------------------
 
 /** Where a room stands on the day overview. `unsent` is the absence of a
@@ -1573,11 +1704,24 @@ export function prefillRoomStatus(
   return 'vc'
 }
 
-// --- the equipment checklist (exception-based) -----------------------------
+// --- the checklist, as photo-backed ticks ----------------------------------
+//
+// The maid's working state is TWO plain records, both JSON-serializable on
+// purpose (the whole draft is written to sessionStorage after every tap — see
+// "the draft" below, and the phone that locks mid-room this exists for):
+//
+//   `HkTickDraft`  item code → { state, qty, photo }
+//   `HkLocalPhoto` one captured shot, from the shutter to its `photoId`
+//
+// Ticks bind to a photo's LOCAL key, never to its `photoId`: the tick exists
+// the instant the shutter closes, and the id arrives seconds later over a
+// corridor's worth of wifi. `reportTicksSubmission` is the one place that
+// resolves the two, and it refuses to build a body while any binding is still
+// unresolved.
 
-/** Quantity floor. An exception exists only when at least one is wrong, so the
- *  stepper's bottom is 1 — dropping to zero is done by un-toggling the row,
- *  not by stepping into a `qty: 0` the wire has no meaning for. */
+/** Quantity floor. A problem tick means at least one is wrong, so the stepper's
+ *  bottom is 1 — dropping to zero is done by cycling the tick back to ครบ, not
+ *  by stepping into a `qty: 0` the wire has no meaning for. */
 export const REPORT_MIN_QTY = 1
 
 /** Quantity ceiling. Mirrors the server's 1..=99 and, like the linen stepper's
@@ -1591,142 +1735,668 @@ export function clampReportQty(qty: number): number {
   return Math.min(REPORT_MAX_QTY, Math.max(REPORT_MIN_QTY, Math.trunc(qty)))
 }
 
+/** One item's tick while the form is open. `photo` is a LOCAL photo key
+ *  (`HkLocalPhoto.key`), null while the tick is waiting to be re-backed after
+ *  its photo was removed — a state the review step shows and the submit
+ *  refuses on. */
+export interface HkTickEntry {
+  state: TickState
+  qty: number | null
+  photo: string | null
+}
+
+/** The form's whole checklist: item code → its tick. Sparse until a zone is
+ *  captured — an item with no entry has not been attested at all, which is
+ *  NOT the same as ครบ and is why the body builder never invents one. */
+export type HkTickDraft = Record<string, HkTickEntry>
+
+/** Where one captured photo stands. `key` is the client's own identity for the
+ *  shot and is what ticks bind to; `photoId` is the server's, and is null until
+ *  the upload lands. */
+export type HkUploadStatus = 'queued' | 'uploading' | 'uploaded' | 'failed'
+
+export interface HkLocalPhoto {
+  key: string
+  zone: string
+  photoId: number | null
+  bytes: number | null
+  attempts: number
+  status: HkUploadStatus
+  /** When the last attempt failed (epoch ms) — the backoff clock. */
+  failedAt: number | null
+}
+
+/** The client's identity for the n-th shot of a report. Sequential rather than
+ *  random so a restored draft and its object URLs line up, and so a test can
+ *  name a photo. PURE. */
+export function localPhotoKey(seq: number): string {
+  return `photo-${seq}`
+}
+
+/** A freshly captured shot, before anything has been uploaded. PURE. */
+export function newLocalPhoto(key: string, zone: string): HkLocalPhoto {
+  return { key, zone, photoId: null, bytes: null, attempts: 0, status: 'queued', failedAt: null }
+}
+
+/** One zone's shots, in capture order. PURE. */
+export function zonePhotos(photos: HkLocalPhoto[], zone: string): HkLocalPhoto[] {
+  return photos.filter((photo) => photo.zone === zone)
+}
+
+/** One photo by its local key. PURE. */
+export function findLocalPhoto(photos: HkLocalPhoto[], key: string | null): HkLocalPhoto | null {
+  if (!key) return null
+  return photos.find((photo) => photo.key === key) ?? null
+}
+
 /**
- * The form's exception draft: `"<item>:<problem>" → qty`. Keyed by the PAIR
- * because one item can be wrong in two ways at once (two towels หาย and a
- * third ชำรุด is one room, two exceptions), and sparse because the wire says
- * what is wrong and never what is fine.
+ * "รูปที่ 1/2" — which of its zone's shots backs this tick. The chip that makes
+ * rebinding discoverable without a menu: a zone with one photo says 1/1 and is
+ * not worth tapping; a zone with two says which one vouches for this item.
+ * Empty string when the tick has no photo at all. PURE.
  */
-export type HkReportExceptionDraft = Record<string, number>
-
-/** The draft's key for one item+problem pair. One helper, so the toggle, the
- *  stepper and the body builder can never spell it differently. PURE. */
-export function reportExceptionKey(item: string, problem: string): string {
-  return `${item}:${problem}`
-}
-
-/** This pair's quantity, or 0 when it is not an exception at all. PURE. */
-export function reportExceptionQty(
-  draft: HkReportExceptionDraft,
-  item: string,
-  problem: string
-): number {
-  return draft[reportExceptionKey(item, problem)] ?? 0
-}
-
-/** Turn one item+problem on (at `REPORT_MIN_QTY`) or off. Off DELETES the key
- *  rather than storing a zero — see `HkReportExceptionDraft`. PURE. */
-export function toggleReportException(
-  draft: HkReportExceptionDraft,
-  item: string,
-  problem: string
-): HkReportExceptionDraft {
-  const key = reportExceptionKey(item, problem)
-  if (draft[key]) {
-    const next = { ...draft }
-    delete next[key]
-    return next
-  }
-  return { ...draft, [key]: REPORT_MIN_QTY }
-}
-
-/** Step one pair's quantity, clamped in the REDUCER rather than only on the
- *  buttons' `disabled` — a bound that exists only as an attribute is one
- *  double-tap away from not existing. A pair that is not on stays off. PURE. */
-export function stepReportException(
-  draft: HkReportExceptionDraft,
-  item: string,
-  problem: string,
-  delta: number
-): HkReportExceptionDraft {
-  const key = reportExceptionKey(item, problem)
-  const current = draft[key]
-  if (!current) return draft
-  return { ...draft, [key]: clampReportQty(current + delta) }
+export function photoChipLabel(photos: HkLocalPhoto[], key: string | null): string {
+  const photo = findLocalPhoto(photos, key)
+  if (!photo) return ''
+  const siblings = zonePhotos(photos, photo.zone)
+  const index = siblings.findIndex((p) => p.key === photo.key)
+  if (index === -1) return ''
+  return `รูปที่ ${index + 1}/${siblings.length}`
 }
 
 /**
- * The request body's `items` — every selected pair, in REPORT_ITEMS ×
- * ITEM_PROBLEMS order so the report reads the way the form did however it was
- * tapped. PURE.
+ * A zone's photo has landed: PRE-TICK every item of that zone ครบ against it.
+ *
+ * The whole speed of the flow is here. Two rules keep it from undoing her work:
+ * an item she has already decided (any entry with a photo) is left ALONE, and
+ * an item whose photo she removed (`photo: null`) is RE-BOUND to this one —
+ * a retake repairs the ticks it orphaned instead of making her tick them again.
+ * PURE.
  */
-export function reportExceptionItems(
-  draft: HkReportExceptionDraft
-): HkReportItemException[] {
-  const items: HkReportItemException[] = []
-  for (const { item } of REPORT_ITEMS) {
-    for (const { problem } of ITEM_PROBLEMS) {
-      const qty = reportExceptionQty(draft, item, problem)
-      if (qty > 0) items.push({ item, problem, qty })
+export function applyZoneCapture(
+  draft: HkTickDraft,
+  zone: string,
+  photoKey: string
+): HkTickDraft {
+  const next = { ...draft }
+  for (const item of reportZoneItems(zone)) {
+    const current = next[item]
+    if (!current) {
+      next[item] = { state: 'ok', qty: null, photo: photoKey }
+    } else if (current.photo === null) {
+      next[item] = { ...current, photo: photoKey }
     }
   }
-  return items
+  return next
 }
 
 /**
- * A draft rebuilt from a report's exceptions — the RETURNED-report path, where
- * the maid's previous answers are prefilled into the fresh form so she edits
- * what was wrong instead of re-entering twenty-two rows in a corridor. Unknown
- * codes from a newer backend are carried through as-is; the picker simply has
- * no row for them, and they are dropped by `reportExceptionItems` on the way
- * back out (the form can only send what it can show). PURE.
+ * One tap on an item cycles it ครบ → หาย → ชำรุด → ครบ.
+ *
+ * A problem starts at `REPORT_MIN_QTY` and KEEPS its quantity across
+ * หาย → ชำรุด (two towels gone and two towels torn is the same two towels she
+ * already counted); returning to ครบ drops it, because the wire has no meaning
+ * for a quantity of nothing wrong. An item with no entry — a zone she has not
+ * shot yet — is not cyclable at all. PURE.
  */
-export function reportExceptionDraftFrom(
-  items: HkReportItemException[] | null | undefined
-): HkReportExceptionDraft {
-  const draft: HkReportExceptionDraft = {}
-  for (const { item, problem, qty } of items ?? []) {
-    draft[reportExceptionKey(item, problem)] = clampReportQty(qty)
+export function cycleTickState(draft: HkTickDraft, item: string): HkTickDraft {
+  const current = draft[item]
+  if (!current) return draft
+  const order = TICK_STATES.map(({ state }) => state)
+  const index = order.indexOf(current.state as TickState)
+  const state = order[(index === -1 ? 0 : index + 1) % order.length]
+  return {
+    ...draft,
+    [item]: {
+      ...current,
+      state,
+      qty: state === 'ok' ? null : clampReportQty(current.qty ?? REPORT_MIN_QTY),
+    },
+  }
+}
+
+/** Step a PROBLEM tick's quantity, clamped in the reducer rather than only on
+ *  the buttons' `disabled` — a bound that exists only as an attribute is one
+ *  double-tap away from not existing. An ok tick has no quantity to step. PURE. */
+export function stepTickQty(draft: HkTickDraft, item: string, delta: number): HkTickDraft {
+  const current = draft[item]
+  if (!current || current.state === 'ok') return draft
+  return {
+    ...draft,
+    [item]: { ...current, qty: clampReportQty((current.qty ?? REPORT_MIN_QTY) + delta) },
+  }
+}
+
+/** Point one tick at a different photo — the close-up she just took, or another
+ *  of the zone's shots. An item with no entry is left alone. PURE. */
+export function bindTickPhoto(
+  draft: HkTickDraft,
+  item: string,
+  photoKey: string | null
+): HkTickDraft {
+  const current = draft[item]
+  if (!current) return draft
+  return { ...draft, [item]: { ...current, photo: photoKey } }
+}
+
+/**
+ * Point one tick at the NEXT shot of its own zone — the "รูปที่ 1/2" chip's
+ * whole behaviour. A tap, not a menu: a zone almost always has one or two
+ * photos, and a picker for a two-way choice is a picker a gloved thumb misses.
+ * Wraps around, and leaves a tick alone when its zone has nothing else to offer.
+ * PURE.
+ */
+export function cycleTickPhoto(
+  draft: HkTickDraft,
+  item: string,
+  photos: HkLocalPhoto[]
+): HkTickDraft {
+  const current = draft[item]
+  if (!current) return draft
+  const zone = reportItemZone(item)
+  if (!zone) return draft
+  const siblings = zonePhotos(photos, zone)
+  if (siblings.length === 0) return draft
+  const index = siblings.findIndex((photo) => photo.key === current.photo)
+  const next = siblings[(index + 1) % siblings.length]
+  return { ...draft, [item]: { ...current, photo: next.key } }
+}
+
+/**
+ * A photo is going away: UNBIND every tick it backs rather than deleting them.
+ *
+ * The tick is her judgement about the room and survives the picture; what it
+ * loses is its evidence, which the review step then shows as "ต้องถ่ายรูปใหม่"
+ * and the submit refuses on. Silently dropping the ticks instead would make a
+ * removed photo quietly un-attest five items. PURE.
+ */
+export function unbindPhotoTicks(draft: HkTickDraft, photoKey: string): HkTickDraft {
+  const next: HkTickDraft = {}
+  for (const [item, entry] of Object.entries(draft)) {
+    next[item] = entry.photo === photoKey ? { ...entry, photo: null } : entry
+  }
+  return next
+}
+
+/** The item codes one photo backs, in the paper form's order — the caption of
+ *  the full-screen viewer, and what makes a removal's cost visible. PURE. */
+export function ticksBackedBy(draft: HkTickDraft, photoKey: string): string[] {
+  return REPORT_ITEMS.map(({ item }) => item).filter((item) => draft[item]?.photo === photoKey)
+}
+
+/** How many of a report's ticks are problems. PURE. */
+export function draftProblemCount(draft: HkTickDraft): number {
+  return Object.values(draft).filter((entry) => entry.state !== 'ok').length
+}
+
+/** One zone's standing, for the stepper's dots and the review step. PURE. */
+export interface HkZoneProgress {
+  zone: string
+  label: string
+  index: number
+  photoCount: number
+  itemCount: number
+  /** Items with a tick that is actually photo-backed. */
+  backedCount: number
+  problemCount: number
+  /** Ticks whose photo was removed — evidence owed. */
+  unbackedCount: number
+  /** Every item of the zone attested AND backed. */
+  done: boolean
+}
+
+/** Every zone's standing, in shooting order. PURE. */
+export function reportZoneProgress(
+  draft: HkTickDraft,
+  photos: HkLocalPhoto[]
+): HkZoneProgress[] {
+  return REPORT_ZONES.map(({ zone, label, items }, index) => {
+    let backedCount = 0
+    let problemCount = 0
+    let unbackedCount = 0
+    for (const item of items) {
+      const entry = draft[item]
+      if (!entry) continue
+      if (entry.state !== 'ok') problemCount += 1
+      if (entry.photo) backedCount += 1
+      else unbackedCount += 1
+    }
+    return {
+      zone,
+      label,
+      index,
+      photoCount: zonePhotos(photos, zone).length,
+      itemCount: items.length,
+      backedCount,
+      problemCount,
+      unbackedCount,
+      done: backedCount === items.length,
+    }
+  })
+}
+
+/** One tick on its way to the wire, still allowed to be unbacked — this is
+ *  what the REVIEW step renders and what `reportTicksSubmission` refuses on. */
+export interface HkReportTickDraft {
+  item: string
+  label: string
+  zone: string
+  state: TickState
+  qty: number | null
+  photo: string | null
+  photoId: number | null
+}
+
+/**
+ * The 22 ticks as the review step reads them: vocabulary order (so the report
+ * reads like the paper form however it was tapped), each resolved to the
+ * `photoId` of the local photo it names.
+ *
+ * Items with NO entry are omitted rather than invented as ครบ: a zone she never
+ * shot has not been attested, and a body that fabricated "fine" rows would be
+ * the one bug on this surface that could cost a guest a charge nobody can
+ * explain. `reportTicksSubmission` then refuses a short list. PURE.
+ */
+export function buildReportTicks(
+  draft: HkTickDraft,
+  photos: HkLocalPhoto[]
+): HkReportTickDraft[] {
+  const rows: HkReportTickDraft[] = []
+  for (const { item, label } of REPORT_ITEMS) {
+    const entry = draft[item]
+    if (!entry) continue
+    rows.push({
+      item,
+      label,
+      zone: reportItemZone(item) ?? '',
+      state: entry.state,
+      qty: entry.state === 'ok' ? null : clampReportQty(entry.qty ?? REPORT_MIN_QTY),
+      photo: entry.photo,
+      photoId: findLocalPhoto(photos, entry.photo)?.photoId ?? null,
+    })
+  }
+  return rows
+}
+
+/**
+ * The submit body's `ticks`, or NULL when the draft is not fileable.
+ *
+ * Null — rather than a partial array — because there is exactly one caller and
+ * the alternative is a body assembled from `photoId: null`s that the server
+ * would refuse after she has walked out of the room. Requires all 22 items,
+ * each once, each photo-backed; emits `qty` on problems ONLY. PURE.
+ */
+export function reportTicksSubmission(
+  ticks: HkReportTickDraft[]
+): HkReportTickSubmission[] | null {
+  if (ticks.length !== REPORT_ITEMS.length) return null
+  const seen = new Set<string>()
+  const body: HkReportTickSubmission[] = []
+  for (const tick of ticks) {
+    if (seen.has(tick.item)) return null
+    seen.add(tick.item)
+    if (tick.photoId === null) return null
+    if (tick.state === 'ok') {
+      body.push({ item: tick.item, state: 'ok', photoId: tick.photoId })
+    } else {
+      const qty = clampReportQty(tick.qty ?? REPORT_MIN_QTY)
+      body.push({ item: tick.item, state: tick.state, qty, photoId: tick.photoId })
+    }
+  }
+  return body
+}
+
+/** Uploaded photos no tick names — an extra shot of a zone, which is evidence
+ *  and travels with the report rather than being thrown away. PURE. */
+export function reportExtraPhotoIds(
+  ticks: HkReportTickDraft[],
+  photos: HkLocalPhoto[]
+): number[] {
+  const named = new Set(ticks.map((tick) => tick.photoId).filter((id): id is number => id !== null))
+  const extras: number[] = []
+  for (const photo of photos) {
+    if (photo.photoId === null || named.has(photo.photoId)) continue
+    if (!extras.includes(photo.photoId)) extras.push(photo.photoId)
+  }
+  return extras
+}
+
+/** Every DISTINCT photo the submission would attach (ticks ∪ extras) — the
+ *  number the server bounds. PURE. */
+export function reportPhotoIds(
+  ticks: HkReportTickDraft[],
+  extraPhotoIds: number[] = []
+): number[] {
+  const ids: number[] = []
+  for (const id of [...ticks.map((tick) => tick.photoId), ...extraPhotoIds]) {
+    if (id !== null && id !== undefined && !ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+/** Rebuild a tick draft from a report — the RETURNED path, where her previous
+ *  answers come back so she fixes what was wrong instead of re-deciding
+ *  twenty-two rows in a corridor. Photos are DELIBERATELY not carried over
+ *  (v1's rule, kept): reception rejected the evidence, and re-sending it is not
+ *  a fix, so every tick comes back unbacked and the stepper starts at zone 1.
+ *
+ *  A legacy v1 report has no ticks — its `items` exceptions are read instead,
+ *  and everything it did not name stays UNTICKED (v1 never attested those
+ *  individually, and inventing ครบ for them here would be putting words in her
+ *  mouth). PURE. */
+export function tickDraftFromReport(
+  report: Pick<HkReport, 'ticks' | 'items'> | null | undefined
+): HkTickDraft {
+  const draft: HkTickDraft = {}
+  const known = new Set<string>(REPORT_ITEMS.map(({ item }) => item))
+  const states = new Set<string>(TICK_STATES.map(({ state }) => state))
+  for (const tick of report?.ticks ?? []) {
+    if (!known.has(tick.item) || !states.has(tick.state)) continue
+    const state = tick.state as TickState
+    draft[tick.item] = {
+      state,
+      qty: state === 'ok' ? null : clampReportQty(tick.qty ?? REPORT_MIN_QTY),
+      photo: null,
+    }
+  }
+  if (Object.keys(draft).length > 0) return draft
+  for (const { item, problem, qty } of report?.items ?? []) {
+    if (!known.has(item) || !states.has(problem)) continue
+    draft[item] = { state: problem as TickState, qty: clampReportQty(qty), photo: null }
   }
   return draft
 }
 
-/** The exceptions as renderable rows — Thai labels resolved once, order as
- *  delivered (the server already orders them; re-sorting would invent a second
- *  opinion about an order that is already agreed). PURE. */
-export function reportItemRows(
-  items: HkReportItemException[] | null | undefined
-): Array<{ key: string; item: string; problem: string; qty: number; label: string; problemLabel: string }> {
-  return (items ?? []).map(({ item, problem, qty }) => ({
-    key: reportExceptionKey(item, problem),
-    item,
-    problem,
-    qty,
-    label: reportItemLabel(item),
-    problemLabel: itemProblemLabel(problem),
-  }))
+// --- the upload queue ------------------------------------------------------
+//
+// Uploads run BEHIND the maid, never in front of her: the shutter closes, the
+// thumbnail appears, the ticks land, and the bytes go up whenever the corridor
+// lets them. Everything here is a PURE reducer over `HkLocalPhoto[]` — the
+// page owns the timers and the blobs, this owns the rules — because retry
+// arithmetic that only exists inside an effect is arithmetic no test can see.
+
+/** How many times one photo is retried before it needs a deliberate tap.
+ *  Five attempts spans ~31s of backoff; past that the wifi is not coming back
+ *  on its own and a silent loop just eats her battery. */
+export const REPORT_UPLOAD_MAX_ATTEMPTS = 5
+
+/** Exponential backoff for attempt `attempts` (1-based), capped. PURE. */
+export function uploadBackoffMs(attempts: number): number {
+  const n = Math.max(1, Math.trunc(attempts))
+  return Math.min(30_000, 1000 * 2 ** (n - 1))
+}
+
+/** What the queue does next. `at`/`now` are passed in rather than read from the
+ *  clock so the reducer stays pure. */
+export type HkUploadAction =
+  | { type: 'add'; key: string; zone: string }
+  | { type: 'start'; key: string }
+  | { type: 'uploaded'; key: string; photoId: number; bytes?: number | null }
+  | { type: 'failed'; key: string; at: number }
+  | { type: 'resume' }
+  | { type: 'remove'; key: string }
+
+/**
+ * The queue reducer. Never mutates; an action naming a key it does not hold is
+ * a no-op rather than a throw (a settling upload can outlive the photo the
+ * maid just removed, and that must not take the screen down with it). PURE.
+ */
+export function reduceUploadQueue(
+  photos: HkLocalPhoto[],
+  action: HkUploadAction
+): HkLocalPhoto[] {
+  switch (action.type) {
+    case 'add':
+      return photos.some((p) => p.key === action.key)
+        ? photos
+        : [...photos, newLocalPhoto(action.key, action.zone)]
+    case 'start':
+      return photos.map((p) =>
+        p.key === action.key
+          ? { ...p, status: 'uploading', attempts: p.attempts + 1, failedAt: null }
+          : p
+      )
+    case 'uploaded':
+      return photos.map((p) =>
+        p.key === action.key
+          ? {
+              ...p,
+              status: 'uploaded',
+              photoId: action.photoId,
+              bytes: action.bytes ?? p.bytes,
+              failedAt: null,
+            }
+          : p
+      )
+    case 'failed':
+      return photos.map((p) =>
+        p.key === action.key ? { ...p, status: 'failed', failedAt: action.at } : p
+      )
+    // The deliberate tap: every stalled photo goes back into the queue with its
+    // five attempts restored, eligible IMMEDIATELY rather than after another
+    // backoff. "Resumable on next tap" is the whole recovery story for a maid
+    // who has walked out of the dead spot, and making her wait 16 more seconds
+    // for the retry she just asked for is not that.
+    case 'resume':
+      return photos.map((p) =>
+        p.status === 'failed' ? { ...p, status: 'queued', attempts: 0, failedAt: null } : p
+      )
+    case 'remove':
+      return photos.filter((p) => p.key !== action.key)
+    default:
+      return photos
+  }
+}
+
+/**
+ * The next photo to send, or null. One at a time — a corridor has one radio,
+ * and four parallel 1600px JPEGs is how the whole queue stalls together. A
+ * failed photo waits out its backoff; one that has spent all its attempts waits
+ * for a `resume`. PURE.
+ */
+export function nextUploadPhoto(photos: HkLocalPhoto[], now: number): HkLocalPhoto | null {
+  if (photos.some((p) => p.status === 'uploading')) return null
+  for (const photo of photos) {
+    if (photo.status === 'queued') return photo
+    if (
+      photo.status === 'failed' &&
+      photo.attempts < REPORT_UPLOAD_MAX_ATTEMPTS &&
+      now - (photo.failedAt ?? 0) >= uploadBackoffMs(photo.attempts)
+    ) {
+      return photo
+    }
+  }
+  return null
+}
+
+/** How long until the queue has something to do again, or null when it is
+ *  finished or waiting on a tap. The page's one timer. PURE. */
+export function nextUploadWakeMs(photos: HkLocalPhoto[], now: number): number | null {
+  if (photos.some((p) => p.status === 'uploading')) return null
+  let soonest: number | null = null
+  for (const photo of photos) {
+    if (photo.status !== 'failed' || photo.attempts >= REPORT_UPLOAD_MAX_ATTEMPTS) continue
+    const due = (photo.failedAt ?? 0) + uploadBackoffMs(photo.attempts)
+    const wait = Math.max(0, due - now)
+    if (soonest === null || wait < soonest) soonest = wait
+  }
+  return soonest
+}
+
+/** The queue at a glance. PURE. */
+export function uploadCounts(photos: HkLocalPhoto[]): {
+  total: number
+  uploaded: number
+  pending: number
+  stuck: number
+} {
+  const uploaded = photos.filter((p) => p.status === 'uploaded').length
+  const stuck = photos.filter(
+    (p) => p.status === 'failed' && p.attempts >= REPORT_UPLOAD_MAX_ATTEMPTS
+  ).length
+  return { total: photos.length, uploaded, pending: photos.length - uploaded, stuck }
+}
+
+/** "อัปโหลดแล้ว 3/5" — the persistent indicator, and the number the blocked
+ *  submit quotes back at her so "why can't I send" is never a mystery. PURE. */
+export function uploadProgressLabel(photos: HkLocalPhoto[]): string {
+  const { uploaded, total } = uploadCounts(photos)
+  return `อัปโหลดแล้ว ${uploaded}/${total}`
+}
+
+/** Every captured photo has an id. PURE. */
+export function uploadsSettled(photos: HkLocalPhoto[]): boolean {
+  return photos.every((photo) => photo.photoId !== null)
+}
+
+// --- the draft -------------------------------------------------------------
+//
+// A phone locks mid-room, a LINE WebView is evicted, a maid takes a call: the
+// half-filled room must still be there. Every tap writes the draft to
+// sessionStorage; the next open reads it back and RECONCILES the photo ids it
+// remembers against the server (a photo attached to something else, or gone,
+// cannot back a tick any more).
+//
+// sessionStorage, not local: a draft is about the room she is standing in, and
+// one that survived until tomorrow would file yesterday's evidence.
+
+/** Everything the stepper needs to come back exactly as she left it. */
+export interface HkReportDraft {
+  roomStatus: RoomStatusCode | null
+  step: number
+  ticks: HkTickDraft
+  photos: HkLocalPhoto[]
+  /** The local-key counter, so a restored draft never re-issues a key. */
+  seq: number
+}
+
+/**
+ * One key per branch + room + day. The branch is in the key on purpose even
+ * though the contract names room+date: room ids are per-property, so 7 is a
+ * different room at each hotel, and §A1's rule is that a wrong-hotel anything
+ * is a bug we design out rather than one we hope not to hit. PURE.
+ */
+export function reportDraftKey(branch: Branch | null, roomId: number, date: string): string {
+  return `hk.reportDraft.${branch ?? 'none'}.${roomId}.${date}`
+}
+
+/** Read a stored draft, or null. Same defensive idiom as the branch storage:
+ *  a storage failure, a truncated write or a shape from another bundle degrades
+ *  to "no draft" rather than to a screen that throws. */
+export function readReportDraft(
+  branch: Branch | null,
+  roomId: number,
+  date: string
+): HkReportDraft | null {
+  try {
+    const raw = sessionStorage.getItem(reportDraftKey(branch, roomId, date))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<HkReportDraft> | null
+    if (!parsed || typeof parsed !== 'object') return null
+    if (!Array.isArray(parsed.photos) || !parsed.ticks || typeof parsed.ticks !== 'object') {
+      return null
+    }
+    return {
+      roomStatus: parsed.roomStatus ?? null,
+      step: typeof parsed.step === 'number' ? parsed.step : 0,
+      ticks: parsed.ticks as HkTickDraft,
+      photos: parsed.photos as HkLocalPhoto[],
+      seq: typeof parsed.seq === 'number' ? parsed.seq : parsed.photos.length,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Persist the draft. Failure is silent — a full quota must cost her the
+ *  RESUME, never the tap she just made. */
+export function writeReportDraft(
+  branch: Branch | null,
+  roomId: number,
+  date: string,
+  draft: HkReportDraft
+): void {
+  try {
+    sessionStorage.setItem(reportDraftKey(branch, roomId, date), JSON.stringify(draft))
+  } catch {
+    /* nothing to do — the form simply will not survive a reload */
+  }
+}
+
+/** Drop the draft — a landed submit, and nothing else. */
+export function clearReportDraft(branch: Branch | null, roomId: number, date: string): void {
+  try {
+    sessionStorage.removeItem(reportDraftKey(branch, roomId, date))
+  } catch {
+    /* nothing to do */
+  }
+}
+
+/**
+ * Reconcile a restored draft against the photo ids the server still says are
+ * hers and UNATTACHED.
+ *
+ * Two kinds of photo cannot survive a reload and both are dropped here: one
+ * that never got an id (its bytes lived only in a page that is gone), and one
+ * the server no longer offers (attached to a submission, deleted, or
+ * unverifiable). Their ticks are UNBOUND, never deleted — she keeps every
+ * judgement she made and owes only the pictures. PURE; the meta lookups happen
+ * in the page, which hands the confirmed ids in.
+ */
+export function reconcileReportDraft(
+  draft: HkReportDraft,
+  usablePhotoIds: number[]
+): HkReportDraft {
+  const usable = new Set(usablePhotoIds)
+  const kept: HkLocalPhoto[] = []
+  const dropped: string[] = []
+  for (const photo of draft.photos) {
+    if (photo.photoId !== null && usable.has(photo.photoId)) kept.push({ ...photo })
+    else dropped.push(photo.key)
+  }
+  let ticks = draft.ticks
+  for (const key of dropped) ticks = unbindPhotoTicks(ticks, key)
+  return { ...draft, ticks, photos: kept }
 }
 
 // --- validation ------------------------------------------------------------
 
-/** The toggle and the list must agree: `allItemsOk` means the room is fine, so
- *  there can be no exceptions; its opposite is a claim that must NAME at least
- *  one. Empty iff ok — the server enforces the same. PURE. */
-export function reportItemsConsistent(
-  allItemsOk: boolean,
-  items: HkReportItemException[]
-): boolean {
-  return allItemsOk ? items.length === 0 : items.length > 0
-}
-
-/** 1..=4, both sides. PURE. */
+/** 1..=4 — reception's own evidence, unchanged from v1. PURE. */
 export function reportPhotoCountValid(count: number): boolean {
   return count >= REPORT_MIN_PHOTOS && count <= REPORT_MAX_PHOTOS
 }
 
-/** May the maid's ส่งรายงาน button fire? Every rule the server would refuse
- *  on, checked here so she is never told "no" after the upload. PURE. */
+/** The report's photo floor: one per capture zone. Derived from the vocabulary
+ *  rather than typed as a 4, so adding a fifth zone moves the floor with it. */
+export const REPORT_MIN_PHOTOS_TOTAL = REPORT_ZONES.length
+
+/** The whole report's distinct-photo bound, mirrored from the server so she is
+ *  told here rather than after the upload. PURE. */
+export function reportPhotoTotalValid(count: number): boolean {
+  return count >= REPORT_MIN_PHOTOS_TOTAL && count <= REPORT_MAX_PHOTOS_TOTAL
+}
+
+/** Every one of the 22 items ticked, each exactly once, each photo-backed.
+ *  PURE. */
+export function reportTicksComplete(ticks: HkReportTickDraft[]): boolean {
+  return reportTicksSubmission(ticks) !== null
+}
+
+/**
+ * May the maid's ส่งรายงาน button fire? Every rule the server would refuse on,
+ * checked here so she is never told "no" after walking away from the room:
+ * a room status from the vocabulary, all 22 ticks photo-backed, and a distinct
+ * photo count inside 4..24. PURE.
+ */
 export function canSubmitReport(draft: {
   roomStatus: string | null
-  allItemsOk: boolean
-  items: HkReportItemException[]
-  photoIds: number[]
+  ticks: HkReportTickDraft[]
+  extraPhotoIds?: number[]
 }): boolean {
   if (!draft.roomStatus) return false
   if (!ROOM_STATUS_CODES.some(({ code }) => code === draft.roomStatus)) return false
-  if (!reportItemsConsistent(draft.allItemsOk, draft.items)) return false
-  if (draft.items.some(({ qty }) => qty < REPORT_MIN_QTY || qty > REPORT_MAX_QTY)) return false
-  return reportPhotoCountValid(draft.photoIds.length)
+  if (!reportTicksComplete(draft.ticks)) return false
+  return reportPhotoTotalValid(reportPhotoIds(draft.ticks, draft.extraPhotoIds ?? []).length)
 }
 
 /** A verify needs reception's OWN photos — the two-sided evidence IS the
@@ -1752,6 +2422,182 @@ export function canFileReport(role: HkSignalRole): boolean {
 
 export function canVerifyReports(role: HkSignalRole): boolean {
   return role === 'reception'
+}
+
+// --- reading a filed report ------------------------------------------------
+//
+// Two shapes reach these: a v2 report with `ticks` + `photos`, and a legacy v1
+// one with neither, whose only record of what was wrong is the `items`
+// exceptions array. Both must render — a report is permanent, and the bundle
+// that reads it will outlive the bundle that wrote it.
+
+/** One tick as a screen renders it. PURE-built by `reportTickRows`. */
+export interface HkReportTickRow {
+  key: string
+  item: string
+  label: string
+  zone: string
+  zoneLabel: string
+  state: string
+  stateLabel: string
+  qty: number | null
+  photoId: number | null
+  problem: boolean
+}
+
+/** The report's ticks as renderable rows, in the paper form's order — the
+ *  server already orders them, but a screen must not depend on that to group
+ *  by zone. Unknown item codes keep their raw code and land in the อื่น ๆ
+ *  group rather than being dropped. PURE. */
+export function reportTickRows(
+  ticks: HkReportTick[] | null | undefined
+): HkReportTickRow[] {
+  const order: string[] = REPORT_ITEMS.map(({ item }) => item)
+  return [...(ticks ?? [])]
+    .sort((a, b) => {
+      const ai = order.indexOf(a.item)
+      const bi = order.indexOf(b.item)
+      return (ai === -1 ? order.length : ai) - (bi === -1 ? order.length : bi)
+    })
+    .map((tick) => {
+      const zone = reportItemZone(tick.item)
+      return {
+        key: tick.item,
+        item: tick.item,
+        label: reportItemLabel(tick.item),
+        zone: zone ?? '',
+        zoneLabel: zone ? reportZoneLabel(zone) : 'อื่น ๆ',
+        state: tick.state,
+        stateLabel: tickStateLabel(tick.state),
+        qty: tick.qty ?? null,
+        photoId: tick.photoId ?? null,
+        problem: tick.state !== 'ok',
+      }
+    })
+}
+
+/** The exceptions as renderable rows — v1's renderer, kept because a legacy
+ *  report has nothing else. Order as delivered (the server already orders them;
+ *  re-sorting would invent a second opinion about an order that is already
+ *  agreed). PURE. */
+export function reportItemRows(
+  items: HkReportItemException[] | null | undefined
+): Array<{ key: string; item: string; problem: string; qty: number; label: string; problemLabel: string }> {
+  return (items ?? []).map(({ item, problem, qty }) => ({
+    key: `${item}:${problem}`,
+    item,
+    problem,
+    qty,
+    label: reportItemLabel(item),
+    problemLabel: itemProblemLabel(problem),
+  }))
+}
+
+/** Ticks grouped into the capture zones, in shooting order, with an อื่น ๆ
+ *  bucket for codes this bundle predates. Empty groups are dropped. PURE. */
+export function reportTicksByZone(
+  ticks: HkReportTick[] | null | undefined
+): Array<{ zone: string; label: string; ticks: HkReportTickRow[] }> {
+  const rows = reportTickRows(ticks)
+  const groups: Array<{ zone: string; label: string; ticks: HkReportTickRow[] }> =
+    REPORT_ZONES.map(({ zone, label }) => ({
+      zone: zone as string,
+      label: label as string,
+      ticks: rows.filter((row) => row.zone === zone),
+    }))
+  const others = rows.filter((row) => !row.zone)
+  if (others.length > 0) groups.push({ zone: '', label: 'อื่น ๆ', ticks: others })
+  return groups.filter((group) => group.ticks.length > 0)
+}
+
+/**
+ * ONE SIDE's photos grouped by capture zone, each carrying the ticks it backs —
+ * the reception verify view's whole layout, computed once here rather than with
+ * three nested `filter`s in JSX.
+ *
+ * A photo with no zone (a v1 photo, or a close-up uploaded before the zone
+ * field existed) groups under อื่น ๆ; a photo backing nothing still appears,
+ * because an extra shot of a zone is evidence reception is entitled to see.
+ * PURE.
+ */
+export function reportPhotoGroups(
+  photos: HkReportPhotoRef[] | null | undefined,
+  ticks: HkReportTick[] | null | undefined,
+  side: string
+): Array<{
+  zone: string
+  label: string
+  photos: Array<{ photoId: number; bytes: number | null; ticks: HkReportTickRow[] }>
+}> {
+  const rows = reportTickRows(ticks)
+  const mine = (photos ?? []).filter((photo) => photo.side === side)
+  const build = (zone: string) =>
+    mine
+      .filter((photo) => (photo.zone ?? '') === zone)
+      .map((photo) => ({
+        photoId: photo.photoId,
+        bytes: photo.bytes ?? null,
+        ticks: rows.filter((row) => row.photoId === photo.photoId),
+      }))
+  const groups: Array<{
+    zone: string
+    label: string
+    photos: Array<{ photoId: number; bytes: number | null; ticks: HkReportTickRow[] }>
+  }> = REPORT_ZONES.map(({ zone, label }) => ({
+    zone: zone as string,
+    label: label as string,
+    photos: build(zone),
+  }))
+  const known = new Set<string>(REPORT_ZONES.map(({ zone }) => zone))
+  const others = mine
+    .filter((photo) => !known.has(photo.zone ?? ''))
+    .map((photo) => ({
+      photoId: photo.photoId,
+      bytes: photo.bytes ?? null,
+      ticks: rows.filter((row) => row.photoId === photo.photoId),
+    }))
+  if (others.length > 0) groups.push({ zone: '', label: 'อื่น ๆ', photos: others })
+  return groups.filter((group) => group.photos.length > 0)
+}
+
+/** One side's photo ids, in delivered order — the fallback the read-only
+ *  galleries use when a report predates `photos` and carries only the two id
+ *  arrays. PURE. */
+export function reportSidePhotoIds(report: HkReport | null | undefined, side: string): number[] {
+  const fromPhotos = (report?.photos ?? [])
+    .filter((photo) => photo.side === side)
+    .map((photo) => photo.photoId)
+  if (fromPhotos.length > 0) return fromPhotos
+  return (side === 'reception' ? report?.receptionPhotoIds : report?.maidPhotoIds) ?? []
+}
+
+/**
+ * How many things are wrong in this report. The server's derived
+ * `problemCount` when it sent one, the ticks when it did not, and v1's
+ * exceptions for a legacy report — in that order, so a cached bundle reading a
+ * new report and a new bundle reading an old one both get a number. PURE.
+ */
+export function reportProblemCount(
+  report: (HkReportSummary & Partial<HkReport>) | null | undefined
+): number {
+  if (!report) return 0
+  if (typeof report.problemCount === 'number') return report.problemCount
+  if (report.ticks?.length) return report.ticks.filter((tick) => tick.state !== 'ok').length
+  return report.items?.length ?? 0
+}
+
+/**
+ * Is this report's room fine? The TICKS decide when there are any, then the
+ * rows, and the flag only when there is nothing else — v1's rule kept
+ * verbatim, because showing "ครบทุกรายการ" over a list of missing items is the
+ * one failure on this surface that could cost a guest a charge nobody can
+ * explain. PURE.
+ */
+export function reportAllOk(report: HkReport | null | undefined): boolean {
+  if (!report) return false
+  if (report.ticks?.length) return report.ticks.every((tick) => tick.state === 'ok')
+  if ((report.items?.length ?? 0) > 0) return false
+  return report.allItemsOk !== false
 }
 
 // --- photos ----------------------------------------------------------------
@@ -1889,7 +2735,7 @@ async function postReportJson<T extends { success: boolean }>(
 
 /**
  * The day overview: every active room of the branch with its LATEST report for
- * that date. `date` is omitted for today — v1 has no date picker, and the
+ * that date. `date` is omitted for today — there is no date picker, and the
  * server's Bangkok "today" is the one answer both roles must be looking at.
  *
  * Returns the server's echoed `date` so the screen renders the day it actually
@@ -1910,8 +2756,8 @@ export async function fetchHkReports(
   }
 }
 
-/** One report in full — items and photo ids, which the overview's summary DTO
- *  deliberately does not carry. */
+/** One report in full — ticks, photos with their metadata, and the v1 arrays,
+ *  none of which the overview's summary DTO carries. */
 export async function fetchHkReport(
   branch: Branch | null,
   reportId: number
@@ -1930,7 +2776,7 @@ export async function fetchHkReport(
  * Composed here rather than in the page because there is no "latest report for
  * this room" endpoint — the day list IS that index — and a screen that
  * open-coded the two-step would be one refactor away from rendering a summary
- * DTO's absent `items` as "no exceptions".
+ * DTO's absent `ticks` as "nothing was wrong".
  */
 export async function fetchHkRoomReport(
   branch: Branch | null,
@@ -1945,33 +2791,82 @@ export async function fetchHkRoomReport(
 }
 
 /**
- * Upload ONE photo and get its id back. Multipart, field name `photo`.
+ * Upload ONE photo and get its id (and stored size) back. Multipart, field name
+ * `photo`, with the capture ZONE as a second text field when the caller knows
+ * it — informational on the server, and what lets the verify view group a
+ * report's evidence the way it was shot.
  *
  * NO `Content-Type` header — the browser must set it itself so the multipart
  * boundary matches the body. Setting it by hand is the classic way to make
  * every upload fail with a 400 that looks like a server bug.
  *
- * The `photoId` is the whole result: photos are uploaded as they are taken and
- * ATTACHED later by the submit/verify body, so an abandoned form leaves
- * unattached rows behind. That is accepted debt in v1 (no GC) — the alternative
- * is holding four full-size images in a WebView's memory until the maid taps
- * submit, which is how a phone kills the tab mid-report.
+ * Photos are uploaded as they are taken and ATTACHED later by the submit body,
+ * so an abandoned form leaves unattached rows behind. The DELETE below is what
+ * a maid's own remove/retake uses; anything she abandons outright stays, and
+ * that is deliberate — photos are kept forever (owner decision 2026-09-02).
  */
 export async function uploadHkReportPhoto(
   branch: Branch | null,
   photo: Blob,
-  filename = 'photo.jpg'
-): Promise<number> {
+  options: { zone?: string; filename?: string } = {}
+): Promise<HkReportPhotoUpload> {
   if (photo.size > REPORT_PHOTO_MAX_BYTES) throw new Error(PHOTO_TOO_LARGE_ERROR)
   const form = new FormData()
-  form.append('photo', photo, filename)
+  form.append('photo', photo, options.filename ?? 'photo.jpg')
+  if (options.zone) form.append('zone', options.zone)
   const res = await hkFetch('/report-photos', branch, { method: 'POST', body: form })
   if (res.status === 413) throw new Error(PHOTO_TOO_LARGE_ERROR)
   const body: HkReportPhotoResponse | null = res.ok ? await res.json().catch(() => null) : null
   if (!res.ok || !body?.success || typeof body.photoId !== 'number') {
     throw new Error(PHOTO_UPLOAD_ERROR)
   }
-  return body.photoId
+  return { photoId: body.photoId, bytes: typeof body.bytes === 'number' ? body.bytes : null }
+}
+
+/**
+ * Remove one of MY still-unattached photos — the retake primitive.
+ *
+ * Uploader-only and only while unattached, both enforced server-side; a photo
+ * that is already part of a filed report answers 400 and this resolves FALSE
+ * rather than throwing. The caller has already dropped it from the form by the
+ * time this settles: a maid in a corridor must never wait on a round trip to
+ * retake a picture, and an orphaned row is the cheap side of that trade.
+ */
+export async function deleteHkReportPhoto(
+  branch: Branch | null,
+  photoId: number
+): Promise<boolean> {
+  const res = await hkFetch(`/report-photos/${photoId}`, branch, { method: 'DELETE' })
+  if (!res.ok) return false
+  const body: { success?: boolean } | null = await res.json().catch(() => null)
+  return body?.success === true
+}
+
+/**
+ * One photo's metadata — what a restored draft asks before it trusts a
+ * `photoId` it remembers from before the reload.
+ *
+ * Resolves NULL for every answer that is not a clean one (404, a 400 from
+ * another uploader's id, a body without a photo, a network failure). The caller
+ * reads null as "cannot be used" and unbinds the ticks it backed: dropping a
+ * picture she must retake now is kinder than a submit refused after she has
+ * left the room.
+ */
+export async function fetchHkReportPhotoMeta(
+  branch: Branch | null,
+  photoId: number
+): Promise<HkReportPhotoMeta | null> {
+  try {
+    const res = await hkFetch(`/report-photos/${photoId}/meta`, branch)
+    if (!res.ok) return null
+    const body: { success?: boolean; photo?: HkReportPhotoMeta } | null = await res
+      .json()
+      .catch(() => null)
+    if (!body?.success || !body.photo) return null
+    return body.photo
+  } catch {
+    return null
+  }
 }
 
 /** File a room's daily report. Maid-only; a viewer's POST is refused with 403

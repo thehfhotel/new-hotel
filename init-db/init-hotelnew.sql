@@ -552,14 +552,23 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_room_created
 -- rationale). rr_status and rri_problem ARE checked because they are
 -- structural: every transition is written over the first, and the second is the
 -- pair the item_missing / item_damaged room signals are built on.
--- Items are EXCEPTIONS ONLY: a ครบทุกรายการ report has zero item rows.
--- Photos are BYTEA + mime (the 077 ht_hk_broken_reports pattern), 1..=4 per
--- side; rrp_side is DERIVED from the uploader's role, never client-sent, and
--- rrp_report_id is NULLABLE because a phone uploads BEFORE the form is
--- submitted -- the submit/verify transaction binds them (WHERE rrp_report_id IS
--- NULL AND rrp_badge = the caller), which makes "your own, not already
--- attached" one atomic check. ACCEPTED DEBT: unattached rows linger forever;
--- there is no GC in v1, deliberately.
+-- SUPERSEDED BY MIGRATION 092 (same day): items are no longer EXCEPTIONS but
+-- PHOTO-BACKED TICKS -- one row per checklist item per report, all 22 every
+-- time, each with rri_state (ok|missing|damaged) and rri_photo_id. A perfect
+-- room is four camera taps, one per capture zone. rr_all_items_ok is now
+-- DERIVED (true iff no tick is a problem); the column stays and is still
+-- written, for v1 readers.
+-- Photos are BYTEA + mime (the 077 ht_hk_broken_reports pattern); a submission
+-- carries 4..=24 DISTINCT photos across its ticks and extras, a verification
+-- 1..=4 of its own. rrp_side is DERIVED from the uploader's role, never
+-- client-sent, and rrp_report_id is NULLABLE because a phone uploads BEFORE the
+-- form is submitted -- the submit/verify transaction binds them (WHERE
+-- rrp_report_id IS NULL AND rrp_badge = the caller), which makes "your own, not
+-- already attached" one atomic check.
+-- RETENTION: photos are KEPT FOREVER (owner decision 2026-09-02). No purge job,
+-- no TTL, no sweeper, for attached or unattached rows. The only deletion path
+-- is DELETE /api/hk/report-photos/{id}, which is uploader-only and refuses
+-- anything already attached to a report.
 -- PG-CANONICAL ONLY: iHOTEL has no Report HK counterpart at all, so no sync
 -- mapper, no writeback, no WritebackIntent, and no domain event of its own --
 -- but a submission with item exceptions raises the EXISTING item_missing /
@@ -593,16 +602,9 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_room_reports_open
     ON ht_hk_room_reports (rr_room_id, rr_date)
     WHERE rr_status = 'submitted';
 
-CREATE TABLE IF NOT EXISTS ht_hk_room_report_items (
-    rri_id        BIGSERIAL PRIMARY KEY,
-    rri_report_id BIGINT    NOT NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
-    rri_item      TEXT      NOT NULL,
-    rri_problem   TEXT      NOT NULL CHECK (rri_problem IN ('missing', 'damaged')),
-    rri_qty       INTEGER   NOT NULL CHECK (rri_qty >= 1 AND rri_qty <= 99)
-);
-CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_report
-    ON ht_hk_room_report_items (rri_report_id, rri_id);
-
+-- The photos table is declared BEFORE the items table, because migration 092
+-- made rri_photo_id a foreign key into it (the tick names the picture that
+-- backs it) and a fresh cluster runs this file top to bottom.
 CREATE TABLE IF NOT EXISTS ht_hk_room_report_photos (
     rrp_id         BIGSERIAL   PRIMARY KEY,
     rrp_report_id  BIGINT      NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
@@ -610,6 +612,14 @@ CREATE TABLE IF NOT EXISTS ht_hk_room_report_photos (
     rrp_photo      BYTEA       NOT NULL,
     rrp_photo_mime TEXT        NOT NULL,
     rrp_badge      TEXT        NOT NULL,
+    -- Migration 092: the capture zone (bed|desk|bathroom|general), which is
+    -- INFORMATIONAL ONLY -- nothing joins or filters on it, and the
+    -- one-photo-per-zone rule is the client's -- and the stored size, so the
+    -- upload response and the report's photo strip need not detoast the image.
+    -- TEXT with NO CHECK on the zone, the 088 rationale: the shooting order is
+    -- app-owned vocabulary (domain::hk_report::REPORT_ZONES).
+    rrp_zone       TEXT,
+    rrp_bytes      INTEGER,
     rrp_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_report
@@ -619,6 +629,38 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_report
 CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_open
     ON ht_hk_room_report_photos (rrp_badge, rrp_id)
     WHERE rrp_report_id IS NULL;
+
+-- The TICK table since migration 092 (was EXCEPTIONS-only in 091): ONE ROW PER
+-- ITEM PER REPORT -- all 22, every time -- each carrying the state the maid
+-- recorded and the photo that backs it. rri_qty is NULL for an ok tick and
+-- 1..=99 for a problem; rri_problem is NULL for an ok tick and otherwise EQUALS
+-- rri_state, written from the same value by one statement so the two cannot
+-- disagree (which keeps the v1 "exceptions" projection correct for old
+-- bundles). rri_photo_id IS NULL is what a v1 row looks like, and is therefore
+-- the discriminator every read uses. ON DELETE CASCADE on the photo FK is a
+-- cascade-ORDERING backstop, not a feature: the app refuses to delete a photo a
+-- report names, so it can only fire from the room->report cascade.
+CREATE TABLE IF NOT EXISTS ht_hk_room_report_items (
+    rri_id        BIGSERIAL PRIMARY KEY,
+    rri_report_id BIGINT    NOT NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
+    rri_item      TEXT      NOT NULL,
+    rri_state     TEXT      NOT NULL DEFAULT 'ok'
+                            CONSTRAINT ht_hk_room_report_items_rri_state_check
+                            CHECK (rri_state IN ('ok', 'missing', 'damaged')),
+    rri_problem   TEXT      NULL CHECK (rri_problem IN ('missing', 'damaged')),
+    rri_qty       INTEGER   NULL CHECK (rri_qty >= 1 AND rri_qty <= 99),
+    rri_photo_id  BIGINT    NULL REFERENCES ht_hk_room_report_photos(rrp_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_report
+    ON ht_hk_room_report_items (rri_report_id, rri_id);
+-- One row per item per report -- the invariant the tick model is built on.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_hk_room_report_items_report_item
+    ON ht_hk_room_report_items (rri_report_id, rri_item);
+-- The problem-count read behind problemCount and the DERIVED allItemsOk.
+-- PARTIAL: 21 of 22 ticks in a healthy property are ok.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_problems
+    ON ht_hk_room_report_items (rri_report_id)
+    WHERE rri_state <> 'ok';
 
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
@@ -2900,6 +2942,25 @@ ON CONFLICT (version) DO NOTHING;
 -- row records the migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('091', '091_create_ht_hk_room_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 092 - Report HK v2: the equipment checklist becomes PHOTO-BACKED
+-- TICKS (owner directives 2026-09-02, "1 picture for each tick"). Columns and
+-- indexes inlined above: ht_hk_room_report_items gains rri_state +
+-- rri_photo_id, drops NOT NULL on rri_qty and rri_problem, and gains
+-- UNIQUE (rri_report_id, rri_item) plus a partial problem index;
+-- ht_hk_room_report_photos gains rrp_zone (capture zone, informational) and
+-- rrp_bytes (stored size). ONE ROW PER ITEM PER REPORT -- all 22, every time --
+-- so "the room is fine" and "she did not look" stop being the same submission;
+-- rr_all_items_ok becomes DERIVED. Photos are kept FOREVER (owner decision);
+-- the only deletion path is the uploader-only, unattached-only DELETE
+-- /api/hk/report-photos/{id}. Still PG-canonical only: no legacy counterpart,
+-- no sync mapper, no writeback, no domain event of its own -- problem ticks
+-- raise the existing item_missing / item_damaged room signals (089) in the
+-- submit's own transaction, one per problem kind. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('092', '092_hk_room_report_photo_backed_ticks.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

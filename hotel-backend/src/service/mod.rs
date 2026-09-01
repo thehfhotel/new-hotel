@@ -75,8 +75,8 @@ pub use customer::{
 };
 pub use error::{ServiceError, ServiceResult};
 pub use hk_reports::{
-    HkReportService, ReportItemInput, ReturnReportCommand, StorePhotoCommand, StoredPhoto,
-    SubmitReportCommand, VerifyReportCommand,
+    HkReportService, ReportTickInput, ReturnReportCommand, StorePhotoCommand, StoredPhoto,
+    StoredPhotoId, SubmitReportCommand, VerifyReportCommand,
 };
 pub use hk_signals::{
     ActOnSignalCommand, AnswerOutcome, AnswerRoomCheckCommand, HkSignalService,

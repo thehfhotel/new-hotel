@@ -300,7 +300,7 @@ async fn hfville_report_hk_is_admitted_while_ville_writes_are_disabled() {
     for (uri, body) in [
         (
             "/api/hk/rooms/1/report?branch=hfville",
-            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+            r#"{"roomStatus":"vc","ticks":[{"item":"pillow","state":"ok","photoId":1}]}"#,
         ),
         ("/api/hk/reports/9/verify?branch=hfville", r#"{"photoIds":[1]}"#),
         (
@@ -316,6 +316,95 @@ async fn hfville_report_hk_is_admitted_while_ville_writes_are_disabled() {
             "expected the Ville guard to ADMIT {uri} (leaving the Access gate to \
              answer 401); a 403 means Ville housekeeping cannot file or judge a \
              room report whenever front-desk Ville writes are turned off"
+        );
+    }
+}
+
+/// **Migration 092's DELETE.** `DELETE /api/hk/report-photos/{id}` — the maid
+/// removing a picture she has not filed yet — must be admitted for
+/// `branch=hfville` while Ville writes are disabled.
+///
+/// This is the FIRST exemption on this surface for a method other than POST, so
+/// it is also the proof that the guard grew a DELETE arm rather than falling
+/// through: before 092 the gate refused every non-POST Ville mutation, so it
+/// would answer 403 here.
+///
+/// The safety argument is the narrowest of any exemption in the guard: ONE
+/// `DELETE` of a row the endpoint's own predicate proves is UNATTACHED, so it
+/// belongs to no report, enqueues no writeback intent, writes no outbox row and
+/// publishes no domain event. There is nothing a narrowed
+/// `HFVILLE_WRITEBACK_INTENTS` could park as `'skipped'`, because there is
+/// nothing to enqueue.
+///
+/// Without it a Ville maid who took a blurred picture could not retake it while
+/// front-desk Ville writes are off — exactly the collateral damage the
+/// exemption exists to prevent.
+///
+/// Needs no database: both layers answer before a pool is touched.
+#[tokio::test]
+async fn hfville_report_photo_delete_is_admitted_while_ville_writes_are_disabled() {
+    for uri in [
+        "/api/hk/report-photos/1?branch=hfville",
+        "/api/hk/report-photos/987654?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "DELETE", uri, false, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "expected the Ville guard to ADMIT DELETE {uri} (leaving the Access gate \
+             to answer 401); a 403 means a Ville maid cannot retake a blurred photo \
+             whenever front-desk Ville writes are turned off"
+        );
+    }
+}
+
+/// The DELETE widening is narrow on BOTH axes — this VERB and this SHAPE — and
+/// this is the half that matters. A guard that simply added the path to the
+/// existing exempt list would pass the admit test above while exempting POST,
+/// PUT and PATCH on it too; one that matched a prefix would exempt every
+/// `/api/hk/report-photos/*` mutation including future ones.
+#[tokio::test]
+async fn the_report_photo_delete_exemption_does_not_widen_on_the_shipped_router() {
+    // The VERB axis: only DELETE is exempt on that path.
+    for method in ["POST", "PUT", "PATCH"] {
+        let status = probe_with_body(
+            lazy_pool(),
+            method,
+            "/api/hk/report-photos/1?branch=hfville",
+            false,
+            "{}",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} on the photo path must NOT inherit the DELETE exemption"
+        );
+    }
+
+    // The SHAPE axis: DELETE is exempt for `{report-photos}/{digits}` alone.
+    for uri in [
+        // The intake path itself has no id — it is exempt for POST only.
+        "/api/hk/report-photos?branch=hfville",
+        // Deeper paths, including the READ's own `/meta` sub-path.
+        "/api/hk/report-photos/1/meta?branch=hfville",
+        "/api/hk/report-photos/1/delete?branch=hfville",
+        "/api/hk/report-photos/1/?branch=hfville",
+        // Malformed or absent ids.
+        "/api/hk/report-photos/1a?branch=hfville",
+        "/api/hk/report-photos/?branch=hfville",
+        // Near-misses on the collection, and the desk tree.
+        "/api/hk/report-photosX/1?branch=hfville",
+        "/api/hk/reports/1?branch=hfville",
+        "/api/hk/rooms/1/report?branch=hfville",
+        "/api/housekeeping/report-photos/1?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "DELETE", uri, false, "").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "DELETE {uri} must be refused by the Ville guard; 401 would mean the \
+             exemption is matching a shape rather than one path"
         );
     }
 }

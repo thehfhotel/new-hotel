@@ -38,6 +38,53 @@ export const REPORT_ITEMS = [
 
 export type ReportItemCode = (typeof REPORT_ITEMS)[number]['item']
 
+/**
+ * Capture ZONES — the maid's shooting order (owner directive 2026-09-02: fast
+ * for a maid working against the clock). One camera tap per zone; the zone's
+ * items appear PRE-TICKED against that photo and she only touches what is
+ * wrong. Every item belongs to exactly ONE zone (test-pinned); every tick must
+ * be backed by a photo, one photo may back several ticks, and a problem item
+ * (หาย/ชำรุด) takes its own close-up.
+ */
+export const REPORT_ZONES = [
+  {
+    zone: 'bed',
+    label: 'เตียง',
+    items: ['bed_sheet', 'pillowcase', 'duvet', 'duvet_cover', 'pillow'],
+  },
+  {
+    zone: 'desk',
+    label: 'โต๊ะและมินิบาร์',
+    items: ['water_glass', 'coffee_tray', 'coffee_cup', 'coffee_sachet_jar', 'kettle', 'ashtray'],
+  },
+  {
+    zone: 'bathroom',
+    label: 'ห้องน้ำ',
+    items: ['bathroom_bin', 'hairdryer', 'bath_amenity_tray', 'bath_towel', 'face_towel', 'foot_towel', 'bathrobe'],
+  },
+  {
+    zone: 'general',
+    label: 'ทั่วไป',
+    items: ['aircon_remote', 'tv_remote', 'mirror_bin', 'hangers'],
+  },
+] as const
+
+export type ReportZone = (typeof REPORT_ZONES)[number]['zone']
+
+/** A tick's state. `ok` is the pre-ticked default; the other two are problems
+ *  and carry a quantity. Every state is photo-backed. */
+export const TICK_STATES = [
+  { state: 'ok', label: 'ครบ' },
+  { state: 'missing', label: 'หาย' },
+  { state: 'damaged', label: 'ชำรุด' },
+] as const
+
+export type TickState = (typeof TICK_STATES)[number]['state']
+
+/** Photo evidence bounds for the whole report: at least one photo per zone
+ *  (4 zones) and a generous ceiling for close-ups and re-shots. */
+export const REPORT_MAX_PHOTOS_TOTAL = 24
+
 /** What can be wrong with an item — the same pair the signal vocabulary uses. */
 export const ITEM_PROBLEMS = [
   { problem: 'missing', label: 'หาย' },

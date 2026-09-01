@@ -89,14 +89,85 @@ pub const ROOM_STATUS_CODES: [&str; 4] = ["vc", "co", "oo", "so"];
 /// "Report verification" — _Avoid_: free-text rejection notes).
 pub const RETURN_REASONS: [&str; 3] = ["not_clean", "items_mismatch", "photos_unclear"];
 
+/// The maid's CAPTURE ZONES — her shooting order, mirroring `REPORT_ZONES`.
+///
+/// One camera tap per zone; the zone's items appear PRE-TICKED `ok` against
+/// that photo and she only touches what is wrong. A perfect room is four shots
+/// and no further interaction, which is the whole "fast for a maid working
+/// against the clock" directive.
+///
+/// **Zones are a capture ORDER, not a data-model entity** (CONTEXT.md
+/// §Housekeeping, "Capture zone"). Nothing joins on a zone, no read is filtered
+/// by one, and no submission is refused because a zone is unrepresented — the
+/// one-photo-per-zone rule is the CLIENT's. This table exists here for exactly
+/// two jobs: answering "is that a real zone code" for the upload's optional
+/// `zone` field, and pinning (by the test below) the vocab file's claim that
+/// **every checklist item belongs to exactly one zone**, which is what makes
+/// the pre-ticking total.
+pub const REPORT_ZONES: [(&str, &[&str]); 4] = [
+    // เตียง
+    (
+        "bed",
+        &["bed_sheet", "pillowcase", "duvet", "duvet_cover", "pillow"],
+    ),
+    // โต๊ะและมินิบาร์
+    (
+        "desk",
+        &[
+            "water_glass",
+            "coffee_tray",
+            "coffee_cup",
+            "coffee_sachet_jar",
+            "kettle",
+            "ashtray",
+        ],
+    ),
+    // ห้องน้ำ
+    (
+        "bathroom",
+        &[
+            "bathroom_bin",
+            "hairdryer",
+            "bath_amenity_tray",
+            "bath_towel",
+            "face_towel",
+            "foot_towel",
+            "bathrobe",
+        ],
+    ),
+    // ทั่วไป
+    (
+        "general",
+        &["aircon_remote", "tv_remote", "mirror_bin", "hangers"],
+    ),
+];
+
 /// Photo-evidence bounds, enforced client- AND server-side — mirrors
 /// `REPORT_MIN_PHOTOS` / `REPORT_MAX_PHOTOS`.
 ///
-/// They apply PER SIDE and per transition: a submission carries 1..=4 maid
-/// photos, and a verification carries 1..=4 reception photos of its own. A
-/// return carries none at all (the reason is the evidence there).
+/// They apply PER SIDE and per transition on the VERIFY side: a verification
+/// carries 1..=4 reception photos of its own, and a return carries none at all
+/// (the reason is the evidence there).
+///
+/// The SUBMIT side is no longer counted this way — a v2 submission's bound is
+/// [`REPORT_MIN_PHOTOS_TOTAL`]..=[`REPORT_MAX_PHOTOS_TOTAL`] over the DISTINCT
+/// photos its ticks and extras name.
 pub const REPORT_MIN_PHOTOS: usize = 1;
 pub const REPORT_MAX_PHOTOS: usize = 4;
+
+/// The SUBMISSION's photo bound — DISTINCT photos across every tick and every
+/// extra, mirroring `REPORT_MAX_PHOTOS_TOTAL`.
+///
+/// The floor is the four capture zones: a report backed by fewer pictures than
+/// there are zones cannot have been shot zone by zone. The server checks only
+/// the TOTAL — "at least one per zone" is a UI rule, because the server cannot
+/// tell a legitimately re-used shot from a missed zone without making
+/// `rrp_zone` load-bearing, which CONTEXT.md rules out.
+///
+/// The ceiling is the vocab file's `REPORT_MAX_PHOTOS_TOTAL`: four zone shots
+/// plus a generous allowance of close-ups and re-shots.
+pub const REPORT_MIN_PHOTOS_TOTAL: usize = REPORT_ZONES.len();
+pub const REPORT_MAX_PHOTOS_TOTAL: usize = 24;
 
 /// Inclusive quantity bounds for ONE item exception.
 ///
@@ -106,15 +177,14 @@ pub const REPORT_MAX_PHOTOS: usize = 4;
 pub const MIN_ITEM_QTY: i32 = 1;
 pub const MAX_ITEM_QTY: i32 = 99;
 
-/// The most exceptions ONE report may carry.
+/// How many ticks ONE submission carries: **exactly the checklist**.
 ///
-/// Equal to `REPORT_ITEMS.len() * 2` — every item, both problems — and that is
-/// not a coincidence: exceptions are unique per (item, problem), so a body with
-/// more entries than there are pairs is necessarily malformed regardless of the
-/// duplicate check. Its own constant so widening the checklist later does not
-/// silently widen the accepted body size before anyone has thought about it
-/// (the `MAX_LINEN_ITEMS` precedent).
-pub const MAX_REPORT_ITEMS: usize = REPORT_ITEMS.len() * 2;
+/// Not a cap — an EQUALITY. v2 is not exception-based: every item is ticked
+/// every time, so a body with 21 entries is as malformed as one with 23, and
+/// [`check_tick_coverage`] refuses both by naming what is missing or extra.
+/// Its own constant so the arithmetic is stated once and widening the checklist
+/// moves the requirement with it.
+pub const REPORT_TICK_COUNT: usize = REPORT_ITEMS.len();
 
 // ============================================================================
 // Structural enums
@@ -173,6 +243,72 @@ impl ItemProblem {
     /// submit's signal-raising uses, so two reports with the same exceptions
     /// always raise their signals in the same order.
     pub const ALL: [ItemProblem; 2] = [ItemProblem::Missing, ItemProblem::Damaged];
+}
+
+/// What ONE checklist item's tick says — mirrors `TICK_STATES`.
+///
+/// `Ok` (ครบ) is the PRE-TICKED default the maid never has to touch; the other
+/// two are problems and carry a quantity. Every state is photo-backed — that is
+/// the v2 model, and it is why this is a three-value enum rather than
+/// `Option<ItemProblem>`: an `ok` tick is a positive attestation about an item
+/// with a picture behind it, not the absence of a record.
+///
+/// CHECKED in the DB (`rri_state`, migration 092) for [`ItemProblem`]'s reason:
+/// the triple is STRUCTURAL. `ok` is the absence of a problem and the other two
+/// are exactly the pair the `item_missing` / `item_damaged` signals are built
+/// on, which [`Self::problem`] is the bridge to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TickState {
+    /// ครบ — present and undamaged.
+    Ok,
+    /// หาย
+    Missing,
+    /// ชำรุด
+    Damaged,
+}
+
+impl TickState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TickState::Ok => "ok",
+            TickState::Missing => "missing",
+            TickState::Damaged => "damaged",
+        }
+    }
+
+    /// Parse an already-normalized code. `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ok" => Some(TickState::Ok),
+            "missing" => Some(TickState::Missing),
+            "damaged" => Some(TickState::Damaged),
+            _ => None,
+        }
+    }
+
+    /// The v1 problem this tick is, if it is one — the bridge to
+    /// [`ItemProblem::signal_type`] and to the `rri_problem` column, which new
+    /// writes fill from exactly this (`NULLIF(state, 'ok')`).
+    ///
+    /// Total over the enum, so the compiler guarantees `ok` maps to nothing and
+    /// each problem maps to exactly one — no route or service may re-decide it.
+    pub fn problem(self) -> Option<ItemProblem> {
+        match self {
+            TickState::Ok => None,
+            TickState::Missing => Some(ItemProblem::Missing),
+            TickState::Damaged => Some(ItemProblem::Damaged),
+        }
+    }
+
+    /// Does this tick carry a quantity? `ok` MUST NOT, a problem MUST — stated
+    /// once so the route, the service and the DB agree.
+    pub fn is_problem(self) -> bool {
+        self.problem().is_some()
+    }
+
+    /// Every state, in the vocab file's order.
+    pub const ALL: [TickState; 3] = [TickState::Ok, TickState::Missing, TickState::Damaged];
 }
 
 /// Report lifecycle — mirrors the `ReportStatus` union.
@@ -274,15 +410,34 @@ impl PhotoSide {
 pub enum ReportRuleError {
     /// A code that is in NO vocabulary — a typo or a stale bundle. 400.
     UnknownCode { field: &'static str, got: String },
-    /// The checklist contradicts its own attestation. 400.
-    ItemsContradictAttestation { all_items_ok: bool, items: usize },
-    /// The same (item, problem) pair twice. 400.
-    DuplicateItem { item: String, problem: &'static str },
+    /// The ticks are not EXACTLY the checklist: some item was never ticked, or
+    /// an item was ticked that is not on the form. 400.
+    ///
+    /// Carries the offending codes (up to a handful) rather than only a count,
+    /// because the client's job on receiving this is to find the row it failed
+    /// to send — a bare "expected 22, got 21" makes that a search.
+    TicksIncomplete {
+        missing: Vec<String>,
+        unexpected: Vec<String>,
+    },
+    /// The same item ticked twice in one submission. 400.
+    DuplicateTick { item: String },
+    /// An `ok` tick carrying a quantity — there is nothing to count. 400.
+    QtyOnOkTick { item: String },
+    /// A `missing` / `damaged` tick with no quantity. 400.
+    QtyMissingForProblem { item: String },
+    /// A tick with no backing photo. Every tick is photo-backed in v2; this is
+    /// the rule the whole model is named after. 400.
+    TickPhotoMissing { item: String },
     /// Quantity outside 1..=99. 400.
     QtyOutOfRange { item: String },
-    /// Too many exception lines to be a real report. 400.
-    TooManyItems { got: usize },
-    /// Photo count outside 1..=4. 400.
+    /// The submission's DISTINCT photo total is outside 4..=24. 400.
+    PhotoTotalOutOfRange { got: usize },
+    /// A v1-shaped body (`allItemsOk` / `items`) on the v2 endpoint. 400, and
+    /// the message names `ticks` so a stale bundle's operator knows what
+    /// changed. 400.
+    LegacyBodyShape,
+    /// Photo count outside 1..=4 (the VERIFY side's per-transition bound). 400.
     PhotoCountOutOfRange { got: usize },
     /// The same photo id twice in one command. 400.
     DuplicatePhoto { photo_id: i64 },
@@ -315,32 +470,48 @@ impl ReportRuleError {
             ReportRuleError::UnknownCode { field, got } => {
                 format!("invalid {field} '{got}'")
             }
-            ReportRuleError::ItemsContradictAttestation {
-                all_items_ok,
-                items,
+            ReportRuleError::TicksIncomplete {
+                missing,
+                unexpected,
             } => {
-                if *all_items_ok {
-                    format!(
-                        "allItemsOk is true but {items} item exception(s) were sent; \
-                         a report is either ครบทุกรายการ or a list of exceptions"
-                    )
-                } else {
-                    "allItemsOk is false but no item exceptions were sent; \
-                     name what is missing or damaged"
-                        .to_string()
+                let mut parts = Vec::new();
+                if !missing.is_empty() {
+                    parts.push(format!("never ticked: {}", preview(missing)));
                 }
+                if !unexpected.is_empty() {
+                    parts.push(format!("not on the checklist: {}", preview(unexpected)));
+                }
+                format!(
+                    "ticks must name all {REPORT_TICK_COUNT} checklist items exactly once ({})",
+                    parts.join("; ")
+                )
             }
-            ReportRuleError::DuplicateItem { item, problem } => format!(
-                "duplicate exception for item '{item}' / '{problem}'; \
-                 report each item-problem pair once with its total"
+            ReportRuleError::DuplicateTick { item } => format!(
+                "item '{item}' was ticked more than once; every item is ticked exactly once"
+            ),
+            ReportRuleError::QtyOnOkTick { item } => format!(
+                "item '{item}' is ticked 'ok', which carries no qty; \
+                 send qty only with 'missing' or 'damaged'"
+            ),
+            ReportRuleError::QtyMissingForProblem { item } => format!(
+                "item '{item}' needs a qty (an integer {MIN_ITEM_QTY}..={MAX_ITEM_QTY}); \
+                 say how many are missing or damaged"
+            ),
+            ReportRuleError::TickPhotoMissing { item } => format!(
+                "item '{item}' has no photoId; every tick names the photo that backs it"
             ),
             ReportRuleError::QtyOutOfRange { item } => format!(
                 "invalid qty for item '{item}' (expected an integer \
                  {MIN_ITEM_QTY}..={MAX_ITEM_QTY})"
             ),
-            ReportRuleError::TooManyItems { got } => format!(
-                "too many item exceptions ({got}); at most {MAX_REPORT_ITEMS} are accepted"
+            ReportRuleError::PhotoTotalOutOfRange { got } => format!(
+                "expected {REPORT_MIN_PHOTOS_TOTAL}..={REPORT_MAX_PHOTOS_TOTAL} distinct \
+                 photos across the ticks and extras, got {got}"
             ),
+            ReportRuleError::LegacyBodyShape => "this endpoint now takes 'ticks' (one \
+                 photo-backed tick per checklist item); 'allItemsOk' / 'items' are the \
+                 retired v1 shape — reload the app"
+                .to_string(),
             ReportRuleError::PhotoCountOutOfRange { got } => format!(
                 "expected {REPORT_MIN_PHOTOS}..={REPORT_MAX_PHOTOS} photos, got {got}"
             ),
@@ -418,29 +589,144 @@ pub fn parse_return_reason(raw: &str) -> Result<&'static str, ReportRuleError> {
         })
 }
 
-/// The exception-based checklist's ONE invariant: `items` is empty **iff**
-/// `all_items_ok`. PURE.
-///
-/// Stated once, here, because it spans two tables (the flag is on the header,
-/// the exceptions are rows) and is therefore not expressible as a DB CHECK —
-/// so this function is the only thing standing between the wire and a report
-/// that claims the room is fine while listing three broken items.
-pub fn check_attestation(all_items_ok: bool, item_count: usize) -> Result<(), ReportRuleError> {
-    if all_items_ok == (item_count == 0) {
-        return Ok(());
-    }
-    Err(ReportRuleError::ItemsContradictAttestation {
-        all_items_ok,
-        items: item_count,
+/// Is this a tick state the app knows? Returns the enum.
+pub fn parse_tick_state(raw: &str) -> Result<TickState, ReportRuleError> {
+    TickState::parse(&normalize_code(raw)).ok_or_else(|| ReportRuleError::UnknownCode {
+        field: "state",
+        got: raw.to_string(),
     })
 }
 
-/// The photo-count bound, per side and per transition. PURE.
+/// Is this a capture-zone code the app knows? Returns the canonical spelling.
+///
+/// Only ever called for a zone that WAS sent — the field is optional, because a
+/// zone is informational and a re-shot close-up belongs to no zone at all.
+pub fn parse_zone(raw: &str) -> Result<&'static str, ReportRuleError> {
+    let wanted = normalize_code(raw);
+    REPORT_ZONES
+        .iter()
+        .find(|(code, _)| *code == wanted)
+        .map(|(code, _)| *code)
+        .ok_or_else(|| ReportRuleError::UnknownCode {
+            field: "zone",
+            got: raw.to_string(),
+        })
+}
+
+/// **The v2 checklist invariant: the ticks are EXACTLY the 22 items, each
+/// once.** PURE.
+///
+/// This is the rule that replaced v1's `items`-empty-iff-`allItemsOk`
+/// biconditional, and it is stronger in the direction that matters: an
+/// exception-based report could not distinguish "the room is fine" from "she
+/// did not look", and a tick-based one cannot be submitted at all until every
+/// item has been answered.
+///
+/// It reports BOTH directions in one verdict — items never ticked and items
+/// that are not on the checklist — because a stale bundle typically produces
+/// both at once (a renamed code is simultaneously missing and unexpected), and
+/// answering only the first would make the client fix it twice.
+///
+/// Duplicates are a SEPARATE error ([`ReportRuleError::DuplicateTick`]) raised
+/// by the caller as it walks the list, so the offending item can be named while
+/// it is in hand; this function sees a de-duplicated set.
+pub fn check_tick_coverage(ticked: &[String]) -> Result<(), ReportRuleError> {
+    let missing: Vec<String> = REPORT_ITEMS
+        .iter()
+        .filter(|item| !ticked.iter().any(|got| got == *item))
+        .map(|item| (*item).to_string())
+        .collect();
+    let unexpected: Vec<String> = ticked
+        .iter()
+        .filter(|got| !REPORT_ITEMS.contains(&got.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() && unexpected.is_empty() {
+        return Ok(());
+    }
+    Err(ReportRuleError::TicksIncomplete {
+        missing,
+        unexpected,
+    })
+}
+
+/// One tick's quantity rule, in one place: **an `ok` tick carries NO qty, a
+/// problem tick carries 1..=99.** PURE.
+///
+/// Both halves are refusals, not coercions. Dropping a qty sent with an `ok`
+/// tick would silently accept a client that ticked the wrong state, and
+/// defaulting a missing one to 1 would invent a number the maid never counted —
+/// and that number is what reception charges a guest from.
+pub fn check_tick_qty(
+    item: &str,
+    state: TickState,
+    qty: Option<i32>,
+) -> Result<(), ReportRuleError> {
+    match (state.is_problem(), qty) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => Err(ReportRuleError::QtyOnOkTick {
+            item: item.to_string(),
+        }),
+        (true, None) => Err(ReportRuleError::QtyMissingForProblem {
+            item: item.to_string(),
+        }),
+        (true, Some(qty)) if (MIN_ITEM_QTY..=MAX_ITEM_QTY).contains(&qty) => Ok(()),
+        (true, Some(_)) => Err(ReportRuleError::QtyOutOfRange {
+            item: item.to_string(),
+        }),
+    }
+}
+
+/// **Every tick is photo-backed** — the rule the model is named after. PURE.
+///
+/// It applies to `ok` ticks too, and that is the point: the ครบ attestation is
+/// the one a maid against the clock would otherwise wave through, so the picture
+/// is what makes it checkable. The photo MAY be shared with other ticks (the
+/// เตียง shot backs all five bed items); nothing here demands a close-up,
+/// because the server cannot tell one from a zone shot and the UI drives that.
+pub fn check_tick_photo(item: &str, photo_id: Option<i64>) -> Result<(), ReportRuleError> {
+    if photo_id.is_some() {
+        return Ok(());
+    }
+    Err(ReportRuleError::TickPhotoMissing {
+        item: item.to_string(),
+    })
+}
+
+/// The SUBMISSION's bound on DISTINCT photos (ticks ∪ extras). PURE.
+///
+/// DISTINCT, because one photo backing five ticks is one picture — counting the
+/// references instead would refuse a perfectly shot room at the ceiling and
+/// admit a four-tick report with one picture at the floor.
+pub fn check_photo_total(distinct: usize) -> Result<(), ReportRuleError> {
+    if (REPORT_MIN_PHOTOS_TOTAL..=REPORT_MAX_PHOTOS_TOTAL).contains(&distinct) {
+        return Ok(());
+    }
+    Err(ReportRuleError::PhotoTotalOutOfRange { got: distinct })
+}
+
+/// The photo-count bound, per side and per transition — the VERIFY side's rule.
+/// PURE.
 pub fn check_photo_count(count: usize) -> Result<(), ReportRuleError> {
     if (REPORT_MIN_PHOTOS..=REPORT_MAX_PHOTOS).contains(&count) {
         return Ok(());
     }
     Err(ReportRuleError::PhotoCountOutOfRange { got: count })
+}
+
+/// A short, bounded rendering of a code list for an error message — at most
+/// four codes plus a count, so a stale bundle that gets every name wrong cannot
+/// make the 400 body enormous. PURE.
+fn preview(codes: &[String]) -> String {
+    const SHOWN: usize = 4;
+    if codes.len() <= SHOWN {
+        return codes.join(", ");
+    }
+    format!(
+        "{}, … (+{} more)",
+        codes[..SHOWN].join(", "),
+        codes.len() - SHOWN
+    )
 }
 
 /// May a report in `status` be verified or returned? PURE.
@@ -513,6 +799,75 @@ pub struct ReportItem {
     pub qty: i32,
 }
 
+/// One PHOTO-BACKED TICK on the wire — `{"item","state","qty","photoId"}`.
+///
+/// The v2 checklist row: one per item per report, all 22, every time. `qty` is
+/// `null` on an `ok` tick and 1..=99 on a problem; `photoId` names the picture
+/// that backs it and one picture may back several ticks.
+///
+/// `photoId` is `Option<i64>` **only to keep v1 rows readable** — an exception
+/// filed before migration 092 has no backing photo, and a row with `photoId:
+/// null` is exactly how such a row would look if it were ever surfaced here. It
+/// is not: [`RoomReport::ticks`] carries photo-backed rows only. Every tick this
+/// app writes has a photo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTick {
+    /// A [`REPORT_ITEMS`] code, as stored. A plain `String` for
+    /// [`ReportItem::item`]'s reason.
+    pub item: String,
+    pub state: TickState,
+    /// `null` for an `ok` tick; 1..=99 for a problem.
+    pub qty: Option<i32>,
+    /// The backing photo's id. Fetch the bytes from
+    /// `GET /api/hk/report-photos/{id}`.
+    pub photo_id: Option<i64>,
+}
+
+/// One stored photo's METADATA on the wire —
+/// `{"photoId","side","zone","bytes"}`.
+///
+/// Enough for the client to render the evidence strip (which side took it, what
+/// it was a shot of, how big it is) without fetching megabytes of image, and
+/// enough for reception to see WHICH picture vouches for which tick by joining
+/// on `photoId`. The bytes themselves stay behind
+/// `GET /api/hk/report-photos/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportPhoto {
+    pub photo_id: i64,
+    pub side: PhotoSide,
+    /// The capture zone, when the client named one. `null` for a v1 photo and
+    /// for a free-hand close-up — informational either way (CONTEXT.md: zones
+    /// are a capture ORDER, not a data-model entity).
+    pub zone: Option<String>,
+    /// Stored size in bytes; `null` only if a row predates the backfill.
+    pub bytes: Option<i64>,
+}
+
+/// One photo's metadata as `GET /api/hk/report-photos/{id}/meta` serves it —
+/// [`ReportPhoto`] plus the two facts only the photo itself knows.
+///
+/// It exists for the client's RESUME-AFTER-RELOAD reconciliation: a maid whose
+/// phone locks mid-form comes back holding a list of ids in local storage and
+/// has to find out, one id at a time, which of them still exist, are still
+/// hers, and are still unattached — i.e. which she may still tick against or
+/// delete. `attached` is the one bit that decides it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportPhotoMeta {
+    pub photo_id: i64,
+    pub side: PhotoSide,
+    pub zone: Option<String>,
+    pub bytes: Option<i64>,
+    /// `true` once a submit or verify has bound it to a report. An attached
+    /// photo can no longer be deleted, which is exactly what the client needs
+    /// to know before offering a "remove" control.
+    pub attached: bool,
+    /// RFC 3339 UTC.
+    pub uploaded_at: String,
+}
+
 /// The FULL report — `GET /api/hk/reports/{id}` and every mutation's response.
 ///
 /// Optional fields are emitted as explicit `null` rather than omitted, the same
@@ -531,8 +886,20 @@ pub struct RoomReport {
     /// The code the maid REPORTED (vc | co | oo | so). A plain `String` for
     /// [`ReportItem::item`]'s reason.
     pub room_status: String,
+    /// **DERIVED** since migration 092: true iff no tick is a problem. The
+    /// column is still written and still read by v1 bundles, but the ticks are
+    /// the truth and this is computed from them on every read, so the two can
+    /// never be seen disagreeing.
     pub all_items_ok: bool,
-    /// The exceptions; `[]` whenever `allItemsOk` is true.
+    /// The v2 checklist: one photo-backed tick per item, all 22, in checklist
+    /// order. `[]` for a report filed by v1 (whose rows carry no photo) —
+    /// that is the whole v1 tolerance rule, and such a report is read through
+    /// `items` exactly as before.
+    pub ticks: Vec<ReportTick>,
+    /// The problems only, in v1's `{item, problem, qty}` shape. **Kept for
+    /// bundles that predate v2** and populated from the problem ticks, so an
+    /// old client keeps rendering a v2 report's exceptions; `[]` whenever the
+    /// room is fine.
     pub items: Vec<ReportItem>,
     /// A [`RETURN_REASONS`] code; `null` unless `status == "returned"`.
     pub return_reason: Option<String>,
@@ -548,7 +915,11 @@ pub struct RoomReport {
     /// judged it), `null` while `submitted`.
     pub verified_by: Option<ReportActor>,
     pub verified_at: Option<String>,
-    /// Photo ids, in upload order. Fetch the bytes from
+    /// BOTH sides' photos with their metadata, in upload order — what the
+    /// ticks' `photoId`s point at.
+    pub photos: Vec<ReportPhoto>,
+    /// Photo ids, in upload order. **Kept for bundles that predate v2** (the
+    /// same ids `photos` carries, split by side). Fetch the bytes from
     /// `GET /api/hk/report-photos/{id}`.
     pub maid_photo_ids: Vec<i64>,
     pub reception_photo_ids: Vec<i64>,
@@ -581,7 +952,13 @@ pub struct RoomReportSummary {
     pub date: String,
     pub status: ReportStatus,
     pub room_status: String,
+    /// DERIVED, exactly as on [`RoomReport`]: true iff `problemCount == 0`.
     pub all_items_ok: bool,
+    /// How many ticks are a problem (หาย / ชำรุด). The overview's stand-in for
+    /// the tick array — a card says "3 รายการมีปัญหา" and the detail endpoint
+    /// serves which ones, so one screen's payload does not grow with the
+    /// property. `0` for a clean room and for a v1 report with no exceptions.
+    pub problem_count: usize,
     pub return_reason: Option<String>,
     pub parent_report_id: Option<i64>,
     pub submitted_by: ReportActor,
@@ -629,6 +1006,19 @@ mod tests {
         );
         assert_eq!(REPORT_MIN_PHOTOS, 1);
         assert_eq!(REPORT_MAX_PHOTOS, 4);
+        // v2: the tick states, the four capture zones and the submission's
+        // DISTINCT-photo bound (`REPORT_MAX_PHOTOS_TOTAL` in the vocab file).
+        assert_eq!(
+            TickState::ALL.map(TickState::as_str),
+            ["ok", "missing", "damaged"]
+        );
+        assert_eq!(
+            REPORT_ZONES.map(|(zone, _)| zone),
+            ["bed", "desk", "bathroom", "general"]
+        );
+        assert_eq!(REPORT_MIN_PHOTOS_TOTAL, 4, "one shot per capture zone");
+        assert_eq!(REPORT_MAX_PHOTOS_TOTAL, 24);
+        assert_eq!(REPORT_TICK_COUNT, REPORT_ITEMS.len());
         // First and last of the checklist pin the ORDER, which is the paper
         // form's and which the frontend renders from its own copy.
         assert_eq!(REPORT_ITEMS[0], "water_glass");
@@ -640,7 +1030,15 @@ mod tests {
     /// the duplicate-exception check meaningless.
     #[test]
     fn every_code_is_unique_ascii_snake_case() {
-        for list in [&REPORT_ITEMS[..], &ROOM_STATUS_CODES[..], &RETURN_REASONS[..]] {
+        let zones: Vec<&str> = REPORT_ZONES.iter().map(|(zone, _)| *zone).collect();
+        let states: Vec<&str> = TickState::ALL.iter().map(|s| s.as_str()).collect();
+        for list in [
+            &REPORT_ITEMS[..],
+            &ROOM_STATUS_CODES[..],
+            &RETURN_REASONS[..],
+            &zones[..],
+            &states[..],
+        ] {
             for code in list {
                 assert!(
                     code.chars()
@@ -666,6 +1064,41 @@ mod tests {
                 REPORT_ITEMS.contains(&kind),
                 "linen kind '{kind}' must also be a checklist item code"
             );
+        }
+    }
+
+    /// **Every checklist item belongs to exactly ONE capture zone** — the vocab
+    /// file says so and the pre-ticking depends on it: an item in no zone would
+    /// never be shown to the maid (so her submission could never carry all 22
+    /// ticks), and an item in two would be pre-ticked against two photos.
+    #[test]
+    fn every_item_belongs_to_exactly_one_capture_zone() {
+        for item in REPORT_ITEMS {
+            let zones: Vec<&str> = REPORT_ZONES
+                .iter()
+                .filter(|(_, items)| items.contains(&item))
+                .map(|(zone, _)| *zone)
+                .collect();
+            assert_eq!(
+                zones.len(),
+                1,
+                "'{item}' must belong to exactly one capture zone, got {zones:?}"
+            );
+        }
+        // …and no zone may name an item the checklist does not have.
+        let zoned: usize = REPORT_ZONES.iter().map(|(_, items)| items.len()).sum();
+        assert_eq!(
+            zoned,
+            REPORT_ITEMS.len(),
+            "the zones must partition the checklist exactly"
+        );
+        for (zone, items) in REPORT_ZONES {
+            for item in items {
+                assert!(
+                    REPORT_ITEMS.contains(item),
+                    "zone '{zone}' names '{item}', which is not a checklist item"
+                );
+            }
         }
     }
 
@@ -711,7 +1144,12 @@ mod tests {
         for side in [PhotoSide::Maid, PhotoSide::Reception] {
             assert_eq!(PhotoSide::parse(side.as_str()), Some(side));
         }
+        for state in TickState::ALL {
+            assert_eq!(TickState::parse(state.as_str()), Some(state));
+        }
         assert_eq!(ReportStatus::parse("SUBMITTED"), None, "parse is exact");
+        assert_eq!(TickState::parse("OK"), None);
+        assert_eq!(TickState::parse("broken"), None, "the code is 'damaged'");
         assert_eq!(PhotoSide::parse("housekeeping"), None);
     }
 
@@ -740,6 +1178,29 @@ mod tests {
                 serde_json::to_string(&side).unwrap(),
                 format!("\"{}\"", side.as_str())
             );
+        }
+        for state in TickState::ALL {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
+    }
+
+    /// A tick state maps onto the v1 problem vocabulary — and therefore onto a
+    /// room signal — for exactly the two problem states and nothing else. This
+    /// is the bridge new writes use to fill `rri_problem` from `rri_state`
+    /// (`NULLIF(state, 'ok')`), so the two columns are one value written twice.
+    #[test]
+    fn a_tick_state_is_a_problem_for_exactly_the_two_problem_states() {
+        assert_eq!(TickState::Ok.problem(), None);
+        assert!(!TickState::Ok.is_problem());
+        assert_eq!(TickState::Missing.problem(), Some(ItemProblem::Missing));
+        assert_eq!(TickState::Damaged.problem(), Some(ItemProblem::Damaged));
+        for state in [TickState::Missing, TickState::Damaged] {
+            assert!(state.is_problem());
+            // The stored `rri_problem` literal is the state's own literal.
+            assert_eq!(state.problem().unwrap().as_str(), state.as_str());
         }
     }
 
@@ -771,22 +1232,131 @@ mod tests {
         assert!(parse_item("remote").is_err());
         assert!(parse_problem("broken").is_err(), "the code is 'damaged'");
         assert!(parse_return_reason("dirty").is_err());
+
+        // v2 wire codes normalize the same way.
+        assert_eq!(parse_tick_state(" OK ").unwrap(), TickState::Ok);
+        assert_eq!(parse_tick_state("Damaged").unwrap(), TickState::Damaged);
+        assert_eq!(parse_zone(" Bathroom ").unwrap(), "bathroom");
+        for bad in ["", "fine", "ครบ", "broken"] {
+            let err = parse_tick_state(bad).expect_err("'{bad}' must be refused");
+            assert!(err.message().contains("state"), "{}", err.message());
+        }
+        for bad in ["", "kitchen", "ห้องน้ำ", "beds"] {
+            let err = parse_zone(bad).expect_err("'{bad}' must be refused");
+            assert!(err.message().contains("zone"), "{}", err.message());
+        }
     }
 
-    /// The biconditional, both ways round. This is the one rule the DB cannot
-    /// enforce, so it is the one most worth pinning.
+    /// **The ticks are EXACTLY the checklist.** The rule that replaced v1's
+    /// biconditional, and the one the whole v2 model rests on: a report cannot
+    /// be filed until every item has been answered, so "the room is fine" and
+    /// "she did not look" stop being the same submission.
     #[test]
-    fn items_are_empty_iff_all_items_ok() {
-        assert!(check_attestation(true, 0).is_ok());
-        assert!(check_attestation(false, 1).is_ok());
-        assert!(check_attestation(false, 7).is_ok());
+    fn the_ticks_must_be_exactly_the_checklist() {
+        let all: Vec<String> = REPORT_ITEMS.iter().map(|i| i.to_string()).collect();
+        assert!(check_tick_coverage(&all).is_ok(), "all 22 is the only accepted set");
+        // Order is the client's business — the rule is about the SET.
+        let mut shuffled = all.clone();
+        shuffled.reverse();
+        assert!(check_tick_coverage(&shuffled).is_ok());
 
-        let err = check_attestation(true, 2).unwrap_err();
+        // One short: named, not counted.
+        let short: Vec<String> = all.iter().skip(1).cloned().collect();
+        let err = check_tick_coverage(&short).unwrap_err();
         assert!(!err.is_forbidden() && !err.is_conflict(), "malformed ⇒ 400");
-        assert!(err.message().contains("allItemsOk is true"));
+        assert!(err.message().contains("water_glass"), "{}", err.message());
+        assert!(err.message().contains("never ticked"), "{}", err.message());
 
-        let err = check_attestation(false, 0).unwrap_err();
-        assert!(err.message().contains("allItemsOk is false"));
+        // Empty: every item is missing, but the message stays bounded.
+        let err = check_tick_coverage(&[]).unwrap_err();
+        assert!(err.message().contains("+18 more"), "{}", err.message());
+        assert!(err.message().len() < 400, "the 400 body must stay small");
+
+        // An item that is not on the form — the stale-bundle case, which
+        // usually reports BOTH directions at once.
+        let mut renamed = all.clone();
+        renamed[0] = "remote".to_string();
+        let err = check_tick_coverage(&renamed).unwrap_err();
+        assert!(err.message().contains("water_glass"), "{}", err.message());
+        assert!(err.message().contains("remote"), "{}", err.message());
+        assert!(
+            err.message().contains("not on the checklist"),
+            "{}",
+            err.message()
+        );
+
+        // 22 entries, one duplicated and one absent, is STILL refused — the
+        // count alone is never the test.
+        let mut dupe = all.clone();
+        dupe[0] = "tv_remote".to_string();
+        assert!(check_tick_coverage(&dupe).is_err());
+    }
+
+    /// The qty rule per state, in every direction. Neither half coerces: a qty
+    /// on an `ok` tick means the client ticked the wrong state, and a missing
+    /// one on a problem would have to be invented — and reception charges a
+    /// guest from that number.
+    #[test]
+    fn a_qty_belongs_to_a_problem_tick_and_only_to_one() {
+        assert!(check_tick_qty("water_glass", TickState::Ok, None).is_ok());
+        for state in [TickState::Missing, TickState::Damaged] {
+            assert!(check_tick_qty("water_glass", state, Some(MIN_ITEM_QTY)).is_ok());
+            assert!(check_tick_qty("water_glass", state, Some(MAX_ITEM_QTY)).is_ok());
+            assert!(check_tick_qty("water_glass", state, Some(7)).is_ok());
+
+            let err = check_tick_qty("water_glass", state, None).unwrap_err();
+            assert!(err.message().contains("needs a qty"), "{}", err.message());
+
+            for bad in [0, -1, 100, i32::MAX] {
+                let err = check_tick_qty("water_glass", state, Some(bad)).unwrap_err();
+                assert!(err.message().contains("1..=99"), "{}", err.message());
+                assert!(!err.is_forbidden(), "a bad qty is 400, not 403");
+            }
+        }
+        let err = check_tick_qty("water_glass", TickState::Ok, Some(1)).unwrap_err();
+        assert!(err.message().contains("carries no qty"), "{}", err.message());
+        assert!(err.message().contains("water_glass"), "the item must be named");
+    }
+
+    /// Every tick is photo-backed — including an `ok` one, which is the whole
+    /// point (that is the tick a maid against the clock would wave through).
+    #[test]
+    fn every_tick_names_a_backing_photo() {
+        for state in TickState::ALL {
+            let _ = state;
+            assert!(check_tick_photo("pillow", Some(4)).is_ok());
+        }
+        let err = check_tick_photo("pillow", None).unwrap_err();
+        assert!(err.message().contains("photoId"), "{}", err.message());
+        assert!(err.message().contains("pillow"));
+        assert!(!err.is_forbidden() && !err.is_conflict());
+    }
+
+    /// The submission counts DISTINCT photos, 4..=24 — one shot per capture
+    /// zone at the floor, the vocab file's ceiling at the top.
+    #[test]
+    fn the_submission_photo_total_is_four_to_twenty_four() {
+        for ok in REPORT_MIN_PHOTOS_TOTAL..=REPORT_MAX_PHOTOS_TOTAL {
+            assert!(check_photo_total(ok).is_ok(), "{ok} distinct photos must pass");
+        }
+        for bad in [0, 1, 3, 25, 100] {
+            let err = check_photo_total(bad).unwrap_err();
+            assert!(!err.is_forbidden(), "a bad total is 400, not 403");
+            assert!(err.message().contains("4..=24"), "{}", err.message());
+            assert!(err.message().contains("distinct"), "{}", err.message());
+        }
+    }
+
+    /// A v1-shaped body is refused with a message that NAMES `ticks` — the one
+    /// word an operator staring at a stale bundle needs.
+    #[test]
+    fn a_v1_body_is_refused_by_name() {
+        let err = ReportRuleError::LegacyBodyShape;
+        assert!(!err.is_forbidden() && !err.is_conflict(), "malformed ⇒ 400");
+        let message = err.message();
+        assert!(message.contains("ticks"), "{message}");
+        assert!(message.contains("allItemsOk"), "{message}");
+        assert!(message.contains("items"), "{message}");
     }
 
     #[test]
@@ -862,6 +1432,20 @@ mod tests {
             status: ReportStatus::Submitted,
             room_status: "vc".to_string(),
             all_items_ok: false,
+            ticks: vec![
+                ReportTick {
+                    item: "water_glass".to_string(),
+                    state: TickState::Ok,
+                    qty: None,
+                    photo_id: Some(4),
+                },
+                ReportTick {
+                    item: "tv_remote".to_string(),
+                    state: TickState::Missing,
+                    qty: Some(1),
+                    photo_id: Some(5),
+                },
+            ],
             items: vec![ReportItem {
                 item: "tv_remote".to_string(),
                 problem: ItemProblem::Missing,
@@ -876,6 +1460,20 @@ mod tests {
             submitted_at: "2026-09-02T03:00:00+00:00".to_string(),
             verified_by: None,
             verified_at: None,
+            photos: vec![
+                ReportPhoto {
+                    photo_id: 4,
+                    side: PhotoSide::Maid,
+                    zone: Some("desk".to_string()),
+                    bytes: Some(120_500),
+                },
+                ReportPhoto {
+                    photo_id: 5,
+                    side: PhotoSide::Maid,
+                    zone: None,
+                    bytes: Some(98_100),
+                },
+            ],
             maid_photo_ids: vec![4, 5],
             reception_photo_ids: vec![],
         };
@@ -891,6 +1489,7 @@ mod tests {
                 "items",
                 "maidPhotoIds",
                 "parentReportId",
+                "photos",
                 "receptionPhotoIds",
                 "reportId",
                 "returnReason",
@@ -900,6 +1499,7 @@ mod tests {
                 "status",
                 "submittedAt",
                 "submittedBy",
+                "ticks",
                 "verifiedAt",
                 "verifiedBy",
             ]
@@ -909,6 +1509,89 @@ mod tests {
         assert!(object["verifiedBy"].is_null());
         assert_eq!(json["items"][0]["problem"], "missing");
         assert_eq!(json["submittedBy"]["badge"], "Q1001");
+
+        // The v2 tick shape, key by key — this IS the contract.
+        let ok_tick = &json["ticks"][0];
+        let mut tick_keys: Vec<&str> = ok_tick
+            .as_object()
+            .expect("a tick object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        tick_keys.sort_unstable();
+        assert_eq!(tick_keys, ["item", "photoId", "qty", "state"]);
+        assert_eq!(ok_tick["state"], "ok");
+        assert!(ok_tick["qty"].is_null(), "an ok tick carries no qty");
+        assert_eq!(ok_tick["photoId"], 4);
+        assert_eq!(json["ticks"][1]["state"], "missing");
+        assert_eq!(json["ticks"][1]["qty"], 1);
+
+        // …and the photo metadata shape.
+        let photo = &json["photos"][0];
+        let mut photo_keys: Vec<&str> = photo
+            .as_object()
+            .expect("a photo object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        photo_keys.sort_unstable();
+        assert_eq!(photo_keys, ["bytes", "photoId", "side", "zone"]);
+        assert_eq!(photo["side"], "maid");
+        assert_eq!(photo["zone"], "desk");
+        assert_eq!(photo["bytes"], 120_500);
+        assert!(
+            json["photos"][1]["zone"].is_null(),
+            "a free-hand close-up has no zone, and the key is still present"
+        );
+    }
+
+    /// A report filed by v1 still reads: no ticks (its rows carry no backing
+    /// photo), its exceptions where they always were, and `allItemsOk` derived
+    /// from those exceptions rather than from a column.
+    #[test]
+    fn a_v1_report_still_serializes_with_empty_ticks() {
+        let report = RoomReport {
+            report_id: 1,
+            room_id: 2,
+            room_no: "101".to_string(),
+            date: "2026-09-02".to_string(),
+            status: ReportStatus::Verified,
+            room_status: "vc".to_string(),
+            all_items_ok: false,
+            ticks: Vec::new(),
+            items: vec![ReportItem {
+                item: "kettle".to_string(),
+                problem: ItemProblem::Damaged,
+                qty: 2,
+            }],
+            return_reason: None,
+            parent_report_id: None,
+            submitted_by: ReportActor {
+                badge: "Q1001".to_string(),
+                name: None,
+            },
+            submitted_at: "2026-09-02T03:00:00Z".to_string(),
+            verified_by: None,
+            verified_at: None,
+            photos: vec![ReportPhoto {
+                photo_id: 9,
+                side: PhotoSide::Maid,
+                zone: None,
+                bytes: Some(4_096),
+            }],
+            maid_photo_ids: vec![9],
+            reception_photo_ids: vec![],
+        };
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(
+            json["ticks"].as_array().map(Vec::len),
+            Some(0),
+            "a v1 report has no photo-backed ticks, and the key is still present"
+        );
+        assert_eq!(json["items"][0]["item"], "kettle");
+        assert_eq!(json["items"][0]["qty"], 2);
+        assert_eq!(json["allItemsOk"], false);
+        assert!(json["photos"][0]["zone"].is_null(), "v1 photos have no zone");
     }
 
     /// The SUMMARY is the FULL DTO minus `items` / the two id arrays, plus
@@ -924,6 +1607,7 @@ mod tests {
             status: ReportStatus::Verified,
             room_status: "co".to_string(),
             all_items_ok: true,
+            problem_count: 0,
             return_reason: None,
             parent_report_id: Some(3),
             submitted_by: ReportActor {
@@ -960,6 +1644,7 @@ mod tests {
             status: ReportStatus::Verified,
             room_status: "co".to_string(),
             all_items_ok: true,
+            ticks: Vec::new(),
             items: Vec::new(),
             return_reason: None,
             parent_report_id: Some(3),
@@ -967,6 +1652,7 @@ mod tests {
             submitted_at: summary.submitted_at.clone(),
             verified_by: summary.verified_by.clone(),
             verified_at: summary.verified_at.clone(),
+            photos: Vec::new(),
             maid_photo_ids: vec![1, 2],
             reception_photo_ids: vec![9],
         };
@@ -975,16 +1661,104 @@ mod tests {
             .as_object()
             .expect("an object")
             .keys()
-            .filter(|k| !["items", "maidPhotoIds", "receptionPhotoIds"].contains(&k.as_str()))
+            .filter(|k| {
+                ![
+                    "ticks",
+                    "items",
+                    "photos",
+                    "maidPhotoIds",
+                    "receptionPhotoIds",
+                ]
+                .contains(&k.as_str())
+            })
             .cloned()
             .collect();
         expected.push("photoCounts".to_string());
+        expected.push("problemCount".to_string());
         expected.sort();
 
         assert_eq!(summary_keys, expected);
         assert_eq!(summary_json["photoCounts"]["maid"], 2);
         assert_eq!(summary_json["photoCounts"]["reception"], 1);
+        assert_eq!(summary_json["problemCount"], 0);
         assert_eq!(summary_json["status"], "verified");
+    }
+
+    /// `allItemsOk` is DERIVED from the problem count on the summary too, so
+    /// the card's "ครบทุกรายการ" badge and its "N รายการมีปัญหา" line can never
+    /// contradict each other.
+    #[test]
+    fn the_summarys_all_items_ok_agrees_with_its_problem_count() {
+        for (problem_count, all_items_ok) in [(0usize, true), (1, false), (5, false)] {
+            let summary = RoomReportSummary {
+                report_id: 7,
+                room_id: 12,
+                room_no: "101".to_string(),
+                date: "2026-09-02".to_string(),
+                status: ReportStatus::Submitted,
+                room_status: "co".to_string(),
+                all_items_ok,
+                problem_count,
+                return_reason: None,
+                parent_report_id: None,
+                submitted_by: ReportActor {
+                    badge: "Q1001".to_string(),
+                    name: None,
+                },
+                submitted_at: "2026-09-02T03:00:00Z".to_string(),
+                verified_by: None,
+                verified_at: None,
+                photo_counts: PhotoCounts {
+                    maid: 4,
+                    reception: 0,
+                },
+            };
+            let json = serde_json::to_value(&summary).expect("serializes");
+            assert_eq!(
+                json["allItemsOk"].as_bool(),
+                Some(json["problemCount"].as_u64() == Some(0)),
+                "allItemsOk must be exactly problemCount == 0"
+            );
+        }
+    }
+
+    /// The photo-meta shape — the client's resume-after-reload contract.
+    #[test]
+    fn the_photo_meta_serializes_the_contracted_keys() {
+        let meta = ReportPhotoMeta {
+            photo_id: 12,
+            side: PhotoSide::Maid,
+            zone: Some("bed".to_string()),
+            bytes: Some(51_200),
+            attached: false,
+            uploaded_at: "2026-09-02T03:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&meta).expect("serializes");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["attached", "bytes", "photoId", "side", "uploadedAt", "zone"]
+        );
+        assert_eq!(json["side"], "maid");
+        assert_eq!(json["attached"], false);
+
+        // The nullable keys stay PRESENT — a v1 photo has neither.
+        let bare = ReportPhotoMeta {
+            zone: None,
+            bytes: None,
+            attached: true,
+            ..meta
+        };
+        let json = serde_json::to_value(&bare).expect("serializes");
+        assert!(json.get("zone").expect("key present").is_null());
+        assert!(json.get("bytes").expect("key present").is_null());
+        assert_eq!(json["attached"], true);
     }
 
     /// A room with no report still appears on the overview, with `report:
@@ -1005,10 +1779,14 @@ mod tests {
         assert_eq!(json["floor"], 2);
     }
 
-    /// `MAX_REPORT_ITEMS` must stay tied to the checklist size, so widening
-    /// the vocabulary cannot silently widen the accepted body first.
+    /// `REPORT_TICK_COUNT` must stay tied to the checklist size, so widening
+    /// the vocabulary moves the requirement with it rather than leaving the
+    /// coverage rule pinned to yesterday's 22.
     #[test]
-    fn the_body_cap_tracks_the_checklist_size() {
-        assert_eq!(MAX_REPORT_ITEMS, REPORT_ITEMS.len() * ItemProblem::ALL.len());
+    fn the_tick_requirement_tracks_the_checklist_size() {
+        assert_eq!(REPORT_TICK_COUNT, REPORT_ITEMS.len());
+        let all: Vec<String> = REPORT_ITEMS.iter().map(|i| i.to_string()).collect();
+        assert_eq!(all.len(), REPORT_TICK_COUNT);
+        assert!(check_tick_coverage(&all).is_ok());
     }
 }

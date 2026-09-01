@@ -91,12 +91,29 @@ judgment), auto-firing on checkout open (many checkouts settle without an inspec
 **Room report (Report HK)**:
 One maid's per-room daily attestation, digitizing the paper Report HK sheet: the room's
 status code (VC/CO/OO/SO, prefilled from known room facts but stored as SHE reported it),
-an exception-based equipment checklist (ครบทุกรายการ, or named items marked หาย/ชำรุด — an
-excepted item also raises the matching guest-accountability signal immediately), and photo
-evidence. Filled per ROOM, not per day-sheet; the day overview screen is the sheet's heir
+the 22-item equipment checklist as photo-backed ticks (ครบ / หาย / ชำรุด per item, captured
+zone by zone — a หาย/ชำรุด tick also raises the matching guest-accountability signal
+immediately), and the photos those ticks name. Filled per ROOM, not per day-sheet; the day overview screen is the sheet's heir
 and each side's work queue.
 _Avoid_: "day sheet" as the submission unit (a paper artifact, not the domain), "inspection"
 (that's the verification, below), free-text remarks (ruled out everywhere on this surface)
+
+**Photo-backed tick**:
+Each of the 22 checklist items is ticked individually (ครบ / หาย / ชำรุด) and every tick
+names the photo that backs it — reception sees exactly which picture vouches for which
+item. One photo may back several ticks (the bed shot covers the bed linen); a หาย/ชำรุด
+tick takes its own close-up. Photos are kept forever (owner decision 2026-09-02).
+_Avoid_: "exception-only" ticking (superseded the same day it shipped), "one photo per
+item" (22 shots a room — the shared-photo rule exists so a tick is evidenced, not
+photographed twice)
+
+**Capture zone**:
+The maid's shooting order for a room report — เตียง, โต๊ะและมินิบาร์, ห้องน้ำ, ทั่วไป — each
+zone one camera tap, its items pre-ticked ครบ against that photo, only the wrong ones
+touched. The unit of speed: a perfect room is four shots and a handful of taps. Every
+item belongs to exactly one zone.
+_Avoid_: item-by-item capture (the flow the zones replace), zones as a data-model entity
+(they are a capture order; the record is the ticks and their photos)
 
 **Report verification**:
 Reception's countersignature on a room report: any receptionist of the branch verifies —

@@ -356,9 +356,9 @@ use super::mode::{AppState, Branch};
 use crate::config::HfidLocationConfig;
 use crate::db::PgPool;
 use crate::domain::hk_report::{
-    parse_item, parse_problem, parse_return_reason, parse_room_status, PhotoSide, ReportRuleError,
-    RoomReport, RoomReportRow, MAX_ITEM_QTY, MAX_REPORT_ITEMS, MIN_ITEM_QTY, REPORT_MAX_PHOTOS,
-    REPORT_MIN_PHOTOS,
+    parse_item, parse_return_reason, parse_room_status, parse_tick_state, parse_zone, PhotoSide,
+    ReportPhotoMeta, ReportRuleError, RoomReport, RoomReportRow, MAX_ITEM_QTY, MIN_ITEM_QTY,
+    REPORT_MAX_PHOTOS, REPORT_MAX_PHOTOS_TOTAL, REPORT_MIN_PHOTOS, REPORT_TICK_COUNT,
 };
 use crate::domain::hk_signal::{RoomCheckOutcome, RoomSignal, SignalAction, SignalRole};
 use crate::error::{ApiError, ApiResult};
@@ -367,7 +367,7 @@ use crate::legacy_room_status::{RoomFlagsOutcome, RoomFlagsSource};
 use crate::middleware::hk_access::HkIdentity;
 use crate::outbox::event::EventSource;
 use crate::service::hk_reports::{
-    HkReportService, ReportItemInput, ReturnReportCommand, StorePhotoCommand, SubmitReportCommand,
+    HkReportService, ReportTickInput, ReturnReportCommand, StorePhotoCommand, SubmitReportCommand,
     VerifyReportCommand,
 };
 use crate::service::hk_signals::{
@@ -508,6 +508,18 @@ pub const REPORT_DATE_INVALID_ERROR: &str =
 
 /// The multipart field the photo must arrive in — `POST /api/hk/report-photos`.
 pub const REPORT_PHOTO_FIELD: &str = "photo";
+
+/// The OPTIONAL multipart field naming the capture zone the picture was taken
+/// in (`bed` | `desk` | `bathroom` | `general`).
+///
+/// A plain text part alongside the image, not a query parameter, so the phone
+/// sends one request per picture and the zone travels with the bytes it
+/// describes. Optional because a re-shot close-up belongs to no zone, and
+/// because the zone is INFORMATIONAL — nothing joins on it and no submission is
+/// refused for its absence (CONTEXT.md: zones are a capture ORDER, not a
+/// data-model entity). A zone that IS sent must be a real one, though: silently
+/// storing `bedroom` would make the evidence strip lie about a picture forever.
+pub const REPORT_ZONE_FIELD: &str = "zone";
 
 /// Per-file cap on an uploaded report photo, enforced in the handler.
 ///
@@ -1224,13 +1236,13 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
         // a read of this branch's data, and showing a maid the other
         // property's signals is the wrong-hotel bug one tap earlier.
         .route("/api/hk/events", get(signal_events))
-        // Report HK (migration 091). Three path shapes, each chosen the way the
-        // signal routes were: the SUBMISSION is about a room, so it hangs off
-        // `/rooms/{id}`, alongside the other maid reports; a VERDICT addresses
-        // the report, which already knows its room; and a PHOTO belongs to
-        // neither yet — it is uploaded BEFORE the report exists, so it is its
-        // own collection. `middleware::ville_guard` exempts all three write
-        // shapes (they are PG-only).
+        // Report HK (migrations 091 + 092). Three path shapes, each chosen the
+        // way the signal routes were: the SUBMISSION is about a room, so it
+        // hangs off `/rooms/{id}`, alongside the other maid reports; a VERDICT
+        // addresses the report, which already knows its room; and a PHOTO
+        // belongs to neither yet — it is uploaded BEFORE the report exists, so
+        // it is its own collection. `middleware::ville_guard` exempts all four
+        // write shapes, POST and the one DELETE (they are PG-only).
         .route("/api/hk/reports", get(list_reports))
         .route("/api/hk/reports/{report_id}", get(report_detail))
         .route("/api/hk/rooms/{room_id}/report", post(submit_report))
@@ -1245,7 +1257,19 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
             post(upload_report_photo)
                 .layer(axum::extract::DefaultBodyLimit::max(REPORT_PHOTO_BODY_LIMIT)),
         )
-        .route("/api/hk/report-photos/{photo_id}", get(report_photo))
+        // The photo's own three verbs. DELETE is the maid's
+        // manage-pictures-before-submit primitive (retake, drop a duplicate)
+        // and is uploader-only + unattached-only; `/meta` is the client's
+        // resume-after-reload probe. Both hang off the photo itself, which
+        // already knows its side, its uploader and whether it is filed.
+        .route(
+            "/api/hk/report-photos/{photo_id}",
+            get(report_photo).delete(delete_report_photo),
+        )
+        .route(
+            "/api/hk/report-photos/{photo_id}/meta",
+            get(report_photo_meta),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(Extension(policy))
         .with_state(state)
@@ -1747,11 +1771,36 @@ pub struct UploadPhotoResponse {
     pub success: bool,
     /// `ht_hk_room_report_photos.rrp_id`. The row is UNATTACHED until a
     /// submit/verify names it; fetch the bytes back from
-    /// `GET /api/hk/report-photos/{id}`.
+    /// `GET /api/hk/report-photos/{id}`, its metadata from
+    /// `GET /api/hk/report-photos/{id}/meta`, and remove it (while unattached)
+    /// with `DELETE /api/hk/report-photos/{id}`.
     pub photo_id: i64,
+    /// The STORED size, echoed so the client can show and total it without a
+    /// second round-trip — the maid's evidence strip renders it, and the report
+    /// form is the only place that knows the whole set.
+    pub bytes: i64,
 }
 
-/// Body for `POST /api/hk/rooms/{id}/report`.
+/// `GET /api/hk/report-photos/{id}/meta` — one photo's metadata.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotoMetaResponse {
+    pub success: bool,
+    pub photo: ReportPhotoMeta,
+}
+
+/// `DELETE /api/hk/report-photos/{id}` — the bare acknowledgement.
+///
+/// No body beyond `success`: the client already knows which id it deleted, and
+/// there is nothing left to describe. Same shape as the other bare-ack
+/// responses on this surface.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePhotoResponse {
+    pub success: bool,
+}
+
+/// Body for `POST /api/hk/rooms/{id}/report` — **v2, photo-backed ticks**.
 ///
 /// **Every field is an `Option`** — the same discipline
 /// [`ReportLinenShortageBody`] follows and for the same reason: a required
@@ -1759,6 +1808,15 @@ pub struct UploadPhotoResponse {
 /// renders its own plain-text shape the maid's client cannot parse. Making them
 /// optional moves every rejection into this module's pure parsers, where the
 /// `{success:false,error}` envelope is ours.
+///
+/// ## The two retired fields are still declared, on purpose
+///
+/// `allItemsOk` and `items` are the v1 (exception-based) shape, retired the day
+/// it shipped. They are kept here as `Option`s **only so a stale bundle gets a
+/// 400 that names `ticks`** instead of a bare "ticks is required" that reads
+/// like a client bug. Sending either is a refusal, whether or not `ticks` is
+/// also present: a client sending both shapes does not know which one the
+/// server will believe, and neither should we.
 ///
 /// There is deliberately NO `parentReportId` field. A returned report is fixed
 /// by a new submission that references it, but the LINK IS DERIVED server-side
@@ -1778,27 +1836,43 @@ pub struct SubmitReportBody {
     /// `vc` | `co` | `oo` | `so` — prefilled client-side from known room facts,
     /// overridable, and stored as SHE reported it.
     pub room_status: Option<String>,
-    /// ครบทุกรายการ. Must be `true` exactly when `items` is empty.
+    /// **The whole checklist**: one photo-backed tick per item, all 22, each
+    /// once. Order is the client's business; the SET is the rule.
+    pub ticks: Option<Vec<ReportTickEntry>>,
+    /// Photos no tick names — a wider shot, a second angle. Optional; they
+    /// count towards the submission's DISTINCT photo total and nothing else.
+    pub extra_photo_ids: Option<Vec<serde_json::Value>>,
+    /// **RETIRED (v1).** Present only to detect a stale bundle — see the type
+    /// doc.
     pub all_items_ok: Option<bool>,
-    /// The exceptions; omit or send `[]` alongside `allItemsOk: true`.
-    pub items: Option<Vec<ReportItemEntry>>,
-    /// 1..=4 ids from `POST /api/hk/report-photos`, this caller's own.
-    pub photo_ids: Option<Vec<serde_json::Value>>,
+    /// **RETIRED (v1).** Present only to detect a stale bundle — see the type
+    /// doc.
+    pub items: Option<serde_json::Value>,
 }
 
-/// One `{item, problem, qty}` exception as it arrives on the wire.
+/// One PHOTO-BACKED TICK as it arrives on the wire —
+/// `{"item","state","qty"?,"photoId"}`.
 ///
-/// `qty` is a raw [`serde_json::Value`], NOT an `i32`, for exactly
-/// [`LinenShortageEntry::qty`](LinenShortageEntry)'s reason: `{"qty": 1.5}`,
-/// `{"qty": "3"}` and `{"qty": null}` are all things a hand-rolled or
-/// half-broken client sends, and each would otherwise be a serde rejection with
-/// a foreign body shape.
+/// `qty` and `photoId` are raw [`serde_json::Value`]s, NOT typed fields, for
+/// exactly [`LinenShortageEntry::qty`](LinenShortageEntry)'s reason:
+/// `{"qty": 1.5}`, `{"qty": "3"}` and `{"photoId": null}` are all things a
+/// hand-rolled or half-broken client sends, and each would otherwise be a serde
+/// rejection with a foreign body shape.
+///
+/// `qty` is `Option` because an `ok` tick MUST omit it — the two are different
+/// facts, and [`crate::domain::hk_report::check_tick_qty`] refuses a body that
+/// confuses them rather than coercing either way.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReportItemEntry {
+pub struct ReportTickEntry {
     pub item: String,
-    pub problem: String,
-    pub qty: serde_json::Value,
+    /// `ok` | `missing` | `damaged`.
+    pub state: String,
+    /// Omitted for `ok`; an integer 1..=99 for a problem.
+    pub qty: Option<serde_json::Value>,
+    /// The backing photo's id, from `POST /api/hk/report-photos`. Required on
+    /// EVERY tick — one photo may back several.
+    pub photo_id: Option<serde_json::Value>,
 }
 
 /// Body for `POST /api/hk/reports/{id}/verify` — reception's own photos and
@@ -1974,73 +2048,121 @@ fn parse_report_date(raw: Option<&str>) -> ApiResult<NaiveDate> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| refuse())
 }
 
-/// Normalize + validate the equipment-checklist exceptions.
+/// Normalize + validate the equipment checklist — **the v2 tick list**.
 ///
 /// Order of checks per entry mirrors [`parse_linen_items`]: the CODES first
-/// (they name the entry in every later message), then the DUPLICATE test on the
-/// NORMALIZED pair — otherwise `"TV_Remote"` and `"tv_remote"` would slip past
-/// as two lines and land as two rows for one exception — and only then the
-/// quantity.
+/// (they name the entry in every later message), then the per-tick facts (qty
+/// against the state, and the backing photo). The SET rules — every item
+/// exactly once — are [`crate::domain::hk_report::check_tick_coverage`]'s and
+/// run in the service, which is where they must hold for any caller; the route
+/// runs them too, via `check_ticks`, so a bad body is a 400 before any database
+/// round-trip.
 ///
-/// The duplicate key is the (item, PROBLEM) PAIR, not the item: "two glasses
-/// missing AND one glass damaged" is a real report of one room, and collapsing
-/// it onto the item would force the maid to choose which half to tell the desk.
-///
-/// It does NOT check the empty-vs-`allItemsOk` biconditional — that is
-/// [`crate::domain::hk_report::check_attestation`]'s, because it spans two
-/// fields and must hold for any caller of the service.
-fn parse_report_items(items: Option<Vec<ReportItemEntry>>) -> ApiResult<Vec<ReportItemInput>> {
-    let items = items.unwrap_or_default();
-    if items.len() > MAX_REPORT_ITEMS {
+/// It does NOT check the photo TOTAL, and it does not check ownership. The
+/// total spans this list and `extraPhotoIds`, so it belongs to the caller that
+/// has both; ownership ("your own photo, not already attached") is a fact about
+/// rows, and the service's attach statement decides it atomically.
+fn parse_report_ticks(ticks: Option<Vec<ReportTickEntry>>) -> ApiResult<Vec<ReportTickInput>> {
+    let Some(ticks) = ticks else {
+        // Absent `ticks` on a body that carries no v1 field either — a client
+        // that sent neither shape. Name the field it needs.
+        return Err(report_rule_error(ReportRuleError::LegacyBodyShape));
+    };
+    // The equality is the service's rule; refusing a wildly oversized array
+    // here keeps a hostile body from being walked entry by entry first.
+    if ticks.len() > REPORT_TICK_COUNT * 2 {
         return Err(ApiError::BadRequest(format!(
-            "too many item exceptions ({}); at most {MAX_REPORT_ITEMS} are accepted",
-            items.len()
+            "too many ticks ({}); the checklist has {REPORT_TICK_COUNT} items",
+            ticks.len()
         )));
     }
 
-    let mut parsed: Vec<ReportItemInput> = Vec::with_capacity(items.len());
-    for entry in items {
+    let mut parsed: Vec<ReportTickInput> = Vec::with_capacity(ticks.len());
+    for entry in ticks {
         let item = parse_item(&entry.item).map_err(report_rule_error)?;
-        let problem = parse_problem(&entry.problem).map_err(report_rule_error)?;
-
-        if parsed
-            .iter()
-            .any(|done| done.item == *item && done.problem == problem)
-        {
-            return Err(report_rule_error(ReportRuleError::DuplicateItem {
-                item: item.to_string(),
-                problem: problem.as_str(),
-            }));
-        }
+        let state = parse_tick_state(&entry.state).map_err(report_rule_error)?;
 
         // `as_i64` is the whole integer test: it says None for `1.5`, for
         // `"3"`, for `null` and for `true`, and Some only for a JSON integer.
         // The i32 narrowing then rejects anything beyond i32 before the range
         // check, so a 2^40 quantity cannot wrap into an accepted value.
-        let qty = entry
-            .qty
-            .as_i64()
-            .and_then(|n| i32::try_from(n).ok())
-            .filter(|n| (MIN_ITEM_QTY..=MAX_ITEM_QTY).contains(n))
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "invalid qty {} for item '{item}' (expected an integer \
-                     {MIN_ITEM_QTY}..={MAX_ITEM_QTY})",
-                    entry.qty
-                ))
-            })?;
+        let qty = match entry.qty.as_ref().filter(|value| !value.is_null()) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        ApiError::BadRequest(format!(
+                            "invalid qty {value} for item '{item}' (expected an integer \
+                             {MIN_ITEM_QTY}..={MAX_ITEM_QTY})"
+                        ))
+                    })?,
+            ),
+        };
+        // The qty-vs-state rule (ok carries none, a problem carries 1..=99) is
+        // the domain's, so the route and the service cannot disagree about it.
+        crate::domain::hk_report::check_tick_qty(item, state, qty).map_err(report_rule_error)?;
 
-        parsed.push(ReportItemInput {
+        let photo_id = entry
+            .photo_id
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .and_then(|value| value.as_i64())
+            .filter(|id| *id > 0);
+        crate::domain::hk_report::check_tick_photo(item, photo_id).map_err(report_rule_error)?;
+        let photo_id = photo_id.expect("check_tick_photo refuses None");
+
+        parsed.push(ReportTickInput {
             item: item.to_string(),
-            problem,
+            state,
             qty,
+            photo_id,
         });
     }
 
     Ok(parsed)
 }
 
+/// Normalize + validate `extraPhotoIds`: 0..=24 distinct positive integers.
+///
+/// Absent and `[]` are the same thing and both fine — the extras are optional
+/// evidence. The real bound is the DISTINCT total across the ticks AND these,
+/// which the service computes; the cap here only keeps a hostile array from
+/// being walked. A raw [`serde_json::Value`] per entry, for
+/// [`parse_photo_ids`]'s reason.
+fn parse_extra_photo_ids(photo_ids: Option<Vec<serde_json::Value>>) -> ApiResult<Vec<i64>> {
+    let raw = photo_ids.unwrap_or_default();
+    if raw.len() > REPORT_MAX_PHOTOS_TOTAL {
+        return Err(ApiError::BadRequest(format!(
+            "too many extraPhotoIds ({}); at most {REPORT_MAX_PHOTOS_TOTAL} photos back one report",
+            raw.len()
+        )));
+    }
+
+    let mut parsed: Vec<i64> = Vec::with_capacity(raw.len());
+    for value in raw {
+        let id = value
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| ApiError::BadRequest(format!("invalid photoId {value}")))?;
+        if parsed.contains(&id) {
+            return Err(ApiError::BadRequest(format!(
+                "photoId {id} was listed more than once"
+            )));
+        }
+        parsed.push(id);
+    }
+    Ok(parsed)
+}
+
 /// Normalize + validate a `photoIds` list: 1..=4 distinct positive integers.
+///
+/// **The VERIFY side's parser.** A v2 SUBMISSION names its photos through its
+/// ticks and `extraPhotoIds`, bounded by the DISTINCT total
+/// ([`parse_extra_photo_ids`] + `service::hk_reports::check_ticks`); a
+/// verification still carries 1..=4 of the verifier's own pictures, because a
+/// verify is a walk-up and its evidence is the request.
 ///
 /// The COUNT bound is `domain::hk_report`'s ([`REPORT_MIN_PHOTOS`] ..=
 /// [`REPORT_MAX_PHOTOS`]) and is re-stated by the service, so a body the route
@@ -3368,8 +3490,9 @@ pub async fn list_reports(
 /// `GET /api/hk/reports/{report_id}?branch=` — one report in FULL.
 ///
 /// The summary the overview carries is deliberately not enough to judge a
-/// report: the exceptions and the photo ids live here, and reception fetches
-/// this before verifying. Readable by BOTH sides — reception must see the
+/// report: the TICKS — each with the photo that backs it — and the photo
+/// metadata live here, and reception fetches this before verifying, so it can
+/// see exactly which picture vouches for which item. Readable by BOTH sides — reception must see the
 /// maid's evidence, and the maid must see what came back with a return.
 ///
 /// An unknown id is a 404 from the service, matching the room routes' shape.
@@ -3393,9 +3516,16 @@ pub async fn report_detail(
 /// `POST /api/hk/report-photos?branch=` — store ONE image, unattached, and
 /// return its id.
 ///
-/// `multipart/form-data` with a single [`REPORT_PHOTO_FIELD`] part. One photo
-/// per request on purpose: a phone uploads as the maid takes each picture, so
-/// the ids come back one at a time and the form holds them until she submits.
+/// `multipart/form-data` with a [`REPORT_PHOTO_FIELD`] part and an OPTIONAL
+/// [`REPORT_ZONE_FIELD`] text part. One photo per request on purpose: a phone
+/// uploads as the maid takes each picture, so the ids come back one at a time
+/// and the form holds them until she submits — and the response carries the
+/// stored size so her evidence strip can render without a second round-trip.
+///
+/// The zone travels WITH the bytes it describes rather than as a query
+/// parameter, is validated against `REPORT_ZONES` when present, and is
+/// informational: nothing joins on it and no submission is refused for its
+/// absence.
 ///
 /// **The side is DERIVED from the role** ([`report_photo_side`]), never sent:
 /// a maid's upload is `maid` evidence and a receptionist's is `reception`, so
@@ -3434,49 +3564,67 @@ pub async fn upload_report_photo(
     let branch = require_branch(&policy, query.branch.as_deref())?;
     require_location(&policy, &identity, branch).await?;
 
-    // Walk the parts rather than assuming the photo is first: browsers order
-    // form fields as the DOM does, and a client that adds a hidden field later
-    // must not break the upload.
+    // Walk EVERY part rather than assuming the photo is first or last: browsers
+    // order form fields as the DOM does, the optional `zone` may arrive on
+    // either side of the image, and a client that adds a hidden field later
+    // must not break the upload. (v1 stopped at the photo; it cannot, now that
+    // a second field matters.)
     let mut found: Option<(&'static str, Vec<u8>)> = None;
+    let mut zone: Option<&'static str> = None;
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| ApiError::BadRequest(format!("malformed multipart body: {e}")))?
     {
-        if field.name() != Some(REPORT_PHOTO_FIELD) {
-            continue;
+        match field.name() {
+            Some(REPORT_PHOTO_FIELD) => {
+                let mime = parse_photo_mime(field.content_type())?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("could not read the photo: {e}")))?;
+                if bytes.len() > MAX_REPORT_PHOTO_BYTES {
+                    return Err(ApiError::BadRequest(PHOTO_TOO_LARGE_ERROR.to_string()));
+                }
+                if bytes.is_empty() {
+                    return Err(ApiError::BadRequest(PHOTO_FIELD_MISSING_ERROR.to_string()));
+                }
+                found = Some((mime, bytes.to_vec()));
+            }
+            Some(REPORT_ZONE_FIELD) => {
+                let raw = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("could not read the zone: {e}")))?;
+                // An EMPTY zone part is "no zone", not a bad one: a form that
+                // always sends the field and leaves it blank for a free-hand
+                // close-up is the normal client, not a broken one.
+                if !raw.trim().is_empty() {
+                    zone = Some(parse_zone(&raw).map_err(report_rule_error)?);
+                }
+            }
+            _ => continue,
         }
-        let mime = parse_photo_mime(field.content_type())?;
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|e| ApiError::BadRequest(format!("could not read the photo: {e}")))?;
-        if bytes.len() > MAX_REPORT_PHOTO_BYTES {
-            return Err(ApiError::BadRequest(PHOTO_TOO_LARGE_ERROR.to_string()));
-        }
-        if bytes.is_empty() {
-            return Err(ApiError::BadRequest(PHOTO_FIELD_MISSING_ERROR.to_string()));
-        }
-        found = Some((mime, bytes.to_vec()));
-        break;
     }
 
     let Some((mime, bytes)) = found else {
         return Err(ApiError::BadRequest(PHOTO_FIELD_MISSING_ERROR.to_string()));
     };
 
-    let photo_id = report_service_for(&state, branch)?
+    let stored = report_service_for(&state, branch)?
         .store_photo(StorePhotoCommand {
             bytes,
             mime: mime.to_string(),
             side: report_photo_side(&identity),
+            zone: zone.map(str::to_string),
             badge: identity.badge.clone(),
         })
         .await?;
 
     Ok(Json(UploadPhotoResponse {
         success: true,
-        photo_id,
+        photo_id: stored.photo_id,
+        bytes: stored.bytes,
     }))
 }
 
@@ -3506,6 +3654,70 @@ pub async fn report_photo(
         .map_err(|e| ApiError::Internal(format!("failed to build photo response: {e}")))
 }
 
+/// `GET /api/hk/report-photos/{photo_id}/meta?branch=` — one photo's metadata.
+///
+/// The client's RESUME-AFTER-RELOAD primitive. A maid whose phone locks or
+/// whose browser reloads mid-form comes back holding photo ids in local
+/// storage; before she can tick against them or offer a "remove" control she
+/// has to know, per id, whether it still exists, is still hers, and is still
+/// unattached. `attached` is the bit that decides it.
+///
+/// Readable by BOTH roles, exactly like [`report_photo`] and for the same
+/// reason: the evidence is what each side judges the other on. Gated on
+/// `?branch=` alone — a photo carries no room and no report, so the branch is
+/// the only thing that says which site's database to look in.
+pub async fn report_photo_meta(
+    State(state): State<AppState>,
+    Path(photo_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<PhotoMetaResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    let photo = report_service_for(&state, branch)?.photo_meta(photo_id).await?;
+    Ok(Json(PhotoMetaResponse {
+        success: true,
+        photo,
+    }))
+}
+
+/// `DELETE /api/hk/report-photos/{photo_id}?branch=` — remove one of the
+/// caller's OWN unattached photos.
+///
+/// **The manage-pictures-before-submit primitive** (migration 092): a maid
+/// retakes a blurred shot or drops a duplicate before she files. It is
+/// deliberately NOT a way to edit a filed report — once a submit or verify has
+/// bound a photo it is evidence, and with the owner's keep-forever decision
+/// this endpoint's refusal means **no path in this app deletes a photo a report
+/// names**.
+///
+/// Open to BOTH roles for [`upload_report_photo`]'s reason: the side is derived
+/// from the uploader, so each role can only ever reach its own pictures, and a
+/// receptionist must be able to drop a bad verify shot exactly as a maid drops
+/// a bad zone shot. The ownership rule does the gating, not a capability check.
+///
+/// Refusals, from the service: 404 unknown, **403** someone else's photo, and
+/// **400** already attached (the repo's conflict mapping — `ApiError::Conflict`
+/// / 409 stays reserved for ship-dark FLAG refusals). PG-only: one DELETE, no
+/// writeback, no event.
+pub async fn delete_report_photo(
+    State(state): State<AppState>,
+    Path(photo_id): Path<i64>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<DeletePhotoResponse>> {
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    report_service_for(&state, branch)?
+        .delete_photo(photo_id, &identity.badge)
+        .await?;
+    Ok(Json(DeletePhotoResponse { success: true }))
+}
+
 /// `POST /api/hk/rooms/{room_id}/report` — the maid's attestation.
 ///
 /// **Maid-only.** [`require_report_capability`] runs FIRST, so a read-only
@@ -3516,14 +3728,21 @@ pub async fn report_photo(
 /// reasons: report capability (403) → required `?branch=` (400/403) → location
 /// gate (403/503) → body validation (400) → room existence (404) → the service.
 /// Body before room means a misspelled item code is answered without a database
-/// round-trip.
+/// round-trip. Inside body validation the RETIRED-SHAPE check runs first, so a
+/// stale bundle is told to reload rather than told its `ticks` are missing.
 ///
-/// What the SERVICE then does in ONE transaction: the header, the exception
-/// rows, the ATTACHMENT of these photo ids (which is also the check that they
-/// are hers and unattached), and one standing `item_missing` / `item_damaged`
-/// room signal per excepted PROBLEM KIND. A guest may be settling while this
-/// runs, so "the report says the remote is gone but the desk never heard" is
-/// not an observable state.
+/// The body is **v2**: `ticks` carries one photo-backed tick per checklist
+/// item — all 22, each once, `ok` ones included — and `extraPhotoIds` any
+/// pictures no tick names. `allItemsOk` / `items` are the retired v1 shape and
+/// are refused with a 400 naming `ticks`.
+///
+/// What the SERVICE then does in ONE transaction: the header (its
+/// `rr_all_items_ok` DERIVED from the ticks), the ATTACHMENT of every DISTINCT
+/// photo the ticks and extras name (which is also the check that they are hers
+/// and unattached), all 22 tick rows, and one standing `item_missing` /
+/// `item_damaged` room signal per PROBLEM KIND present. A guest may be settling
+/// while this runs, so "the report says the remote is gone but the desk never
+/// heard" is not an observable state.
 ///
 /// A second submission while one is still `submitted` for this room+day is
 /// refused as a CONFLICT — which this repo renders 400, not 409
@@ -3541,18 +3760,26 @@ pub async fn submit_report(
     let branch = require_branch(&policy, query.branch.as_deref())?;
     require_location(&policy, &identity, branch).await?;
 
+    // The v1 shape FIRST, ahead of every other body rule: a stale bundle sends
+    // a complete, internally consistent v1 body, so every later parser would
+    // answer it with something true but useless ("ticks is required") while the
+    // real problem is that the app needs reloading. Refusing here names `ticks`
+    // and says so.
+    if body.all_items_ok.is_some() || body.items.is_some() {
+        return Err(report_rule_error(ReportRuleError::LegacyBodyShape));
+    }
+
     let date = parse_report_date(body.date.as_deref())?;
     let room_status = parse_room_status(body.room_status.as_deref().unwrap_or_default())
         .map_err(report_rule_error)?;
-    // Absent is NOT "true": a client that forgot the field has not attested
-    // anything, and defaulting it would silently sign off a room.
-    let all_items_ok = body.all_items_ok.ok_or_else(|| {
-        ApiError::BadRequest("allItemsOk is required (true = ครบทุกรายการ)".to_string())
-    })?;
-    let items = parse_report_items(body.items)?;
-    crate::domain::hk_report::check_attestation(all_items_ok, items.len())
-        .map_err(report_rule_error)?;
-    let photo_ids = parse_photo_ids(body.photo_ids)?;
+    let ticks = parse_report_ticks(body.ticks)?;
+    let extra_photo_ids = parse_extra_photo_ids(body.extra_photo_ids)?;
+    // The SET rules — every item ticked exactly once, and the DISTINCT photo
+    // total — run HERE as well as in the service. Not a second enforcement
+    // point: the same function, called earlier, so an incomplete checklist is a
+    // 400 before the room probe rather than after it. Body before room is the
+    // ordering every mutation on this surface follows.
+    crate::service::hk_reports::check_ticks(&ticks, &extra_photo_ids)?;
 
     let pool = resolve_pool(&state, branch)?;
     require_room(pool, room_id).await?;
@@ -3562,9 +3789,8 @@ pub async fn submit_report(
             room_id,
             date,
             room_status: room_status.to_string(),
-            all_items_ok,
-            items,
-            photo_ids,
+            ticks,
+            extra_photo_ids,
             can_report: identity.can_report,
             badge: identity.badge.clone(),
             name: identity.display_name.clone(),
@@ -5771,15 +5997,28 @@ mod tests {
     // Report HK (migration 091)
     // ====================================================================
 
-    use crate::domain::hk_report::{ItemProblem, REPORT_ITEMS, RETURN_REASONS, ROOM_STATUS_CODES};
+    use crate::domain::hk_report::{
+        TickState, REPORT_ITEMS, REPORT_ZONES, RETURN_REASONS, ROOM_STATUS_CODES,
+    };
 
-    /// Build a wire item entry with an integer quantity.
-    fn report_entry(item: &str, problem: &str, qty: i64) -> ReportItemEntry {
-        ReportItemEntry {
+    /// Build a wire TICK entry. `qty` is `None` for an `ok` tick.
+    fn tick_entry(item: &str, state: &str, qty: Option<i64>, photo_id: i64) -> ReportTickEntry {
+        ReportTickEntry {
             item: item.to_string(),
-            problem: problem.to_string(),
-            qty: serde_json::json!(qty),
+            state: state.to_string(),
+            qty: qty.map(|q| serde_json::json!(q)),
+            photo_id: Some(serde_json::json!(photo_id)),
         }
+    }
+
+    /// A complete, valid wire checklist: all 22 items `ok`, over four photos —
+    /// what a zone-by-zone capture of a perfect room produces.
+    fn full_tick_entries() -> Vec<ReportTickEntry> {
+        REPORT_ITEMS
+            .iter()
+            .enumerate()
+            .map(|(index, item)| tick_entry(item, "ok", None, (index % 4) as i64 + 1))
+            .collect()
     }
 
     fn photo_ids(ids: &[i64]) -> Option<Vec<serde_json::Value>> {
@@ -5846,42 +6085,71 @@ mod tests {
         }
     }
 
-    // ---- the checklist body ---------------------------------------------
+    // ---- the checklist body (v2 ticks) ----------------------------------
 
     #[test]
-    fn report_items_accept_every_vocabulary_pair_and_normalize() {
-        let parsed = parse_report_items(Some(vec![
-            report_entry(" TV_Remote ", " MISSING ", 1),
-            report_entry("kettle", "damaged", 99),
-        ]))
-        .expect("valid entries parse");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].item, "tv_remote", "the NORMALIZED code is stored");
-        assert_eq!(parsed[0].problem, ItemProblem::Missing);
-        assert_eq!(parsed[1].qty, 99, "the ceiling is inclusive");
+    fn report_ticks_accept_the_whole_checklist_and_normalize() {
+        let parsed = parse_report_ticks(Some(full_tick_entries())).expect("22 ok ticks parse");
+        assert_eq!(parsed.len(), REPORT_TICK_COUNT);
+        assert!(parsed.iter().all(|tick| tick.state == TickState::Ok));
+        assert!(
+            parsed.iter().all(|tick| tick.qty.is_none()),
+            "an ok tick carries no qty"
+        );
+        assert!(parsed.iter().all(|tick| tick.photo_id > 0));
 
-        // Every item code in the vocabulary is accepted, with both problems.
+        // Codes are NORMALIZED before they are stored, so the table never
+        // accumulates casing variants of one item.
+        let mut mixed = full_tick_entries();
+        mixed[9] = tick_entry(" TV_Remote ", " MISSING ", Some(1), 2);
+        let parsed = parse_report_ticks(Some(mixed)).expect("mixed casing parses");
+        let tick = parsed
+            .iter()
+            .find(|tick| tick.item == "tv_remote")
+            .expect("the NORMALIZED code is stored");
+        assert_eq!(tick.state, TickState::Missing);
+        assert_eq!(tick.qty, Some(1));
+
+        // Every item code, with every state, is accepted.
         for item in REPORT_ITEMS {
-            for problem in ItemProblem::ALL {
+            for state in TickState::ALL {
+                let qty = state.is_problem().then_some(1);
+                let mut ticks = full_tick_entries();
+                let index = REPORT_ITEMS.iter().position(|i| *i == item).unwrap();
+                ticks[index] = tick_entry(item, state.as_str(), qty, 1);
                 assert!(
-                    parse_report_items(Some(vec![report_entry(item, problem.as_str(), 1)])).is_ok(),
+                    parse_report_ticks(Some(ticks)).is_ok(),
                     "'{item}' / '{}' must be accepted",
-                    problem.as_str()
+                    state.as_str()
                 );
             }
         }
     }
 
-    /// The validation matrix, one row per way a body can be wrong. Every row is
-    /// a 400 in the repo's envelope — never a 500 from a DB CHECK.
+    /// The validation matrix, one row per way a tick body can be wrong. Every
+    /// row is a 400 in the repo's envelope — never a 500 from a DB CHECK, and
+    /// never serde's own shape.
     #[test]
-    fn report_items_reject_every_malformed_shape() {
+    fn report_ticks_reject_every_malformed_shape() {
+        let swap = |index: usize, entry: ReportTickEntry| {
+            let mut ticks = full_tick_entries();
+            ticks[index] = entry;
+            ticks
+        };
+
         // Unknown codes.
-        assert!(parse_report_items(Some(vec![report_entry("remote", "missing", 1)])).is_err());
-        assert!(parse_report_items(Some(vec![report_entry("tv_remote", "broken", 1)])).is_err());
+        assert!(parse_report_ticks(Some(swap(9, tick_entry("remote", "ok", None, 1)))).is_err());
+        assert!(
+            parse_report_ticks(Some(swap(9, tick_entry("tv_remote", "broken", Some(1), 1))))
+                .is_err(),
+            "the code is 'damaged'"
+        );
         // `stolen` is the near-miss that matters: it is the word an author
         // reaches for instead of `missing`.
-        assert!(parse_report_items(Some(vec![report_entry("tv_remote", "stolen", 1)])).is_err());
+        assert!(
+            parse_report_ticks(Some(swap(9, tick_entry("tv_remote", "stolen", Some(1), 1))))
+                .is_err()
+        );
 
         // Quantities: the range, and the non-integer shapes a broken client
         // sends. Each must be OURS to answer, not serde's.
@@ -5891,59 +6159,166 @@ mod tests {
             serde_json::json!(100),
             serde_json::json!(1.5),
             serde_json::json!("3"),
-            serde_json::json!(null),
             serde_json::json!(true),
             serde_json::json!(1_099_511_627_776i64),
         ] {
-            let entry = ReportItemEntry {
+            let entry = ReportTickEntry {
                 item: "tv_remote".to_string(),
-                problem: "missing".to_string(),
-                qty: bad_qty.clone(),
+                state: "missing".to_string(),
+                qty: Some(bad_qty.clone()),
+                photo_id: Some(serde_json::json!(1)),
             };
-            let err = parse_report_items(Some(vec![entry]))
-                .expect_err("qty {bad_qty} must be refused");
+            let err =
+                parse_report_ticks(Some(swap(9, entry))).expect_err("qty must be refused");
             assert!(matches!(err, ApiError::BadRequest(_)), "qty {bad_qty}");
         }
 
-        // A repeated (item, problem) PAIR.
-        let err = parse_report_items(Some(vec![
-            report_entry("tv_remote", "missing", 1),
-            report_entry("TV_REMOTE", "Missing", 2),
-        ]))
-        .expect_err("a duplicate pair must be refused after normalisation");
-        assert!(matches!(err, ApiError::BadRequest(_)));
+        // The qty-vs-state rule, both ways round.
+        let err = parse_report_ticks(Some(swap(
+            9,
+            tick_entry("tv_remote", "missing", None, 1),
+        )))
+        .expect_err("a problem tick needs a qty");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("needs a qty")));
 
-        // …but the SAME ITEM with the OTHER problem is a real report of one
-        // room and must be accepted.
-        assert!(parse_report_items(Some(vec![
-            report_entry("water_glass", "missing", 2),
-            report_entry("water_glass", "damaged", 1),
-        ]))
-        .is_ok());
+        let err = parse_report_ticks(Some(swap(9, tick_entry("tv_remote", "ok", Some(1), 1))))
+            .expect_err("an ok tick carries no qty");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("carries no qty")));
 
-        // Too many lines.
-        let flood: Vec<ReportItemEntry> = (0..=MAX_REPORT_ITEMS)
-            .map(|_| report_entry("tv_remote", "missing", 1))
+        // …and `null` qty is the same as absent, which is what a client that
+        // always sends the key produces for an ok tick.
+        let null_qty = ReportTickEntry {
+            item: "tv_remote".to_string(),
+            state: "ok".to_string(),
+            qty: Some(serde_json::json!(null)),
+            photo_id: Some(serde_json::json!(1)),
+        };
+        assert!(parse_report_ticks(Some(swap(9, null_qty))).is_ok());
+
+        // Every tick must name a backing photo — including the ok ones.
+        for bad_photo in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(-3)),
+            Some(serde_json::json!("7")),
+            Some(serde_json::json!(1.5)),
+        ] {
+            let entry = ReportTickEntry {
+                item: "tv_remote".to_string(),
+                state: "ok".to_string(),
+                qty: None,
+                photo_id: bad_photo.clone(),
+            };
+            let err = parse_report_ticks(Some(swap(9, entry)))
+                .expect_err("a tick without a usable photo must be refused");
+            assert!(
+                matches!(err, ApiError::BadRequest(ref m) if m.contains("photoId")),
+                "photoId {bad_photo:?}"
+            );
+        }
+
+        // A flood is refused before the list is walked entry by entry.
+        let flood: Vec<ReportTickEntry> = (0..=REPORT_TICK_COUNT * 2)
+            .map(|_| tick_entry("tv_remote", "ok", None, 1))
             .collect();
-        assert!(parse_report_items(Some(flood)).is_err());
+        let err = parse_report_ticks(Some(flood)).expect_err("a flood must be refused");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("too many ticks")));
     }
 
-    /// An empty / absent `items` is NOT an error by itself — it is exactly what
-    /// a ครบทุกรายการ report sends. The contradiction test lives in the domain
-    /// and is applied by the handler.
+    /// An absent `ticks` is NOT "an empty checklist" — it is a body this
+    /// endpoint cannot serve, and the refusal must NAME the field so a stale
+    /// bundle's operator knows what changed.
     #[test]
-    fn an_empty_checklist_is_parsed_and_judged_by_the_attestation_rule() {
-        assert!(parse_report_items(None).unwrap().is_empty());
-        assert!(parse_report_items(Some(Vec::new())).unwrap().is_empty());
+    fn an_absent_tick_list_is_refused_by_name() {
+        let err = parse_report_ticks(None).expect_err("ticks is required");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("ticks")), "{err:?}");
 
-        // The biconditional, as the handler applies it.
-        assert!(crate::domain::hk_report::check_attestation(true, 0).is_ok());
-        let err = crate::domain::hk_report::check_attestation(true, 1)
-            .expect_err("ครบทุกรายการ with exceptions is a contradiction");
+        // An EMPTY list is refused too — by the coverage rule, in the service.
+        let empty = parse_report_ticks(Some(Vec::new())).expect("an empty list parses");
+        assert!(empty.is_empty());
+        let err = crate::domain::hk_report::check_tick_coverage(&[])
+            .expect_err("zero ticks is not the checklist");
         assert!(matches!(report_rule_error(err), ApiError::BadRequest(_)));
-        let err = crate::domain::hk_report::check_attestation(false, 0)
-            .expect_err("not-ok with nothing named is a contradiction");
-        assert!(matches!(report_rule_error(err), ApiError::BadRequest(_)));
+    }
+
+    /// The v1 body shape answers 400 with a message that names `ticks`. This
+    /// is the whole cross-version contract: both halves deploy as one atomic
+    /// pair, so the only client that can send v1 is a cached bundle, and the
+    /// only useful thing to tell it is what the field is now called.
+    #[test]
+    fn a_v1_body_is_refused_with_a_message_naming_ticks() {
+        let err = report_rule_error(ReportRuleError::LegacyBodyShape);
+        let ApiError::BadRequest(message) = err else {
+            panic!("a retired body shape is a 400, not a 403");
+        };
+        assert!(message.contains("ticks"), "{message}");
+        assert!(message.contains("allItemsOk"), "{message}");
+
+        // The v1 body still DESERIALIZES (the two retired fields are declared
+        // for exactly this purpose) — the handler is what refuses it, and the
+        // detection is on either field alone.
+        let v1: SubmitReportBody = serde_json::from_str(
+            r#"{"roomStatus":"vc","allItemsOk":true,"items":[],"photoIds":[1]}"#,
+        )
+        .expect("a v1 body must parse so the handler can name the problem");
+        assert_eq!(v1.all_items_ok, Some(true));
+        assert!(v1.items.is_some());
+        assert!(v1.ticks.is_none());
+
+        let items_only: SubmitReportBody = serde_json::from_str(
+            r#"{"roomStatus":"vc","items":[{"item":"tv_remote","problem":"missing","qty":1}]}"#,
+        )
+        .expect("parses");
+        assert!(items_only.all_items_ok.is_none());
+        assert!(items_only.items.is_some(), "either field alone is the v1 shape");
+    }
+
+    /// The capture-zone code list is the vocabulary file's, and the upload
+    /// validates against it only when a zone was actually sent.
+    #[test]
+    fn the_zone_field_is_optional_but_validated() {
+        for (zone, _) in REPORT_ZONES {
+            assert_eq!(parse_zone(zone).unwrap(), zone);
+            assert_eq!(parse_zone(&zone.to_uppercase()).unwrap(), zone);
+        }
+        for bad in ["bedroom", "minibar", "ห้องน้ำ", "beds", ""] {
+            let err = parse_zone(bad).expect_err("'{bad}' must be refused");
+            assert!(matches!(report_rule_error(err), ApiError::BadRequest(_)));
+        }
+    }
+
+    /// `extraPhotoIds` is optional, distinct, positive — and bounded only so a
+    /// hostile array is not walked. The REAL bound is the DISTINCT total across
+    /// ticks and extras, which the service computes.
+    #[test]
+    fn extra_photo_ids_are_optional_distinct_and_positive() {
+        assert!(parse_extra_photo_ids(None).unwrap().is_empty());
+        assert!(parse_extra_photo_ids(Some(Vec::new())).unwrap().is_empty());
+        assert_eq!(
+            parse_extra_photo_ids(photo_ids(&[9, 10])).unwrap(),
+            vec![9, 10]
+        );
+
+        for bad in [
+            serde_json::json!("3"),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!(-4),
+        ] {
+            let err = parse_extra_photo_ids(Some(vec![bad.clone()]))
+                .expect_err("extra photoId must be refused");
+            assert!(matches!(err, ApiError::BadRequest(_)), "extra photoId {bad}");
+        }
+
+        let err =
+            parse_extra_photo_ids(photo_ids(&[5, 5])).expect_err("a repeat must be refused");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("more than once")));
+
+        let flood: Vec<i64> = (1..=(REPORT_MAX_PHOTOS_TOTAL as i64 + 1)).collect();
+        let err = parse_extra_photo_ids(photo_ids(&flood)).expect_err("a flood must be refused");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("extraPhotoIds")));
     }
 
     // ---- photos ---------------------------------------------------------
@@ -6159,20 +6534,39 @@ mod tests {
     #[test]
     fn the_request_bodies_read_the_contracted_camel_case_keys() {
         let body: SubmitReportBody = serde_json::from_str(
-            r#"{"date":"2026-09-02","roomStatus":"vc","allItemsOk":false,
-                 "items":[{"item":"tv_remote","problem":"missing","qty":1}],
-                 "photoIds":[3,4]}"#,
+            r#"{"date":"2026-09-02","roomStatus":"vc",
+                 "ticks":[{"item":"tv_remote","state":"missing","qty":1,"photoId":3}],
+                 "extraPhotoIds":[4,5]}"#,
         )
         .expect("the submit body parses");
         assert_eq!(body.date.as_deref(), Some("2026-09-02"));
         assert_eq!(body.room_status.as_deref(), Some("vc"));
-        assert_eq!(body.all_items_ok, Some(false));
-        assert_eq!(body.items.as_ref().map(Vec::len), Some(1));
-        assert_eq!(parse_photo_ids(body.photo_ids).unwrap(), vec![3, 4]);
+        assert_eq!(body.ticks.as_ref().map(Vec::len), Some(1));
+        let tick = &body.ticks.as_ref().unwrap()[0];
+        assert_eq!(tick.item, "tv_remote");
+        assert_eq!(tick.state, "missing");
+        assert_eq!(tick.qty, Some(serde_json::json!(1)));
+        assert_eq!(tick.photo_id, Some(serde_json::json!(3)));
+        assert_eq!(
+            parse_extra_photo_ids(body.extra_photo_ids).unwrap(),
+            vec![4, 5]
+        );
+        assert!(
+            body.all_items_ok.is_none() && body.items.is_none(),
+            "a v2 body carries neither retired field"
+        );
+
+        // An `ok` tick omits `qty` entirely — the shape the client sends 21
+        // times out of 22.
+        let ok_body: SubmitReportBody = serde_json::from_str(
+            r#"{"roomStatus":"vc","ticks":[{"item":"pillow","state":"ok","photoId":7}]}"#,
+        )
+        .expect("an ok tick parses without qty");
+        assert!(ok_body.ticks.unwrap()[0].qty.is_none());
 
         // A body of `{}` must reach OUR validators, not serde's rejection.
         let empty: SubmitReportBody = serde_json::from_str("{}").expect("an empty body parses");
-        assert!(empty.room_status.is_none() && empty.all_items_ok.is_none());
+        assert!(empty.room_status.is_none() && empty.ticks.is_none());
 
         let verify: VerifyReportBody =
             serde_json::from_str(r#"{"photoIds":[9]}"#).expect("the verify body parses");
@@ -6219,10 +6613,41 @@ mod tests {
         let upload = UploadPhotoResponse {
             success: true,
             photo_id: 12,
+            bytes: 51_200,
         };
         assert_eq!(
             serde_json::to_string(&upload).unwrap(),
-            r#"{"success":true,"photoId":12}"#
+            r#"{"success":true,"photoId":12,"bytes":51200}"#
+        );
+
+        // The two photo endpoints migration 092 added.
+        let meta = PhotoMetaResponse {
+            success: true,
+            photo: ReportPhotoMeta {
+                photo_id: 12,
+                side: PhotoSide::Maid,
+                zone: Some("bed".to_string()),
+                bytes: Some(51_200),
+                attached: false,
+                uploaded_at: "2026-09-02T03:00:00Z".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&meta).expect("serializes");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["photo", "success"]);
+        assert_eq!(json["photo"]["photoId"], 12);
+        assert_eq!(json["photo"]["attached"], false);
+        assert_eq!(json["photo"]["zone"], "bed");
+
+        assert_eq!(
+            serde_json::to_string(&DeletePhotoResponse { success: true }).unwrap(),
+            r#"{"success":true}"#
         );
     }
 
