@@ -7,9 +7,10 @@
 //! is inert. These tests pin the DISABLED posture — the one an operator can
 //! return to — because that is where the exemption has teeth:
 //!
-//! - the maid's two report routes — `cleaning` and, since migration 088,
-//!   `linen-shortage` — must still be admitted, so a housekeeping report is not
-//!   collateral damage of a front-desk write-policy toggle;
+//! - the maid's report routes — `cleaning`, `linen-shortage` (migration 088)
+//!   and, since migration 090, `linen-shortage/resolve` — must still be
+//!   admitted, so a housekeeping report is not collateral damage of a
+//!   front-desk write-policy toggle;
 //! - nothing else may be, so an admitted mutation can never outrun a narrowed
 //!   `HFVILLE_WRITEBACK_INTENTS`, which would leave canonical PG ahead of
 //!   Ville's iHOTEL. (`linen-shortage` cannot outrun anything even in
@@ -143,6 +144,96 @@ async fn hfville_linen_shortage_is_admitted_while_ville_writes_are_disabled() {
          the Access gate to answer 401); a 403 means Ville maids cannot report a \
          linen shortage whenever front-desk Ville writes are turned off"
     );
+}
+
+/// The linen RESOLVE route (migration 090, เติมผ้าแล้ว) must be admitted for
+/// `branch=hfville` exactly the way the report it completes is.
+///
+/// It is the ONE six-segment write on this surface, so this is also the proof
+/// that the guard's matcher actually grew that shape rather than falling
+/// through: before migration 090 this path had five-plus-one segments and the
+/// matcher rejected anything past the fifth, so it would answer 403 here.
+///
+/// The safety argument is `linen-shortage`'s, at one remove and slightly
+/// stronger: the resolve is ONE `UPDATE` closing open rows, with no writeback
+/// intent, no outbox row and — unlike ADR 0008's signals — not even a domain
+/// event. There is nothing for a narrowed `HFVILLE_WRITEBACK_INTENTS` to park.
+///
+/// Needs no database: both layers answer before a pool is touched.
+#[tokio::test]
+async fn hfville_linen_resolve_is_admitted_while_ville_writes_are_disabled() {
+    let status = probe_with_body(
+        lazy_pool(),
+        "POST",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=hfville",
+        false,
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "expected the Ville guard to ADMIT the maid linen-resolve route (leaving \
+         the Access gate to answer 401); a 403 means Ville maids cannot mark a \
+         room restocked whenever front-desk Ville writes are turned off"
+    );
+}
+
+/// The six-segment widening admits ONE path, not a SHAPE. `resolve` is exempt
+/// as the completion of `linen-shortage` and under no other action, on no other
+/// collection — and appending a sixth segment to an already-exempt five-segment
+/// route must not inherit its exemption.
+///
+/// This is the half that matters: a matcher that simply stopped checking the
+/// sixth segment would pass the admit test above and silently exempt every
+/// `/api/hk/rooms/{id}/{anything}/{anything}`.
+#[tokio::test]
+async fn the_linen_resolve_exemption_does_not_widen_on_the_shipped_router() {
+    for uri in [
+        // `resolve` under an action that does not own it.
+        "/api/hk/rooms/1/cleaning/resolve?branch=hfville",
+        "/api/hk/rooms/1/signals/resolve?branch=hfville",
+        "/api/hk/rooms/1/broken-items/resolve?branch=hfville",
+        // …and on the other collection.
+        "/api/hk/signals/1/ack/resolve?branch=hfville",
+        "/api/hk/signals/1/linen-shortage/resolve?branch=hfville",
+        // Near-misses on either half of the pair.
+        "/api/hk/rooms/1/linen-shortage/resolveX?branch=hfville",
+        "/api/hk/rooms/1/linen-shortageX/resolve?branch=hfville",
+        // Trailing slash and deeper paths still fall through.
+        "/api/hk/rooms/1/linen-shortage/resolve/?branch=hfville",
+        "/api/hk/rooms/1/linen-shortage/resolve/extra?branch=hfville",
+        // Malformed room id.
+        "/api/hk/rooms/1a/linen-shortage/resolve?branch=hfville",
+        "/api/hk/rooms//linen-shortage/resolve?branch=hfville",
+        // The desk tree follows front-desk write policy, at every depth.
+        "/api/housekeeping/rooms/1/linen-shortage/resolve?branch=hfville",
+    ] {
+        let status = probe_with_body(lazy_pool(), "POST", uri, false, "").await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{uri} must be refused by the Ville guard; 401 would mean the \
+             six-segment exemption is matching a shape rather than one path"
+        );
+    }
+
+    // The exempt path with a mutating non-POST method.
+    for method in ["PUT", "PATCH", "DELETE"] {
+        let status = probe_with_body(
+            lazy_pool(),
+            method,
+            "/api/hk/rooms/1/linen-shortage/resolve?branch=hfville",
+            false,
+            "",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} on the linen-resolve path must NOT be exempt"
+        );
+    }
 }
 
 /// The exemption is POST-only and exact-match, on the SHIPPED router. A

@@ -284,6 +284,88 @@ async fn row8b_linen_shortage_post_without_branch_is_400() {
     assert_branch_400(status, &body, "POST linen-shortage with no branch");
 }
 
+/// Row 8e. The linen RESOLVE route (migration 090, เติมผ้าแล้ว) answers the
+/// SAME required-branch gate as the report it completes. It takes no body at
+/// all, so this is the whole pre-pool surface: without `?branch=` it must be
+/// the stable 400, never a default to HF Hotel.
+#[tokio::test]
+async fn row8e_linen_resolve_post_without_branch_is_400() {
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/linen-shortage/resolve",
+        "",
+    )
+    .await;
+    assert_branch_400(status, &body, "POST linen-shortage/resolve with no branch");
+}
+
+/// Row 8f. …and a branch this deployment does not offer is refused too, on the
+/// same route, before any pool is resolved.
+#[tokio::test]
+async fn row8f_linen_resolve_with_an_unoffered_branch_is_403() {
+    let app = inner(
+        AppState::new(lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=hfville",
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unoffered branch must be 403 on the resolve route too, body={body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).expect("403 body must be JSON");
+    assert_eq!(
+        json.get("error").and_then(|v| v.as_str()),
+        Some(BRANCH_NOT_ENABLED_ERROR),
+        "stable error message, body={body}"
+    );
+}
+
+/// Row 8g. A MAID with a valid branch passes every pure gate on the resolve
+/// route and falls through to the database.
+///
+/// Asserted NEGATIVELY (the pool never connects, so what comes back is a
+/// server-side failure) because the point is only that no gate fired: a 400,
+/// 401, 403 or 404 here would mean the branch gate, the Access layer, the
+/// capability check or the routing table refused a legitimate เติมผ้าแล้ว. This
+/// is the row that would catch the route simply not being mounted.
+#[tokio::test]
+async fn row8g_a_maid_reaches_the_database_on_the_resolve_route() {
+    let app = inner(
+        AppState::new(clamped_lazy_pool()),
+        policy(vec![Branch::Hfhotel], false),
+    );
+    let (status, body) = call(
+        app,
+        "POST",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=hfhotel",
+        "",
+    )
+    .await;
+    assert!(
+        !matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "a maid's เติมผ้าแล้ว must pass every gate and reach the pool; got {status} {body}"
+    );
+}
+
 /// Row 8c. A body so malformed it could not possibly be recorded STILL yields
 /// the branch 400 first. This is the ordering half of row 8b: it proves the
 /// branch gate is not merely present but ahead of validation, so an
@@ -555,6 +637,15 @@ async fn viewer_is_403_on_both_mutations() {
             r#"{"items":[{"kind":"bath_towel","qty":2}]}"#,
             "linen shortage",
         ),
+        // Migration 090. Deliberately NOT the room-signals rule (where
+        // `can_report` picks a SIDE and both sides act): completing a shortage
+        // is a maid's physical act, so the viewer sees the backlog and cannot
+        // close it.
+        (
+            "/api/hk/rooms/1/linen-shortage/resolve?branch=hfhotel",
+            "",
+            "linen shortage: resolve",
+        ),
     ] {
         // `mark_dirty_enabled: true` on purpose: the capability refusal must
         // not depend on a flag that only ever narrows what a MAID may do.
@@ -601,6 +692,19 @@ async fn viewer_capability_is_checked_before_branch_and_body() {
             "/api/hk/rooms/1/linen-shortage?branch=hfville",
             r#"{"items":[{"kind":"blanket","qty":99}]}"#,
             "unoffered branch, invalid items",
+        ),
+        // The resolve route has no body to be wrong, so the capability check
+        // is pinned against the branch gate alone: no branch, and a branch this
+        // deployment does not offer, are both still the capability 403.
+        (
+            "/api/hk/rooms/1/linen-shortage/resolve",
+            "",
+            "resolve with no branch at all",
+        ),
+        (
+            "/api/hk/rooms/1/linen-shortage/resolve?branch=hfville",
+            "",
+            "resolve on an unoffered branch",
         ),
     ] {
         let app = inner_viewer(
@@ -822,6 +926,34 @@ async fn shipped_router_answers_401_for_linen_shortage_without_a_db() {
             StatusCode::UNAUTHORIZED,
             "POST {uri} must be refused by the Access gate before any branch, body \
              or pool logic can answer; got {status} {got}"
+        );
+    }
+}
+
+/// The same proof for the linen RESOLVE route (migration 090), WITHOUT needing
+/// a database.
+///
+/// A new mutation that forgot the Access layer would be a silently
+/// unauthenticated write endpoint — and this one is additionally the first
+/// SIX-segment write on the surface, so it also proves the Ville guard ADMITS
+/// it (401 from auth) rather than short-circuiting (403) even on `hfville`,
+/// through the shipped stack that `main.rs` mounts.
+#[tokio::test]
+async fn shipped_router_answers_401_for_linen_resolve_without_a_db() {
+    for uri in [
+        "/api/hk/rooms/1/linen-shortage/resolve",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=hfhotel",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=hfville",
+        "/api/hk/rooms/1/linen-shortage/resolve?branch=all",
+    ] {
+        let app =
+            hotel_backend::routes::hk::router(AppState::new(lazy_pool()).with_hfville_writes(true));
+        let (status, got) = call(app, "POST", uri, "").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "POST {uri} must be refused by the Access gate before any branch or \
+             pool logic can answer; got {status} {got}"
         );
     }
 }

@@ -149,15 +149,29 @@ export interface HkRoom {
   expectedArrival?: boolean
   expectedDeparture?: boolean
   /**
-   * `true` ⇒ at least one linen shortage was reported for this room TODAY
-   * (Thai day, the same day scope as `cleaning`). Sent on the list AND the
-   * detail room so the two screens can never disagree about it.
+   * @deprecated Superseded by `linenShortageOpen` (owner request 2026-09-01).
    *
-   * Optional for the same bundle/backend-skew reason as `occupancy`: an older
-   * backend simply omits it, and `linenShortageTag` renders nothing rather
-   * than a guessed "no shortage" claim.
+   * `true` ⇒ at least one linen shortage was reported for this room TODAY
+   * (Thai day, the same day scope as `cleaning`). Its meaning is EXACTLY what
+   * it always was and the backend still sends it unchanged — it is kept on the
+   * wire purely so an older bundle mid-deploy keeps rendering the chip it knows
+   * how to render. New code reads `linenShortageOpen`; this field survives only
+   * as `linenShortageTag`'s skew fallback.
    */
   linenShortageToday?: boolean
+  /**
+   * `true` ⇒ this room has at least one OPEN linen-shortage report — filed and
+   * not yet marked restocked, of ANY age. This is what ขาดผ้า now MEANS: a
+   * shortage is somebody's outstanding work until a maid taps เติมผ้าแล้ว, and
+   * completion (not the day rolling over) is what clears it — the same
+   * "visible until done" convention the room signals follow (ADR 0008).
+   *
+   * Sent on the list AND the detail room so the two screens can never disagree.
+   * Optional for the same bundle/backend-skew reason as `occupancy`: an older
+   * backend omits it, and `linenShortageTag` then falls back to the day-scoped
+   * `linenShortageToday` rather than claiming a room is clear of shortages.
+   */
+  linenShortageOpen?: boolean
 }
 
 /** `GET /hk/api/rooms`. */
@@ -201,6 +215,22 @@ export interface HkRoomDetail {
    * See `HkLinenShortageTotal` for why `kind` is a plain `string` here.
    */
   linenShortages?: HkLinenShortageTotal[]
+  /**
+   * The OPEN linen-shortage totals for this room — one row per kind, in the
+   * backend's `VALID_LINEN_KINDS` order, `[]` when nothing is outstanding.
+   * Same shape as `linenShortages` above, a different QUESTION: that one is
+   * "what was reported today" (a record), this one is "what is still owed to
+   * this room" (the work). They disagree routinely — a shortage filed
+   * yesterday and never restocked is open but not today's, and one filed and
+   * restocked this morning is today's but not open.
+   *
+   * Optional for backend skew, and the fallback is deliberately NOTHING: an
+   * older backend omits it and the room screen renders the old day-scoped
+   * totals LINE instead of the task card. Guessing the open set from today's
+   * totals would put an เติมผ้าแล้ว button in front of a maid for reports the
+   * server has no endpoint to resolve.
+   */
+  linenShortagesOpen?: HkLinenShortageTotal[]
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +339,25 @@ export interface HkLinenShortageResponse {
   success: boolean
   roomId: number
   reported: number
+}
+
+/**
+ * `POST /hk/api/rooms/{roomId}/linen-shortage/resolve` — เติมผ้าแล้ว.
+ *
+ * ROOM-LEVEL by design: one tap closes EVERY open report row for the room,
+ * whatever kind and whatever day it was filed. A maid restocks a room in one
+ * trip, so a per-kind tap would be busywork that leaves half a room "still
+ * short" because she forgot the third button.
+ *
+ * `resolved` is how many rows the server closed, and **zero is a success**:
+ * two maids tapping the same room seconds apart, or a retry after a dropped
+ * response, must both land on "done", never on an error the second maid has no
+ * way to act on.
+ */
+export interface HkLinenResolveResponse {
+  success: boolean
+  roomId: number
+  resolved: number
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +517,37 @@ export async function hkFetch(
   return response
 }
 
+const LINEN_RESOLVE_ERROR = 'บันทึกไม่สำเร็จ กรุณาลองใหม่'
+
+/**
+ * เติมผ้าแล้ว — `POST /hk/api/rooms/{roomId}/linen-shortage/resolve`.
+ *
+ * NO BODY: the room in the path is the whole request. There is nothing to
+ * choose (it resolves every open row for the room) and nothing to stamp (the
+ * resolver's identity comes from the verified Cloudflare Access assertion,
+ * server-side, exactly as the report's does) — so a body could only ever be a
+ * way for a client bug to say something the server would have to refuse.
+ *
+ * Branches on `success` ALONE, like the report and the signals: a 200 carrying
+ * `success: false` is a resolve that did NOT land, and a green banner over it
+ * sends a maid away believing a room is stocked. A `resolved: 0` success is
+ * still a success — see `HkLinenResolveResponse`. Maid-only; a viewer's POST
+ * is refused with 403 (which `hkFetch` turns into the standing Thai message)
+ * regardless of what the UI offered.
+ */
+export async function resolveHkLinenShortage(
+  branch: Branch | null,
+  roomId: number
+): Promise<HkLinenResolveResponse> {
+  const res = await hkFetch(`/rooms/${roomId}/linen-shortage/resolve`, branch, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const body: HkLinenResolveResponse | null = res.ok ? await res.json().catch(() => null) : null
+  if (!res.ok || !body?.success) throw new Error(LINEN_RESOLVE_ERROR)
+  return body
+}
+
 // ---------------------------------------------------------------------------
 // Pure display helpers (unit-tested in __tests__/components/hk-lib.test.ts)
 // ---------------------------------------------------------------------------
@@ -576,15 +656,96 @@ export function movementTags(
  * that pairing is the whole point. A room that is finished but still short of
  * linen is not finished, and must not read as finished-and-forgotten.
  *
- * `undefined` (older backend) and `false` both render nothing: silence is not
- * evidence of a shortage. PURE.
+ * Driven by `linenShortageOpen` (outstanding work, any age), falling back to
+ * the deprecated day-scoped `linenShortageToday` ONLY when the open flag is
+ * absent — an older backend mid-deploy. The `??` ordering is the whole skew
+ * rule: an explicit `false` from a NEW backend means "restocked, nothing to
+ * say" and must not be second-guessed by today's record, while an ABSENT flag
+ * means the backend cannot answer the new question and the old answer is
+ * better than none.
+ *
+ * `undefined` on both and `false` render nothing: silence is not evidence of a
+ * shortage. PURE.
  */
 export function linenShortageTag(
-  room: Pick<HkRoom, 'linenShortageToday'>
+  room: Pick<HkRoom, 'linenShortageOpen' | 'linenShortageToday'>
 ): { label: string; className: string } | null {
-  return room.linenShortageToday === true
+  return (room.linenShortageOpen ?? room.linenShortageToday) === true
     ? { label: 'ขาดผ้า', className: 'bg-sky-50 text-sky-800 border-sky-300' }
     : null
+}
+
+/**
+ * Does this room carry OUTSTANDING linen work? STRICT — no fallback to the
+ * day-scoped flag, unlike the chip above.
+ *
+ * The asymmetry is deliberate and is the whole skew contract for this feature.
+ * The chip is decoration on a room that is on screen anyway, so a stale-ish
+ * answer beats none. The task panel below is a WORK QUEUE with a completion
+ * button behind each row, and an older backend that omits `linenShortageOpen`
+ * also has no resolve endpoint — so building a queue out of today's reports
+ * would offer a maid a button that 404s. Absent field ⇒ no queue, exactly the
+ * behaviour that shipped before. PURE.
+ */
+export function hasOpenLinenShortage(room: Pick<HkRoom, 'linenShortageOpen'>): boolean {
+  return room.linenShortageOpen === true
+}
+
+/**
+ * The rooms with open linen shortages, in room-number order — the maid's
+ * ขาดผ้า queue on the list screen.
+ *
+ * Sorted the same numeric-aware way `groupRoomsByFloor` sorts within a floor,
+ * so the queue reads as a walking order (104, 203, 301) rather than the order
+ * the server happened to return. PURE.
+ */
+export function openLinenRooms(rooms: HkRoom[]): HkRoom[] {
+  return rooms
+    .filter(hasOpenLinenShortage)
+    .sort((a, b) => a.roomNo.localeCompare(b.roomNo, undefined, { numeric: true }))
+}
+
+/** The count beside the panel heading ("3 ห้อง"). Its own helper so the panel
+ * and any future summary spell the unit once. PURE. */
+export function openLinenCountLabel(count: number): string {
+  return `${count} ห้อง`
+}
+
+/** The room screen's open-shortage card heading. A CONSTANT rather than a
+ * literal in the page, because the day-scoped line it replaces
+ * ("วันนี้แจ้งขาดผ้า: …") is one word away from it and the two must never be
+ * confused: this one is what is STILL owed, that one is what was reported
+ * today. */
+export const LINEN_OPEN_CARD_TITLE = 'ขาดผ้าค้างอยู่'
+
+/**
+ * The open totals as renderable rows — Thai label resolved once, quantity as
+ * delivered, in the order DELIVERED (the server already orders them like
+ * `LINEN_KINDS`; re-sorting here would invent a second opinion about an order
+ * that is already agreed).
+ *
+ * `null`/`undefined`/`[]` all give `[]`, so the card's "is there anything to
+ * show" test is one `length` check. Unknown codes keep their raw code as the
+ * label via `linenKindLabel` — a readable row beats a dropped one. PURE.
+ */
+export function openLinenRows(
+  shortages: HkLinenShortageTotal[] | null | undefined
+): Array<{ kind: string; label: string; qty: number }> {
+  if (!shortages) return []
+  return shortages.map(({ kind, qty }) => ({ kind, label: linenKindLabel(kind), qty }))
+}
+
+/**
+ * Confirm copy for เติมผ้าแล้ว.
+ *
+ * Earns its second tap for the same reason แจ้งห้องไม่สะอาด does, from the
+ * other direction: one tap clears this room's ขาดผ้า flag for EVERYONE —
+ * reception's viewer included — and the maid cannot un-resolve it from her
+ * phone. The room is NAMED, because a maid in a corridor of near-identical
+ * doors needs to confirm the room, not just the intent. PURE.
+ */
+export function linenResolveConfirmMessage(roomNo: string): string {
+  return `ยืนยันว่าเติมผ้าให้ ห้อง ${roomNo} แล้ว?`
 }
 
 /** Thai label for a wire `kind` code, falling back to the code itself for a
@@ -595,9 +756,14 @@ export function linenKindLabel(kind: string): string {
 }
 
 /**
- * The one-line totals summary under the แจ้งขาดผ้า button
+ * The one-line TODAY'S-RECORD summary under the แจ้งขาดผ้า button
  * ("วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, ผ้าเช็ดตัว 1"), or `null` when nothing was
  * reported today (and for an older backend that sends no totals at all).
+ *
+ * Day-scoped and unchanged. It is what the room screen still renders when the
+ * backend sends no `linenShortagesOpen` — the OPEN card
+ * (`LINEN_OPEN_CARD_TITLE` + `openLinenRows`) is what supersedes it once the
+ * backend can answer the outstanding-work question.
  *
  * Rows are rendered in the order DELIVERED — the server already orders them
  * like `LINEN_KINDS`, and re-sorting here would invent a second opinion about

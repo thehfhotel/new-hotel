@@ -10,7 +10,7 @@
 //! `tests/test_hk_ville_guard.rs`.
 //!
 //! ## The exemptions (housekeeping-ops, 2026-08-11; linen 2026-08-31;
-//! room signals 2026-09-01)
+//! room signals 2026-09-01; linen resolve 2026-09-01)
 //!
 //! [`is_ville_exempt_path`] admits, regardless of the flag, exactly the maid
 //! surface's own write routes — and nothing else:
@@ -24,6 +24,15 @@
 //!   vacuous: there is no intent that `HFVILLE_WRITEBACK_INTENTS` could park as
 //!   `'skipped'`, hence no way for canonical PG to run ahead of Ville's iHOTEL.
 //!   This is the safest possible thing to exempt.
+//! * `POST /api/hk/rooms/{id}/linen-shortage/resolve` — the maid's เติมผ้าแล้ว
+//!   (migration 090), which closes every open row for the room. **PG-ONLY on
+//!   exactly the same terms as the report it completes**, and if anything more
+//!   narrowly: one `UPDATE`, no writeback intent, no outbox row, and not even a
+//!   domain event. It is the ONE **six-segment** exemption on this surface —
+//!   [`is_ville_exempt_path`] admits a single optional trailing segment,
+//!   matched as a `(action, sub-action)` PAIR against
+//!   [`VILLE_EXEMPT_ROOM_SUBACTIONS`], never as a prefix. So `resolve` is
+//!   exempt as the completion of `linen-shortage` and nowhere else.
 //! * `POST /api/hk/rooms/{id}/signals` and
 //!   `POST /api/hk/signals/{id}/{ack|done|cancel|answer}` — the room signals of
 //!   ADR 0008 (migration 089). **PG-ONLY on the same terms as linen, and
@@ -64,7 +73,8 @@
 //! admission and delivery consistent under every combination of the two knobs.
 //!
 //! The exemptions are deliberately NARROW: exact segment match against a
-//! closed list of leaf names, POST only, numeric room id. They do NOT cover
+//! closed list of leaf names (and, for the one six-segment shape, a closed list
+//! of leaf PAIRS), POST only, numeric room id. They do NOT cover
 //! `/broken-items` (retired, 410) or any other hk or non-hk mutation.
 
 use axum::extract::State;
@@ -105,15 +115,40 @@ const VILLE_EXEMPT_ROOM_ACTIONS: [&str; 3] = ["cleaning", "linen-shortage", "sig
 /// front-desk write-policy toggle" case the exemption exists for.
 const VILLE_EXEMPT_SIGNAL_ACTIONS: [&str; 4] = ["ack", "done", "cancel", "answer"];
 
+/// The ONE exempt SIX-segment shape: `/api/hk/rooms/{id}/{action}/{sub}`, as a
+/// closed list of `(action, sub)` PAIRS — migration 090's
+/// `POST /api/hk/rooms/{id}/linen-shortage/resolve` (เติมผ้าแล้ว, the maid
+/// marking a room restocked).
+///
+/// PG-only on exactly `linen-shortage`'s terms, which is what makes it
+/// exemptible: it closes `ht_hk_linen_reports` rows with one `UPDATE` and
+/// enqueues nothing — no writeback intent, no outbox row, and (unlike the room
+/// signals) not even a domain event. There is no intent a narrowed
+/// `HFVILLE_WRITEBACK_INTENTS` could park as `'skipped'`, hence no way for
+/// canonical PG to run ahead of Ville's iHOTEL.
+///
+/// A PAIR list rather than a second leaf list, deliberately: `resolve` is
+/// exempt only as the completion of `linen-shortage`, never as a leaf under
+/// `cleaning`, `signals`, or a future action. Widening this list means naming
+/// both halves.
+const VILLE_EXEMPT_ROOM_SUBACTIONS: [(&str, &str); 1] = [("linen-shortage", "resolve")];
+
 /// Is this request path one of the Ville-exempt routes? PURE.
 ///
-/// TWO shapes, both five segments, both requiring a numeric id and nothing
-/// after the leaf:
+/// THREE shapes, each requiring a numeric id and nothing after the leaf:
 ///
 /// * `/api/hk/rooms/{room_id}/{action}` with `action` in
-///   [`VILLE_EXEMPT_ROOM_ACTIONS`];
+///   [`VILLE_EXEMPT_ROOM_ACTIONS`] (five segments);
 /// * `/api/hk/signals/{signal_id}/{action}` with `action` in
-///   [`VILLE_EXEMPT_SIGNAL_ACTIONS`].
+///   [`VILLE_EXEMPT_SIGNAL_ACTIONS`] (five segments);
+/// * `/api/hk/rooms/{room_id}/{action}/{sub}` with `(action, sub)` in
+///   [`VILLE_EXEMPT_ROOM_SUBACTIONS`] (SIX segments — migration 090's linen
+///   resolve, and nothing else).
+///
+/// The sixth segment is OPTIONAL and, when present, is matched as a pair with
+/// the fifth against a closed list — so the widening admits exactly one more
+/// path. A six-segment path under `/signals/` matches nothing, and neither does
+/// an exempt five-segment leaf with an arbitrary sixth segment appended.
 ///
 /// A trailing slash yields a trailing empty segment and therefore does NOT
 /// match, and no prefix/substring test is used, so
@@ -141,13 +176,23 @@ pub fn is_ville_exempt_path(path: &str) -> bool {
         }
         _ => return false,
     };
-    // Nothing may follow the fifth segment, and the id must be a bare number.
-    if segments.next().is_some() || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+    // The id must be a bare number, on every shape.
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    match collection {
-        "rooms" => VILLE_EXEMPT_ROOM_ACTIONS.contains(&action),
-        "signals" => VILLE_EXEMPT_SIGNAL_ACTIONS.contains(&action),
+    // The OPTIONAL sixth segment. Nothing may follow IT — so a trailing slash
+    // (which yields an empty sixth or seventh segment) and any deeper path
+    // still fall through, exactly as before.
+    let sub_action = segments.next();
+    if segments.next().is_some() {
+        return false;
+    }
+    match (collection, sub_action) {
+        ("rooms", None) => VILLE_EXEMPT_ROOM_ACTIONS.contains(&action),
+        ("signals", None) => VILLE_EXEMPT_SIGNAL_ACTIONS.contains(&action),
+        // The one six-segment exemption, matched as a PAIR: `resolve` is exempt
+        // only under `linen-shortage`, never as a leaf under another action.
+        ("rooms", Some(sub)) => VILLE_EXEMPT_ROOM_SUBACTIONS.contains(&(action, sub)),
         _ => false,
     }
 }
@@ -220,6 +265,7 @@ mod tests {
 
     const CLEANING: &str = "/api/hk/rooms/42/cleaning";
     const LINEN: &str = "/api/hk/rooms/42/linen-shortage";
+    const LINEN_RESOLVE: &str = "/api/hk/rooms/42/linen-shortage/resolve";
     const SIGNALS: &str = "/api/hk/rooms/42/signals";
     const SIGNAL_ACK: &str = "/api/hk/signals/7/ack";
     const SIGNAL_DONE: &str = "/api/hk/signals/7/done";
@@ -237,6 +283,9 @@ mod tests {
         assert!(is_ville_exempt_path("/api/hk/rooms/1/cleaning"));
         assert!(is_ville_exempt_path(LINEN));
         assert!(is_ville_exempt_path("/api/hk/rooms/1/linen-shortage"));
+        // Migration 090's เติมผ้าแล้ว — the ONE six-segment shape.
+        assert!(is_ville_exempt_path(LINEN_RESOLVE));
+        assert!(is_ville_exempt_path("/api/hk/rooms/1/linen-shortage/resolve"));
         // ADR 0008 room signals: the raise hangs off /rooms/, the lifecycle
         // actions off /signals/ — two shapes, one matcher.
         assert!(is_ville_exempt_path(SIGNALS));
@@ -289,6 +338,26 @@ mod tests {
             "/api/hk/rooms/42/linen_shortage",       // underscore, not the route
             "/api/hk/rooms/42/linen",                // truncated leaf
             "/x/api/hk/rooms/42/linen-shortage",     // prefixed
+            // ---- the six-segment widening must admit ONE path, not a shape.
+            // `resolve` is exempt as the completion of `linen-shortage` and
+            // under no other action, on no other collection.
+            "/api/hk/rooms/42/cleaning/resolve",
+            "/api/hk/rooms/42/signals/resolve",
+            "/api/hk/rooms/42/broken-items/resolve",
+            "/api/hk/signals/7/linen-shortage/resolve",
+            "/api/hk/signals/7/ack/resolve",
+            "/api/hk/signals/7/done/resolve",
+            // Near-misses and malformed ids on the six-segment shape.
+            "/api/hk/rooms/42/linen-shortage/resolveX",
+            "/api/hk/rooms/42/linen-shortage/resolve/",      // trailing slash
+            "/api/hk/rooms/42/linen-shortage/resolve/extra", // deeper path
+            "/api/hk/rooms/42/linen-shortageX/resolve",
+            "/api/hk/rooms/42/linen-shortage//resolve",
+            "/api/hk/rooms//linen-shortage/resolve",  // empty room id
+            "/api/hk/rooms/4a2/linen-shortage/resolve", // non-numeric room id
+            "/x/api/hk/rooms/42/linen-shortage/resolve", // prefixed
+            "api/hk/rooms/42/linen-shortage/resolve", // no leading slash
+            "/api/housekeeping/rooms/42/linen-shortage/resolve",
         ] {
             assert!(
                 !is_ville_exempt_path(not_exempt),
@@ -329,6 +398,12 @@ mod tests {
         assert!(
             !ville_write_blocked(&Method::POST, LINEN, VILLE_Q, false),
             "hfville linen-shortage must be admitted while Ville writes are disabled"
+        );
+        // …and so is its completion (migration 090), by the same argument at
+        // one remove: the UPDATE enqueues nothing and publishes nothing.
+        assert!(
+            !ville_write_blocked(&Method::POST, LINEN_RESOLVE, VILLE_Q, false),
+            "hfville linen-shortage resolve must be admitted while Ville writes are disabled"
         );
         // Room signals (ADR 0008) are PG-only in the strongest sense: iHOTEL
         // has no counterpart at all, so there is not even a writeback recipe
@@ -371,6 +446,7 @@ mod tests {
         for path in [
             CLEANING,
             LINEN,
+            LINEN_RESOLVE,
             SIGNALS,
             SIGNAL_ACK,
             SIGNAL_DONE,
@@ -406,6 +482,7 @@ mod tests {
         for path in [
             CLEANING,
             LINEN,
+            LINEN_RESOLVE,
             SIGNALS,
             SIGNAL_ACK,
             SIGNAL_DONE,

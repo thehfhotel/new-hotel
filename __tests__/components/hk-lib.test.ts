@@ -15,6 +15,7 @@ import {
   countRoomsNeedingClean,
   emptyLinenCounts,
   groupRoomsByFloor,
+  hasOpenLinenShortage,
   HK_API_BASE,
   hkFetch,
   hkFetchMe,
@@ -22,15 +23,21 @@ import {
   LEGACY_STATUS_STALE_NOTE,
   legacyStatusNote,
   LINEN_KINDS,
+  LINEN_OPEN_CARD_TITLE,
   linenKindLabel,
+  linenResolveConfirmMessage,
   linenShortageItems,
   linenShortageSummary,
   linenShortageTag,
   markDirtyConfirmMessage,
   movementTags,
   occupancyIndicator,
+  openLinenCountLabel,
+  openLinenRooms,
+  openLinenRows,
   progressLabel,
   readStoredBranch,
+  resolveHkLinenShortage,
   resolveInitialBranch,
   roomCleanChip,
   storeBranch,
@@ -666,6 +673,214 @@ describe('linenShortageSummary', () => {
     expect(linenShortageSummary([])).toBeNull()
     expect(linenShortageSummary(null)).toBeNull()
     expect(linenShortageSummary(undefined)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OPEN linen shortages (owner request, 2026-09-01). ขาดผ้า stopped being a
+// day-scoped note and became work: a report stays OPEN until a maid taps
+// เติมผ้าแล้ว, whatever day it was filed on.
+//
+// What is tested here is mostly the SKEW asymmetry, because it is the part a
+// reader will assume is a mistake: the chip falls back to the deprecated
+// day-scoped flag, and the queue does NOT. A chip is decoration on a room that
+// is on screen anyway; a queue row leads to a completion button, and an older
+// backend that omits `linenShortageOpen` has no endpoint behind it.
+// ---------------------------------------------------------------------------
+
+describe('linenShortageTag — driven by the OPEN flag', () => {
+  it('tags a room with an open shortage, whatever day it was filed', () => {
+    const tag = linenShortageTag(room({ linenShortageOpen: true }))
+    expect(tag?.label).toBe('ขาดผ้า')
+    expect(tag?.className).toContain('sky')
+  })
+
+  // The completion rule, from the chip's side: a room reported AND restocked
+  // today is not short of linen, and the day-scoped record must not resurrect
+  // the chip after a maid has cleared it.
+  it('does not tag a room whose today-reported shortage is already resolved', () => {
+    expect(
+      linenShortageTag(room({ linenShortageOpen: false, linenShortageToday: true }))
+    ).toBeNull()
+  })
+
+  // Bundle/backend skew, the ONE case the deprecated field still serves: an
+  // older backend cannot answer "is anything open", and today's answer beats
+  // silently claiming a room is clear.
+  it('falls back to the day-scoped flag only when the open flag is absent', () => {
+    expect(linenShortageTag(room({ linenShortageToday: true }))?.label).toBe('ขาดผ้า')
+    expect(linenShortageTag(room({ linenShortageToday: false }))).toBeNull()
+    expect(linenShortageTag(room({}))).toBeNull()
+  })
+
+  // An open shortage outlives the day, so it must outlive the cleaning state
+  // too — the finished-but-still-short room is the whole reason for the chip.
+  it('tags a room whose cleaning is already done', () => {
+    expect(
+      linenShortageTag(
+        room({
+          roomClean: true,
+          cleaning: { status: 'done', badge: 'Q1', name: null, at: '2026-09-01T03:00:00.000Z' },
+          linenShortageOpen: true,
+        })
+      )?.label
+    ).toBe('ขาดผ้า')
+  })
+})
+
+describe('hasOpenLinenShortage / openLinenRooms', () => {
+  it('is true only for an explicit open flag', () => {
+    expect(hasOpenLinenShortage(room({ linenShortageOpen: true }))).toBe(true)
+    expect(hasOpenLinenShortage(room({ linenShortageOpen: false }))).toBe(false)
+    expect(hasOpenLinenShortage(room({}))).toBe(false)
+  })
+
+  // THE skew rule for the queue, stated against the chip's: today's report is
+  // not evidence that a resolvable row exists.
+  it('never falls back to the deprecated day-scoped flag', () => {
+    expect(hasOpenLinenShortage(room({ linenShortageToday: true }))).toBe(false)
+    expect(openLinenRooms([room({ roomId: 1, linenShortageToday: true })])).toEqual([])
+  })
+
+  // Numeric-aware, like the floor grouping: the queue reads as a walking order,
+  // not as the order the server happened to answer in.
+  it('keeps only the open rooms, in room-number order', () => {
+    const rooms = [
+      room({ roomId: 3, roomNo: '301', linenShortageOpen: true }),
+      room({ roomId: 1, roomNo: '104', linenShortageOpen: true }),
+      room({ roomId: 2, roomNo: '203' }),
+      room({ roomId: 4, roomNo: '95', linenShortageOpen: true }),
+    ]
+    expect(openLinenRooms(rooms).map((r) => r.roomNo)).toEqual(['95', '104', '301'])
+  })
+
+  it('is empty for a list with nothing open', () => {
+    expect(openLinenRooms([room({}), room({ roomId: 2, linenShortageOpen: false })])).toEqual([])
+    expect(openLinenRooms([])).toEqual([])
+  })
+})
+
+describe('openLinenCountLabel', () => {
+  it('spells the unit once, for the panel heading', () => {
+    expect(openLinenCountLabel(1)).toBe('1 ห้อง')
+    expect(openLinenCountLabel(12)).toBe('12 ห้อง')
+  })
+})
+
+describe('openLinenRows', () => {
+  it('resolves the Thai labels and keeps the delivered order', () => {
+    expect(
+      openLinenRows([
+        { kind: 'pillowcase', qty: 2 },
+        { kind: 'bath_towel', qty: 1 },
+      ])
+    ).toEqual([
+      { kind: 'pillowcase', label: 'ปลอกหมอน', qty: 2 },
+      { kind: 'bath_towel', label: 'ผ้าเช็ดตัว', qty: 1 },
+    ])
+  })
+
+  // Server→client skew again: a kind this bundle predates renders as its raw
+  // code rather than disappearing out of a maid's restock list.
+  it('keeps an unknown kind as a readable row', () => {
+    expect(openLinenRows([{ kind: 'mattress_protector', qty: 1 }])).toEqual([
+      { kind: 'mattress_protector', label: 'mattress_protector', qty: 1 },
+    ])
+  })
+
+  // Nothing open and an older backend are the same on screen: no card, and the
+  // day-scoped totals line renders in its place.
+  it('is empty for an empty list, null and undefined', () => {
+    expect(openLinenRows([])).toEqual([])
+    expect(openLinenRows(null)).toEqual([])
+    expect(openLinenRows(undefined)).toEqual([])
+  })
+})
+
+describe('linenResolveConfirmMessage', () => {
+  // Names the ROOM, like the mark-dirty confirm: a corridor of near-identical
+  // doors is the actual failure mode, not a misread intent.
+  it('names the room in the confirm', () => {
+    expect(linenResolveConfirmMessage('301')).toBe('ยืนยันว่าเติมผ้าให้ ห้อง 301 แล้ว?')
+  })
+
+  it('keeps the card title distinct from the day-scoped line', () => {
+    expect(LINEN_OPEN_CARD_TITLE).toBe('ขาดผ้าค้างอยู่')
+    expect(linenShortageSummary([{ kind: 'pillowcase', qty: 1 }])).not.toContain(
+      LINEN_OPEN_CARD_TITLE
+    )
+  })
+})
+
+describe('resolveHkLinenShortage', () => {
+  beforeEach(() => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { success: true, roomId: 7, resolved: 2 }))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  function lastCall() {
+    const calls = (global.fetch as jest.Mock).mock.calls
+    const [url, init] = calls[calls.length - 1]
+    return { url: url as string, init: init as RequestInit }
+  }
+
+  // SIX path segments, one more than every sibling — the room-scoped action
+  // hangs off the linen-shortage resource rather than being a second verb on
+  // it. Pinned here because the backend's ville-guard matcher had to be widened
+  // for exactly this shape.
+  it('posts to the room-scoped resolve path with the branch', async () => {
+    const body = await resolveHkLinenShortage('hfhotel', 7)
+    const { url, init } = lastCall()
+    expect(url).toBe(`${HK_API_BASE}/rooms/7/linen-shortage/resolve?branch=hfhotel`)
+    expect(init.method).toBe('POST')
+    expect(body.resolved).toBe(2)
+  })
+
+  // Nothing to choose and nothing to stamp: the room in the path IS the
+  // request, and the resolver's identity is the verified Access assertion.
+  it('sends no body at all', async () => {
+    await resolveHkLinenShortage('hfhotel', 7)
+    expect(lastCall().init.body).toBeUndefined()
+  })
+
+  // Two maids tapping the same room seconds apart, or a retry after a dropped
+  // response. The second one is DONE, not broken.
+  it('treats resolved: 0 as a success', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(
+      jsonResponse(200, { success: true, roomId: 7, resolved: 0 })
+    )
+    await expect(resolveHkLinenShortage('hfhotel', 7)).resolves.toEqual({
+      success: true,
+      roomId: 7,
+      resolved: 0,
+    })
+  })
+
+  // Same rule as the report and the signals: a green banner over a write that
+  // never landed sends a maid away believing a room is stocked.
+  it('throws on a 200 that carries success: false', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(200, { success: false }))
+    await expect(resolveHkLinenShortage('hfhotel', 7)).rejects.toThrow(/บันทึกไม่สำเร็จ/)
+  })
+
+  it('throws on a non-2xx', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(500))
+    await expect(resolveHkLinenShortage('hfhotel', 7)).rejects.toThrow(/บันทึกไม่สำเร็จ/)
+  })
+
+  // A viewer's POST is refused server-side whatever the UI offered, and the
+  // refusal keeps the standing Thai message rather than a write-failure one.
+  it('surfaces a 403 as the standing permission message', async () => {
+    ;(global.fetch as jest.Mock).mockResolvedValue(jsonResponse(403))
+    await expect(resolveHkLinenShortage('hfhotel', 7)).rejects.toThrow(/ไม่มีสิทธิ์/)
+  })
+
+  it('refuses to fire at all without a branch', async () => {
+    await expect(resolveHkLinenShortage(null, 7)).rejects.toThrow()
+    expect(global.fetch).not.toHaveBeenCalled()
   })
 })
 

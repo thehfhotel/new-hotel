@@ -441,30 +441,49 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_status
     ON ht_hk_broken_reports (hkbr_status, hkbr_created_at DESC);
 
 -- ht_hk_linen_reports - Maid-reported linen shortages (ขาดผ้า) from the /hk
--- surface (migration 088). Append-only, one row per (submission, kind);
--- hklr_report_uuid groups the rows of ONE submission and is generated
--- server-side in service::housekeeping::report_linen_shortage.
--- RECORD-ONLY and PG-CANONICAL ONLY: iHOTEL has no linen counterpart at all, so
--- no sync mapper, no writeback, no domain event, no notification.
+-- surface (migration 088), COMPLETABLE since migration 090.
+-- Append-only, one row per (submission, kind); hklr_report_uuid groups the rows
+-- of ONE submission and is generated server-side in
+-- service::housekeeping::report_linen_shortage.
+-- A report is OPEN until a maid marks the room restocked (เติมผ้าแล้ว, migration
+-- 090). Completion is ROOM-LEVEL — one tap resolves every open row for that
+-- room — and hklr_resolved_at IS NULL is the status, so there is no separate
+-- status column to disagree with it. The room's ขาดผ้า indication means "has
+-- OPEN reports" of ANY age: completion supersedes day-rollover, the same
+-- visible-until-done convention as ht_hk_room_signals. Still append-only — a
+-- resolved row keeps everything it was filed with and only gains who/when.
+-- PG-CANONICAL ONLY: iHOTEL has no linen counterpart at all, so no sync mapper,
+-- no writeback, no domain event, no notification (the boards re-poll).
 -- hklr_kind is TEXT with NO CHECK on purpose — the kind allowlist lives in
--- routes::hk::VALID_LINEN_KINDS (pillowcase | duvet_cover | bath_towel |
--- face_towel | foot_towel), so adding a kind later needs no migration and no
--- window where the deployed binary and the deployed CHECK disagree. The qty
--- bound IS a data invariant and is enforced here as well as in the app.
--- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
--- ht_users. Per-site (connection-level scoping).
+-- routes::hk::VALID_LINEN_KINDS (bed_sheet | pillowcase | duvet_cover |
+-- bath_towel | face_towel | foot_towel), so adding a kind later needs no
+-- migration and no window where the deployed binary and the deployed CHECK
+-- disagree. The qty bound IS a data invariant and is enforced here as well as
+-- in the app.
+-- Identity = verified HF ID badge (Cloudflare Access claims) on BOTH sides —
+-- who reported and who restocked — with no FK to ht_users.
+-- Per-site (connection-level scoping).
 CREATE TABLE IF NOT EXISTS ht_hk_linen_reports (
-    hklr_id          BIGSERIAL    PRIMARY KEY,
-    hklr_report_uuid UUID         NOT NULL,
-    hklr_room_id     INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
-    hklr_kind        TEXT         NOT NULL,
-    hklr_qty         INTEGER      NOT NULL CHECK (hklr_qty >= 1 AND hklr_qty <= 20),
-    hklr_badge       TEXT         NOT NULL,
-    hklr_name        TEXT,
-    hklr_created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    hklr_id             BIGSERIAL    PRIMARY KEY,
+    hklr_report_uuid    UUID         NOT NULL,
+    hklr_room_id        INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    hklr_kind           TEXT         NOT NULL,
+    hklr_qty            INTEGER      NOT NULL CHECK (hklr_qty >= 1 AND hklr_qty <= 20),
+    hklr_badge          TEXT         NOT NULL,
+    hklr_name           TEXT,
+    hklr_created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    hklr_resolved_at    TIMESTAMPTZ,
+    hklr_resolved_badge TEXT,
+    hklr_resolved_name  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_room_created
     ON ht_hk_linen_reports (hklr_room_id, hklr_created_at DESC);
+-- The open-backlog hot path (list EXISTS, detail totals, the resolve UPDATE).
+-- PARTIAL, for ix_ht_hk_room_signals_live's reason: resolved rows are unbounded
+-- history that only the audit reads.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_open
+    ON ht_hk_linen_reports (hklr_room_id)
+    WHERE hklr_resolved_at IS NULL;
 
 -- ht_hk_room_signals - Canned room signals between reception and maids
 -- (ADR 0008, migration 089). One room per signal, broadcast to the other role
@@ -2768,6 +2787,18 @@ ON CONFLICT (version) DO NOTHING;
 -- drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('089', '089_create_ht_hk_room_signals.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 090 — make the linen-shortage report COMPLETABLE: the three
+-- hklr_resolved_* columns and the partial open-backlog index are inlined into
+-- the ht_hk_linen_reports block above. A report is OPEN until a maid marks the
+-- room restocked (เติมผ้าแล้ว, POST /api/hk/rooms/{id}/linen-shortage/resolve),
+-- completion is room-level, and the ขาดผ้า indication becomes "has OPEN
+-- reports" of any age rather than a day-scoped flag. Still PG-canonical only:
+-- no legacy counterpart, no sync, no writeback, no domain event. This seed row
+-- records the migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('090', '090_hk_linen_reports_resolution.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 086 — loyalty-app channel + membership link:

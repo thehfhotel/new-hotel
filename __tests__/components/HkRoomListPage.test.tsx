@@ -377,4 +377,145 @@ describe('ขาดผ้า tag', () => {
     expect(within(flagged).getByText('ขาดผ้า')).toBeInTheDocument()
     expect(within(plain).queryByText('ขาดผ้า')).not.toBeInTheDocument()
   })
+
+  // The chip now answers "is anything OPEN", not "was anything reported today"
+  // (owner request 2026-09-01). The day-scoped field survives only as the
+  // skew fallback for an older backend.
+  it('tags a room with an open shortage of any age', async () => {
+    await renderRooms([{ ...finishedRoom, linenShortageOpen: true }], '301')
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).getByText('ขาดผ้า')).toBeInTheDocument()
+  })
+
+  // Restocked this morning: reported today, but nothing is owed. The chip must
+  // clear, or เติมผ้าแล้ว would visibly do nothing.
+  it('drops the tag once an open shortage is resolved, even if it was reported today', async () => {
+    await renderRooms(
+      [{ ...finishedRoom, linenShortageOpen: false, linenShortageToday: true }],
+      '301'
+    )
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ขาดผ้า WORK QUEUE panel (owner request, 2026-09-01) — the one thing on this
+// screen that must be impossible to miss.
+//
+// A shortage now survives the day rollover, so a pale chip buried in one card
+// of a ~58-card two-column grid is no longer enough: the rooms that are still
+// short are lifted out into a panel at the top of the list, one tappable row
+// each, straight into the room screen where เติมผ้าแล้ว lives.
+//
+// The other half of these assertions is the skew half: with the new field
+// ABSENT the screen must look EXACTLY as it did before this feature — no
+// panel, chip unchanged — because an older backend has no resolve endpoint
+// behind the rows the panel would offer.
+// ---------------------------------------------------------------------------
+
+describe('ขาดผ้า work-queue panel', () => {
+  const openRoom = {
+    roomId: 5,
+    roomNo: '301',
+    floor: 3,
+    building: null,
+    roomClean: true,
+    cleaning: null,
+    linenShortageOpen: true,
+  }
+  const plainRoom = {
+    roomId: 6,
+    roomNo: '302',
+    floor: 3,
+    building: null,
+    roomClean: true,
+    cleaning: null,
+    linenShortageOpen: false,
+  }
+
+  /** The panel, or a failure that says it was not rendered. */
+  function panel() {
+    return screen.getByTestId('hk-linen-panel')
+  }
+
+  it('lists every room with an open shortage, and nothing else', async () => {
+    await renderRooms([openRoom, plainRoom, { ...openRoom, roomId: 1, roomNo: '104' }], '302')
+    expect(within(panel()).getByText('ขาดผ้า')).toBeInTheDocument()
+    expect(within(panel()).getByText('ห้อง 104')).toBeInTheDocument()
+    expect(within(panel()).getByText('ห้อง 301')).toBeInTheDocument()
+    expect(within(panel()).queryByText('ห้อง 302')).not.toBeInTheDocument()
+  })
+
+  it('counts the rooms in the heading', async () => {
+    await renderRooms([openRoom, plainRoom, { ...openRoom, roomId: 1, roomNo: '104' }], '302')
+    expect(within(panel()).getByText('2 ห้อง')).toBeInTheDocument()
+  })
+
+  // The row IS the way to the completion button — a panel that only announced
+  // the problem would leave the maid to find the room in the grid herself.
+  it('links each row to that room’s screen', async () => {
+    await renderRooms([openRoom, { ...openRoom, roomId: 1, roomNo: '104' }], '301')
+    const links = within(panel()).getAllByRole('link')
+    expect(links.map((a) => a.getAttribute('href'))).toEqual([
+      '/hk/rooms/1',
+      '/hk/rooms/5',
+    ])
+  })
+
+  // Walking order, not server order.
+  it('orders the rows by room number', async () => {
+    await renderRooms(
+      [
+        { ...openRoom, roomId: 3, roomNo: '301' },
+        { ...openRoom, roomId: 1, roomNo: '104' },
+        { ...openRoom, roomId: 2, roomNo: '95' },
+      ],
+      '301'
+    )
+    expect(
+      within(panel())
+        .getAllByRole('link')
+        .map((a) => a.textContent?.trim())
+    ).toEqual(['ห้อง 95', 'ห้อง 104', 'ห้อง 301'])
+  })
+
+  // Above the floor groups: the queue is the first thing after the header, not
+  // something to scroll for.
+  it('renders above the floor groups', async () => {
+    await renderRooms([openRoom], '301')
+    const floorHeading = screen.getByText('ชั้น 3')
+    expect(
+      panel().compareDocumentPosition(floorHeading) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
+  it('renders no panel when nothing is open', async () => {
+    await renderRooms([plainRoom], '302')
+    expect(screen.queryByTestId('hk-linen-panel')).not.toBeInTheDocument()
+  })
+
+  // DEPLOY SKEW — the assertion that protects everyone mid-rollout. An older
+  // backend sends only the day-scoped field: chip yes, queue no, because there
+  // is no endpoint behind the row it would offer.
+  it('renders no panel when the backend sends only the day-scoped flag', async () => {
+    await renderRooms([{ ...openRoom, linenShortageOpen: undefined, linenShortageToday: true }], '301')
+    expect(screen.queryByTestId('hk-linen-panel')).not.toBeInTheDocument()
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).getByText('ขาดผ้า')).toBeInTheDocument()
+  })
+
+  it('renders no panel when the backend omits both fields entirely', async () => {
+    await renderRooms([{ ...openRoom, linenShortageOpen: undefined }], '301')
+    expect(screen.queryByTestId('hk-linen-panel')).not.toBeInTheDocument()
+  })
+
+  // The panel is a lift, not a move: the room keeps its chip in the grid, so a
+  // maid scanning by floor still sees which of her rooms is short.
+  it('keeps the per-room chip in the grid alongside the panel', async () => {
+    await renderRooms([openRoom], '301')
+    const card = screen.getByText('301').closest('li') as HTMLElement
+    expect(within(card).getByText('ขาดผ้า')).toBeInTheDocument()
+    expect(within(panel()).getByText('ห้อง 301')).toBeInTheDocument()
+  })
 })

@@ -20,7 +20,17 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
-import { AlertCircle, Info, Loader2, RefreshCw, Sparkles, Volume2, VolumeX } from 'lucide-react'
+import {
+  AlertCircle,
+  ChevronRight,
+  Info,
+  Loader2,
+  RefreshCw,
+  Shirt,
+  Sparkles,
+  Volume2,
+  VolumeX,
+} from 'lucide-react'
 import {
   canReport,
   countRoomsNeedingClean,
@@ -34,6 +44,8 @@ import {
   mergeSignal,
   movementTags,
   occupancyIndicator,
+  openLinenCountLabel,
+  openLinenRooms,
   progressLabel,
   readSignalSoundMuted,
   readStoredBranch,
@@ -233,6 +245,11 @@ export default function HkRoomListPage() {
   // One pass for the whole grid rather than a scan per card — ~58 cards on a
   // phone, re-rendered on every stream event.
   const signalCounts = signalCountsByRoom(signals)
+  // The ขาดผ้า queue: every room with an OPEN shortage, whatever day it was
+  // filed on. Strict on `linenShortageOpen` (see `openLinenRooms`), so an older
+  // backend renders no panel at all rather than a queue of rows whose
+  // completion button has no endpoint behind it.
+  const openLinen = openLinenRooms(rooms)
 
   // The EMPTY case (§C): location enforcement resolved this maid to no branch
   // at all. Blocks like the picker does, but offers nothing to tap — there is
@@ -317,6 +334,60 @@ export default function HkRoomListPage() {
               <Info className="mt-0.5 h-5 w-5 shrink-0" />
               <span>{legacyStatusNote(legacyStale)}</span>
             </div>
+          )}
+
+          {/* ------------------------------------------------------------- *
+           * ขาดผ้า WORK QUEUE. The owner's ask (2026-09-01) in one panel: an
+           * open linen shortage must be impossible to miss and possible to
+           * FINISH. The per-room chip further down is still there, but a pale
+           * chip inside one card of a two-column grid of ~58 near-identical
+           * cards is exactly the thing an eye skims past — and a shortage now
+           * survives the day rollover, so skimming past it means a room stays
+           * short for days.
+           *
+           * So it is lifted OUT of the grid to the top of the list, above the
+           * floor groups and below the header: a heading, the number of rooms,
+           * and one 44px tappable row per room straight into that room's
+           * screen, where เติมผ้าแล้ว lives. Sky-toned like every other ขาดผ้า
+           * surface (same subject, one colour), but bordered and filled rather
+           * than a chip outline — this is the maid's work queue, not a badge.
+           *
+           * Rendered for BOTH roles: a reception viewer cannot resolve a
+           * shortage, but "which rooms are still short" is precisely the fact
+           * she opens this screen for.
+           * ------------------------------------------------------------- */}
+          {openLinen.length > 0 && (
+            <section
+              data-testid="hk-linen-panel"
+              className="mb-4 rounded-xl border-2 border-sky-400 bg-sky-50 p-3"
+            >
+              <h2 className="mb-2 flex items-center gap-1.5 text-base font-bold text-sky-900">
+                <Shirt className="h-5 w-5 shrink-0" />
+                <span>ขาดผ้า</span>
+                <span className="ml-auto rounded-full border border-sky-300 bg-white px-2 py-0.5 text-xs font-semibold text-sky-800">
+                  {openLinenCountLabel(openLinen.length)}
+                </span>
+              </h2>
+              <ul className="space-y-2">
+                {openLinen.map((room) => (
+                  <li key={room.roomId}>
+                    <Link
+                      href={`/hk/rooms/${room.roomId}`}
+                      className="flex min-h-[44px] items-center justify-between gap-2 rounded-lg border border-sky-300 bg-white px-3 py-2 active:bg-sky-100"
+                    >
+                      {/* "ห้อง 301", not a bare "301": this row sits far from
+                          the grid card that carries the same number, and the
+                          word is what makes it read as a room rather than a
+                          quantity. */}
+                      <span className="text-base font-semibold text-gray-900">
+                        ห้อง {room.roomNo}
+                      </span>
+                      <ChevronRight className="h-5 w-5 shrink-0 text-sky-700" />
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
 
           {/* Progress summary + refresh */}
@@ -417,12 +488,17 @@ export default function HkRoomListPage() {
                               roomClean). Secondary: today's maid-reported
                               progress — dirty + ยังไม่เริ่ม is the ordinary
                               morning state, both chips stay visible together.
-                              Third, when there is one: ขาดผ้า. It lives in the
+                              Third, when there is one: ขาดผ้า — an OPEN linen
+                              shortage of any age, cleared by เติมผ้าแล้ว and
+                              no longer by the day rolling over. It lives in the
                               CHIP row, which every room always renders, rather
                               than in the conditional tag row above — so it
                               shows next to EVERY cleaning state, and above all
                               next to เสร็จแล้ว: a finished room still short of
-                              linen must not read as finished-and-forgotten. */}
+                              linen must not read as finished-and-forgotten.
+                              The queue panel at the top of the list is the
+                              same fact lifted out of the grid; this chip is
+                              what keeps it visible while scanning by floor. */}
                           <div className="mt-2 flex flex-wrap items-center gap-1">
                             <span
                               className={`inline-block rounded-full border px-2 py-0.5 text-xs ${cleanChip.className}`}

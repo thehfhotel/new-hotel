@@ -287,6 +287,39 @@ pub struct LinenShortageReport {
     pub reported: usize,
 }
 
+/// Command for [`HousekeepingService::resolve_linen_shortages`] — one maid's
+/// เติมผ้าแล้ว on `POST /api/hk/rooms/{id}/linen-shortage/resolve` (migration
+/// 090).
+///
+/// ROOM-scoped, and there is deliberately nothing narrower to address: a maid
+/// restocks a room in one trip, so the command carries no `kind`, no
+/// `report_uuid` and no row id. Adding one later would not be a refinement — it
+/// would be a different product decision (per-kind taps), which the owner
+/// request explicitly rejected as busywork.
+#[derive(Debug, Clone)]
+pub struct ResolveLinenShortageCommand {
+    pub room_id: i32,
+    /// Verified HF ID badge of the maid who restocked — ALWAYS present (the
+    /// Access middleware 401s without one). Stamped into `hklr_resolved_badge`.
+    pub badge: String,
+    /// Display-name snapshot for `hklr_resolved_name`.
+    pub name: Option<String>,
+    // Deliberately NO `source: EventSource`, for exactly
+    // `ReportLinenShortageCommand`'s reason: this command publishes no domain
+    // event and enqueues no writeback.
+}
+
+/// Outcome of [`HousekeepingService::resolve_linen_shortages`].
+#[derive(Debug, Clone)]
+pub struct LinenShortageResolution {
+    pub room_id: i32,
+    /// How many previously-open rows this call closed. **`0` is a SUCCESS**,
+    /// not a miss: it means the room had no open shortage, which is the state
+    /// the caller asked for. A second tap, or two maids tapping at once, lands
+    /// here.
+    pub resolved: usize,
+}
+
 /// Outcome of [`HousekeepingService::report_cleaning_progress`].
 #[derive(Debug, Clone)]
 pub struct CleaningReport {
@@ -935,6 +968,75 @@ impl HousekeepingService {
             reported,
         })
     }
+
+    /// Mark a room RESTOCKED (เติมผ้าแล้ว) — migration 090,
+    /// `POST /api/hk/rooms/{id}/linen-shortage/resolve`.
+    ///
+    /// ## Room-level by decision
+    ///
+    /// ONE call closes EVERY open row for the room, whatever kind and whatever
+    /// day it was filed. That is the domain fact: a maid carries the linen up
+    /// once and restocks what is missing, so "which kinds did you actually
+    /// bring" is a question the work does not ask. Per-kind completion was
+    /// considered and rejected as busywork (owner request 2026-09-01).
+    ///
+    /// ## Append-only, still
+    ///
+    /// Nothing is deleted and no reported value is rewritten. A resolved row
+    /// keeps its `hklr_kind` / `hklr_qty` / `hklr_badge` / `hklr_created_at`
+    /// exactly as filed and GAINS `hklr_resolved_at` + the resolver's identity,
+    /// so grouping by kind still recovers consumption over any window — the
+    /// reason the table exists.
+    ///
+    /// ## Idempotent by construction
+    ///
+    /// The `WHERE hklr_resolved_at IS NULL` predicate is both the selection and
+    /// the guard: a second tap matches nothing and returns `resolved: 0`, which
+    /// is a SUCCESS. Two maids tapping concurrently cannot double-stamp either
+    /// — the loser's UPDATE re-reads under READ COMMITTED and finds the rows
+    /// already resolved. No ledger and no idempotency key are needed, because
+    /// nothing crosses to legacy and there is no double-write to prevent.
+    ///
+    /// ## Deliberately silent
+    ///
+    /// NO [`WritebackIntent`], NO [`DomainEvent`], no notification — the same
+    /// terminal position [`Self::report_linen_shortage`] documents, and for the
+    /// same reason (iHOTEL has no linen-inventory counterpart). Note this is
+    /// NOT what ADR 0008's room signals do: their `*Completed` events are the
+    /// SSE plumbing behind two live boards. Linen is record-domain, so the
+    /// maid's page and reception's follow-up view pick the change up on their
+    /// next poll/reload; adding an event here would be a design change, not a
+    /// fill-in-the-blank.
+    ///
+    /// The room's existence is the ROUTE's 404 (`require_room`), exactly as on
+    /// the reporting side. An unknown room simply has no open rows, so this
+    /// method answers `resolved: 0` rather than inventing a second gate.
+    pub async fn resolve_linen_shortages(
+        &self,
+        cmd: ResolveLinenShortageCommand,
+    ) -> ServiceResult<LinenShortageResolution> {
+        if cmd.badge.trim().is_empty() {
+            return Err(ServiceError::validation(
+                "resolve_linen_shortages requires a non-empty verified badge",
+            ));
+        }
+
+        let mut tx = self.pg.begin().await?;
+        let resolved =
+            resolve_open_linen_report_rows(&mut tx, cmd.room_id, &cmd.badge, cmd.name.as_deref())
+                .await?;
+
+        // No enqueue, no publish — see the doc comment. The handles are held
+        // for symmetry with the other methods on this service.
+        let _ = (&self.repo, &self.outbox, &self.events);
+
+        tx.commit().await?;
+
+        Ok(LinenShortageResolution {
+            room_id: cmd.room_id,
+            resolved,
+        })
+    }
 }
 
 /// Set `ht_rooms_new.room_clean` directly via dynamic SQL.
@@ -1068,6 +1170,42 @@ async fn insert_linen_report_rows(
     .bind(name)
     .bind(&kinds)
     .bind(&quantities)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+/// Close every OPEN linen-shortage row for one room — migration 090.
+///
+/// ONE `UPDATE`, so "all of this room's open rows, atomically" is a property of
+/// the statement rather than of remembering to keep a loop inside the
+/// transaction — the same argument as [`insert_linen_report_rows`]'s `UNNEST`.
+///
+/// `hklr_resolved_at IS NULL` in the `WHERE` is what makes a repeat tap a
+/// no-op: an already-resolved row is not re-stamped, so the FIRST maid to
+/// restock stays the recorded one and her timestamp is not silently rewritten
+/// by a second tap. There is deliberately no day predicate — a shortage is open
+/// until it is done, whatever the day.
+///
+/// Runtime `sqlx::query` (not the `query!` macro), matching every other
+/// statement in this module, so no `.sqlx/` regeneration is involved.
+async fn resolve_open_linen_report_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+    badge: &str,
+    name: Option<&str>,
+) -> ServiceResult<usize> {
+    let result = sqlx::query(
+        "UPDATE ht_hk_linen_reports \
+            SET hklr_resolved_at = NOW(), \
+                hklr_resolved_badge = $2, \
+                hklr_resolved_name = $3 \
+          WHERE hklr_room_id = $1 AND hklr_resolved_at IS NULL",
+    )
+    .bind(room_id)
+    .bind(badge)
+    .bind(name)
     .execute(&mut **tx)
     .await?;
 

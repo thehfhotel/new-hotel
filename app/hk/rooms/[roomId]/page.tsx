@@ -21,10 +21,11 @@
 // VIEWER MODE. `/hk` now admits two grants: `housekeeping` (a maid — full
 // access) and `reception` (read-only). `canReport` from the same `/me` call
 // gates the whole ACTION surface below — the progress buttons, the mark-dirty
-// block and แจ้งขาดผ้า — while every informational part of the screen (chips,
-// today's linen totals, the event list, the stale notice) stays exactly as a
-// maid sees it: reception's reason for opening this screen is to READ it. The
-// hiding is UX only; the server refuses a viewer's POST with 403 regardless.
+// block, แจ้งขาดผ้า and เติมผ้าแล้ว — while every informational part of the
+// screen (chips, the ขาดผ้าค้างอยู่ card and its kinds, today's linen totals,
+// the event list, the stale notice) stays exactly as a maid sees it:
+// reception's reason for opening this screen is to READ it. The hiding is UX
+// only; the server refuses a viewer's POST with 403 regardless.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
@@ -60,6 +61,8 @@ import {
   LINEN_KINDS,
   LINEN_MAX_QTY,
   LINEN_MIN_QTY,
+  LINEN_OPEN_CARD_TITLE,
+  linenResolveConfirmMessage,
   linenShortageItems,
   linenShortageSummary,
   linenShortageTag,
@@ -68,8 +71,10 @@ import {
   mergeSignals,
   movementTags,
   occupancyIndicator,
+  openLinenRows,
   progressLabel,
   readStoredBranch,
+  resolveHkLinenShortage,
   resolveInitialBranch,
   roomCleanChip,
   ROOM_CHECK_PROBLEMS,
@@ -132,6 +137,15 @@ export default function HkRoomPage() {
   const [linenOpen, setLinenOpen] = useState(false)
   const [linenCounts, setLinenCounts] = useState<LinenCounts>(emptyLinenCounts)
   const [linenPosting, setLinenPosting] = useState(false)
+
+  // เติมผ้าแล้ว (resolve every open shortage for this room). Two-step, the same
+  // in-place idiom as แจ้งห้องไม่สะอาด and for a comparable reason: one tap
+  // clears this room's ขาดผ้า flag for EVERYONE — the list's queue panel and
+  // reception's viewer included — and there is no un-resolve on this phone.
+  // Unlike แจ้งขาดผ้า, which asks a question the panel exists to answer, this
+  // one has nothing to fill in, so the second step IS the confirm.
+  const [confirmingLinenResolve, setConfirmingLinenResolve] = useState(false)
+  const [linenResolving, setLinenResolving] = useState(false)
 
   // Room signals (ADR 0008). The branch's whole live list is held — that is
   // what both `/signals` and the SSE stream deliver — and `signalsForRoom`
@@ -223,7 +237,11 @@ export default function HkRoomPage() {
   const refreshDetail = useCallback(() => load(true), [load])
   useHkAutoRefresh(
     refreshDetail,
-    Boolean(branch) && posting === null && !linenPosting && signalBusy === null
+    Boolean(branch) &&
+      posting === null &&
+      !linenPosting &&
+      !linenResolving &&
+      signalBusy === null
   )
 
   // --- room signals (ADR 0008) ---------------------------------------------
@@ -455,6 +473,42 @@ export default function HkRoomPage() {
     }
   }
 
+  /**
+   * เติมผ้าแล้ว — closes EVERY open shortage row for this room in one call
+   * (room-level by design: a maid restocks a room in one trip). Mirrors
+   * `reportLinenShortage` exactly — the same viewer guard, the same
+   * success-only banner, the same `load()` behind it — because the two are
+   * halves of one loop and a maid should not be able to tell them apart by
+   * how they behave.
+   */
+  const resolveLinen = async () => {
+    if (!branch) return
+    // Same guard as the two report paths: a viewer has no button to reach this
+    // with, and a caller bug must become nothing at all rather than a request
+    // the server has to refuse.
+    if (!canReportFlag) return
+    setLinenResolving(true)
+    setNotice(null)
+    try {
+      // A `resolved: 0` answer is a SUCCESS, not a no-op to complain about:
+      // another maid may have restocked the room thirty seconds ago, and the
+      // right outcome for this tap is still "the room is stocked".
+      await resolveHkLinenShortage(branch, roomId)
+      setError(null)
+      setNotice('บันทึกแล้ว: เติมผ้าแล้ว')
+      // The card, the header chip and the list's queue row all hang off the
+      // same re-read the report path uses.
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setLinenResolving(false)
+      // Collapse only once the request has SETTLED, so ยืนยัน can carry the
+      // spinner and a failure never leaves a re-armed one-tap button behind.
+      setConfirmingLinenResolve(false)
+    }
+  }
+
   // No valid branch stored — never guess one here. Send the maid back to the
   // room list, which is the only screen that may pick a branch.
   if (branchChecked && !branch) {
@@ -489,10 +543,16 @@ export default function HkRoomPage() {
   // Today's totals behind that tag ("วันนี้แจ้งขาดผ้า: ปลอกหมอน 2, …"), or
   // null when nothing was reported today / the backend sends no totals.
   const linenSummary = linenShortageSummary(detail?.linenShortages)
+  // What is STILL owed to this room, whatever day it was asked for — the task
+  // card's rows. `[]` for an empty list AND for a backend that does not send
+  // the field, which is what keeps the old totals line rendering under a
+  // rolled-back backend instead of a card whose button has no endpoint.
+  const openLinen = openLinenRows(detail?.linenShortagesOpen)
   // ONE in-flight report at a time, whichever kind it is: two reports on one
   // room from one thumb is never what she meant, and the auto-refresh gate
-  // above already treats both the same way.
-  const busy = posting !== null || linenPosting
+  // above already treats them the same way. เติมผ้าแล้ว joins the same lock —
+  // resolving a room while reporting more shortage on it is a race with itself.
+  const busy = posting !== null || linenPosting || linenResolving
   // What ส่งแจ้ง would send right now — also the answer to "is anything
   // selected", so the button and the request can never disagree.
   const linenItems = linenShortageItems(linenCounts)
@@ -573,10 +633,12 @@ export default function HkRoomPage() {
                 >
                   {badge.label}
                 </span>
-                {/* Third chip, when today carries a linen report — same chip,
-                    same words, same row position as the room list, so the two
-                    screens can never disagree about this room. Rendered beside
-                    EVERY cleaning state, เสร็จแล้ว included. */}
+                {/* Third chip, when this room has an OPEN linen shortage —
+                    same chip, same words, same row position as the room list,
+                    so the two screens can never disagree about this room. It
+                    now clears on เติมผ้าแล้ว rather than on the day rolling
+                    over, and is rendered beside EVERY cleaning state,
+                    เสร็จแล้ว included. */}
                 {linenTag && (
                   <span
                     className={`inline-block rounded-full border px-2.5 py-1 text-xs ${linenTag.className}`}
@@ -1007,16 +1069,99 @@ export default function HkRoomPage() {
               </>
             )}
 
-            {/* What has ALREADY been reported for this room today — the detail
-                behind the ขาดผ้า chip in the header, in the same muted register
-                as the cleaning-event list below. For a maid it sits directly
-                under the button that files a report, so she can see before she
-                counts anything that the morning shift already asked for two
-                pillowcases; for a viewer it is one of the facts she opened the
-                screen to read. Rendered for BOTH, only when there is something
-                to say. */}
-            {linenSummary && (
-              <p className="mt-2 text-xs text-gray-500">{linenSummary}</p>
+            {/* ------------------------------------------------------------ *
+             * ขาดผ้าค้างอยู่ — what this room is STILL short of, and the one
+             * control that finishes it.
+             *
+             * This replaced a one-line grey summary, and the promotion is the
+             * point (owner request, 2026-09-01): an open shortage now survives
+             * the day rollover, so it is outstanding WORK rather than a note
+             * about today, and a line of 12px grey text under a button is not
+             * how work gets seen. Same sky palette as everything else ขาดผ้า —
+             * one subject, one colour — but a bordered filled card, matching
+             * the queue panel on the list this room was tapped from.
+             *
+             * Rendered for BOTH roles; only the button is a maid's. A viewer
+             * reading "ปลอกหมอน 2 ค้างอยู่" is exactly why reception holds
+             * this screen, and a greyed-out button she can never use would
+             * read as breakage.
+             *
+             * When there is nothing open — or the backend is older and cannot
+             * answer the question — the original day-scoped totals line renders
+             * unchanged in its place. Today's record is still worth showing to
+             * a maid about to count the same pillowcases twice.
+             * ------------------------------------------------------------ */}
+            {openLinen.length > 0 ? (
+              <div
+                data-testid="hk-linen-open-card"
+                className="mt-3 rounded-xl border-2 border-sky-400 bg-sky-50 p-3"
+              >
+                <p className="mb-2 flex items-center gap-1.5 text-sm font-bold text-sky-900">
+                  <Shirt className="h-4 w-4 shrink-0" />
+                  <span>{LINEN_OPEN_CARD_TITLE}</span>
+                </p>
+                <ul className="space-y-1">
+                  {openLinen.map(({ kind, label, qty }) => (
+                    <li
+                      key={kind}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-sky-200 bg-white px-3 py-2"
+                    >
+                      <span className="text-sm font-medium text-gray-800">{label}</span>
+                      <span className="text-base font-semibold tabular-nums text-sky-900">
+                        {qty}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+
+                {canReportFlag &&
+                  (confirmingLinenResolve ? (
+                    /* Step 2 — in place of the button, never over it, and with
+                       ยกเลิก first and calmer so the reflex tap is the one that
+                       changes nothing. Same shape as the mark-dirty confirm. */
+                    <div className="mt-3 rounded-xl border border-sky-300 bg-white p-3">
+                      <p className="mb-3 flex items-start gap-1.5 text-sm font-semibold text-sky-900">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span>{linenResolveConfirmMessage(room.roomNo)}</span>
+                      </p>
+                      <div className="grid grid-cols-2 gap-3">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingLinenResolve(false)}
+                          disabled={busy}
+                          className="rounded-lg border border-gray-300 bg-white px-3 py-3 text-sm font-semibold text-gray-700 active:bg-gray-100 disabled:opacity-50"
+                        >
+                          ยกเลิก
+                        </button>
+                        <button
+                          type="button"
+                          onClick={resolveLinen}
+                          disabled={busy}
+                          className="flex items-center justify-center rounded-lg border border-sky-500 bg-sky-600 px-3 py-3 text-sm font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+                        >
+                          {linenResolving ? (
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                          ) : (
+                            'ยืนยัน'
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Step 1 — arms the confirm. Fires NO request. */
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingLinenResolve(true)}
+                      disabled={busy}
+                      className="mt-3 flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-lg border border-sky-500 bg-sky-600 px-3 py-3 text-sm font-semibold text-white active:bg-sky-700 disabled:opacity-50"
+                    >
+                      <Check className="h-4 w-4" />
+                      เติมผ้าแล้ว
+                    </button>
+                  ))}
+              </div>
+            ) : (
+              linenSummary && <p className="mt-2 text-xs text-gray-500">{linenSummary}</p>
             )}
 
             {detail && detail.events.length > 0 && (

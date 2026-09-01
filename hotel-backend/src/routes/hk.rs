@@ -8,21 +8,34 @@
 //! - `GET  /api/hk/rooms/{id}`                  — one room + today's events.
 //! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`/`dirty`).
 //! - `POST /api/hk/rooms/{id}/linen-shortage`   — report a linen shortage (ขาดผ้า).
+//! - `POST /api/hk/rooms/{id}/linen-shortage/resolve` — mark the room restocked (เติมผ้าแล้ว).
 //! - `POST /api/hk/rooms/{id}/broken-items`     — RETIRED, answers `410 Gone`.
 //! - `GET  /api/hk/broken-items/{id}/photo`     — stream a report's photo.
 //!
-//! `linen-shortage` (migration 088) is the RECORD-ONLY one: it writes
-//! `ht_hk_linen_reports` rows and returns. No notification, no domain event, no
-//! outbox row, no legacy writeback — iHOTEL has no linen counterpart, so there
-//! is nothing to mirror and no dark flag waiting to enable one. It shares every
-//! gate with the cleaning route (required `?branch=`, the location gate, the
-//! Ville-guard exemption) so the two maid mutations behave identically.
+//! The two `linen-shortage` routes (migrations 088 + 090) are the LEGACY-INERT
+//! pair: they write `ht_hk_linen_reports` rows and return. No notification, no
+//! domain event, no outbox row, no legacy writeback — iHOTEL has no linen
+//! counterpart, so there is nothing to mirror and no dark flag waiting to
+//! enable one. They share every gate with the cleaning route (required
+//! `?branch=`, the location gate, the Ville-guard exemption) so the maid
+//! mutations behave identically.
 //!
-//! Those rows ARE read back on this surface — canonically, still with no legacy
-//! coupling: every room carries `linenShortageToday` (any report filed for it
-//! today), and the detail card additionally carries `linenShortages`, today's
-//! reports for that room summed per kind. Both are scoped by the SAME Bangkok
-//! civil day as today's cleaning events ([`TODAY_BKK_LINEN`]).
+//! ### Open vs today (migration 090)
+//!
+//! A linen-shortage report is **OPEN until a maid marks the room restocked**,
+//! and completion is ROOM-LEVEL: one `…/resolve` closes every open row for the
+//! room, whatever kind and whatever day. So the ขาดผ้า indication now means
+//! "this room has OPEN reports" of ANY age — completion SUPERSEDES the old day
+//! rollover, matching the visible-until-done convention ADR 0008's room signals
+//! already follow. `linenShortageOpen` (list + detail) and `linenShortagesOpen`
+//! (detail, summed per kind) are those fields.
+//!
+//! The day-scoped [`HkRoom::linen_shortage_today`] and
+//! [`RoomDetailResponse::linen_shortages`] are **PRESERVED with their exact 088
+//! meaning and DEPRECATED**, purely so a cached bundle keeps rendering while
+//! the new one rolls out. New clients must badge from the OPEN fields; a room
+//! restocked at 09:00 is not ขาดผ้า at 09:01, and a room short since yesterday
+//! still is.
 //!
 //! ## `?branch=` is REQUIRED on every room endpoint (wave-4 A)
 //!
@@ -136,7 +149,7 @@
 //! |---|---|---|
 //! | `GET /api/hk/me` | `canReport: true` | `canReport: false`, `markDirtyEnabled: false` |
 //! | `GET /api/hk/rooms`, `/rooms/{id}`, `/broken-items/{id}/photo` | ✅ | ✅ |
-//! | `POST …/cleaning`, `POST …/linen-shortage` | ✅ | **403** [`REPORT_NOT_PERMITTED_ERROR`] |
+//! | `POST …/cleaning`, `POST …/linen-shortage`, `POST …/linen-shortage/resolve` | ✅ | **403** [`REPORT_NOT_PERMITTED_ERROR`] |
 //!
 //! [`require_report_capability`] is the enforcement and it runs FIRST in both
 //! mutations. `canReport` in `/api/hk/me` is UX only: it lets the client hide
@@ -353,7 +366,8 @@ use crate::service::hk_signals::{
 };
 use crate::service::housekeeping::{
     CleaningProgressStatus, HousekeepingService, LegacyCleanliness, LinenShortageItem,
-    ReportCleaningCommand, ReportLinenShortageCommand, MAX_LINEN_QTY, MIN_LINEN_QTY,
+    ReportCleaningCommand, ReportLinenShortageCommand, ResolveLinenShortageCommand, MAX_LINEN_QTY,
+    MIN_LINEN_QTY,
 };
 
 /// Cleaning-progress statuses a maid can report. `started` =
@@ -1042,6 +1056,15 @@ pub fn routes_inside_access(state: AppState, policy: HkPolicy) -> Router {
             "/api/hk/rooms/{room_id}/linen-shortage",
             post(report_linen_shortage),
         )
+        // เติมผ้าแล้ว (migration 090). A SUB-path of the report route on
+        // purpose: completing a shortage is the same object's other half, not a
+        // new noun. It is the only SIX-segment write on this surface, which is
+        // why `middleware::ville_guard`'s matcher had to gain one optional
+        // trailing segment (matched against a closed pair list, never a prefix).
+        .route(
+            "/api/hk/rooms/{room_id}/linen-shortage/resolve",
+            post(resolve_linen_shortage),
+        )
         .route(
             "/api/hk/rooms/{room_id}/broken-items",
             post(report_broken_item),
@@ -1232,18 +1255,38 @@ pub struct HkRoom {
     pub expected_departure: bool,
     /// Today's latest maid-reported progress; `None` = nothing reported yet.
     pub cleaning: Option<CleaningProgress>,
+    /// **DEPRECATED (migration 090) — use [`Self::linen_shortage_open`].**
+    ///
     /// At least one `ht_hk_linen_reports` row was filed for this room TODAY
-    /// (Bangkok civil day, [`TODAY_BKK_LINEN`]) — migration 088.
+    /// (Bangkok civil day, [`TODAY_BKK_LINEN`]) — migration 088, and this field
+    /// keeps that EXACT meaning: it still ignores whether the shortage was
+    /// resolved, and it still dies at Bangkok midnight.
+    ///
+    /// Preserved only so a cached bundle built before 090 keeps rendering
+    /// something sensible during the rollout. It is the WRONG badge now: a room
+    /// restocked at 09:00 still reads `true` all day, and a room short since
+    /// yesterday reads `false`. Remove it once no deployed client reads it.
+    ///
+    /// Canonical-side fact exactly like [`Self::expected_arrival`]: it never
+    /// consults iHOTEL (which has no linen counterpart at all), so it is NOT
+    /// covered by `legacy_status_stale`.
+    pub linen_shortage_today: bool,
+    /// This room has at least one OPEN linen-shortage report — any age,
+    /// `hklr_resolved_at IS NULL` (migration 090). **This is the ขาดผ้า badge.**
     ///
     /// A FLAG, not a count: the list only needs to badge the card, and the
     /// per-kind totals live on the detail card
-    /// ([`RoomDetailResponse::linen_shortages`]).
+    /// ([`RoomDetailResponse::linen_shortages_open`]).
     ///
-    /// Dies at Bangkok midnight — pure per-fetch derivation, no stored state,
-    /// nothing to clear. Canonical-side fact exactly like
-    /// [`Self::expected_arrival`]: it never consults iHOTEL (which has no linen
-    /// counterpart at all), so it is NOT covered by `legacy_status_stale`.
-    pub linen_shortage_today: bool,
+    /// Cleared by a maid's เติมผ้าแล้ว ([`resolve_linen_shortage`]) and by
+    /// nothing else — NOT by midnight, which is the whole correction 090 makes:
+    /// a shortage is visible until it is done, whatever the day (the same
+    /// convention ADR 0008's room signals follow). Still a pure per-fetch
+    /// derivation with no stored flag to keep in step.
+    ///
+    /// Canonical-side fact, NOT covered by `legacy_status_stale`, for
+    /// [`Self::linen_shortage_today`]'s reason.
+    pub linen_shortage_open: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1291,17 +1334,36 @@ pub struct RoomDetailResponse {
     pub room: HkRoom,
     /// Today's cleaning events, recent first.
     pub events: Vec<CleaningEvent>,
-    /// Today's linen shortages for this room, summed per kind — migration 088.
+    /// **DEPRECATED (migration 090) — use [`Self::linen_shortages_open`].**
+    ///
+    /// Today's linen shortages for this room, summed per kind — migration 088,
+    /// with its EXACT original meaning: the Bangkok civil day, resolved rows
+    /// included. Preserved only for bundle skew during the rollout, exactly as
+    /// [`HkRoom::linen_shortage_today`] is.
     ///
     /// One entry per kind actually reported (never a zero row), ordered by
-    /// [`VALID_LINEN_KINDS`]; `[]` when nothing was reported today. The
-    /// list's [`HkRoom::linen_shortage_today`] is exactly `!is_empty()` of this
-    /// — same table, same Thai day, so the badge and the breakdown can never
-    /// disagree.
+    /// [`VALID_LINEN_KINDS`]; `[]` when nothing was reported today. The list's
+    /// [`HkRoom::linen_shortage_today`] is exactly `!is_empty()` of this — same
+    /// table, same Thai day, so the old badge and the old breakdown can never
+    /// disagree with each other.
     ///
     /// ADDITIVE and always serialized, so a client branches on the VALUE, not
     /// on whether the key exists.
     pub linen_shortages: Vec<LinenShortageTotal>,
+    /// This room's OPEN linen shortages, summed per kind — migration 090.
+    /// **This is the breakdown behind the ขาดผ้า badge.**
+    ///
+    /// Same shape and same ordering rule as [`Self::linen_shortages`]
+    /// (`[{"kind","qty"}]` in [`VALID_LINEN_KINDS`] order, `[]` when none, wire
+    /// codes only), scoped by `hklr_resolved_at IS NULL` instead of by the
+    /// Thai day — so it spans however long the shortage has been standing, and
+    /// a maid's เติมผ้าแล้ว empties it in one tap.
+    ///
+    /// [`HkRoom::linen_shortage_open`] is exactly `!is_empty()` of this: same
+    /// table, same predicate, so the badge and the breakdown cannot disagree.
+    ///
+    /// ADDITIVE and always serialized, same rule as every field above.
+    pub linen_shortages_open: Vec<LinenShortageTotal>,
     /// Same meaning as [`RoomsResponse::legacy_status_stale`]. Carried here
     /// too so the two screens can never tell the maid different stories about
     /// the same room.
@@ -1392,6 +1454,23 @@ pub struct ReportLinenShortageResponse {
     /// Deliberately not a total of the quantities: it answers "did all my lines
     /// land", which is what a client that just POSTed a list needs to know.
     pub reported: usize,
+}
+
+/// Response for `POST /api/hk/rooms/{id}/linen-shortage/resolve` — migration
+/// 090. There is no request body to document: the command is "this room is
+/// restocked", which the path already says in full.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveLinenShortageResponse {
+    pub success: bool,
+    pub room_id: i32,
+    /// How many previously-OPEN rows this tap closed, across every kind.
+    ///
+    /// **`0` is a SUCCESS, not a miss.** The room has no open shortage, which
+    /// is the state the maid asked for — a double tap, or a second maid
+    /// arriving behind the first, lands here. A client must render this as
+    /// done, never as an error.
+    pub resolved: usize,
 }
 
 /// Body for `POST /api/hk/rooms/{id}/signals` — ADR 0008.
@@ -1871,6 +1950,28 @@ fn linen_shortage_today_sql() -> String {
     )
 }
 
+/// The OPEN linen-shortage flag — migration 090, and the one the ขาดผ้า badge
+/// is actually served from. A SELECT-list fragment shared VERBATIM by
+/// [`rooms_list_sql`] and [`room_detail_sql`], same one-definition rule as
+/// [`linen_shortage_today_sql`] beside it.
+///
+/// Note what is NOT here: any date predicate at all. That absence is the
+/// feature — a shortage is open until a maid restocks the room, whatever the
+/// day, so the only condition is `hklr_resolved_at IS NULL`. The partial index
+/// `ix_ht_hk_linen_reports_open` is built on exactly this predicate.
+///
+/// A correlated `EXISTS`, NOT a per-room query: the list is one statement and
+/// must stay one statement.
+fn linen_shortage_open_sql() -> String {
+    r#"
+            EXISTS (
+              SELECT 1 FROM ht_hk_linen_reports lro
+               WHERE lro.hklr_room_id = r.room_id
+                 AND lro.hklr_resolved_at IS NULL
+            ) AS linen_shortage_open"#
+        .to_string()
+}
+
 /// `GET /api/hk/rooms` — the active-room list with today's latest cleaning
 /// progress and the three derived facts.
 ///
@@ -1885,7 +1986,7 @@ pub(crate) fn rooms_list_sql() -> String {
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},
+            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},{linen_open},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1902,7 +2003,8 @@ pub(crate) fn rooms_list_sql() -> String {
         ORDER BY r.room_no
         "#,
         facts = derived_room_facts_sql(),
-        linen = linen_shortage_today_sql()
+        linen = linen_shortage_today_sql(),
+        linen_open = linen_shortage_open_sql()
     )
 }
 
@@ -1916,7 +2018,7 @@ pub(crate) fn room_detail_sql() -> String {
             r.room_no,
             r.room_floor,
             r.room_building,
-            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},
+            COALESCE(r.room_clean, true) AS room_clean,{facts},{linen},{linen_open},
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
@@ -1932,7 +2034,8 @@ pub(crate) fn room_detail_sql() -> String {
         WHERE r.room_id = $1 AND COALESCE(r.room_active, true) = true
         "#,
         facts = derived_room_facts_sql(),
-        linen = linen_shortage_today_sql()
+        linen = linen_shortage_today_sql(),
+        linen_open = linen_shortage_open_sql()
     )
 }
 
@@ -1989,6 +2092,9 @@ fn room_from_row(row: &sqlx::postgres::PgRow) -> HkRoom {
         // could not compute is better absent than invented.
         linen_shortage_today: row
             .try_get::<bool, _>("linen_shortage_today")
+            .unwrap_or(false),
+        linen_shortage_open: row
+            .try_get::<bool, _>("linen_shortage_open")
             .unwrap_or(false),
     }
 }
@@ -2071,6 +2177,39 @@ async fn fetch_today_linen_shortages(
         .bind(room_id)
         .fetch_all(pool)
         .await?;
+    Ok(order_linen_totals(
+        rows.iter()
+            .map(|row| LinenShortageTotal {
+                kind: row.try_get::<String, _>("hklr_kind").unwrap_or_default(),
+                qty: row.try_get::<i64, _>("qty").unwrap_or(0),
+            })
+            .collect(),
+    ))
+}
+
+/// This room's OPEN linen shortages, summed per kind — migration 090, and the
+/// breakdown behind the ขาดผ้า badge.
+///
+/// [`fetch_today_linen_shortages`] with ONE predicate swapped: no day window at
+/// all, only `hklr_resolved_at IS NULL`. That is the whole 090 correction in
+/// one line — a shortage is open until a maid restocks the room, whatever the
+/// day. `ix_ht_hk_linen_reports_open` is built on exactly this predicate.
+///
+/// GROUPed in the database, ORDERed in Rust by [`order_linen_totals`] — the
+/// same split, for the same reason (the vocabulary is a Rust constant).
+async fn fetch_open_linen_shortages(
+    pool: &PgPool,
+    room_id: i32,
+) -> Result<Vec<LinenShortageTotal>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT hklr_kind, SUM(hklr_qty)::bigint AS qty \
+           FROM ht_hk_linen_reports \
+          WHERE hklr_room_id = $1 AND hklr_resolved_at IS NULL \
+          GROUP BY hklr_kind",
+    )
+    .bind(room_id)
+    .fetch_all(pool)
+    .await?;
     Ok(order_linen_totals(
         rows.iter()
             .map(|row| LinenShortageTotal {
@@ -2271,8 +2410,12 @@ pub async fn room_detail(
         .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
     let events = fetch_today_events(pool, room_id).await?;
     // Today's ขาดผ้า breakdown, from the SAME table and the SAME Thai day the
-    // room's `linenShortageToday` badge was derived from.
+    // room's (deprecated) `linenShortageToday` badge was derived from.
     let linen_shortages = fetch_today_linen_shortages(pool, room_id).await?;
+    // The OPEN breakdown (migration 090) — the same table under the SAME
+    // predicate the room's `linenShortageOpen` badge came from, so the badge
+    // and the card can never tell the maid different stories.
+    let linen_shortages_open = fetch_open_linen_shortages(pool, room_id).await?;
     // CR-1: the SAME merge as the list, so a maid who taps into a room never
     // sees a different answer than the tile she tapped.
     let mut rooms = [room];
@@ -2284,6 +2427,7 @@ pub async fn room_detail(
         room,
         events,
         linen_shortages,
+        linen_shortages_open,
         legacy_status_stale,
     }))
 }
@@ -2427,6 +2571,72 @@ pub async fn report_linen_shortage(
         success: true,
         room_id,
         reported: report.reported,
+    }))
+}
+
+/// POST /api/hk/rooms/{id}/linen-shortage/resolve — mark the room RESTOCKED
+/// (เติมผ้าแล้ว), migration 090.
+///
+/// A thin gate over
+/// [`HousekeepingService::resolve_linen_shortages`](crate::service::housekeeping::HousekeepingService::resolve_linen_shortages),
+/// which closes EVERY open `ht_hk_linen_reports` row for the room in ONE
+/// statement inside ONE transaction.
+///
+/// **Room-level, and there is no body.** One tap means "this room is
+/// restocked": a maid carries the linen up once, so per-kind taps would be
+/// busywork (owner request 2026-09-01). Nothing is deleted — history stays
+/// append-only and a resolved row keeps everything it was filed with.
+///
+/// **Maid-only.** [`require_report_capability`] runs FIRST, so the read-only
+/// reception viewer gets the same 403 [`REPORT_NOT_PERMITTED_ERROR`] it gets on
+/// the other two maid mutations. That is deliberately NOT the room-signals rule
+/// (where `can_report` picks a SIDE and both sides may act): completing a
+/// shortage is a maid's physical act, not a message, so reception sees the
+/// backlog and cannot close it.
+///
+/// Gating is otherwise IDENTICAL to [`report_linen_shortage`] and in the same
+/// order: report capability (403) → required `?branch=` (400/403) → location
+/// gate (403/503) → room existence (404). There is no body step, because there
+/// is no body.
+///
+/// **`resolved: 0` is a 200.** A repeat tap, or a second maid arriving behind
+/// the first, closes nothing and that is the state she asked for — the
+/// predicate `hklr_resolved_at IS NULL` is both the selection and the
+/// idempotency guard, so the FIRST resolver's identity and timestamp are never
+/// overwritten.
+///
+/// **PG-only**, exactly like the report it completes: no notification, no
+/// domain event, no outbox row, no legacy writeback (iHOTEL has no linen
+/// counterpart). The boards refresh by poll/reload — this is record-domain, not
+/// the live-board domain ADR 0008's signals publish events for. That is also
+/// why `middleware::ville_guard` may exempt this path.
+pub async fn resolve_linen_shortage(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Query(query): Query<HkBranchQuery>,
+    Extension(policy): Extension<HkPolicy>,
+    Extension(identity): Extension<HkIdentity>,
+) -> ApiResult<Json<ResolveLinenShortageResponse>> {
+    require_report_capability(&identity)?;
+    let branch = require_branch(&policy, query.branch.as_deref())?;
+    require_location(&policy, &identity, branch).await?;
+
+    let pool = resolve_pool(&state, branch)?;
+    require_room(pool, room_id).await?;
+
+    let svc = service_for(&state, branch)?;
+    let resolution = svc
+        .resolve_linen_shortages(ResolveLinenShortageCommand {
+            room_id,
+            badge: identity.badge.clone(),
+            name: identity.display_name.clone(),
+        })
+        .await?;
+
+    Ok(Json(ResolveLinenShortageResponse {
+        success: true,
+        room_id,
+        resolved: resolution.resolved,
     }))
 }
 
@@ -3082,16 +3292,21 @@ mod tests {
             room: pg_room("104", true),
             events: vec![],
             linen_shortages: vec![],
+            linen_shortages_open: vec![],
             legacy_status_stale: false,
         })
         .expect("serializes");
         assert!(empty.contains("\"linenShortageToday\":false"), "{empty}");
         assert!(empty.contains("\"linenShortages\":[]"), "{empty}");
+        // Migration 090's additions carry the same always-present rule.
+        assert!(empty.contains("\"linenShortageOpen\":false"), "{empty}");
+        assert!(empty.contains("\"linenShortagesOpen\":[]"), "{empty}");
 
         let reported = serde_json::to_string(&RoomDetailResponse {
             success: true,
             room: HkRoom {
                 linen_shortage_today: true,
+                linen_shortage_open: true,
                 ..pg_room("104", true)
             },
             events: vec![],
@@ -3099,16 +3314,100 @@ mod tests {
                 linen_total("bath_towel", 5),
                 linen_total("bed_sheet", 2),
             ]),
+            linen_shortages_open: order_linen_totals(vec![
+                linen_total("bath_towel", 5),
+                linen_total("bed_sheet", 2),
+            ]),
             legacy_status_stale: false,
         })
         .expect("serializes");
         assert!(reported.contains("\"linenShortageToday\":true"), "{reported}");
+        assert!(reported.contains("\"linenShortageOpen\":true"), "{reported}");
         assert!(
             reported.contains(
                 "\"linenShortages\":[{\"kind\":\"bed_sheet\",\"qty\":2},\
                  {\"kind\":\"bath_towel\",\"qty\":5}]"
             ),
             "wire codes only, vocabulary order, {{kind,qty}} shape: {reported}"
+        );
+        assert!(
+            reported.contains(
+                "\"linenShortagesOpen\":[{\"kind\":\"bed_sheet\",\"qty\":2},\
+                 {\"kind\":\"bath_towel\",\"qty\":5}]"
+            ),
+            "the OPEN totals share the report shape and the ONE display order: {reported}"
+        );
+    }
+
+    /// The deprecated day-scoped fields and the migration-090 open fields are
+    /// INDEPENDENT on the wire — the whole point of keeping both through the
+    /// bundle-skew window. A room restocked this morning is `today: true`,
+    /// `open: false`; a room short since yesterday is the mirror image, and
+    /// THAT is the pair a pre-090 client gets wrong.
+    #[test]
+    fn the_open_and_today_linen_fields_do_not_track_each_other() {
+        let restocked_today = serde_json::to_string(&RoomDetailResponse {
+            success: true,
+            room: HkRoom {
+                linen_shortage_today: true,
+                linen_shortage_open: false,
+                ..pg_room("104", true)
+            },
+            events: vec![],
+            linen_shortages: vec![linen_total("bath_towel", 5)],
+            linen_shortages_open: vec![],
+            legacy_status_stale: false,
+        })
+        .expect("serializes");
+        assert!(
+            restocked_today.contains("\"linenShortageToday\":true")
+                && restocked_today.contains("\"linenShortageOpen\":false")
+                && restocked_today.contains("\"linenShortagesOpen\":[]"),
+            "a room reported AND restocked today is no longer ขาดผ้า: {restocked_today}"
+        );
+
+        let standing_since_yesterday = serde_json::to_string(&RoomDetailResponse {
+            success: true,
+            room: HkRoom {
+                linen_shortage_today: false,
+                linen_shortage_open: true,
+                ..pg_room("104", true)
+            },
+            events: vec![],
+            linen_shortages: vec![],
+            linen_shortages_open: vec![linen_total("bath_towel", 5)],
+            legacy_status_stale: false,
+        })
+        .expect("serializes");
+        assert!(
+            standing_since_yesterday.contains("\"linenShortageToday\":false")
+                && standing_since_yesterday.contains("\"linenShortageOpen\":true"),
+            "an unresolved shortage survives Bangkok midnight: {standing_since_yesterday}"
+        );
+    }
+
+    /// The resolve response's LOCKED wire shape, including the `resolved: 0`
+    /// success — a client must render that as done, so `success` must not
+    /// depend on the count.
+    #[test]
+    fn the_resolve_response_serializes_under_its_locked_names() {
+        let closed = serde_json::to_string(&ResolveLinenShortageResponse {
+            success: true,
+            room_id: 7,
+            resolved: 3,
+        })
+        .expect("serializes");
+        assert_eq!(closed, r#"{"success":true,"roomId":7,"resolved":3}"#);
+
+        let idempotent = serde_json::to_string(&ResolveLinenShortageResponse {
+            success: true,
+            room_id: 7,
+            resolved: 0,
+        })
+        .expect("serializes");
+        assert_eq!(
+            idempotent, r#"{"success":true,"roomId":7,"resolved":0}"#,
+            "a repeat tap is a success with resolved=0, never an error"
         );
     }
 
@@ -3130,6 +3429,26 @@ mod tests {
         .expect("serializes");
         assert!(body.contains("\"legacyStatusStale\":true"), "{body}");
         assert!(body.contains("\"linenShortageToday\":true"), "{body}");
+    }
+
+    /// The 090 flag is canonical-only for the same reason, so it survives a
+    /// legacy outage too — the CR-1 merge must never reach it.
+    #[test]
+    fn the_open_linen_flag_survives_a_stale_legacy_read() {
+        let mut rooms = vec![HkRoom {
+            linen_shortage_open: true,
+            ..pg_room("104", false)
+        }];
+        let stale =
+            merge_legacy_room_flags(&mut rooms, &RoomFlagsOutcome::Unavailable, Branch::Hfhotel);
+        let body = serde_json::to_string(&RoomsResponse {
+            success: true,
+            data: rooms,
+            legacy_status_stale: stale,
+        })
+        .expect("serializes");
+        assert!(body.contains("\"legacyStatusStale\":true"), "{body}");
+        assert!(body.contains("\"linenShortageOpen\":true"), "{body}");
     }
 
     // ---- HK_BRANCHES parsing -------------------------------------------
@@ -3788,6 +4107,7 @@ mod tests {
             expected_departure: false,
             cleaning: None,
             linen_shortage_today: false,
+            linen_shortage_open: false,
         }
     }
 
@@ -4273,6 +4593,61 @@ mod tests {
         assert!(TODAY_BKK_LINEN.contains(TODAY_BKK_DATE));
         assert!(!TODAY_BKK_LINEN.contains("CURRENT_DATE"));
         assert!(linen_shortage_today_sql().contains(TODAY_BKK_LINEN));
+    }
+
+    /// Both statements carry the OPEN flag too, from its OWN shared fragment —
+    /// the badge the surface actually renders (migration 090). Same
+    /// one-definition rule as the day-scoped flag beside it.
+    #[test]
+    fn both_fetch_statements_carry_the_open_linen_flag() {
+        let open = linen_shortage_open_sql();
+        for sql in [rooms_list_sql(), room_detail_sql()] {
+            assert!(sql.contains(&open), "shared fragment missing: {sql}");
+            assert!(sql.contains("AS linen_shortage_open"), "{sql}");
+            // ONE statement for the whole list: a correlated EXISTS, never a
+            // per-room round trip.
+            assert!(
+                sql.contains("EXISTS (\n              SELECT 1 FROM ht_hk_linen_reports lro"),
+                "the open flag must stay an EXISTS subquery, not an N+1: {sql}"
+            );
+        }
+    }
+
+    /// **The 090 correction, pinned.** The open flag is scoped by RESOLUTION
+    /// and by nothing else: no Bangkok day, no `CURRENT_DATE`, no
+    /// `hklr_created_at` at all. A date predicate creeping back in here would
+    /// silently restore the day-rollover bug — a room short since yesterday
+    /// going un-badged at 00:01 — which is exactly what completion supersedes.
+    #[test]
+    fn the_open_linen_flag_is_scoped_by_resolution_never_by_a_day() {
+        let open = linen_shortage_open_sql();
+        assert!(
+            open.contains("hklr_resolved_at IS NULL"),
+            "resolution is the ONLY predicate: {open}"
+        );
+        for banned in [
+            TODAY_BKK_LINEN,
+            TODAY_BKK_DATE,
+            "CURRENT_DATE",
+            "hklr_created_at",
+            "Asia/Bangkok",
+        ] {
+            assert!(
+                !open.contains(banned),
+                "the open flag must not be day-scoped, found '{banned}' in: {open}"
+            );
+        }
+        // The two fragments are DIFFERENT facts and must not be confused: the
+        // deprecated one stays day-scoped and resolution-blind.
+        let today = linen_shortage_today_sql();
+        assert!(
+            !today.contains("hklr_resolved_at"),
+            "linenShortageToday keeps its exact 088 meaning: {today}"
+        );
+        assert_ne!(open, today);
+        // Distinct correlation aliases, so the two EXISTS clauses can sit in
+        // one SELECT list without shadowing each other.
+        assert!(open.contains(" lro\n") && today.contains(" lr\n"), "{open} / {today}");
     }
 
     /// The maid label stamped into `HT_Housewife.h_name` prefers the verified

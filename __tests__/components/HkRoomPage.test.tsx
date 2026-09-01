@@ -34,6 +34,13 @@ const mockHkFetchMe = jest.fn()
 // suite (`HkRoomSignals.test.tsx`); stubbed empty here so this file keeps
 // asserting only what it was written for — the cleaning/linen surface.
 const mockFetchHkSignals = jest.fn()
+// เติมผ้าแล้ว goes out through a hk-lib helper rather than a bare `hkFetch`
+// call, so it is mocked at the module boundary like the signal helpers in
+// `HkRoomSignals.test.tsx`. `hk-lib.test.ts` owns what that helper puts on the
+// wire (the six-segment path, POST, no body, the success-only rule); what this
+// suite owns is that the page CALLS it, for this room, only after a confirm,
+// and re-reads the room behind it.
+const mockResolveHkLinenShortage = jest.fn()
 
 jest.mock('next/navigation', () => ({
   useParams: () => ({ roomId: '7' }),
@@ -46,6 +53,7 @@ jest.mock('@/app/hk/hk-lib', () => {
     hkFetch: (...args: unknown[]) => mockHkFetch(...args),
     hkFetchMe: (...args: unknown[]) => mockHkFetchMe(...args),
     fetchHkSignals: (...args: unknown[]) => mockFetchHkSignals(...args),
+    resolveHkLinenShortage: (...args: unknown[]) => mockResolveHkLinenShortage(...args),
   }
 })
 
@@ -102,6 +110,7 @@ beforeEach(() => {
   jest.clearAllMocks()
   localStorage.clear()
   mockFetchHkSignals.mockResolvedValue([])
+  mockResolveHkLinenShortage.mockResolvedValue({ success: true, roomId: 7, resolved: 3 })
 })
 
 describe('mark-dirty confirm step (R2b)', () => {
@@ -665,6 +674,221 @@ describe('ขาดผ้า tag and today\'s totals on the detail screen', () =
     expect(screen.getByText('วันนี้แจ้งขาดผ้า: ปลอกหมอน 1')).toBeInTheDocument()
     // The success banner is unchanged by any of this.
     expect(screen.getByText('บันทึกแล้ว: แจ้งขาดผ้า')).toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ขาดผ้าค้างอยู่ — the OPEN-shortage task card and เติมผ้าแล้ว (owner request,
+// 2026-09-01). A shortage is now outstanding work until a maid says the room
+// is restocked, so the day-scoped grey line grew into a card with the one
+// control that finishes it.
+//
+// Three things are worth a test here, and they are the three that cost someone
+// real work when they break:
+//  1. the card says WHAT is missing (a maid carries linen up a stairwell once);
+//  2. the completion is two-tap and the first tap files NOTHING — one tap
+//     clears the flag for everyone, including reception's viewer, and there is
+//     no un-resolve on her phone;
+//  3. with the new field ABSENT the screen behaves exactly as it did before.
+// ---------------------------------------------------------------------------
+
+describe('ขาดผ้าค้างอยู่ card and เติมผ้าแล้ว', () => {
+  const OPEN_DETAIL = {
+    room: { ...ROOM, linenShortageOpen: true },
+    linenShortagesOpen: [
+      { kind: 'pillowcase', qty: 2 },
+      { kind: 'bath_towel', qty: 1 },
+    ],
+  }
+
+  function card() {
+    return screen.getByTestId('hk-linen-open-card')
+  }
+
+  /** Every POST the page has issued, with its path and body. */
+  function postCalls() {
+    return mockHkFetch.mock.calls
+      .filter(([, , init]) => (init as RequestInit | undefined)?.method === 'POST')
+      .map(([path, , init]) => ({
+        path: path as string,
+        body: (init as RequestInit).body,
+      }))
+  }
+
+  it('lists each open kind with its Thai label and quantity', async () => {
+    await renderRoom(OPEN_DETAIL)
+    expect(within(card()).getByText('ขาดผ้าค้างอยู่')).toBeInTheDocument()
+    expect(within(card()).getByText('ปลอกหมอน')).toBeInTheDocument()
+    expect(within(card()).getByText('2')).toBeInTheDocument()
+    expect(within(card()).getByText('ผ้าเช็ดตัว')).toBeInTheDocument()
+    expect(within(card()).getByText('1')).toBeInTheDocument()
+  })
+
+  // Server→client skew: a kind this bundle predates must still reach the maid
+  // as a row she can act on, not vanish from the armful she goes to fetch.
+  it('renders a kind it does not know as its raw code', async () => {
+    await renderRoom({
+      ...OPEN_DETAIL,
+      linenShortagesOpen: [{ kind: 'mattress_protector', qty: 1 }],
+    })
+    expect(within(card()).getByText('mattress_protector')).toBeInTheDocument()
+  })
+
+  // The card SUPERSEDES the day-scoped line — two linen summaries, one saying
+  // "today" and one saying "still owed", is exactly how a maid ends up
+  // restocking the wrong number.
+  it('replaces the day-scoped totals line', async () => {
+    await renderRoom({
+      ...OPEN_DETAIL,
+      linenShortages: [{ kind: 'pillowcase', qty: 2 }],
+    })
+    expect(card()).toBeInTheDocument()
+    expect(screen.queryByText(/วันนี้แจ้งขาดผ้า/)).not.toBeInTheDocument()
+  })
+
+  // DEPLOY SKEW — an older backend cannot answer "what is still open", and has
+  // no resolve endpoint either. The screen must be exactly what shipped before.
+  it('falls back to the old totals line when the backend omits linenShortagesOpen', async () => {
+    await renderRoom({
+      room: { ...ROOM, linenShortageToday: true },
+      linenShortages: [{ kind: 'pillowcase', qty: 2 }],
+    })
+    expect(screen.queryByTestId('hk-linen-open-card')).not.toBeInTheDocument()
+    expect(screen.getByText('วันนี้แจ้งขาดผ้า: ปลอกหมอน 2')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'เติมผ้าแล้ว' })).not.toBeInTheDocument()
+  })
+
+  it('renders no card for an empty open list', async () => {
+    await renderRoom({ ...OPEN_DETAIL, linenShortagesOpen: [] })
+    expect(screen.queryByTestId('hk-linen-open-card')).not.toBeInTheDocument()
+  })
+
+  // THE regression this two-step exists for, stated the same way the
+  // mark-dirty one is: the arming tap must reach the backend not at all.
+  it('the first tap of เติมผ้าแล้ว issues NO request — it only arms the confirm', async () => {
+    await renderRoom(OPEN_DETAIL)
+    fireEvent.click(screen.getByRole('button', { name: /เติมผ้าแล้ว/ }))
+
+    await screen.findByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')
+    expect(mockResolveHkLinenShortage).not.toHaveBeenCalled()
+    expect(postCalls()).toHaveLength(0)
+  })
+
+  it('ยกเลิก closes the confirm and files nothing', async () => {
+    await renderRoom(OPEN_DETAIL)
+    fireEvent.click(screen.getByRole('button', { name: /เติมผ้าแล้ว/ }))
+    await screen.findByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')
+
+    fireEvent.click(within(card()).getByRole('button', { name: 'ยกเลิก' }))
+
+    await waitFor(() =>
+      expect(screen.queryByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')).not.toBeInTheDocument()
+    )
+    expect(mockResolveHkLinenShortage).not.toHaveBeenCalled()
+    expect(postCalls()).toHaveLength(0)
+    // The card is still there — cancelling armed nothing and cleared nothing.
+    expect(card()).toBeInTheDocument()
+  })
+
+  // The whole loop: ยืนยัน resolves THIS room, then RE-READS it. Without the
+  // re-read the maid is left looking at a card for linen she has just carried
+  // up, and taps it again.
+  it('ยืนยัน resolves this room, re-fetches, and clears the card', async () => {
+    mockHkFetchMe.mockResolvedValue(meResponse())
+    mockHkFetch.mockResolvedValue(jsonResponse({ success: true, events: [], ...OPEN_DETAIL }))
+    render(<HkRoomPage />)
+    await screen.findByText('ห้อง 104')
+    const readsBefore = mockHkFetch.mock.calls.length
+
+    fireEvent.click(screen.getByRole('button', { name: /เติมผ้าแล้ว/ }))
+    await screen.findByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')
+
+    // The reload behind the resolve answers with a stocked room.
+    mockHkFetch.mockResolvedValueOnce(
+      jsonResponse({
+        success: true,
+        room: { ...ROOM, linenShortageOpen: false },
+        events: [],
+        linenShortagesOpen: [],
+      })
+    )
+    fireEvent.click(within(card()).getByRole('button', { name: 'ยืนยัน' }))
+
+    expect(await screen.findByText('บันทึกแล้ว: เติมผ้าแล้ว')).toBeInTheDocument()
+    // Room-level and room-scoped: the branch and THIS room, nothing else to say.
+    expect(mockResolveHkLinenShortage).toHaveBeenCalledTimes(1)
+    expect(mockResolveHkLinenShortage).toHaveBeenCalledWith('hfhotel', 7)
+    // Nothing else was written — no per-kind POST, no cleaning report.
+    expect(postCalls()).toHaveLength(0)
+    // The re-read is what removes the card and the header chip.
+    expect(mockHkFetch.mock.calls.length).toBeGreaterThan(readsBefore)
+    expect(mockHkFetch.mock.calls[readsBefore][0]).toBe('/rooms/7')
+    await waitFor(() =>
+      expect(screen.queryByTestId('hk-linen-open-card')).not.toBeInTheDocument()
+    )
+    expect(screen.queryByText('ขาดผ้า')).not.toBeInTheDocument()
+  })
+
+  // Idempotent success: another maid got there first. "Nothing to do" is the
+  // right outcome for this tap, not an error she cannot act on.
+  it('shows the success banner for a resolved: 0 answer', async () => {
+    mockResolveHkLinenShortage.mockResolvedValue({ success: true, roomId: 7, resolved: 0 })
+    await renderRoom(OPEN_DETAIL)
+
+    fireEvent.click(screen.getByRole('button', { name: /เติมผ้าแล้ว/ }))
+    await screen.findByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')
+    fireEvent.click(within(card()).getByRole('button', { name: 'ยืนยัน' }))
+
+    expect(await screen.findByText('บันทึกแล้ว: เติมผ้าแล้ว')).toBeInTheDocument()
+  })
+
+  // A resolve that did NOT land (a 200 carrying `success: false`, which the
+  // helper turns into this rejection). Showing the green banner for it would
+  // send the maid away from a room still short of linen.
+  it('reports a failure and keeps the card when the resolve does not land', async () => {
+    mockResolveHkLinenShortage.mockRejectedValue(new Error('บันทึกไม่สำเร็จ กรุณาลองใหม่'))
+    await renderRoom(OPEN_DETAIL)
+
+    fireEvent.click(screen.getByRole('button', { name: /เติมผ้าแล้ว/ }))
+    await screen.findByText('ยืนยันว่าเติมผ้าให้ ห้อง 104 แล้ว?')
+    fireEvent.click(within(card()).getByRole('button', { name: 'ยืนยัน' }))
+
+    expect(await screen.findByText(/บันทึกไม่สำเร็จ/)).toBeInTheDocument()
+    expect(screen.queryByText('บันทึกแล้ว: เติมผ้าแล้ว')).not.toBeInTheDocument()
+    expect(card()).toBeInTheDocument()
+  })
+
+  // Reporting MORE while a shortage is open is legitimate — she found another
+  // missing towel on the same round — so the send panel is untouched.
+  it('leaves the แจ้งขาดผ้า send panel exactly as it was', async () => {
+    await renderRoom(OPEN_DETAIL)
+    expect(screen.getByRole('button', { name: 'แจ้งขาดผ้า' })).toBeEnabled()
+  })
+
+  // A viewer READS the card — "which linen does 104 still owe" is the fact she
+  // opened the screen for — and cannot finish it. The server 403s her POST
+  // either way; this is about what she can tap.
+  describe('viewer mode (reception grant)', () => {
+    async function renderAsViewer() {
+      mockHkFetchMe.mockResolvedValue(meResponse({ canReport: false }))
+      mockHkFetch.mockResolvedValue(jsonResponse({ success: true, events: [], ...OPEN_DETAIL }))
+      render(<HkRoomPage />)
+      await screen.findByText('ห้อง 104')
+    }
+
+    it('still shows the card and its kinds', async () => {
+      await renderAsViewer()
+      expect(within(card()).getByText('ขาดผ้าค้างอยู่')).toBeInTheDocument()
+      expect(within(card()).getByText('ปลอกหมอน')).toBeInTheDocument()
+    })
+
+    // Hidden whole, not disabled: a greyed-out button reads as breakage and
+    // invites a support call, while its absence reads as "not my job".
+    it('offers no เติมผ้าแล้ว button at all', async () => {
+      await renderAsViewer()
+      expect(screen.queryByRole('button', { name: /เติมผ้าแล้ว/ })).not.toBeInTheDocument()
+      expect(within(card()).queryAllByRole('button')).toHaveLength(0)
+    })
   })
 })
 
