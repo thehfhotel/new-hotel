@@ -27,6 +27,7 @@ import {
   cycleTickState,
   deleteHkReportPhoto,
   downscaleDimensions,
+  downscalePhoto,
   fetchHkReport,
   fetchHkReportPhotoMeta,
   fetchHkReports,
@@ -2143,6 +2144,343 @@ describe('downscaleDimensions', () => {
     expect(downscaleDimensions(0, 100)).toEqual({ width: 0, height: 0 })
     expect(downscaleDimensions(Number.NaN, 100)).toEqual({ width: 0, height: 0 })
     expect(downscaleDimensions(-4, -4)).toEqual({ width: 0, height: 0 })
+  })
+})
+
+/**
+ * The DOM half of the downscale — the half the HF Ville bug lived in.
+ *
+ * A maid's phone (old Android, LINE's in-app WebView) has no
+ * `createImageBitmap`, so the old code handed the 3–7MB camera original
+ * straight back and the 5MB client cap refused it before a single request left
+ * the phone — zero failed uploads in the server log, "cannot attach a photo" on
+ * the phone. What is asserted here is that EVERY WebView has a path that works,
+ * and that the original is returned only when they have all been tried.
+ */
+describe('downscalePhoto', () => {
+  type Slot = Record<string, unknown>
+  const globals = globalThis as unknown as Slot
+  const canvasProto = HTMLCanvasElement.prototype as unknown as Slot
+  const urlGlobal = URL as unknown as Slot
+
+  /** Every `drawImage` this test's canvas saw, as the size it was drawn at. */
+  let drawn: Array<{ width: number; height: number }> = []
+  /** Object URLs handed out and given back — a WebView that keeps a whole
+   *  round's photos alive is the leak this guards. */
+  let objectUrls: string[] = []
+  let revokedUrls: string[] = []
+  /** How many `<img>` elements the fallback path built. Zero proves the fast
+   *  path was taken. */
+  let imagesBuilt = 0
+
+  const savedGlobals: Slot = {}
+  const savedCanvas: Record<string, PropertyDescriptor | undefined> = {}
+
+  function saveAll() {
+    for (const key of ['createImageBitmap', 'Image']) {
+      savedGlobals[key] = globals[key]
+    }
+    for (const key of ['getContext', 'toBlob', 'toDataURL']) {
+      savedCanvas[key] = Object.getOwnPropertyDescriptor(canvasProto, key)
+    }
+    savedGlobals.createObjectURL = urlGlobal.createObjectURL
+    savedGlobals.revokeObjectURL = urlGlobal.revokeObjectURL
+  }
+
+  function restoreAll() {
+    for (const key of ['createImageBitmap', 'Image']) {
+      if (savedGlobals[key] === undefined) delete globals[key]
+      else globals[key] = savedGlobals[key]
+    }
+    for (const key of ['getContext', 'toBlob', 'toDataURL']) {
+      const descriptor = savedCanvas[key]
+      if (descriptor) Object.defineProperty(canvasProto, key, descriptor)
+      else delete canvasProto[key]
+    }
+    if (savedGlobals.createObjectURL === undefined) delete urlGlobal.createObjectURL
+    else urlGlobal.createObjectURL = savedGlobals.createObjectURL
+    if (savedGlobals.revokeObjectURL === undefined) delete urlGlobal.revokeObjectURL
+    else urlGlobal.revokeObjectURL = savedGlobals.revokeObjectURL
+  }
+
+  /** An 8MP camera original: the thing that has to come back smaller. */
+  function cameraOriginal() {
+    return new File([new Uint8Array(64)], 'IMG_0042.JPG', { type: 'image/jpeg' })
+  }
+
+  /** jsdom has no object URLs at all, so the `<img>` path needs them installed
+   *  before it can even start. */
+  function installObjectUrls() {
+    urlGlobal.createObjectURL = (blob: Blob) => {
+      const url = `blob:hk/${objectUrls.length}/${blob.size}`
+      objectUrls.push(url)
+      return url
+    }
+    urlGlobal.revokeObjectURL = (url: string) => {
+      revokedUrls.push(url)
+    }
+  }
+
+  /** The canvas: a 2D context that only records, plus whichever exporters this
+   *  WebView is pretending to have. */
+  function installCanvas({
+    context = true,
+    toBlob = true,
+    toDataURL = 'data:image/jpeg;base64,' + btoa('resized-jpeg-bytes'),
+  }: { context?: boolean; toBlob?: boolean; toDataURL?: string | false } = {}) {
+    canvasProto.getContext = context
+      ? () => ({
+          drawImage: (_source: unknown, _x: number, _y: number, w: number, h: number) => {
+            drawn.push({ width: w, height: h })
+          },
+        })
+      : () => null
+    if (toBlob) {
+      canvasProto.toBlob = (cb: (blob: Blob | null) => void) => {
+        cb(new Blob([new Uint8Array(8)], { type: 'image/jpeg' }))
+      }
+    } else {
+      delete canvasProto.toBlob
+    }
+    if (toDataURL === false) delete canvasProto.toDataURL
+    else canvasProto.toDataURL = () => toDataURL
+  }
+
+  /** `createImageBitmap`, as a modern WebView has it. */
+  function installImageBitmap(
+    result: { width: number; height: number } | 'reject' = { width: 4000, height: 3000 }
+  ) {
+    const calls: unknown[][] = []
+    globals.createImageBitmap = (...args: unknown[]) => {
+      calls.push(args)
+      if (result === 'reject') return Promise.reject(new Error('no decoder'))
+      return Promise.resolve({ ...result, close: () => undefined })
+    }
+    return calls
+  }
+
+  /** `new Image()` on a WebView that decodes (`ok`) or gives up (`onerror`). */
+  function installImageElement({
+    ok = true,
+    width = 4000,
+    height = 3000,
+    decode = false,
+    loadEvent = true,
+  }: {
+    ok?: boolean
+    width?: number
+    height?: number
+    decode?: boolean
+    /** false = a WebView that fires neither `load` nor `error`, so only
+     *  `decode()` can say the picture arrived. */
+    loadEvent?: boolean
+  } = {}) {
+    class FakeImage {
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      naturalWidth = ok ? width : 0
+      naturalHeight = ok ? height : 0
+      width = 0
+      height = 0
+      decode = decode ? () => Promise.resolve() : undefined
+      private innerSrc = ''
+      constructor() {
+        imagesBuilt += 1
+      }
+      set src(value: string) {
+        this.innerSrc = value
+        if (!loadEvent) return
+        setTimeout(() => (ok ? this.onload?.() : this.onerror?.()), 0)
+      }
+      get src() {
+        return this.innerSrc
+      }
+    }
+    globals.Image = FakeImage
+  }
+
+  beforeAll(saveAll)
+  afterAll(restoreAll)
+
+  beforeEach(() => {
+    drawn = []
+    objectUrls = []
+    revokedUrls = []
+    imagesBuilt = 0
+    delete globals.createImageBitmap
+    delete urlGlobal.createObjectURL
+    delete urlGlobal.revokeObjectURL
+  })
+
+  afterEach(restoreAll)
+
+  it('takes the createImageBitmap path when the WebView has one, EXIF-corrected', async () => {
+    const calls = installImageBitmap()
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+
+    const file = cameraOriginal()
+    const out = await downscalePhoto(file)
+
+    expect(out).not.toBe(file)
+    expect(out.type).toBe('image/jpeg')
+    expect(calls).toHaveLength(1)
+    // A portrait shot must not arrive sideways where the decoder can help.
+    expect(calls[0][1]).toEqual({ imageOrientation: 'from-image' })
+    expect(drawn).toEqual([{ width: 1600, height: 1200 }])
+    // The fast path never touches an object URL or an <img>.
+    expect(imagesBuilt).toBe(0)
+    expect(objectUrls).toHaveLength(0)
+  })
+
+  // THE HF VILLE BUG. No `createImageBitmap` used to mean no downscale at all.
+  it('falls back to <img> + canvas when createImageBitmap is missing', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+
+    const file = cameraOriginal()
+    const out = await downscalePhoto(file)
+
+    expect(out).not.toBe(file)
+    expect(out.type).toBe('image/jpeg')
+    expect(imagesBuilt).toBe(1)
+    expect(drawn).toEqual([{ width: 1600, height: 1200 }])
+  })
+
+  it('uses the <img> path when createImageBitmap exists but gives up', async () => {
+    installImageBitmap('reject')
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).not.toBe(file)
+    expect(imagesBuilt).toBe(1)
+  })
+
+  // A WebView that fires no load event at all still gets its photo resized,
+  // because decode() is asked too — and it is asked AFTER the src is set,
+  // which is the only order in which it can resolve.
+  it('accepts decode() as the decoder where no load event ever fires', async () => {
+    installImageElement({ decode: true, loadEvent: false })
+    installObjectUrls()
+    installCanvas()
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).not.toBe(file)
+    expect(drawn).toEqual([{ width: 1600, height: 1200 }])
+  })
+
+  // Android WebViews before ~5.0 draw the canvas but cannot export a Blob.
+  it('falls back to toDataURL when the canvas has no toBlob', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas({ toBlob: false })
+
+    const file = cameraOriginal()
+    const out = await downscalePhoto(file)
+
+    expect(out).not.toBe(file)
+    expect(out.type).toBe('image/jpeg')
+    expect(out.size).toBe('resized-jpeg-bytes'.length)
+  })
+
+  it('falls back to toDataURL when toBlob hands back nothing', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+    canvasProto.toBlob = (cb: (blob: Blob | null) => void) => cb(null)
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).not.toBe(file)
+  })
+
+  it('scales by the LONGEST edge on the <img> path too', async () => {
+    installImageElement({ width: 3000, height: 4000 })
+    installObjectUrls()
+    installCanvas()
+
+    await downscalePhoto(cameraOriginal())
+    expect(drawn).toEqual([{ width: 1200, height: 1600 }])
+  })
+
+  it('honours a caller-supplied max', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+
+    await downscalePhoto(cameraOriginal(), 800)
+    expect(drawn).toEqual([{ width: 800, height: 600 }])
+  })
+
+  // A maid must always be able to file. The original is the LAST answer, never
+  // an early one.
+  it('returns the ORIGINAL only when every path has failed', async () => {
+    installImageBitmap('reject')
+    installImageElement({ ok: false })
+    installObjectUrls()
+    installCanvas()
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).toBe(file)
+    expect(imagesBuilt).toBe(1)
+  })
+
+  it('returns the original when there is no 2D context', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas({ context: false })
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).toBe(file)
+  })
+
+  it('returns the original when neither exporter exists', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas({ toBlob: false, toDataURL: false })
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).toBe(file)
+  })
+
+  // jsdom itself, and the oldest WebViews: no object URLs, so no <img> path.
+  it('returns the original where there are no object URLs at all', async () => {
+    installImageElement()
+    installCanvas()
+
+    const file = cameraOriginal()
+    expect(await downscalePhoto(file)).toBe(file)
+  })
+
+  it('revokes the object URL it took — on success AND on failure', async () => {
+    installImageElement()
+    installObjectUrls()
+    installCanvas()
+    await downscalePhoto(cameraOriginal())
+    expect(objectUrls).toHaveLength(1)
+    expect(revokedUrls).toEqual(objectUrls)
+
+    installImageElement({ ok: false })
+    await downscalePhoto(cameraOriginal())
+    expect(objectUrls).toHaveLength(2)
+    expect(revokedUrls).toEqual(objectUrls)
+  })
+
+  it('never throws, whatever the runtime does', async () => {
+    globals.createImageBitmap = () => {
+      throw new Error('synchronous nonsense')
+    }
+    installImageElement()
+    installObjectUrls()
+    canvasProto.getContext = () => {
+      throw new Error('no canvas here')
+    }
+
+    const file = cameraOriginal()
+    await expect(downscalePhoto(file)).resolves.toBe(file)
   })
 })
 

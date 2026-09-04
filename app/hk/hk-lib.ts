@@ -2638,50 +2638,193 @@ export function downscaleDimensions(
   }
 }
 
+/** How long a decode may hang before it is written off. An old WebView that
+ *  fires neither `load` nor `error` on a photo it cannot read would otherwise
+ *  stall the upload queue forever, because the queue awaits this promise. */
+const REPORT_PHOTO_DECODE_TIMEOUT_MS = 20_000
+
+/** Turn a `data:` URL into a Blob for the `toDataURL` fallback below. Returns
+ *  null for anything that is not a base64 data URL we can decode. */
+function dataUrlToBlob(dataUrl: string): Blob | null {
+  const comma = dataUrl.indexOf(',')
+  if (!dataUrl.startsWith('data:') || comma < 0) return null
+  const head = dataUrl.slice(5, comma)
+  if (!head.includes('base64')) return null
+  const type = head.split(';')[0] || 'image/jpeg'
+  if (typeof atob !== 'function') return null
+  const binary = atob(dataUrl.slice(comma + 1))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type })
+}
+
+/**
+ * Draw a decoded image onto a canvas at `width`×`height` and hand back a JPEG.
+ *
+ * `toBlob` first, `toDataURL` second: Android WebViews before ~5.0 ship the
+ * canvas but not `toBlob`, and a maid's phone that can draw the picture but
+ * cannot export it is exactly the device this whole path exists for. Returns
+ * null — never throws — when neither export works.
+ */
+async function canvasJpeg(
+  source: CanvasImageSource,
+  width: number,
+  height: number
+): Promise<Blob | null> {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null
+  if (!ctx) return null
+  ctx.drawImage(source, 0, 0, width, height)
+  if (typeof canvas.toBlob === 'function') {
+    const blob = await new Promise<Blob | null>((resolve) => {
+      try {
+        canvas.toBlob(resolve, 'image/jpeg', REPORT_PHOTO_QUALITY)
+      } catch {
+        resolve(null)
+      }
+    })
+    if (blob && blob.size > 0) return blob
+  }
+  if (typeof canvas.toDataURL !== 'function') return null
+  const blob = dataUrlToBlob(canvas.toDataURL('image/jpeg', REPORT_PHOTO_QUALITY))
+  return blob && blob.size > 0 ? blob : null
+}
+
+/**
+ * The MODERN decode path. `createImageBitmap` is the fast one (off the main
+ * thread, no object URL) and the only one that can be told to honour the
+ * camera's EXIF rotation, so it is tried first. Null when it is absent or
+ * gives up; never throws.
+ */
+async function decodeWithImageBitmap(file: Blob, max: number): Promise<Blob | null> {
+  if (typeof createImageBitmap !== 'function') return null
+  let bitmap: ImageBitmap
+  try {
+    // `imageOrientation` is what stops a portrait shot arriving sideways.
+    // Old implementations reject the options bag outright — hence the retry.
+    try {
+      bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
+    } catch {
+      bitmap = await createImageBitmap(file)
+    }
+  } catch {
+    return null
+  }
+  try {
+    const { width, height } = downscaleDimensions(bitmap.width, bitmap.height, max)
+    if (width === 0 || height === 0) return null
+    return await canvasJpeg(bitmap, width, height)
+  } catch {
+    return null
+  } finally {
+    bitmap.close?.()
+  }
+}
+
+/**
+ * The UNIVERSAL decode path — `<img src=blob:>` + canvas, which every WebView
+ * that can show a photo at all can also draw. This is the one that fixes HF
+ * Ville's "cannot attach a photo": an old Android WebView has no
+ * `createImageBitmap`, so the previous code handed the 3–7MB camera original
+ * straight back and the 5MB client cap refused it before a single request left
+ * the phone.
+ *
+ * EXIF orientation is left to the browser here (modern WebViews apply it for
+ * `<img>`; ancient ones do not). A sideways thumbnail is ACCEPTED degradation
+ * — reception can still read the room — where a refused upload is not.
+ *
+ * Null on every failure, and the object URL is revoked on every path.
+ */
+async function decodeWithImageElement(file: Blob, max: number): Promise<Blob | null> {
+  if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return null
+  if (typeof Image !== 'function') return null
+  let url = ''
+  try {
+    url = URL.createObjectURL(file)
+  } catch {
+    return null
+  }
+  try {
+    const img = new Image()
+    const loaded = await new Promise<boolean>((resolve) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const settle = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        resolve(ok)
+      }
+      timer = setTimeout(() => settle(false), REPORT_PHOTO_DECODE_TIMEOUT_MS)
+      img.onload = () => settle(true)
+      img.onerror = () => settle(false)
+      img.src = url
+      // AFTER the src, or `decode()` rejects on an image with nothing to
+      // decode. It resolves on the WebViews that have it; where it is absent,
+      // or rejects, `onload`/`onerror` are still the deciders.
+      try {
+        img.decode?.().then(
+          () => settle(true),
+          () => undefined
+        )
+      } catch {
+        /* an implementation that throws synchronously is just an absent one */
+      }
+    })
+    if (!loaded) return null
+    const { width, height } = downscaleDimensions(
+      img.naturalWidth || img.width,
+      img.naturalHeight || img.height,
+      max
+    )
+    if (width === 0 || height === 0) return null
+    return await canvasJpeg(img, width, height)
+  } catch {
+    return null
+  } finally {
+    try {
+      URL.revokeObjectURL(url)
+    } catch {
+      /* nothing to do */
+    }
+  }
+}
+
 /**
  * Downscale a captured photo to a ≤`REPORT_PHOTO_MAX_PX` JPEG before it goes
  * up. DOM-dependent by nature (canvas), so the arithmetic lives in
  * `downscaleDimensions` above, which is what the tests own.
  *
- * EVERY failure path returns the ORIGINAL file rather than throwing: no
- * `createImageBitmap` (an ancient WebView, or jsdom), no 2D context, a decoder
- * that gives up, a `toBlob` that hands back nothing. A maid standing in a room
- * she has just cleaned must be able to file her report; a 4MB upload is a slow
- * report, while a thrown error is no report at all — and the server's 5MB cap
- * is still the backstop underneath.
+ * TWO decode paths, tried in order, because the phone in a maid's hand is not
+ * the phone this was written on: `createImageBitmap` where it exists, then
+ * `<img>` + canvas, which works on every WebView that can render a photo.
+ *
+ * EVERY failure path returns the ORIGINAL file rather than throwing — no
+ * canvas, no 2D context, a decoder that gives up, a `toBlob` AND a `toDataURL`
+ * that both hand back nothing. A maid standing in a room she has just cleaned
+ * must be able to file her report; a 4MB upload is a slow report, while a
+ * thrown error is no report at all — and the server's 5MB cap is still the
+ * backstop underneath.
  */
 export async function downscalePhoto(
   file: File | Blob,
   max: number = REPORT_PHOTO_MAX_PX
 ): Promise<Blob> {
-  // Checked FIRST, before anything is decoded: this is the one call that is
-  // simply absent outside a real browser, and bailing here keeps the fallback
-  // silent instead of noisy.
-  if (typeof createImageBitmap !== 'function') return file
   try {
-    const bitmap = await createImageBitmap(file)
-    const { width, height } = downscaleDimensions(bitmap.width, bitmap.height, max)
-    if (width === 0 || height === 0) {
-      bitmap.close?.()
-      return file
-    }
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      bitmap.close?.()
-      return file
-    }
-    ctx.drawImage(bitmap, 0, 0, width, height)
-    bitmap.close?.()
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, 'image/jpeg', REPORT_PHOTO_QUALITY)
-    })
-    return blob && blob.size > 0 ? blob : file
+    const viaBitmap = await decodeWithImageBitmap(file, max)
+    if (viaBitmap) return viaBitmap
   } catch {
-    return file
+    /* fall through to the universal path */
   }
+  try {
+    const viaElement = await decodeWithImageElement(file, max)
+    if (viaElement) return viaElement
+  } catch {
+    /* fall through to the original */
+  }
+  return file
 }
 
 /**
@@ -2704,7 +2847,11 @@ const REPORT_READ_ERROR = 'ไม่สามารถดึงรายงา�
 const REPORT_WRITE_ERROR = 'บันทึกไม่สำเร็จ กรุณาลองใหม่'
 const REPORT_CONFLICT_ERROR = 'ห้องนี้ส่งรายงานของวันนี้ไปแล้ว'
 const PHOTO_UPLOAD_ERROR = 'อัปโหลดรูปไม่สำเร็จ กรุณาลองใหม่'
-const PHOTO_TOO_LARGE_ERROR = 'รูปใหญ่เกินไป กรุณาถ่ายใหม่'
+/** The LAST resort, after BOTH downscale paths have failed: the copy names the
+ *  way out (the album picker, whose files an old WebView will happily hand over
+ *  even when its camera intent has stopped re-launching) rather than telling a
+ *  maid to retake a shot that would be refused exactly the same way. */
+const PHOTO_TOO_LARGE_ERROR = 'รูปใหญ่เกินไปและย่อไม่ได้ ลองเลือกรูปจากอัลบั้มแทน'
 
 /** Success copy, as constants: the overview and the report screen both show
  *  them, and two spellings of "ส่งรายงานแล้ว" is how a maid learns to distrust

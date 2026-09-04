@@ -456,6 +456,176 @@ describe('managing the photos', () => {
     expect(within(viewer).getByText(/ผ้าปูที่นอน/)).toBeInTheDocument()
   })
 })
+// ---------------------------------------------------------------------------
+// THE ALBUM — the second way in.
+//
+// HF Ville, an old Android phone in LINE's in-app browser: the WebView stops
+// re-launching the camera intent after the first shot, and the only control on
+// the screen was `capture="environment"`. The maid reported being "limited to
+// one photo". The album control has no `capture`, is `multiple`, and shares the
+// camera's handler, so a whole zone can land in one tap.
+// ---------------------------------------------------------------------------
+
+describe('the album control', () => {
+  it('sits beside the camera on the zone step — multiple, and NO capture', async () => {
+    await renderReport()
+    const camera = screen.getByLabelText('ถ่ายรูปเตียง') as HTMLInputElement
+    const album = screen.getByLabelText('เลือกรูปเตียง') as HTMLInputElement
+
+    expect(camera).toHaveAttribute('capture', 'environment')
+    expect(camera).not.toHaveAttribute('multiple')
+    // A `capture` here would send her straight back to the camera that is
+    // refusing to open — which is the entire bug.
+    expect(album).not.toHaveAttribute('capture')
+    expect(album).toHaveAttribute('multiple')
+    expect(album.accept).toBe('image/*')
+    expect(album.type).toBe('file')
+  })
+
+  it('follows the stepper from zone to zone', async () => {
+    await renderReport()
+    for (const zone of REPORT_ZONES) {
+      expect(screen.getByLabelText(`เลือกรูป${zone.label}`)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: /ถัดไป|ตรวจทาน/ }))
+      await flush()
+    }
+  })
+
+  // TWO files, ONE tap: what the camera-only screen could not do at all.
+  it('enqueues every file it hands back, each bound to the zone', async () => {
+    await renderReport()
+    mockUploadHkReportPhoto
+      .mockResolvedValueOnce({ photoId: 301, bytes: 1024 })
+      .mockResolvedValueOnce({ photoId: 302, bytes: 1024 })
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('เลือกรูปเตียง'), {
+        target: { files: [photoFile(), photoFile()] },
+      })
+    })
+    await flush()
+    await waitFor(() => expect(mockUploadHkReportPhoto).toHaveBeenCalledTimes(2))
+
+    expect(mockUploadHkReportPhoto.mock.calls.map((call) => call[2])).toEqual([
+      { zone: 'bed' },
+      { zone: 'bed' },
+    ])
+    expect(screen.getByTestId('hk-upload-status')).toHaveTextContent('อัปโหลดแล้ว 2/2')
+    expect(screen.getByRole('button', { name: 'ดูรูปที่ 1 โซนเตียง' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'ดูรูปที่ 2 โซนเตียง' })).toBeInTheDocument()
+    // Same pre-tick as the camera: the zone is attested by the first shot.
+    for (const item of REPORT_ZONES[0].items) {
+      const row = screen.getByTestId(`hk-tick-${item}`)
+      expect(within(row).getByRole('button', { name: /ครบ$/ })).toBeInTheDocument()
+    }
+  })
+
+  it('downscales every one of them, not just the first', async () => {
+    await renderReport()
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('เลือกรูปเตียง'), {
+        target: { files: [photoFile(), photoFile(), photoFile()] },
+      })
+    })
+    await flush()
+    expect(mockDownscalePhoto).toHaveBeenCalledTimes(3)
+  })
+
+  it('is offered for a close-up and in the viewer too', async () => {
+    await renderReport()
+    await shoot('เตียง', 101)
+    fireEvent.click(screen.getByRole('button', { name: 'หมอน ครบ' }))
+    // ครบ → หาย opens the close-up controls.
+    expect(screen.getByLabelText('ถ่ายรูปใกล้ หมอน')).toBeInTheDocument()
+    const closeUp = screen.getByLabelText('เลือกรูปใกล้ หมอน') as HTMLInputElement
+    expect(closeUp).not.toHaveAttribute('capture')
+    expect(closeUp).toHaveAttribute('multiple')
+
+    fireEvent.click(screen.getByRole('button', { name: 'ดูรูปที่ 1 โซนเตียง' }))
+    const viewer = screen.getByTestId('hk-photo-viewer')
+    expect(within(viewer).getByLabelText('ถ่ายรูปนี้ใหม่')).toBeInTheDocument()
+    expect(within(viewer).getByLabelText('เลือกรูปแทนรูปนี้')).toBeInTheDocument()
+  })
+
+  // The queue is BACKGROUND by design. Locking the camera behind it is how a
+  // maid on corridor wifi ends up unable to shoot the room she is standing in.
+  it('leaves BOTH controls live while an upload is still in flight', async () => {
+    await renderReport()
+    let release: (result: { photoId: number; bytes: number }) => void = () => {}
+    mockUploadHkReportPhoto.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('ถ่ายรูปเตียง'), {
+        target: { files: [photoFile()] },
+      })
+    })
+    await flush()
+    expect(screen.getByTestId('hk-upload-status')).toHaveTextContent('อัปโหลดแล้ว 0/1')
+
+    expect(screen.getByLabelText('ถ่ายรูปเตียง')).not.toBeDisabled()
+    expect(screen.getByLabelText('เลือกรูปเตียง')).not.toBeDisabled()
+
+    // And she can actually use them: a second shot lands mid-upload.
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('เลือกรูปเตียง'), {
+        target: { files: [photoFile()] },
+      })
+    })
+    await flush()
+    expect(screen.getByRole('button', { name: 'ดูรูปที่ 2 โซนเตียง' })).toBeInTheDocument()
+
+    await act(async () => {
+      release({ photoId: 101, bytes: 1024 })
+      await Promise.resolve()
+    })
+    await flush()
+  })
+
+  // Without the `e.target.value = ''` reset, a real browser keeps the old value
+  // and fires NO change event, so the second pick of the same picture would do
+  // nothing at all. (jsdom will not let a file input's value be set to anything
+  // but '', so the assertion below is the shape; the retake is the behaviour.)
+  it('resets both inputs so the SAME picture can be picked twice', async () => {
+    await renderReport()
+    const camera = screen.getByLabelText('ถ่ายรูปเตียง') as HTMLInputElement
+    const album = screen.getByLabelText('เลือกรูปเตียง') as HTMLInputElement
+    const sameShot = photoFile()
+
+    await act(async () => {
+      fireEvent.change(camera, { target: { files: [sameShot] } })
+    })
+    await flush()
+    expect(camera.value).toBe('')
+
+    await act(async () => {
+      fireEvent.change(album, { target: { files: [sameShot] } })
+    })
+    await flush()
+    expect(album.value).toBe('')
+
+    // Two shots, from one file, through the two controls.
+    expect(screen.getByTestId('hk-upload-status')).toHaveTextContent('/2')
+    expect(screen.getByRole('button', { name: 'ดูรูปที่ 2 โซนเตียง' })).toBeInTheDocument()
+  })
+
+  it('gives reception an album beside her verify camera', async () => {
+    await renderReport({ report: SUBMITTED_REPORT, me: { canReport: false } })
+    const strip = screen.getByTestId('hk-report-reception-photos')
+    expect(within(strip).getByLabelText('ถ่ายรูปการตรวจ')).toHaveAttribute(
+      'capture',
+      'environment'
+    )
+    const album = within(strip).getByLabelText('เลือกรูปการตรวจ')
+    expect(album).not.toHaveAttribute('capture')
+    expect(album).toHaveAttribute('multiple')
+  })
+})
+
 
 // ---------------------------------------------------------------------------
 // Filing it — the blocked submit, then the exact body.

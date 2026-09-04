@@ -164,6 +164,16 @@ const PHOTO_LIMIT_MESSAGE = `แนบรูปได้ไม่เกิน ${
 const RECEPTION_PHOTO_LIMIT_MESSAGE = `แนบรูปได้ไม่เกิน ${REPORT_MAX_PHOTOS} รูป`
 const DRAFT_PHOTOS_DROPPED_NOTICE = 'รูปบางรูปใช้ไม่ได้แล้ว กรุณาถ่ายใหม่ในโซนที่ยังไม่มีรูป'
 
+/** What the album control SAYS. Short on purpose — it has to sit beside a
+ *  camera button without shrinking it. The aria-label at each call site is the
+ *  long, unique one. */
+const GALLERY_BUTTON_TEXT = 'เลือกรูป'
+
+/** …and how it LOOKS: secondary (white, grey border) so the camera stays the
+ *  obvious tap, but never under 44px. */
+const GALLERY_BUTTON_CLASS =
+  'min-h-[44px] shrink-0 rounded-lg border border-gray-300 bg-white px-3 text-sm font-semibold text-gray-700 active:bg-gray-100'
+
 /** A local object URL for the shot she just took, or '' where the runtime has
  *  no `createObjectURL` (jsdom, an ancient WebView) — the thumbnail then waits
  *  for the uploaded copy rather than breaking the row. */
@@ -185,13 +195,28 @@ function revokePreview(url: string | undefined): void {
 }
 
 /**
- * The one camera control on this screen: a label wrapping a visually-hidden
- * input, because a bare file input cannot be made 44px tall reliably across
- * WebViews, and `capture="environment"` is what opens the camera straight away
- * instead of a file browser.
+/**
+ * ONE file control: a label wrapping a visually-hidden input, because a bare
+ * file input cannot be made 44px tall reliably across WebViews.
+ *
+ * TWO sources, and BOTH are always offered (HF Ville, 2026-09-04):
+ *
+ *   * `camera` — `capture="environment"`, which opens the camera straight away
+ *     instead of a file browser. The primary control, and the bigger one.
+ *   * `gallery` — deliberately NO `capture` and `multiple`, i.e. the album.
+ *     An old Android / LINE in-app WebView is unreliable re-launching the
+ *     camera intent after the FIRST shot, which is why a maid reported being
+ *     "limited to one photo": there was no second way in. The album picker is
+ *     that way, and it hands over several files at once.
+ *
+ * `label` is what assistive tech and the tests see; `text` is what fits on the
+ * button, so the album control can read "เลือกรูป" while still being uniquely
+ * addressable next to three other album controls on the same screen.
  */
-function CameraButton({
+function PhotoInputButton({
   label,
+  text,
+  source,
   onPick,
   disabled,
   busy,
@@ -199,12 +224,15 @@ function CameraButton({
   icon,
 }: {
   label: string
+  text?: string
+  source: 'camera' | 'gallery'
   onPick: (files: FileList | null) => void
   disabled?: boolean
   busy?: boolean
   className?: string
   icon?: React.ReactNode
 }) {
+  const isCamera = source === 'camera'
   return (
     <label
       className={`flex items-center justify-center gap-1.5 ${className ?? ''} ${
@@ -214,13 +242,16 @@ function CameraButton({
       {busy ? (
         <Loader2 className="h-5 w-5 animate-spin" />
       ) : (
-        (icon ?? <Camera className="h-5 w-5" />)
+        (icon ?? (isCamera ? <Camera className="h-5 w-5" /> : <Images className="h-5 w-5" />))
       )}
-      <span>{label}</span>
+      <span>{text ?? label}</span>
       <input
         type="file"
         accept="image/*"
-        capture="environment"
+        // `undefined`/`false` render NO attribute, which is the point: a
+        // `capture` on the album control would send her back to the camera.
+        capture={isCamera ? 'environment' : undefined}
+        multiple={!isCamera}
         aria-label={label}
         disabled={disabled}
         className="sr-only"
@@ -233,6 +264,36 @@ function CameraButton({
         }}
       />
     </label>
+  )
+}
+
+/** The camera, unchanged for every caller that already had one. */
+function CameraButton(props: Omit<React.ComponentProps<typeof PhotoInputButton>, 'source'>) {
+  return <PhotoInputButton source="camera" {...props} />
+}
+
+/** The album, always rendered beside a camera. Secondary by colour, never by
+ *  size — 44px is the floor for a gloved thumb in a corridor. */
+function GalleryButton({
+  label,
+  onPick,
+  disabled,
+  className,
+}: {
+  label: string
+  onPick: (files: FileList | null) => void
+  disabled?: boolean
+  className?: string
+}) {
+  return (
+    <PhotoInputButton
+      source="gallery"
+      label={label}
+      text={GALLERY_BUTTON_TEXT}
+      onPick={onPick}
+      disabled={disabled}
+      className={className ?? GALLERY_BUTTON_CLASS}
+    />
   )
 }
 
@@ -445,12 +506,20 @@ function TickRow({
             it (CONTEXT.md §Housekeeping "Photo-backed tick") and a maid who cannot get closer
             must still be able to file. */}
         {problem && (
-          <CameraButton
-            label={`ถ่ายรูปใกล้ ${label}`}
-            onPick={onCloseUp}
-            disabled={busy}
-            className="min-h-[40px] rounded-lg border border-red-400 bg-white px-3 text-xs font-semibold text-red-700 active:bg-red-50"
-          />
+          <span className="flex items-center gap-2">
+            <CameraButton
+              label={`ถ่ายรูปใกล้ ${label}`}
+              onPick={onCloseUp}
+              disabled={busy}
+              className="min-h-[44px] rounded-lg border border-red-400 bg-white px-3 text-xs font-semibold text-red-700 active:bg-red-50"
+            />
+            <GalleryButton
+              label={`เลือกรูปใกล้ ${label}`}
+              onPick={onCloseUp}
+              disabled={busy}
+              className="min-h-[44px] shrink-0 rounded-lg border border-gray-300 bg-white px-3 text-xs font-semibold text-gray-700 active:bg-gray-100"
+            />
+          </span>
         )}
       </div>
     </li>
@@ -537,11 +606,14 @@ function PhotoViewer({
           </span>
           <span className="flex gap-2">
             {onRetake && (
-              <CameraButton
-                label="ถ่ายรูปนี้ใหม่"
-                onPick={onRetake}
-                className="min-h-[44px] rounded-lg border border-teal-600 bg-teal-600 px-3 text-sm font-semibold text-white active:bg-teal-700"
-              />
+              <>
+                <CameraButton
+                  label="ถ่ายรูปนี้ใหม่"
+                  onPick={onRetake}
+                  className="min-h-[44px] rounded-lg border border-teal-600 bg-teal-600 px-3 text-sm font-semibold text-white active:bg-teal-700"
+                />
+                <GalleryButton label="เลือกรูปแทนรูปนี้" onPick={onRetake} />
+              </>
             )}
             {onRemove && (
               <button
@@ -567,6 +639,7 @@ function PhotoViewer({
  */
 function ReportPhotoStrip({
   captureLabel,
+  galleryLabel,
   branch,
   photoIds,
   onPick,
@@ -576,6 +649,7 @@ function ReportPhotoStrip({
   testId,
 }: {
   captureLabel: string
+  galleryLabel: string
   branch: Branch | null
   photoIds: number[]
   onPick: (files: FileList | null) => void
@@ -610,13 +684,22 @@ function ReportPhotoStrip({
           ))}
         </ul>
       )}
-      <CameraButton
-        label={captureLabel}
-        onPick={onPick}
-        busy={uploading}
-        disabled={disabled || uploading || full}
-        className="min-h-[44px] w-full rounded-lg border border-teal-400 bg-white px-3 py-3 text-sm font-semibold text-teal-800 active:bg-teal-50"
-      />
+      <div className="flex items-stretch gap-2">
+        <CameraButton
+          label={captureLabel}
+          onPick={onPick}
+          busy={uploading}
+          disabled={disabled || uploading || full}
+          className="min-h-[44px] flex-1 rounded-lg border border-teal-400 bg-white px-3 py-3 text-sm font-semibold text-teal-800 active:bg-teal-50"
+        />
+        {/* Reception's own escape hatch — a desk phone whose camera intent
+            misbehaves is the same bug on the other side of the counter. */}
+        <GalleryButton
+          label={galleryLabel}
+          onPick={onPick}
+          disabled={disabled || uploading || full}
+        />
+      </div>
       <p className="mt-1 text-[11px] text-gray-400">
         แนบรูปได้ {photoIds.length}/{REPORT_MAX_PHOTOS} รูป
       </p>
@@ -1575,31 +1658,45 @@ export default function HkRoomReportPage() {
             )}
 
             {step < STEP_REVIEW ? (
-              <div className="flex items-center gap-2">
-                {step > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  {step > 0 && (
+                    <button
+                      type="button"
+                      aria-label="ย้อนกลับ"
+                      onClick={() => setStep((n) => Math.max(0, n - 1))}
+                      className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-gray-300 bg-white text-gray-600 active:bg-gray-100"
+                    >
+                      <ChevronLeft className="h-6 w-6" />
+                    </button>
+                  )}
+                  <CameraButton
+                    label={`ถ่ายรูป${zone?.label ?? ''}`}
+                    onPick={(files) => zone && capture(zone.zone, files)}
+                    disabled={submitting}
+                    className="min-h-[56px] flex-1 rounded-xl border border-teal-600 bg-teal-600 px-3 text-base font-bold text-white active:bg-teal-700"
+                  />
                   <button
                     type="button"
-                    aria-label="ย้อนกลับ"
-                    onClick={() => setStep((n) => Math.max(0, n - 1))}
-                    className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-gray-300 bg-white text-gray-600 active:bg-gray-100"
+                    onClick={() => setStep((n) => Math.min(STEP_REVIEW, n + 1))}
+                    className="flex min-h-[56px] shrink-0 items-center gap-1 rounded-xl border border-gray-300 bg-white px-4 text-base font-semibold text-gray-800 active:bg-gray-100"
                   >
-                    <ChevronLeft className="h-6 w-6" />
+                    {step === STEP_REVIEW - 1 ? 'ตรวจทาน' : 'ถัดไป'}
+                    <ChevronRight className="h-5 w-5" />
                   </button>
-                )}
-                <CameraButton
-                  label={`ถ่ายรูป${zone?.label ?? ''}`}
+                </div>
+                {/* THE SECOND WAY IN, on its own line so the camera keeps the
+                    width it needs. This is what the HF Ville "limited to one
+                    photo" report was really about: the LINE WebView stops
+                    re-launching the camera intent after the first shot, and
+                    until now there was no other door. `multiple`, so a whole
+                    zone's worth of shots lands in one tap. */}
+                <GalleryButton
+                  label={`เลือกรูป${zone?.label ?? ''}`}
                   onPick={(files) => zone && capture(zone.zone, files)}
                   disabled={submitting}
-                  className="min-h-[56px] flex-1 rounded-xl border border-teal-600 bg-teal-600 px-3 text-base font-bold text-white active:bg-teal-700"
+                  className="min-h-[48px] w-full rounded-xl border border-teal-300 bg-white px-3 text-sm font-semibold text-teal-800 active:bg-teal-50"
                 />
-                <button
-                  type="button"
-                  onClick={() => setStep((n) => Math.min(STEP_REVIEW, n + 1))}
-                  className="flex min-h-[56px] shrink-0 items-center gap-1 rounded-xl border border-gray-300 bg-white px-4 text-base font-semibold text-gray-800 active:bg-gray-100"
-                >
-                  {step === STEP_REVIEW - 1 ? 'ตรวจทาน' : 'ถัดไป'}
-                  <ChevronRight className="h-5 w-5" />
-                </button>
               </div>
             ) : confirming === 'submit' ? (
               /* Rendered IN PLACE of the button, never over it, ยกเลิก first
@@ -1745,6 +1842,7 @@ export default function HkRoomReportPage() {
             <ReportPhotoStrip
               testId="hk-report-reception-photos"
               captureLabel="ถ่ายรูปการตรวจ"
+              galleryLabel="เลือกรูปการตรวจ"
               branch={branch}
               photoIds={receptionPhotoIds}
               uploading={uploading}
