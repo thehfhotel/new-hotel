@@ -523,7 +523,8 @@ jobs:
 
           # `\\$` (not `\$`): bash collapses it to a literal `$` for ERE, and the
           # doubled backslash is also what keeps this out of GitHub Actions'
-          # own `${{ }}` expression scanner.
+          # own expression scanner (which evaluates a literal dollar-brace-brace
+          # anywhere in this file, comments included).
           grep -oE "^[[:space:]]+[A-Z0-9_]+:[[:space:]]+\\$\{\{[[:space:]]*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'[^']*'" "$WF" \
             | sed -E "s/^[[:space:]]*([A-Z0-9_]+):.*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'([^']*)'.*/\1\t\2/" \
             | sort -u > /tmp/wf_pairs.tsv || true
