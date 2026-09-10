@@ -1339,6 +1339,41 @@ jobs:
           # the hydrator skips empty), whereas a compose `secrets:` entry
           # pointing at a MISSING file aborts the entire stack start.
           HFID_RESOLVE_SECRET:     ${{ secrets.HFID_RESOLVE_SECRET }}
+          # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+          # Declared here blank/false so the go-live (board items B4/B10/B12) is
+          # a VALUE change — `gh variable set` / `gh secret set` + redeploy —
+          # rather than a code change.
+          #
+          # The two non-secret keys follow the ROUND_WRITEBACK_ENABLED /
+          # HFID_LOCATION_URL pattern: the fallbacks below reproduce
+          # docker-compose.yml's own defaults EXACTLY, so an unset repo variable
+          # is a no-op. They are NOT part of the ADR-0004 compose-owned set (see
+          # the NOTE further down) — that set is the reconcile + OTA_BRIDGE_*
+          # flags only.
+          #
+          # LOYALTY_CHANNEL_ENABLED=true is NOT "just config": a channel hold
+          # writes into the shared legacy DB as a normal จอง on creation
+          # (coexistence invariant #6). Reception-coordinated live verification
+          # first, HF Ville before HF.
+          LOYALTY_CHANNEL_ENABLED: ${{ vars.LOYALTY_CHANNEL_ENABLED || 'false' }}
+          # Loyalty-app base URL for the outbound checkout→stay hook. Empty =
+          # accrual off. A URL is config, not a credential — hence a variable.
+          LOYALTY_APP_URL:         ${{ vars.LOYALTY_APP_URL || '' }}
+          # The two loyalty bearers are SECRETS: delivered via the payload's
+          # `secrets:` block ONLY, never as an `env:` entry in the container.
+          # `LOYALTY_CHANNEL_TOKEN` is the inbound bearer the loyalty app
+          # presents on /api/channel/*; `LOYALTY_SERVICE_TOKEN` is the outbound
+          # bearer this PMS presents on the stay hook and MUST hold the same
+          # string as the loyalty app's own service token.
+          #
+          # These land one deploy BEFORE the compose `secrets:` declaration, for
+          # the reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh
+          # writes a file for every `.secrets` key including empty values
+          # (harmless — the hydrator skips empty and both gates stay closed),
+          # whereas a compose `secrets:` entry pointing at a MISSING file aborts
+          # the ENTIRE stack start.
+          LOYALTY_CHANNEL_TOKEN:   ${{ secrets.LOYALTY_CHANNEL_TOKEN }}
+          LOYALTY_SERVICE_TOKEN:   ${{ secrets.LOYALTY_SERVICE_TOKEN }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1490,6 +1525,10 @@ jobs:
             --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
             --arg HFID_ESCALATE_URL               "${HFID_ESCALATE_URL:-}" \
             --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
+            --arg LOYALTY_CHANNEL_ENABLED "${LOYALTY_CHANNEL_ENABLED:-false}" \
+            --arg LOYALTY_APP_URL         "${LOYALTY_APP_URL:-}" \
+            --arg LOYALTY_CHANNEL_TOKEN   "${LOYALTY_CHANNEL_TOKEN:-}" \
+            --arg LOYALTY_SERVICE_TOKEN   "${LOYALTY_SERVICE_TOKEN:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1527,6 +1566,8 @@ jobs:
                 HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
                 HFID_LOCATION_URL:            $HFID_LOCATION_URL,
                 HFID_ESCALATE_URL:            $HFID_ESCALATE_URL,
+                LOYALTY_CHANNEL_ENABLED:      $LOYALTY_CHANNEL_ENABLED,
+                LOYALTY_APP_URL:              $LOYALTY_APP_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
@@ -1552,6 +1593,8 @@ jobs:
                 ota_bridge_token:          $OTA_BRIDGE_TOKEN,
                 ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
                 hfid_resolve_secret:       $HFID_RESOLVE_SECRET,
+                loyalty_channel_token:     $LOYALTY_CHANNEL_TOKEN,
+                loyalty_service_token:     $LOYALTY_SERVICE_TOKEN,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \
