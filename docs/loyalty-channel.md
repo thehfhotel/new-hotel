@@ -36,18 +36,28 @@ a value change (a repo variable / secret + a redeploy), never a code change.
 
 | key | kind | where it is declared | default |
 |---|---|---|---|
-| `LOYALTY_CHANNEL_ENABLED` | flag | GH repo **variable** → `docker-build.yml` `vars.… \|\| 'false'` → payload `.env` → compose `${LOYALTY_CHANNEL_ENABLED:-false}` | `false` |
+| `LOYALTY_CHANNEL_ENABLED` | flag | **`docker-compose.yml` default only** (ADR 0004) — deliberately absent from `docker-build.yml`; flip = edit `${LOYALTY_CHANNEL_ENABLED:-false}` | `false` |
 | `LOYALTY_APP_URL` | config | GH repo **variable** → same path → compose `${LOYALTY_APP_URL:-}` | blank |
 | `LOYALTY_CHANNEL_TOKEN` | secret | GH repo **secret** → payload `.secrets.loyalty_channel_token` → `/home/deploy/secrets/loyalty_channel_token` → `/run/secrets/…` | absent (empty file) |
 | `LOYALTY_SERVICE_TOKEN` | secret | GH repo **secret** → payload `.secrets.loyalty_service_token` → same file path | absent (empty file) |
 
 Notes that matter when changing this wiring:
 
-* The two flags/URLs follow the `ROUND_WRITEBACK_ENABLED` / `HFID_LOCATION_URL`
-  family — the workflow fallback and the `docker-compose.yml` default are the
-  same literal, so an unset repo variable is a no-op. They are **not** part of
-  the ADR-0004 compose-owned set (reconcile flags + `OTA_BRIDGE_*`), which must
-  stay out of the workflow.
+* `LOYALTY_CHANNEL_ENABLED` **is** part of the ADR-0004 compose-owned set
+  (reconcile flags + `OTA_BRIDGE_*`): it is an operational flag guarding a
+  legacy write, so its state is the committed `docker-compose.yml` default and
+  it is deliberately absent from `docker-build.yml`. Routing it through a repo
+  variable would make that default unreachable — `run-deploy.sh` materialises
+  `.env` wholesale — leaving the repo asserting the channel is dark while it
+  writes `จอง` rows. The flip is therefore a one-line reviewable diff that
+  `git log -S LOYALTY_CHANNEL_ENABLED` can date, **not** a `gh variable set`.
+* `LOYALTY_APP_URL` is a per-environment base URL, the category ADR 0004 leaves
+  on the variable path (`ROUND_WRITEBACK_ENABLED` / `HFID_LOCATION_URL` family).
+  Its workflow fallback and its compose default are the same literal, so an
+  unset repo variable is a no-op.
+* CI job **`lint-deploy-flag-ownership`** enforces both halves: no compose-owned
+  key may appear in `docker-build.yml`, and every key that rides both files must
+  carry the same literal on each side.
 * The two tokens are secrets and therefore have **no `environment:` entry**;
   `secrets.rs::SECRET_FILE_MAP` already maps both files, and `env` wins over a
   file if both are present (local dev).
@@ -95,15 +105,31 @@ independent causes, both currently true**:
 Consequences for verification:
 
 * While dark, a request with **no** bearer, a **wrong** bearer and the **right**
-  bearer are indistinguishable — all three get 503. That is why the go-live
-  check is "an authorised call gets **503-by-flag**, not 401": a `401`
-  (`{"error": "invalid or missing bearer token"}`) can only be produced once the
-  flag is on *and* a token is provisioned, so seeing 401 proves the gate opened
-  and the credential is wrong.
+  bearer are indistinguishable — all three get 503. **This makes HTTP useless as
+  the acceptance test for B4 (mint the tokens).** A 503 is returned whether the
+  secret was minted, minted with a typo'd payload key, or never minted at all;
+  whether the compose `secrets:` follow-up landed or not. A check that cannot
+  fail certifies nothing, and the missing mount would surface only at step 5 of
+  the checklist — inside the reception-coordinated live window.
+* **The acceptance test for B4 is the startup log line**, which is the only
+  secret-free observable that discriminates. After the redeploy, in the
+  `backend` container log:
+
+  ```
+  Loyalty channel: enabled=false (token set: true); stay hook configured: false
+  ```
+
+  `token set:` is `true` **exactly when** the token actually reached the process
+  — i.e. the compose `secrets:` declaration landed and the file is non-empty. If
+  it reads `false` after B4, the mount or the secret is missing; do not proceed.
+  (`hotel-backend/src/main.rs`, `LoyaltyConfig::from_env`.) The same line is the
+  B12 check for accrual: `stay hook configured: true`.
+* A `401` (`{"error": "invalid or missing bearer token"}`) can only be produced
+  once the flag is on *and* a token is provisioned — so once the channel is
+  live, an unauthorised call returning 401 rather than 503 proves the gate
+  opened. That is a step-5 observation, not a B4 one.
 * A `404` instead of a 503 means the channel router was never mounted (no
   `AppState` — the backend is running without a DB), not a flag state.
-* The startup log line is the ops discriminator, and it prints no secret:
-  `Loyalty channel: enabled=<bool> (token set: <bool>); stay hook configured: <bool>`.
 
 ## The two settings that make accrual live
 
@@ -263,26 +289,58 @@ matters, the upgrade path is a `domain_events` subscriber with an
 
 ## Go-live checklist (when the loyalty app is ready)
 
-Ordering note: the estate program board's decision **P1 supersedes the
-"HF Hotel first" reading of this list** — the first live channel flip is at
-**HF Ville** (lower volume, ~30% OTA), and HF follows only after two clean
-weeks. See `hf-tasks/tasks/direct-booking.md` (B9–B11).
+### Two facts that fix the ordering
+
+**1. There is one flag and it opens both properties.** The estate program
+board's decision **P1** wants the first live channel at **HF Ville** (lower
+volume, ~30% OTA), with HF Hotel following after two clean weeks. There is one
+`backend` service and one `LOYALTY_CHANNEL_ENABLED`, and
+`routes::channel::channel_service_for` gates only *Ville* mutations (on
+`HFVILLE_WRITES_ENABLED`) — **HF Hotel has no second gate.** So the flip makes
+`POST /api/channel/holds` live for `property=hf` in the same deploy, and a
+channel hold writes a `จอง` into HF's shared legacy DB on creation.
+
+> **The P1 canary is therefore a caller-side discipline, not a server-side
+> gate.** During the canary the loyalty app must send only `property=hfville`;
+> nothing in this PMS will stop an `hf` hold. HF Hotel reception must be in the
+> loop for the same flip, and the HF-side agreement is "no `property=hf` calls
+> yet", not "the surface is closed". If that is not good enough, add the gate
+> first — a property allowlist in `channel_service_for` modelled on
+> `HK_BRANCHES` is the smallest version.
+
+**2. Nothing can be live-tested before the flip.** Every `/api/channel/*`
+request answers 503 while the flag is off (see the 503 section above), so a
+hold → checkout cycle is not merely inconvenient before the flip — it is
+impossible. The flip must come *first*, and it is safe to put first: **the flip
+alone writes nothing to the legacy DB.** A `จอง` appears only when the loyalty
+app actually calls hold-create. Rollback is one line and ~10 min.
+
+### Steps
 
 1. `gh secret set LOYALTY_CHANNEL_TOKEN` / `LOYALTY_SERVICE_TOKEN`, then
    redeploy so `run-deploy.sh` writes the two secret files.
 2. Land the compose `secrets:` declaration (step 2 of *Provisioning* above) so
-   the files are actually mounted, and redeploy.
+   the files are actually mounted, and redeploy. **Acceptance (board item B4):
+   the backend startup line reads `token set: true`** — not "an HTTP call
+   returns 503", which it does either way.
 3. `gh variable set LOYALTY_APP_URL` and verify the stay hook against a linked
    test guest (checkout one real stay, confirm the points transaction).
-4. Reception-coordinated live test of one hold → payment-verified → release →
-   checkout at **HF Ville**; verify the `จอง` appears/clears correctly in
-   iHOTEL (invariant #6). HF Ville mutations additionally require
-   `HFVILLE_WRITES_ENABLED=true` (ADR 0002 Ship-B gate) — check its current
-   value before the test rather than assuming it.
-5. `gh variable set LOYALTY_CHANNEL_ENABLED -b true` + redeploy. Confirm the
-   promoted image SHA, then confirm an authorised
-   `GET /api/channel/availability` returns **200** (not 503) and an
-   unauthorised one returns **401** (not 503).
-6. Rollback is the same one-liner in reverse
-   (`gh variable set LOYALTY_CHANNEL_ENABLED -b false` + redeploy); it stops new
-   holds but does not cancel existing ones — the 2h expiry sweep still runs.
+   Acceptance: startup line reads `stay hook configured: true`.
+4. Confirm `HFVILLE_WRITES_ENABLED=true` (ADR 0002 Ship-B gate) by reading its
+   current value — Ville mutations need it and it is a separate knob. Confirm
+   with **both** receptions that the loyalty app will send only
+   `property=hfville` until P1's two clean weeks are up (fact 1 above).
+5. **Flip the flag:** edit `docker-compose.yml`'s
+   `LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}` to `:-true` and
+   merge — `docker-compose.yml` is in the workflow's `deploy` paths filter, so
+   the edit ships itself (ADR 0004). Confirm the promoted image SHA, then that
+   an authorised `GET /api/channel/availability` returns **200** (not 503) and
+   an unauthorised one **401** (not 503). No legacy row exists yet.
+6. **Now** the reception-coordinated live cycle, with reception watching iHOTEL
+   and the rollback diff staged: one hold → payment-verified → release →
+   checkout at **HF Ville**; verify the `จอง` appears and clears correctly
+   (invariant #6).
+7. Rollback is the same one-line diff in reverse (`:-true` → `:-false`, merge,
+   ~10 min). It stops new holds but does **not** cancel holds already created —
+   the 2h expiry sweep still runs, and any `จอง` already written stays written
+   and must be cleared in iHOTEL by hand.

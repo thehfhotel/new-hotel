@@ -179,8 +179,17 @@ echo "[deploy] artifacts staged at $DEPLOY_DIR, .env mode $(stat -c '%a' .env)"
 #
 # Writes are atomic: `install` creates the destination + sets mode + owner
 # in one syscall, so a concurrent `docker compose up` can never see a
-# half-written file. Mode 0400 (read-only, owner-only) matches the same
-# tight perms `docker secret create` would use in swarm mode.
+# half-written file.
+#
+# Mode is 0444 — read-only, but world-readable, so every local account on the
+# box can read every secret file here. That is looser than the 0400 `docker
+# secret create` uses in swarm mode. It is deliberate only in the sense that it
+# has always been so and the container uid's read path has never been tested
+# against a tighter bit; 0440 (owner deploy, group docker) is the value to try,
+# but tightening it blind can wedge the whole stack, so it needs a real test on
+# the running containers. Tracked as a follow-up — do not "fix" it in passing.
+# The directory itself is 0755 deploy:docker (below), so the perms here are the
+# only thing standing between a local account and the bearers.
 SECRETS_DIR_HOST=/home/deploy/secrets
 mkdir -p "$SECRETS_DIR_HOST"
 chmod 0755 "$SECRETS_DIR_HOST"
