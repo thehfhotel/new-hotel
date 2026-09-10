@@ -24,17 +24,105 @@ because the two per-site databases have overlapping SERIAL sequences.
 | `LOYALTY_APP_URL` | Loyalty app base URL for the checkout stay hook | unset — hook off |
 | `LOYALTY_SERVICE_TOKEN` | Bearer for the outbound stay hook | unset — hook off |
 
-Secret-file hydration entries exist (`loyalty_channel_token`,
-`loyalty_service_token` in `secrets.rs::SECRET_FILE_MAP`); the
-`docker-compose.yml` `secrets:` block and deploy-payload wiring are
-**deliberately deferred** to the coordinated go-live (declaring a compose
-secret whose file the deploy payload doesn't write yet would break the stack
-start). Until then, plain env vars are the provisioning path.
-
 **The flag flip is NOT "just config"** (coexistence invariant #6): a channel
 hold writes into the shared legacy DB (as a normal booking `จอง`) the moment
 it is created. Enabling the channel requires a reception-coordinated live
 verification, same as every other dark-shipped legacy write.
+
+## Provisioning (deploy plumbing)
+
+All four keys are **declared in the deploy path, blank/false**, so the flip is
+a value change (a repo variable / secret + a redeploy), never a code change.
+
+| key | kind | where it is declared | default |
+|---|---|---|---|
+| `LOYALTY_CHANNEL_ENABLED` | flag | GH repo **variable** → `docker-build.yml` `vars.… \|\| 'false'` → payload `.env` → compose `${LOYALTY_CHANNEL_ENABLED:-false}` | `false` |
+| `LOYALTY_APP_URL` | config | GH repo **variable** → same path → compose `${LOYALTY_APP_URL:-}` | blank |
+| `LOYALTY_CHANNEL_TOKEN` | secret | GH repo **secret** → payload `.secrets.loyalty_channel_token` → `/home/deploy/secrets/loyalty_channel_token` → `/run/secrets/…` | absent (empty file) |
+| `LOYALTY_SERVICE_TOKEN` | secret | GH repo **secret** → payload `.secrets.loyalty_service_token` → same file path | absent (empty file) |
+
+Notes that matter when changing this wiring:
+
+* The two flags/URLs follow the `ROUND_WRITEBACK_ENABLED` / `HFID_LOCATION_URL`
+  family — the workflow fallback and the `docker-compose.yml` default are the
+  same literal, so an unset repo variable is a no-op. They are **not** part of
+  the ADR-0004 compose-owned set (reconcile flags + `OTA_BRIDGE_*`), which must
+  stay out of the workflow.
+* The two tokens are secrets and therefore have **no `environment:` entry**;
+  `secrets.rs::SECRET_FILE_MAP` already maps both files, and `env` wins over a
+  file if both are present (local dev).
+* `run-deploy.sh` writes a file for **every** `.secrets` key, including empty
+  values. An unset GH secret therefore yields an *empty* file, which the
+  hydrator treats as absent — the gate stays closed. A compose `secrets:` entry
+  pointing at a **missing** file, by contrast, aborts the entire stack start.
+  Hence the standing repo idiom (`ota_bridge_token`, `hfid_resolve_secret`):
+  **the payload key ships one deploy AHEAD of the compose declaration.**
+* **Step 2, after the deploy that first carries the payload keys** — add to
+  `docker-compose.yml`: the two top-level `secrets:` definitions
+  (`file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token`, same for
+  `loyalty_service_token`) and the matching two entries under the `backend`
+  service's `secrets:` list. Backend only — no worker calls the channel or the
+  stay hook. Until that lands, the tokens exist on the host but are not mounted,
+  which is exactly the intended dark state.
+
+## Why `/api/channel/availability` answers 503 today
+
+Confirmed against the code on 2026-09-10.
+
+Every `/api/channel/*` route is wrapped by
+`middleware::channel_token::require_channel_token`, whose decision function is:
+
+```rust
+let Some(expected) = expected_token.filter(|_| enabled) else {
+    return ChannelAccess::Disabled;   // -> 503
+};
+```
+
+`Disabled` renders `503` with body
+`{"success": false, "error": "loyalty channel is disabled"}`.
+
+That gate runs **before** the bearer is examined, so today's 503 has **two
+independent causes, both currently true**:
+
+1. `LOYALTY_CHANNEL_ENABLED` is not `true` — `config::flag_enabled` accepts only
+   `true`/`1` (trimmed, case-insensitive); unset, blank, `false`, `0`, `off`,
+   `no` all read as off. Before this change the key was absent from the deploy
+   manifests entirely, so it could only ever be off in production.
+2. `LOYALTY_CHANNEL_TOKEN` is unset/empty — `config::optional_env` maps
+   unset **and** blank/whitespace to `None`, and `expected_token.filter(...)`
+   turns `None` into `Disabled` even with the flag on.
+
+Consequences for verification:
+
+* While dark, a request with **no** bearer, a **wrong** bearer and the **right**
+  bearer are indistinguishable — all three get 503. That is why the go-live
+  check is "an authorised call gets **503-by-flag**, not 401": a `401`
+  (`{"error": "invalid or missing bearer token"}`) can only be produced once the
+  flag is on *and* a token is provisioned, so seeing 401 proves the gate opened
+  and the credential is wrong.
+* A `404` instead of a 503 means the channel router was never mounted (no
+  `AppState` — the backend is running without a DB), not a flag state.
+* The startup log line is the ops discriminator, and it prints no secret:
+  `Loyalty channel: enabled=<bool> (token set: <bool>); stay hook configured: <bool>`.
+
+## The two settings that make accrual live
+
+Checkout accrual (`service::loyalty`, Piece 3 below) is off unless **both** of
+these are set — `LoyaltyConfig::stay_hook_configured()` is
+`app_url.is_some() && service_token.is_some()`, and
+`LoyaltyClient::from_config` returns `None` otherwise:
+
+1. **`LOYALTY_APP_URL`** — base URL; the hook POSTs `{LOYALTY_APP_URL}/api/loyalty/stays`.
+2. **`LOYALTY_SERVICE_TOKEN`** — the outbound bearer.
+
+Neither is the channel flag: accrual is independent of
+`LOYALTY_CHANNEL_ENABLED`, so a walk-in or iHOTEL-originated stay accrues too,
+as long as the guest carries a membership link. With either setting missing the
+client is never built, `checkout` proceeds normally and **no stay ever accrues**
+— silently, by design (the hook can never fail a checkout). Per-stay
+preconditions on top of the two settings: the checkout must complete the stay
+(a per-room partial checkout leaves `cin_status='active'` and is skipped) and
+the guest must have `ht_customers.cust_membership_id` set.
 
 ## Piece 1 — inbound channel API (`routes/channel.rs`)
 
@@ -175,11 +263,26 @@ matters, the upgrade path is a `domain_events` subscriber with an
 
 ## Go-live checklist (when the loyalty app is ready)
 
-1. Provision `LOYALTY_CHANNEL_TOKEN` / `LOYALTY_SERVICE_TOKEN` (+ compose
-   `secrets:` wiring + deploy-payload `.secrets` entries if using files).
-2. Set `LOYALTY_APP_URL`; verify the stay hook against a linked test guest.
-3. Reception-coordinated live test of one hold → payment-verified →
-   checkout at HF Hotel; verify the `จอง` appears/clears correctly in
-   iHOTEL (invariant #6).
-4. Flip `LOYALTY_CHANNEL_ENABLED=true` (HF Hotel). HF Ville additionally
-   waits on `HFVILLE_WRITES_ENABLED` (ADR 0002 Ship-B gate).
+Ordering note: the estate program board's decision **P1 supersedes the
+"HF Hotel first" reading of this list** — the first live channel flip is at
+**HF Ville** (lower volume, ~30% OTA), and HF follows only after two clean
+weeks. See `hf-tasks/tasks/direct-booking.md` (B9–B11).
+
+1. `gh secret set LOYALTY_CHANNEL_TOKEN` / `LOYALTY_SERVICE_TOKEN`, then
+   redeploy so `run-deploy.sh` writes the two secret files.
+2. Land the compose `secrets:` declaration (step 2 of *Provisioning* above) so
+   the files are actually mounted, and redeploy.
+3. `gh variable set LOYALTY_APP_URL` and verify the stay hook against a linked
+   test guest (checkout one real stay, confirm the points transaction).
+4. Reception-coordinated live test of one hold → payment-verified → release →
+   checkout at **HF Ville**; verify the `จอง` appears/clears correctly in
+   iHOTEL (invariant #6). HF Ville mutations additionally require
+   `HFVILLE_WRITES_ENABLED=true` (ADR 0002 Ship-B gate) — check its current
+   value before the test rather than assuming it.
+5. `gh variable set LOYALTY_CHANNEL_ENABLED -b true` + redeploy. Confirm the
+   promoted image SHA, then confirm an authorised
+   `GET /api/channel/availability` returns **200** (not 503) and an
+   unauthorised one returns **401** (not 503).
+6. Rollback is the same one-liner in reverse
+   (`gh variable set LOYALTY_CHANNEL_ENABLED -b false` + redeploy); it stops new
+   holds but does not cancel existing ones — the 2h expiry sweep still runs.
