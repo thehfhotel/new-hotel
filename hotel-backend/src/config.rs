@@ -863,7 +863,11 @@ fn parse_escalation_cap(raw: Option<&str>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+
+    /// Shared with `secrets::tests` — one process-wide lock for every
+    /// env-mutating unit test in the crate (see its doc comment for why two
+    /// private mutexes did not serialise).
+    use crate::secrets::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// The escalation cap is a rate limiter on METERED spend, so every odd
     /// input must fail toward "fewer messages", never toward "no limit" and
@@ -964,12 +968,6 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed.contains("mark_room_clean"));
     }
-
-    /// Serialise env-mutating tests. `std::env::set_var` mutates
-    /// process-wide state — running these in parallel under
-    /// `cargo test` (which uses one process) would cause flakes when
-    /// one test clears `DB_PASSWORD` while another asserts it parses.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Snapshot the env vars we touch, restore them on drop. Lets each
     /// test mutate freely without leaking state to siblings.
@@ -1380,6 +1378,101 @@ mod tests {
         assert!(
             LoyaltyConfig::from_env().stay_hook_configured(),
             "both set ⇒ accrual live (the ONLY two settings that do it)"
+        );
+    }
+
+    /// Every env var `hydrate_env_from_secret_files` can write, so the guard
+    /// restores the process to its prior state even if a stray secret file is
+    /// picked up. `SECRETS_DIR` is included because this test re-points it.
+    const SECRET_HYDRATION_VARS: &[&str] = &[
+        "SECRETS_DIR",
+        "DB_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "VILLE_DB_PASSWORD",
+        "NEW_DB_PASSWORD",
+        "SLACK_WEBHOOK_URL",
+        "DATABASE_URL",
+        "POSTGRES_USER",
+        "POSTGRES_DB",
+        "READER_RESOLVE_SECRET",
+        "OTA_BRIDGE_TOKEN",
+        "OTA_BRIDGE_TOKEN_PREVIOUS",
+        "HFID_RESOLVE_SECRET",
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The compose `secrets:` mount (docs/loyalty-channel.md → *Provisioning*
+    /// step 2) must be safe to declare while the two GH secrets are still
+    /// unset. Two shapes have to boot with the channel dark:
+    ///
+    /// * **no file at all** — every local dev box, and any deploy predating the
+    ///   payload keys;
+    /// * **a mounted but EMPTY file** — what production actually has today,
+    ///   because `run-deploy.sh` writes a file for every `.secrets` key
+    ///   including empty values.
+    ///
+    /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// never an empty-string "token" that the constant-time compare would then
+    /// accept), and `LoyaltyConfig` must report the channel dark and the stay
+    /// hook off — including with the flag forced on, which is the state the
+    /// go-live flip lands in if the secret was never minted.
+    #[test]
+    fn loyalty_tokens_stay_unprovisioned_when_the_secret_file_is_missing_or_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(SECRET_HYDRATION_VARS);
+
+        // RAII — the dir is removed even if an assertion below fails.
+        let dir = crate::secrets::SecretsDir::new("hotel-backend-loyalty-secrets");
+        env::set_var("SECRETS_DIR", &dir.path);
+
+        // 1. Nothing mounted.
+        crate::secrets::hydrate_env_from_secret_files();
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "a missing secret file must leave LOYALTY_CHANNEL_TOKEN unset"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(!cfg.channel_enabled, "missing token file ⇒ channel dark");
+        assert!(cfg.channel_token.is_none(), "no token to accept");
+        assert!(!cfg.stay_hook_configured(), "missing token file ⇒ no accrual");
+
+        // 2. Mounted but empty — the unset-GH-secret shape, i.e. what
+        //    production actually has today. Assert at the ENV layer first:
+        //    `optional_env` would map an empty string to `None` anyway, so the
+        //    LoyaltyConfig assertions alone cannot observe the hydrator
+        //    dropping its `trimmed.is_empty()` guard.
+        for name in ["loyalty_channel_token", "loyalty_service_token"] {
+            dir.write(name, "");
+        }
+        let hydrated = crate::secrets::hydrate_env_from_secret_files();
+        assert_eq!(hydrated, 0, "an empty secret file must hydrate nothing");
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "an empty secret file must leave LOYALTY_CHANNEL_TOKEN unset — never an empty-string bearer"
+        );
+        assert!(
+            env::var("LOYALTY_SERVICE_TOKEN").is_err(),
+            "same for the outbound bearer"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(
+            cfg.channel_token.is_none(),
+            "an empty secret file must read as unprovisioned, not as an empty bearer"
+        );
+        assert!(cfg.service_token.is_none(), "same for the outbound bearer");
+        assert!(!cfg.stay_hook_configured(), "empty token file ⇒ no accrual");
+
+        // 3. Flag flipped on with the secret still unminted: the channel must
+        //    have nothing to accept (middleware::channel_token renders 503).
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        let cfg = LoyaltyConfig::from_env();
+        assert!(cfg.channel_enabled);
+        assert!(
+            cfg.channel_token.is_none(),
+            "flag on + no token file must still be closed — the flip alone opens nothing"
         );
     }
 
