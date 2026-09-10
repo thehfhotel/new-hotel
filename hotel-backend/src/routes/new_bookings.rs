@@ -113,6 +113,18 @@ pub struct NewBooking {
     pub children: Option<i32>,
     pub status: String,
     pub source: Option<String>,
+    /// Provenance channel from `ht_bookings.book_channel` — serialised as
+    /// `bookChannel`. `Some("loyalty")` for a booking made in the guest app
+    /// (`service::channel::LOYALTY_CHANNEL`), an OTA slug (`"bookingcom"`,
+    /// `"agoda"`, …) for an OTA-Desk write-back, `None` for walk-in / phone /
+    /// manual desk bookings.
+    ///
+    /// READ-ONLY on this DTO: it is set by the create path
+    /// (`CreateBookingCommand::book_channel`) and never by an update, so
+    /// serialising it here adds no write surface. Always present on the wire
+    /// (`null` when absent) so the desk UI can branch on it without an
+    /// `undefined` check — see the reservations channel chip.
+    pub book_channel: Option<String>,
     pub total_amount: Option<f64>,
     pub deposit_amount: Option<f64>,
     pub notes: Option<String>,
@@ -136,6 +148,7 @@ impl NewBooking {
             children: row.book_children,
             status: row.book_status,
             source: row.book_source,
+            book_channel: row.book_channel,
             total_amount: row.book_total_amount,
             deposit_amount: row.book_deposit_amount,
             notes: row.book_notes,
@@ -159,6 +172,7 @@ impl NewBooking {
             children: row.book_children,
             status: row.book_status.unwrap_or_else(|| "pending".to_string()),
             source: row.book_source,
+            book_channel: row.book_channel,
             total_amount: row.book_total_amount,
             deposit_amount: row.book_deposit_amount,
             notes: row.book_notes,
@@ -958,5 +972,112 @@ fn map_cancel_error(err: crate::service::ServiceError) -> ApiError {
             ApiError::BadRequest("Booking not found or cannot be cancelled".to_string())
         }
         other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::channel::LOYALTY_CHANNEL;
+
+    fn list_row(book_channel: Option<&str>) -> BookingListRow {
+        BookingListRow {
+            book_id: 1,
+            book_no: "B000001".to_string(),
+            legacy_book_id: None,
+            book_cust_id: 7,
+            customer_name: Some("สมชาย ใจดี".to_string()),
+            book_checkin: None,
+            book_checkout: None,
+            book_nights: Some(1),
+            book_adults: Some(2),
+            book_children: Some(0),
+            book_status: "confirmed".to_string(),
+            book_source: Some("loyalty".to_string()),
+            book_channel: book_channel.map(str::to_string),
+            book_total_amount: Some(1200.0),
+            book_deposit_amount: Some(600.0),
+            book_notes: None,
+            room_count: 1,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn detail_row(book_channel: Option<&str>) -> BookingDetailRow {
+        BookingDetailRow {
+            book_id: 1,
+            book_no: "B000001".to_string(),
+            legacy_book_id: None,
+            book_cust_id: 7,
+            customer_name: Some("สมชาย ใจดี".to_string()),
+            book_checkin: NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(),
+            book_checkout: NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
+            book_nights: Some(1),
+            book_adults: Some(2),
+            book_children: Some(0),
+            book_status: Some("confirmed".to_string()),
+            book_source: Some("loyalty".to_string()),
+            book_channel: book_channel.map(str::to_string),
+            book_total_amount: Some(1200.0),
+            book_deposit_amount: Some(600.0),
+            book_notes: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// The reservations LIST endpoint carries the channel as camelCase
+    /// `bookChannel`, using the canonical `'loyalty'` literal verbatim (the
+    /// desk chip matches on it).
+    #[test]
+    fn list_dto_serialises_book_channel_as_camel_case() {
+        let dto = NewBooking::from_list_row(list_row(Some(LOYALTY_CHANNEL)));
+        let json = serde_json::to_value(&dto).expect("NewBooking serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+        assert!(
+            json.get("book_channel").is_none(),
+            "snake_case key must not leak onto the wire: {json}"
+        );
+    }
+
+    /// The reservations DETAIL endpoint carries the same field.
+    #[test]
+    fn detail_dto_serialises_book_channel() {
+        let dto = NewBooking::from_detail_row(detail_row(Some("bookingcom")), 1);
+        let json = serde_json::to_value(&dto).expect("NewBooking serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("bookingcom"));
+    }
+
+    /// Walk-in / phone bookings have no channel. The key must still be PRESENT
+    /// as `null` (not skipped) so the frontend can branch on it without an
+    /// `undefined` check — this is what makes the chip null-safe.
+    #[test]
+    fn absent_book_channel_serialises_as_explicit_null() {
+        for json in [
+            serde_json::to_value(NewBooking::from_list_row(list_row(None))).unwrap(),
+            serde_json::to_value(NewBooking::from_detail_row(detail_row(None), 1)).unwrap(),
+        ] {
+            assert!(
+                json.as_object().unwrap().contains_key("bookChannel"),
+                "bookChannel must be present even when NULL: {json}"
+            );
+            assert_eq!(json["bookChannel"], serde_json::Value::Null);
+        }
+    }
+
+    /// `NewBookingDetail` flattens `NewBooking`, so the detail response body
+    /// (booking + rooms) carries `bookChannel` at the top level too.
+    #[test]
+    fn flattened_detail_response_carries_book_channel() {
+        let detail = NewBookingDetail {
+            booking: NewBooking::from_detail_row(detail_row(Some(LOYALTY_CHANNEL)), 0),
+            rooms: vec![],
+        };
+        let json = serde_json::to_value(&detail).expect("NewBookingDetail serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
     }
 }

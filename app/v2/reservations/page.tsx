@@ -9,6 +9,7 @@ import { formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import type { Booking, BookingDetail } from '@/types/booking'
 import { bookingStatusView } from '@/lib/v2/status'
 import { V2Spinner, V2PageHeader, StatusPill, VilleNotice } from '@/components/v2/primitives'
+import BookingChannelChip from '@/components/v2/BookingChannelChip'
 import BookingForm, { type BookingFormState } from '@/components/forms/BookingForm'
 
 const STATUS_FILTERS = [
@@ -142,6 +143,7 @@ export default function V2Reservations() {
         children: d.children || 0,
         status: d.status,
         source: d.source,
+        bookChannel: d.bookChannel,
         depositAmount: d.depositAmount,
         notes: d.notes,
         rooms: d.rooms.map((r) => ({ roomId: r.roomId, pricePerNight: r.pricePerNight })),
@@ -285,6 +287,11 @@ export default function V2Reservations() {
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[15px] font-semibold truncate">{b.customerName || 'ไม่ระบุชื่อ'}</span>
                   <StatusPill view={bookingStatusView(b.status)} />
+                  {/* Where the booking came from — "แอป" for a guest-app
+                      booking, the OTA name for an OTA one, nothing for a
+                      walk-in. Without it a walk-in and an app booking read
+                      identically at the desk. */}
+                  <BookingChannelChip bookChannel={b.bookChannel} bookSource={b.source} />
                   {(() => {
                     const bal = (b.totalAmount ?? 0) - (b.depositAmount ?? 0)
                     return bal > 0 ? (
