@@ -633,6 +633,55 @@ services:
       # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
       - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-true}
       - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-true}
+      # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+      #
+      # ADR 0004 applies to LOYALTY_CHANNEL_ENABLED exactly as to OTA_BRIDGE_*
+      # above: THE DEFAULT BELOW IS THE LIVE PRODUCTION VALUE, the key is
+      # deliberately NOT in .github/workflows/docker-build.yml, and it is NOT a
+      # GitHub repo variable. Flip it by editing the default here —
+      # docker-compose.yml is in the workflow's `deploy` paths filter, so the
+      # edit triggers its own deploy and the flip is a one-line reviewable diff
+      # that `git log -S LOYALTY_CHANNEL_ENABLED` can date. Adding the key back
+      # to the workflow would make this default unreachable and leave this file
+      # asserting the channel is dark while it is writing to the legacy DB;
+      # `lint-deploy-flag-ownership` fails CI if anyone does.
+      #
+      # Off ⇒ EVERY /api/channel/* request answers 503 before any credential is
+      # looked at (middleware::channel_token). Flipping it on is NOT "just
+      # config": a channel hold writes into the shared legacy DB as a normal จอง
+      # the moment it is created (coexistence invariant #6), so it needs a
+      # reception-coordinated live verification.
+      #
+      # There is ONE flag for BOTH properties — routes::channel::
+      # channel_service_for gates only HF Ville mutations (on
+      # HFVILLE_WRITES_ENABLED) and HF Hotel has no second gate — so this flip
+      # opens the mutating channel at HF Hotel and HF Ville in the same deploy.
+      # A single-property canary can only be enforced by the caller (the loyalty
+      # app choosing which `property=` it sends). See docs/loyalty-channel.md →
+      # "Go-live checklist".
+      - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
+      # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
+      # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
+      # secret file; with either missing, LoyaltyClient::from_config yields None
+      # and no stay ever accrues points (the checkout itself is unaffected).
+      #
+      # Unlike the flag above this one DOES ride the workflow as
+      # `vars.LOYALTY_APP_URL || ''` — a per-environment URL is the category ADR
+      # 0004 leaves on the variable path (ROUND_WRITEBACK_ENABLED /
+      # HFID_LOCATION_URL family). The two literals must stay identical;
+      # `lint-deploy-flag-ownership` asserts it.
+      - LOYALTY_APP_URL=${LOYALTY_APP_URL:-}
+      # NOTE: LOYALTY_CHANNEL_TOKEN and LOYALTY_SERVICE_TOKEN are SECRETS and so
+      # deliberately have NO `environment:` entry. They ride the deploy payload's
+      # `.secrets` block → /home/deploy/secrets/<name> → /run/secrets/<name>
+      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP already maps both files).
+      # Their compose `secrets:` declaration lands ONE DEPLOY AFTER the payload
+      # keys added in this change, exactly as ota_bridge_token and
+      # hfid_resolve_secret did: run-deploy.sh writes a file for EVERY .secrets
+      # key including empty values (the hydrator treats an empty file as absent,
+      # so the gate simply stays closed), whereas a compose `secrets:` entry
+      # pointing at a MISSING file aborts the ENTIRE stack start. See
+      # docs/loyalty-channel.md → "Provisioning (deploy plumbing)".
     secrets:
       - db_password
       - postgres_password

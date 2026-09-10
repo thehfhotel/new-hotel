@@ -471,6 +471,82 @@ jobs:
           fi
           echo "OK: all $(echo $BIN_FILES | wc -w) binaries call the hydrator"
 
+  # ADR-0004 tripwire, made load-bearing (PR #296 review).
+  #
+  # ADR 0004 says operational flag state lives in docker-compose.yml defaults
+  # and those keys are deliberately ABSENT from this workflow — because
+  # run-deploy.sh materialises .env WHOLESALE from the deploy payload, so any
+  # key this workflow ships makes the matching `${X:-default}` in compose
+  # unreachable. Until now the only guards were two comments, and the sibling
+  # invariant for the keys that DO ride both files ("the workflow fallback and
+  # the compose default are the same literal") was enforced by nothing at all.
+  # Drift there is invisible: CI stays green, and the compose diff that looks
+  # like a shipped flip is a no-op in production.
+  #
+  # ADR 0004 rejected a CI drift check that needed `gh` API access to compare a
+  # live repo variable. This is not that: it is pure text over two committed
+  # files, no network, no credentials, ~1s.
+  lint-deploy-flag-ownership:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+
+      - name: Compose-owned keys stay out of the workflow; shared keys agree
+        run: |
+          set -euo pipefail
+          WF=.github/workflows/docker-build.yml
+          CF=docker-compose.yml
+
+          # ADR-0004 compose-owned keys (and their HFVILLE_ siblings) must not
+          # appear here as `vars.X || '...'`.
+          OWNED="RECONCILE_FORCE_CONVERGE_ENABLED RECONCILE_REINGEST_MISSING_PG_ENABLED WORKER_RECONCILE_ENABLED SYNC_PER_TABLE_WATERMARK OTA_BRIDGE_ENABLED OTA_BRIDGE_ENFORCE LOYALTY_CHANNEL_ENABLED"
+          bad=0
+          for k in $OWNED; do
+            for name in "$k" "HFVILLE_$k"; do
+              if grep -qE "vars\.${name}[[:space:]]*\|\|" "$WF"; then
+                echo "::error file=$WF::$name is ADR-0004 compose-owned (docs/adr/0004-flag-state-in-compose.md) but appears here as a repo variable — that makes its docker-compose.yml default unreachable and silently reverts the committed value on the next deploy. Remove it."
+                bad=1
+              fi
+            done
+          done
+
+          # Every key that rides BOTH files must carry the SAME literal on each
+          # side, or an unset repo variable stops being a no-op.
+          #
+          # RUST_LOG is the one legitimate divergence: each one-shot job service
+          # in compose carries its own per-binary filter, so a single workflow
+          # fallback cannot equal all of them. Add a key here only with a reason.
+          DIVERGENT_OK=" RUST_LOG "
+
+          # `\\$` (not `\$`): bash collapses it to a literal `$` for ERE, and the
+          # doubled backslash is also what keeps this out of GitHub Actions'
+          # own expression scanner (which evaluates a literal dollar-brace-brace
+          # anywhere in this file, comments included).
+          grep -oE "^[[:space:]]+[A-Z0-9_]+:[[:space:]]+\\$\{\{[[:space:]]*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'[^']*'" "$WF" \
+            | sed -E "s/^[[:space:]]*([A-Z0-9_]+):.*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'([^']*)'.*/\1\t\2/" \
+            | sort -u > /tmp/wf_pairs.tsv || true
+
+          checked=0
+          while IFS=$'\t' read -r key lit; do
+            [ -z "$key" ] && continue
+            case "$DIVERGENT_OK" in *" $key "*) continue ;; esac
+            defaults=$(grep -oE "[-[:space:]]${key}=\\$\{${key}:-[^}]*\}" "$CF" | sed -E "s/.*:-([^}]*)\}/\1/" | sort -u || true)
+            [ -z "$defaults" ] && continue
+            checked=$((checked + 1))
+            while IFS= read -r d; do
+              if [ "$d" != "$lit" ]; then
+                echo "::error file=$CF::$key: the workflow fallback is '$lit' but the docker-compose default is '$d'. run-deploy.sh writes .env wholesale, so the compose default here is dead and editing it is a no-op in production. Make the two literals identical (or move the key to the compose-owned set)."
+                bad=1
+              fi
+            done <<< "$defaults"
+          done < /tmp/wf_pairs.tsv
+
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "OK: $checked shared workflow/compose keys agree; no compose-owned key leaked into the workflow"
+
   # Track J7 guard (audit-2026-05-14 follow-on to PR #102).
   #
   # PR #102 wired up googleapis/release-please-action@v4: feature PRs are
@@ -1339,6 +1415,42 @@ jobs:
           # the hydrator skips empty), whereas a compose `secrets:` entry
           # pointing at a MISSING file aborts the entire stack start.
           HFID_RESOLVE_SECRET:     ${{ secrets.HFID_RESOLVE_SECRET }}
+          # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+          # Declared here blank so the go-live (board items B4/B12) is a VALUE
+          # change — `gh variable set` / `gh secret set` + redeploy — rather
+          # than a code change.
+          #
+          # LOYALTY_CHANNEL_ENABLED is deliberately NOT here: it is an
+          # operational flag guarding a legacy write (a channel hold lands in
+          # the shared legacy DB as a normal จอง the moment it is created,
+          # coexistence invariant #6), which is the ADR-0004 compose-owned
+          # shape exactly as OTA_BRIDGE_ENABLED is. Its state lives in the
+          # docker-compose.yml default and the flip is a one-line reviewable
+          # diff there. See the NOTE further down; `lint-deploy-flag-ownership`
+          # fails CI if anyone adds it back.
+          #
+          # LOYALTY_APP_URL is a per-environment base URL, not a flag and not a
+          # credential — that is the category ADR 0004 explicitly leaves on the
+          # variable path (ROUND_WRITEBACK_ENABLED / HFID_LOCATION_URL family).
+          # The fallback below reproduces docker-compose.yml's own default
+          # EXACTLY, so an unset repo variable is a no-op — `lint-deploy-flag-
+          # ownership` asserts the two literals stay equal.
+          LOYALTY_APP_URL:         ${{ vars.LOYALTY_APP_URL || '' }}
+          # The two loyalty bearers are SECRETS: delivered via the payload's
+          # `secrets:` block ONLY, never as an `env:` entry in the container.
+          # `LOYALTY_CHANNEL_TOKEN` is the inbound bearer the loyalty app
+          # presents on /api/channel/*; `LOYALTY_SERVICE_TOKEN` is the outbound
+          # bearer this PMS presents on the stay hook and MUST hold the same
+          # string as the loyalty app's own service token.
+          #
+          # These land one deploy BEFORE the compose `secrets:` declaration, for
+          # the reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh
+          # writes a file for every `.secrets` key including empty values
+          # (harmless — the hydrator skips empty and both gates stay closed),
+          # whereas a compose `secrets:` entry pointing at a MISSING file aborts
+          # the ENTIRE stack start.
+          LOYALTY_CHANNEL_TOKEN:   ${{ secrets.LOYALTY_CHANNEL_TOKEN }}
+          LOYALTY_SERVICE_TOKEN:   ${{ secrets.LOYALTY_SERVICE_TOKEN }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1370,7 +1482,8 @@ jobs:
           # (RECONCILE_FORCE_CONVERGE_ENABLED, RECONCILE_REINGEST_MISSING_PG_ENABLED,
           # WORKER_RECONCILE_ENABLED, SYNC_PER_TABLE_WATERMARK, and their
           # HFVILLE_ siblings) — AND the OTA booking-bridge flags
-          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md) — are
+          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md), AND
+          # LOYALTY_CHANNEL_ENABLED (docs/loyalty-channel.md) — are
           # deliberately NOT listed here. Their state
           # lives in docker-compose.yml defaults, which is the single source of
           # truth. Adding any of them back would make those defaults
@@ -1490,6 +1603,9 @@ jobs:
             --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
             --arg HFID_ESCALATE_URL               "${HFID_ESCALATE_URL:-}" \
             --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
+            --arg LOYALTY_APP_URL         "${LOYALTY_APP_URL:-}" \
+            --arg LOYALTY_CHANNEL_TOKEN   "${LOYALTY_CHANNEL_TOKEN:-}" \
+            --arg LOYALTY_SERVICE_TOKEN   "${LOYALTY_SERVICE_TOKEN:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1527,6 +1643,7 @@ jobs:
                 HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
                 HFID_LOCATION_URL:            $HFID_LOCATION_URL,
                 HFID_ESCALATE_URL:            $HFID_ESCALATE_URL,
+                LOYALTY_APP_URL:              $LOYALTY_APP_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
@@ -1552,6 +1669,8 @@ jobs:
                 ota_bridge_token:          $OTA_BRIDGE_TOKEN,
                 ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
                 hfid_resolve_secret:       $HFID_RESOLVE_SECRET,
+                loyalty_channel_token:     $LOYALTY_CHANNEL_TOKEN,
+                loyalty_service_token:     $LOYALTY_SERVICE_TOKEN,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

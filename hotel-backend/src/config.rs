@@ -1281,6 +1281,108 @@ mod tests {
         assert_eq!(cfg.password, "ville-sa");
     }
 
+    /// Every env var the loyalty integration reads. Declared in
+    /// `docker-compose.yml` / `docker-build.yml` blank-or-false, so these tests
+    /// pin what "declared but dark" must mean at runtime.
+    const LOYALTY_VARS: &[&str] = &[
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The whole point of the B3 dark declaration: putting the keys into the
+    /// deploy manifests must NOT enable anything. Unset, blank, whitespace and
+    /// every non-`true`/`1` literal a hand-edited `.env` might carry all leave
+    /// the inbound channel off.
+    #[test]
+    fn loyalty_channel_stays_dark_when_the_flag_is_unset_or_blank() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        // A provisioned token must never be enough on its own.
+        env::set_var("LOYALTY_CHANNEL_TOKEN", "a-real-looking-channel-token");
+
+        // 1. Key absent entirely (pre-B3 production, and any local `.env`).
+        assert!(
+            !LoyaltyConfig::from_env().channel_enabled,
+            "unset LOYALTY_CHANNEL_ENABLED must leave the channel dark"
+        );
+
+        // 2. Key present but empty — what `${LOYALTY_CHANNEL_ENABLED:-}` or an
+        //    unset GH variable rendered into `.env` looks like.
+        for blank in ["", "   ", "\t"] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", blank);
+            assert!(
+                !LoyaltyConfig::from_env().channel_enabled,
+                "blank LOYALTY_CHANNEL_ENABLED ({blank:?}) must leave the channel dark"
+            );
+        }
+
+        // 3. Anything that is not `true`/`1` is off, including near-misses.
+        for falsey in [
+            "false", "FALSE", "0", "off", "no", "yes", "enabled", "True ",
+        ] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", falsey);
+            let enabled = LoyaltyConfig::from_env().channel_enabled;
+            let expected = falsey.trim().eq_ignore_ascii_case("true");
+            assert_eq!(
+                enabled, expected,
+                "LOYALTY_CHANNEL_ENABLED={falsey:?} must parse as {expected}"
+            );
+        }
+    }
+
+    /// Flag on but the token file empty (an unset GH secret still yields an
+    /// EMPTY `/run/secrets/loyalty_channel_token`, which the hydrator skips) —
+    /// the gate must still have nothing to accept.
+    #[test]
+    fn loyalty_channel_token_blank_reads_as_unprovisioned() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        for blank in ["", "  "] {
+            env::set_var("LOYALTY_CHANNEL_TOKEN", blank);
+            assert!(
+                LoyaltyConfig::from_env().channel_token.is_none(),
+                "blank LOYALTY_CHANNEL_TOKEN ({blank:?}) must read as unprovisioned"
+            );
+        }
+    }
+
+    /// Accrual needs BOTH halves. Declaring `LOYALTY_APP_URL` blank in the
+    /// deploy manifest must not half-arm the checkout stay hook.
+    #[test]
+    fn loyalty_stay_hook_needs_both_url_and_token() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "both unset ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "URL alone ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "");
+        env::set_var("LOYALTY_SERVICE_TOKEN", "a-real-looking-service-token");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "blank URL + token ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            LoyaltyConfig::from_env().stay_hook_configured(),
+            "both set ⇒ accrual live (the ONLY two settings that do it)"
+        );
+    }
+
     /// Overrides are honoured — the deploy topology can move without a code
     /// change (same contract as `DB_SERVER` / `MSSQL_PORT` for HF Hotel).
     #[test]

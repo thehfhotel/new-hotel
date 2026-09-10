@@ -238,4 +238,34 @@ mod tests {
         let t = ChannelTokenState::for_test(true, Some(TOKEN));
         assert_eq!(t.token.as_deref(), Some(TOKEN));
     }
+
+    /// The shape `LoyaltyConfig::from_env()` produces in production today, and
+    /// the shape the B3 dark declaration keeps producing: flag off (unset or
+    /// blank `LOYALTY_CHANNEL_ENABLED`) and no token (unset or empty
+    /// `/run/secrets/loyalty_channel_token`). Every request — credentialled or
+    /// not — must land on `Disabled` (503), never `Unauthorized` (401), which
+    /// is what makes "503-by-flag, not 401" a meaningful go-live check.
+    ///
+    /// `config::flag_enabled` / `optional_env` are what map unset-or-blank onto
+    /// these `false` / `None` values; that mapping is pinned by
+    /// `config::tests::loyalty_channel_stays_dark_when_the_flag_is_unset_or_blank`.
+    #[test]
+    fn default_config_keeps_the_surface_dark_for_every_caller() {
+        let state = ChannelTokenState::new(&LoyaltyConfig::default());
+        assert!(!state.enabled);
+        assert!(state.token.is_none());
+
+        for header in [
+            None,
+            Some(format!("Bearer {TOKEN}")),
+            Some("Bearer wrong-token".to_string()),
+            Some(String::new()),
+        ] {
+            assert_eq!(
+                check_channel_access(state.enabled, state.token.as_deref(), header.as_deref()),
+                ChannelAccess::Disabled,
+                "a dark channel must answer 503 for header {header:?}, never 401"
+            );
+        }
+    }
 }
