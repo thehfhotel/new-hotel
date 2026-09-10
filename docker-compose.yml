@@ -674,14 +674,13 @@ services:
       # NOTE: LOYALTY_CHANNEL_TOKEN and LOYALTY_SERVICE_TOKEN are SECRETS and so
       # deliberately have NO `environment:` entry. They ride the deploy payload's
       # `.secrets` block → /home/deploy/secrets/<name> → /run/secrets/<name>
-      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP already maps both files).
-      # Their compose `secrets:` declaration lands ONE DEPLOY AFTER the payload
-      # keys added in this change, exactly as ota_bridge_token and
-      # hfid_resolve_secret did: run-deploy.sh writes a file for EVERY .secrets
-      # key including empty values (the hydrator treats an empty file as absent,
-      # so the gate simply stays closed), whereas a compose `secrets:` entry
-      # pointing at a MISSING file aborts the ENTIRE stack start. See
-      # docs/loyalty-channel.md → "Provisioning (deploy plumbing)".
+      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP maps both files).
+      # Their compose `secrets:` declaration landed ONE DEPLOY AFTER the payload
+      # keys (#296), exactly as ota_bridge_token and hfid_resolve_secret did —
+      # see the `secrets:` list below and docs/loyalty-channel.md →
+      # "Provisioning (deploy plumbing)" step 2. Mounting the files does not
+      # open anything: the channel still needs LOYALTY_CHANNEL_ENABLED (false,
+      # just above) and the stay hook still needs LOYALTY_APP_URL (blank).
     secrets:
       - db_password
       - postgres_password
@@ -708,6 +707,14 @@ services:
       #
       # Backend only; no worker resolves badges.
       - hfid_resolve_secret
+      # Loyalty-app bearers (docs/loyalty-channel.md). Backend only — no worker
+      # serves /api/channel/* or fires the checkout stay hook. SAFE to declare
+      # for the same reason as the entries above: the deploy payload has carried
+      # both `.secrets` keys since #296, so run-deploy.sh has already written
+      # both host files (empty while the GH secrets are unset, which the
+      # hydrator treats as absent — every gate stays closed).
+      - loyalty_channel_token
+      - loyalty_service_token
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -1495,9 +1502,16 @@ networks:
 # reads `std::env::var("DB_PASSWORD")` keeps working unchanged.
 #
 # DEPLOY-TIME PREREQUISITES on evergreen (must exist BEFORE merge / pipeline
-# runs `docker compose up`). The deploy script (`/srv/run-deploy.sh` on
-# evergreen, NOT in this repo) is responsible for writing these from GH
-# secrets, chmod 0400, chown deploy:docker:
+# runs `docker compose up`). The deploy script (`scripts/deploy/run-deploy.sh`
+# in this repo, self-updating `/srv/run-deploy.sh` on evergreen) is responsible
+# for writing these from the payload's `.secrets` block — `install -m 0444 -o
+# deploy -g docker`, one uniform loop over EVERY key, so a newly added secret
+# lands with exactly the same mode as the ones below.
+#
+# 0444, not 0400: the backend container's non-root `appuser` has to read the
+# bind-mounted file (v2.66.2 operator note). Tightening it is a tracked
+# follow-up with its own reasoning block in run-deploy.sh — do not "fix" the
+# mode in passing.
 #
 #     /home/deploy/secrets/db_password
 #     /home/deploy/secrets/postgres_password
@@ -1551,3 +1565,22 @@ secrets:
   # secrets" for the three-names-one-secret table.
   hfid_resolve_secret:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/hfid_resolve_secret
+  # Loyalty-app integration bearers (docs/loyalty-channel.md → "Provisioning
+  # (deploy plumbing)", step 2). Declared ONE DEPLOY AFTER the docker-build.yml
+  # payload keys `.secrets.loyalty_channel_token` / `.secrets.loyalty_service_token`
+  # (landed in #296), so both host files exist — the same stagger, and the same
+  # reason, as the OTA pair and hfid_resolve_secret above.
+  #
+  # `loyalty_channel_token` is the INBOUND bearer the loyalty app presents on
+  # /api/channel/*; `loyalty_service_token` is the OUTBOUND bearer this PMS
+  # presents on the checkout stay hook (it must hold the identical string as the
+  # loyalty app's own service token).
+  #
+  # Mounting them changes NOTHING about the dark state: the channel surface is
+  # additionally gated on LOYALTY_CHANNEL_ENABLED (false, compose-owned per ADR
+  # 0004) and the stay hook needs LOYALTY_APP_URL as well. An unset GH secret
+  # yields an EMPTY file, which the hydrator treats as absent.
+  loyalty_channel_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token
+  loyalty_service_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_service_token

@@ -85,9 +85,11 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     // bearer for /api/channel/* (loyalty app → PMS) and outbound bearer for
     // the checkout stay hook (PMS → loyalty app). Both fail closed when
     // absent — the channel rejects every request, the hook stays off.
-    // NOTE: not yet declared in docker-compose.yml `secrets:` (the deploy
-    // payload doesn't carry them yet); env vars are the provisioning path
-    // until the coordinated go-live wires the secret files.
+    // Both are declared in docker-compose.yml `secrets:` and mounted on the
+    // `backend` service only (no worker serves /api/channel/* or fires the
+    // stay hook). The mount is dark by construction: an unset GH secret yields
+    // an EMPTY file, which `read_secret_file` skips, so the env var stays unset
+    // and both gates fail closed. Env vars still win for local dev.
     ("loyalty_channel_token", "LOYALTY_CHANNEL_TOKEN"),
     ("loyalty_service_token", "LOYALTY_SERVICE_TOKEN"),
     // OTA booking bridge (docs/ota-bridge.md). Shared bearer ota-desk
@@ -251,13 +253,23 @@ fn reconstruct_database_url() -> Option<String> {
     Some(format!("postgres://{user}:{password}@{host}:{port}/{db}"))
 }
 
+/// ONE process-wide lock for every env-mutating unit test in this crate.
+///
+/// `std::env::set_var` is process-global and `cargo test` runs the unit tests
+/// of a crate as threads in a SINGLE process, so two test modules with two
+/// private mutexes do not actually serialise against each other — the hydrator
+/// tests here and `config::tests` guard overlapping vars (`DB_PASSWORD`,
+/// `POSTGRES_PASSWORD`, `LOYALTY_*`, …) and would race. It lives in this module
+/// (not `config`) because `secrets` is the module every env-mutating test
+/// ultimately exercises, and because both the lib and the bin crate declare it.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serialise env-mutating tests — same rationale as `config::tests`.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    use super::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// Snapshot env vars touched by a test, restore on drop.
     struct EnvGuard {
