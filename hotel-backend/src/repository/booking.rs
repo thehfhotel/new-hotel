@@ -36,6 +36,12 @@ pub struct BookingListRow {
     pub book_children: Option<i32>,
     pub book_status: String,
     pub book_source: Option<String>,
+    /// Provenance channel (migration 076 / `service::channel::LOYALTY_CHANNEL`).
+    /// `'loyalty'` for a booking made in the guest app, an OTA slug
+    /// (`'bookingcom'`, `'agoda'`, …) for an OTA-Desk write-back, `None` for
+    /// walk-in / phone / manual desk bookings. PG-canonical only — never
+    /// mirrored to legacy. Read-only on the wire.
+    pub book_channel: Option<String>,
     pub book_total_amount: Option<f64>,
     pub book_deposit_amount: Option<f64>,
     pub book_notes: Option<String>,
@@ -60,6 +66,8 @@ pub struct BookingDetailRow {
     pub book_children: Option<i32>,
     pub book_status: Option<String>,
     pub book_source: Option<String>,
+    /// See [`BookingListRow::book_channel`].
+    pub book_channel: Option<String>,
     pub book_total_amount: Option<f64>,
     pub book_deposit_amount: Option<f64>,
     pub book_notes: Option<String>,
@@ -444,6 +452,7 @@ impl BookingRepository for PgBookingRepository {
             b.book_children,
             b.book_status,
             b.book_source,
+            b.book_channel,
             b.book_total_amount::float8 as book_total_amount,
             b.book_deposit_amount::float8 as book_deposit_amount,
             b.book_notes,
@@ -497,6 +506,7 @@ impl BookingRepository for PgBookingRepository {
                     .try_get::<String, _>("book_status")
                     .unwrap_or_else(|_| "pending".to_string()),
                 book_source: row.try_get::<String, _>("book_source").ok(),
+                book_channel: row.try_get::<String, _>("book_channel").ok(),
                 book_total_amount: row.try_get::<f64, _>("book_total_amount").ok(),
                 book_deposit_amount: row.try_get::<f64, _>("book_deposit_amount").ok(),
                 book_notes: row.try_get::<String, _>("book_notes").ok(),
@@ -530,6 +540,7 @@ impl BookingRepository for PgBookingRepository {
             b.book_children,
             b.book_status,
             b.book_source,
+            b.book_channel,
             b.book_total_amount::float8 as book_total_amount,
             b.book_deposit_amount::float8 as book_deposit_amount,
             b.book_notes,
@@ -556,6 +567,7 @@ impl BookingRepository for PgBookingRepository {
             book_children: r.try_get("book_children").ok(),
             book_status: r.try_get("book_status").ok(),
             book_source: r.try_get("book_source").ok(),
+            book_channel: r.try_get("book_channel").ok(),
             book_total_amount: r.try_get("book_total_amount").ok(),
             book_deposit_amount: r.try_get("book_deposit_amount").ok(),
             book_notes: r.try_get("book_notes").ok(),

@@ -19,7 +19,16 @@ export interface Booking {
   adults: number | null
   children: number | null
   status: string
+  /** `ht_bookings.book_source` — the coarse legacy origin ('ota', 'loyalty', …). */
   source: string | null
+  /**
+   * `ht_bookings.book_channel` (migration 076) — provenance, READ-ONLY.
+   * `'loyalty'` = booked in the guest app, an OTA slug ('bookingcom', 'agoda',
+   * …) = OTA-Desk write-back, `null` = walk-in / phone / manual desk booking.
+   * The backend always emits the key (null when absent), so no `undefined`
+   * check is needed. Rendered by `components/v2/BookingChannelChip`.
+   */
+  bookChannel: string | null
   totalAmount: number | null
   depositAmount: number | null
   notes: string | null
