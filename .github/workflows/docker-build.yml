@@ -992,6 +992,14 @@ jobs:
           # `scope: backend` per Batch D — isolates GHA cache namespace.
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+          # Baked into the image as ENV GIT_SHA and surfaced by /health as
+          # `revision`, so a live probe proves WHICH COMMIT is serving
+          # instead of inferring it from the promote job's ghcr digest.
+          # The ARG is declared last in hotel-backend/Dockerfile, so this
+          # per-commit value invalidates only the final ENV layer — the
+          # cargo-chef cook + build layers above it still cache-hit.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
 
   # ===========================================================================
   # promote — the single writer of :latest  (incident 2026-08-31)
@@ -1521,6 +1529,25 @@ jobs:
           # quiet-mode is needed (e.g. major version cutovers); unset
           # restores the debug-pinned default.
           RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info' }}
+          # Post-deploy bake assertion (NOT a container env var — it rides the
+          # payload's TOP LEVEL, so it never lands in the materialised .env).
+          # run-deploy.sh probes /health inside the backend container and
+          # compares `.revision` to this value, hard-failing on a mismatch.
+          # Without it the whole `revision` feature can rot silently: every
+          # unit test passes with a value of "unknown" (nothing in CI can bake
+          # a SHA), so deleting the `build-args` block below, or moving the
+          # Dockerfile ARG above a COPY in a refactor, would leave every gate
+          # green and /health reporting "unknown" forever.
+          #
+          # EMPTY unless `build-backend` actually RAN AND SUCCEEDED — that is
+          # load-bearing, not defensive padding. `build-backend` is
+          # path-filtered (`needs.changes.outputs.backend == 'true'` plus the
+          # should-deploy skip), so on a frontend-only or release-please push
+          # the promoted backend image legitimately carries an OLDER sha than
+          # this run's. Asserting unconditionally would fire on every such
+          # deploy, and a check that cries wolf gets disabled. Empty =>
+          # run-deploy.sh logs the observed revision and asserts nothing.
+          EXPECTED_BACKEND_REVISION: ${{ needs.build-backend.result == 'success' && github.sha || '' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -1578,8 +1605,15 @@ jobs:
           # 2026-05-18 — sync_checkins broke silently for 2+ days). Keep
           # in sync with the vars.RUST_LOG default in the `env:` block
           # above.
+          # `expected_backend_revision` is a TOP-LEVEL payload key, not an
+          # `env` entry: run-deploy.sh materialises .env wholesale from the
+          # `env` block, and this value is a per-run deploy assertion, not
+          # container configuration. Older deploy scripts simply ignore the
+          # key, so this is additive — the assertion goes live one deploy
+          # later, when /srv/run-deploy.sh has self-updated from the tarball.
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
+            --arg expected_backend_revision "${EXPECTED_BACKEND_REVISION:-}" \
             --rawfile deploy_payload_b64 /tmp/deploy.b64 \
             --arg ghcr_user           "$GHCR_USER" \
             --arg ghcr_token          "$GHCR_TOKEN" \
@@ -1624,6 +1658,7 @@ jobs:
             --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
+              expected_backend_revision: $expected_backend_revision,
               deploy_payload_b64: $deploy_payload_b64,
               ghcr: { user: $ghcr_user, token: $ghcr_token },
               env: {
