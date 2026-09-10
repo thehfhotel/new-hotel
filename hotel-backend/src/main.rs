@@ -1231,6 +1231,14 @@ fn build_new_routes(app_state: AppState, room_flags_readers: RoomFlagsReaders) -
             "/api/reports/sales-by-customer",
             get(routes::new_reports::get_sales_by_customer),
         )
+        // Direct-booking program D3 — bookings / room-nights / gross revenue /
+        // cancellations bucketed by `ht_bookings.book_channel` + `book_source`
+        // (docs/channel-rollup.md). Read-only, branch-aware, booking-centric
+        // (NOT the check-in basis the five reports above share).
+        .route(
+            "/api/reports/channel-rollup",
+            get(routes::new_reports::get_channel_rollup),
+        )
         // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
         .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Daily guest rosters / desk paperwork (task #43). FULL lists (no silent
