@@ -1513,11 +1513,25 @@ networks:
 # follow-up with its own reasoning block in run-deploy.sh — do not "fix" the
 # mode in passing.
 #
+# One file per key under the top-level `secrets:` block at the end of this
+# file — that block is the authority; keep this list in step with it:
+#
 #     /home/deploy/secrets/db_password
 #     /home/deploy/secrets/postgres_password
-#     /home/deploy/secrets/ville_db_password   # symlink to postgres_password
-#                                              # until ADR 0001 Phase 8 split
+#     /home/deploy/secrets/ville_db_password   # a REAL file per key (one value
+#                                              # per secret, no symlink); still
+#                                              # the postgres value until HF
+#                                              # Ville gets its own credential
+#                                              # (ADR 0002)
 #     /home/deploy/secrets/slack_webhook_url
+#     /home/deploy/secrets/ota_bridge_token
+#     /home/deploy/secrets/ota_bridge_token_previous   # normally EMPTY
+#     /home/deploy/secrets/hfid_resolve_secret
+#     /home/deploy/secrets/loyalty_channel_token       # EMPTY until minted
+#     /home/deploy/secrets/loyalty_service_token       # EMPTY until minted
+#
+# An EMPTY file is fine (the hydrator treats it as absent, the gate stays
+# closed); a MISSING file is not — see below.
 #
 # An entry under `secrets:` that points to a missing file fails fast with
 #     "no such file or directory" before any container starts — operators

@@ -67,7 +67,7 @@ Notes that matter when changing this wiring:
   pointing at a **missing** file, by contrast, aborts the entire stack start.
   Hence the standing repo idiom (`ota_bridge_token`, `hfid_resolve_secret`):
   **the payload key ships one deploy AHEAD of the compose declaration.**
-* **Step 2 — LANDED** (branch `chore/loyalty-token-secrets-mount`), one deploy
+* **Step 2 — LANDED** (PR #298), one deploy
   after the payload keys. `docker-compose.yml` now carries the two top-level
   `secrets:` definitions (`file:
   ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token`, same for
@@ -332,9 +332,9 @@ app actually calls hold-create. Rollback is one line and ~10 min.
 1. `gh secret set LOYALTY_CHANNEL_TOKEN` / `LOYALTY_SERVICE_TOKEN`, then
    redeploy so `run-deploy.sh` writes the two secret files.
 2. ~~Land the compose `secrets:` declaration~~ **DONE** (step 2 of
-   *Provisioning* above): the two files are mounted on `backend` as of branch
-   `chore/loyalty-token-secrets-mount`, so step 1's redeploy is all that is
-   left. **Acceptance (board item B4): the backend startup line reads `token
+   *Provisioning* above): `docker-compose.yml` carries both top-level
+   `secrets:` definitions and both entries under the `backend` service (PR
+   #298), so step 1's redeploy is all that is left. **Acceptance (board item B4): the backend startup line reads `token
    set: true`** — not "an HTTP call returns 503", which it does either way.
 3. `gh variable set LOYALTY_APP_URL` and verify the stay hook against a linked
    test guest (checkout one real stay, confirm the points transaction).

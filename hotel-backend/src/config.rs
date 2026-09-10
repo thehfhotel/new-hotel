@@ -1424,16 +1424,9 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvGuard::new(SECRET_HYDRATION_VARS);
 
-        let dir = std::env::temp_dir().join(format!(
-            "hotel-backend-loyalty-secrets-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp secrets dir");
-        env::set_var("SECRETS_DIR", &dir);
+        // RAII — the dir is removed even if an assertion below fails.
+        let dir = crate::secrets::SecretsDir::new("hotel-backend-loyalty-secrets");
+        env::set_var("SECRETS_DIR", &dir.path);
 
         // 1. Nothing mounted.
         crate::secrets::hydrate_env_from_secret_files();
@@ -1446,11 +1439,24 @@ mod tests {
         assert!(cfg.channel_token.is_none(), "no token to accept");
         assert!(!cfg.stay_hook_configured(), "missing token file ⇒ no accrual");
 
-        // 2. Mounted but empty — the unset-GH-secret shape.
+        // 2. Mounted but empty — the unset-GH-secret shape, i.e. what
+        //    production actually has today. Assert at the ENV layer first:
+        //    `optional_env` would map an empty string to `None` anyway, so the
+        //    LoyaltyConfig assertions alone cannot observe the hydrator
+        //    dropping its `trimmed.is_empty()` guard.
         for name in ["loyalty_channel_token", "loyalty_service_token"] {
-            std::fs::write(dir.join(name), "").expect("write empty secret file");
+            dir.write(name, "");
         }
-        crate::secrets::hydrate_env_from_secret_files();
+        let hydrated = crate::secrets::hydrate_env_from_secret_files();
+        assert_eq!(hydrated, 0, "an empty secret file must hydrate nothing");
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "an empty secret file must leave LOYALTY_CHANNEL_TOKEN unset — never an empty-string bearer"
+        );
+        assert!(
+            env::var("LOYALTY_SERVICE_TOKEN").is_err(),
+            "same for the outbound bearer"
+        );
         let cfg = LoyaltyConfig::from_env();
         assert!(
             cfg.channel_token.is_none(),
@@ -1468,8 +1474,6 @@ mod tests {
             cfg.channel_token.is_none(),
             "flag on + no token file must still be closed — the flip alone opens nothing"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Overrides are honoured — the deploy topology can move without a code
