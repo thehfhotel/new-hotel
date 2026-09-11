@@ -7,6 +7,9 @@
 //! - GET /api/reports/sales-by-customer - Revenue grouped by customer
 //! - GET /api/reports/channel-rollup - Bookings / room-nights / revenue by
 //!   booking channel (direct-booking program D3, `docs/channel-rollup.md`)
+//! - GET /api/reports/loyalty-reconcile - The morning reconciliation reception
+//!   runs at shift open: app bookings PostgreSQL and iHOTEL disagree about
+//!   (direct-booking program B8f, `docs/runbooks/loyalty-morning-reconcile.md`)
 //!
 //! The first five are **check-in centric** (`ht_checkins`, sharing
 //! [`CHECKIN_REVENUE_EXPR`]). The channel rollup is **booking centric**
@@ -31,6 +34,9 @@ use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::service::reports::channel_rollup::{
     load_channel_rollup, rollup, ChannelRollup, DEFAULT_RANGE_DAYS, MAX_RANGE_DAYS,
+};
+use crate::service::reports::loyalty_reconcile::{
+    load_loyalty_reconcile, stall_threshold_minutes, LoyaltyReconcile, DEPOSIT_HORIZON_DAYS,
 };
 
 /// SQL fragment computing a check-in's attributed revenue: the recorded folio
@@ -790,6 +796,80 @@ pub async fn get_channel_rollup(
         rollup: rollup(&rows),
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Direct-booking program B8f — the morning reconciliation (checklist L6)
+// ---------------------------------------------------------------------------
+
+/// Query for `GET /api/reports/loyalty-reconcile`.
+#[derive(Debug, Deserialize)]
+pub struct LoyaltyReconcileQuery {
+    /// `YYYY-MM-DD`. Absent → **today in Asia/Bangkok**: a shift opens on a
+    /// Thai business day, not a UTC one, so a UTC default would hand the
+    /// 07:00 desk yesterday's list for the first seven hours of every day.
+    pub date: Option<String>,
+    pub branch: Option<Branch>,
+}
+
+/// Response for the morning reconciliation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoyaltyReconcileResponse {
+    pub success: bool,
+    /// Echo of the resolved date, so a caller that omitted it knows which
+    /// business day it actually got.
+    pub date: NaiveDate,
+    /// Last date covered by the deposit look-ahead and the in-house scan
+    /// (`date + DEPOSIT_HORIZON_DAYS`).
+    pub through: NaiveDate,
+    /// The writeback age threshold in force, shared with the Track F5 alert.
+    /// Echoed so the desk can see why a two-minute-old job is not listed.
+    pub stall_threshold_minutes: i32,
+    #[serde(flatten)]
+    pub reconcile: LoyaltyReconcile,
+}
+
+/// GET /api/reports/loyalty-reconcile — the five-minute morning read reception
+/// runs at shift open (direct-booking program B8f, checklist **L6**).
+///
+/// `?date=YYYY-MM-DD&branch=hfhotel|hfville`, defaulting to today in Bangkok.
+/// Returns every `book_channel='loyalty'` row that PostgreSQL and iHOTEL
+/// disagree about, in blast-radius order, with the counts summary the desk
+/// reads first. See `docs/runbooks/loyalty-morning-reconcile.md` for the desk
+/// routine and the equivalent read-only SQL for when this route is down.
+///
+/// **A PRE-FLIP control**: it must work while the channel is still dark, which
+/// it does — every query is a partial-index scan matching nothing until the
+/// first app booking exists.
+///
+/// Read-only and PG-only (no MSSQL, no outbox, no writeback), same auth and
+/// the same branch-aware pool selection as the other `/api/reports/*` routes.
+pub async fn get_loyalty_reconcile(
+    State(state): State<AppState>,
+    Query(params): Query<LoyaltyReconcileQuery>,
+) -> ApiResult<Json<LoyaltyReconcileResponse>> {
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel; the report is
+    // per-desk (one shift opens at one property) so cross-site aggregation
+    // would produce a list nobody is responsible for working.
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let date = parse_optional_date(params.date.as_ref(), "date")?.unwrap_or_else(today_bangkok);
+    let threshold = stall_threshold_minutes();
+
+    let reconcile = load_loyalty_reconcile(pool, date, DEPOSIT_HORIZON_DAYS, threshold).await?;
+
+    Ok(Json(LoyaltyReconcileResponse {
+        success: true,
+        date,
+        through: date + chrono::Duration::days(DEPOSIT_HORIZON_DAYS),
+        stall_threshold_minutes: threshold,
+        reconcile,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2036,7 +2036,13 @@ const LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY: &str = "loyalty_writeback_stall";
 ///     guest who has paid a deposit holds a room iHOTEL believes is free".
 ///     Different fact, different remedy, and when the worker is down no job
 ///     ever *reaches* `exhausted` anyway.
-const WRITEBACK_APPLIED_STATUS: &str = "done";
+///
+/// `pub` so the B8f morning reconciliation report
+/// (`service::reports::loyalty_reconcile`) shares this literal rather than
+/// re-spelling it. A row on that report must be a row this tripwire would
+/// fire on, and vice versa — a report that defines "applied" differently
+/// from the alert teaches the desk to distrust both.
+pub const WRITEBACK_APPLIED_STATUS: &str = "done";
 
 /// Resolve the stall threshold (minutes) from
 /// `LOYALTY_WRITEBACK_STALL_ALERT_MINUTES`, clamped to a floor of 1 minute.

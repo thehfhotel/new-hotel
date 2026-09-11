@@ -1239,6 +1239,18 @@ fn build_new_routes(app_state: AppState, room_flags_readers: RoomFlagsReaders) -
             "/api/reports/channel-rollup",
             get(routes::new_reports::get_channel_rollup),
         )
+        // Direct-booking program B8f (checklist L6) — the morning
+        // reconciliation reception runs at shift open: loyalty-channel rows
+        // PostgreSQL and iHOTEL disagree about (unapplied writebacks, sweep
+        // lag, phantom `จอง`, unlinked check-ins) plus the B7 deposit
+        // divergence the desk must expect. Read-only, branch-aware, PG-ONLY —
+        // it deliberately touches no MSSQL, so it keeps answering when the
+        // legacy leg is the thing that is broken.
+        // See docs/runbooks/loyalty-morning-reconcile.md.
+        .route(
+            "/api/reports/loyalty-reconcile",
+            get(routes::new_reports::get_loyalty_reconcile),
+        )
         // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
         .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Daily guest rosters / desk paperwork (task #43). FULL lists (no silent
