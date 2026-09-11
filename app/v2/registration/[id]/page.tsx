@@ -12,6 +12,7 @@ import RegistrationSlipTemplate, {
 import { V2PageHeader, V2Spinner } from '@/components/v2/primitives'
 import ScanRegistrationDocModal from '@/components/modals/ScanRegistrationDocModal'
 import GuestRegistryModal from '@/components/modals/GuestRegistryModal'
+import AppDepositNotice from '@/components/v2/AppDepositNotice'
 
 /**
  * v2 registration slip (ใบลงทะเบียนเข้าพัก) — #29 reprint path. iHOTEL exposes a
@@ -91,6 +92,16 @@ export default function V2RegistrationSlipPage({
         </div>
       ) : slip ? (
         <>
+          {/* Task B7 — this stay came from a booking the guest paid in the app,
+              but iHOTEL shows that booking's deposit as 0 until checkout. Say so
+              at the moment reception has the arriving guest in front of them,
+              before anyone asks for the money a second time. Renders nothing for
+              a walk-in or an OTA booking. */}
+          <AppDepositNotice
+            bookChannel={slip.bookChannel}
+            depositAmount={slip.bookingAdvance}
+          />
+
           <div className="v2-card p-5 space-y-1.5 text-[14px]">
             <div className="v2-eyebrow">เลขที่ {slip.registrationNo}</div>
             <div className="font-semibold text-[17px]">{slip.guestName || 'ไม่ระบุชื่อ'}</div>
