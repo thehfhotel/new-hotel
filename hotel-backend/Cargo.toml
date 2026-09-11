@@ -140,7 +140,7 @@ uuid = { version = "1", features = ["serde", "v4", "v5"] }
 # base64 — decode the `imageBase64` payload on `POST /api/guest-documents`
 # into `bytea`. Promoted from transitive (already resolved at 0.22 in the dep
 # tree) to a direct dep; no new version pulled.
-base64 = "0.22"
+base64 = "0.23"
 
 # Error handling (matches Tauri)
 thiserror = "2"
@@ -193,7 +193,7 @@ rpassword = "7"
 # v10: a crypto backend must be selected explicitly — `rust_crypto`
 # (RustCrypto, pure Rust) over `aws_lc_rs` (C/asm build deps we don't want).
 # `use_pem` lets the cfg(test) fixtures sign with a static PEM key.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 # Cookie extraction for the Phase 4 PR2 auth routes + middleware.
 # - axum-extra: `cookie` feature gives us `axum_extra::extract::cookie::CookieJar`,
