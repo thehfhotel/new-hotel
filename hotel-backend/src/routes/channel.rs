@@ -201,10 +201,36 @@ pub mod reason {
     /// 409 — the property is at its last-room floor (B8e / L2). Guest copy:
     /// call the desk; reception can still sell this room.
     pub const LAST_ROOM_HELD_FOR_DESK: &str = "last_room_held_for_desk";
-    /// 503 — a concurrent booking write held the inventory lock (B8e / L3).
-    /// **Retryable**, and the response carries `Retry-After`. Nothing was
-    /// written; the same request replayed will normally succeed.
-    pub const INVENTORY_LOCK_TIMEOUT: &str = "inventory_lock_timeout";
+    /// 503 — a concurrent booking write held the inventory lock, or the
+    /// connection pool had nothing to lend (B8e / L3; both shapes of
+    /// `InventoryLockError::Busy`). **Retryable**, and the response carries
+    /// `Retry-After`. Nothing was written; the same request replayed will
+    /// normally succeed.
+    ///
+    /// Defined once in [`crate::error::BUSY_REASON`] because the desk/OTA
+    /// router emits the identical code for the identical condition.
+    pub const INVENTORY_LOCK_TIMEOUT: &str = crate::error::BUSY_REASON;
+    /// 503 — the channel is DARK (`LOYALTY_CHANNEL_ENABLED` off, or no
+    /// `LOYALTY_CHANNEL_TOKEN` provisioned). Emitted by
+    /// `middleware::channel_token` before any handler runs, and it is the
+    /// response `/api/channel/*` returns in production today.
+    ///
+    /// **The one distinction loyalty-app must not get wrong.** This and
+    /// [`INVENTORY_LOCK_TIMEOUT`] are both `503` and mean opposite things:
+    ///
+    /// | | `inventory_lock_timeout` | `channel_disabled` |
+    /// |---|---|---|
+    /// | cause | momentary write contention | the surface is switched off |
+    /// | `Retry-After` | present | absent |
+    /// | client action | **retry the same request** | **do not retry** — fall back to the desk |
+    ///
+    /// Without a `reason` the two are indistinguishable on the wire, and a
+    /// client that retried a dark channel would hammer it for nothing.
+    pub const CHANNEL_DISABLED: &str = "channel_disabled";
+    /// 401 — missing or wrong bearer. Also from `middleware::channel_token`.
+    /// Equal to [`for_status`]`(401)` by construction; the totality test pins
+    /// that so the middleware and the fallback cannot drift apart.
+    pub const UNAUTHORIZED: &str = "unauthorized";
     /// 422 — this `Idempotency-Key` is bound to a different request.
     pub const IDEMPOTENCY_KEY_MISMATCH: &str = "idempotency_key_mismatch";
 
@@ -1194,5 +1220,47 @@ mod reason_tests {
                 "status {status} produced an empty reason"
             );
         }
+    }
+
+    /// The vocabulary is a set of DISTINCT codes, and the two `503`s are the
+    /// pair that must never collapse.
+    ///
+    /// `channel_disabled` (the response `/api/channel/*` gives in production
+    /// today) means "do not retry, the surface is off"; `inventory_lock_timeout`
+    /// means "retry now". Same status code, opposite instruction — if a future
+    /// edit made either of them fall back to `for_status(503)` they would both
+    /// read `unavailable` and loyalty-app would retry a dark channel forever.
+    #[test]
+    fn the_reason_vocabulary_is_distinct_and_the_two_503s_differ() {
+        let codes = [
+            reason::SOLD_OUT,
+            reason::LAST_ROOM_HELD_FOR_DESK,
+            reason::INVENTORY_LOCK_TIMEOUT,
+            reason::CHANNEL_DISABLED,
+            reason::UNAUTHORIZED,
+            reason::IDEMPOTENCY_KEY_MISMATCH,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            assert!(!a.is_empty(), "reason {i} is empty");
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "two reasons share the code '{a}'");
+            }
+        }
+
+        assert_ne!(
+            reason::CHANNEL_DISABLED,
+            reason::INVENTORY_LOCK_TIMEOUT,
+            "the retryable 503 and the dark-channel 503 must stay distinguishable"
+        );
+        assert_ne!(
+            reason::CHANNEL_DISABLED,
+            reason::for_status(503),
+            "channel_disabled must be explicit, not the generic 503 fallback"
+        );
+        assert_eq!(
+            reason::UNAUTHORIZED,
+            reason::for_status(401),
+            "the middleware 401 and the fallback must agree"
+        );
     }
 }

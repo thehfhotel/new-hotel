@@ -103,7 +103,10 @@ let Some(expected) = expected_token.filter(|_| enabled) else {
 ```
 
 `Disabled` renders `503` with body
-`{"success": false, "error": "loyalty channel is disabled"}`.
+`{"success": false, "reason": "channel_disabled", "error": "loyalty channel is disabled"}`
+— and `Unauthorized` renders `401` with `"reason": "unauthorized"`. The
+`reason` field is what separates this 503 from the retryable
+`inventory_lock_timeout` one; see §"`reason` codes on `/api/channel/*`" below.
 
 That gate runs **before** the bearer is examined, so today's 503 has **two
 independent causes, both currently true**:
@@ -445,17 +448,35 @@ number the counter and the picker are derived from), not a raw room count.
 
 ### `reason` codes on `/api/channel/*` (the total mapping)
 
-**Every** error body this router returns carries `reason`, so loyalty-app's
-mapping has no "and otherwise?" hole. Defined in `routes::channel::reason`;
-renaming one is a contract change.
+**Every** error body carries `reason` — from the handlers AND from
+`middleware::channel_token`, which refuses before any handler runs. Defined in
+`routes::channel::reason`; renaming one is a contract change.
 
-| `reason` | status | meaning / guest copy |
-|---|---|---|
-| `sold_out` | 409 | no room of that type for those dates — offer other dates |
-| `last_room_held_for_desk` | 409 | B8e/L2 floor — **call the desk**, reception can still sell it |
-| `inventory_lock_timeout` | 503 + `Retry-After` | transient contention, nothing written — **retry the same request** |
-| `idempotency_key_mismatch` | 422 | the key is bound to a different request |
-| `bad_request` / `not_found` / `forbidden` / `conflict` / `unprocessable` / `unavailable` / `internal` | per status | status-derived fallback so the field is never absent |
+| `reason` | status | emitted by | meaning / client action |
+|---|---|---|---|
+| `sold_out` | 409 | handler | no room of that type for those dates — offer other dates |
+| `last_room_held_for_desk` | 409 | handler | B8e/L2 floor — **call the desk**, reception can still sell it |
+| `inventory_lock_timeout` | 503 + `Retry-After` | handler | transient write contention (lock held, or the PG pool was empty), nothing written — **retry the same request** |
+| `channel_disabled` | 503, no `Retry-After` | **middleware** | `LOYALTY_CHANNEL_ENABLED` off, or no `LOYALTY_CHANNEL_TOKEN` — **do not retry**, fall back to the desk |
+| `unauthorized` | 401 | **middleware** | missing or wrong bearer |
+| `idempotency_key_mismatch` | 422 | handler | the key is bound to a different request |
+| `bad_request` / `not_found` / `forbidden` / `conflict` / `unprocessable` / `unavailable` / `internal` | per status | handler | status-derived fallback so the field is never absent |
+
+**The two 503s are the pair to get right.** `channel_disabled` is what
+`/api/channel/*` returns in production *today* (the surface is dark);
+`inventory_lock_timeout` is a momentary write collision. Same status code,
+opposite instruction — retry one, never the other — and the `Retry-After`
+header is present on exactly the retryable one. Before this the dark 503
+carried no `reason` at all, so the two were indistinguishable on the wire.
+`middleware::channel_token::tests::
+every_refusal_carries_a_reason_distinct_from_the_retryable_503` and
+`routes::channel::reason_tests::
+the_reason_vocabulary_is_distinct_and_the_two_503s_differ` pin it from both
+sides.
+
+The desk/OTA router carries the same `inventory_lock_timeout` code on its own
+`ApiError::Busy` body (`crate::error::BUSY_REASON` is the single definition),
+so the two surfaces describe that one condition identically.
 
 ### Rollout: the floor ships at 0
 

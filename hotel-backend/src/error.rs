@@ -65,6 +65,20 @@ pub enum ApiError {
 /// condition can last.
 pub const BUSY_RETRY_AFTER_SECONDS: u32 = 1;
 
+/// Machine `reason` carried by every [`ApiError::Busy`] body, on BOTH the
+/// desk/OTA router and `/api/channel/*` (which re-exports it as
+/// `routes::channel::reason::INVENTORY_LOCK_TIMEOUT`). Declared here, not
+/// there, so the low-level error type does not have to reach up into a route
+/// module for its own body — and so the two surfaces cannot drift into
+/// describing one condition two ways.
+///
+/// It covers BOTH shapes of `InventoryLockError::Busy`: another writer held
+/// the lock (`LockHeld`) and the connection pool had nothing to lend
+/// (`PoolExhausted`). They are one condition to a caller — transient, nothing
+/// written, retry the identical request — and splitting them would hand
+/// loyalty-app a distinction it cannot act on differently.
+pub const BUSY_REASON: &str = "inventory_lock_timeout";
+
 impl From<tiberius::error::Error> for ApiError {
     fn from(err: tiberius::error::Error) -> Self {
         ApiError::Database(err.to_string())
@@ -94,7 +108,10 @@ impl IntoResponse for ApiError {
                     axum::http::header::RETRY_AFTER,
                     BUSY_RETRY_AFTER_SECONDS.to_string(),
                 )],
-                Json(json!({"success": false, "error": msg})),
+                // `reason` alongside the message so the desk/OTA body mirrors
+                // the channel router's — one condition, one machine code, two
+                // surfaces (B8e round-2 review).
+                Json(json!({"success": false, "reason": BUSY_REASON, "error": msg})),
             )
                 .into_response();
         }
