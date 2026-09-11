@@ -27,6 +27,25 @@
 //! 2. Rooms:     `HT_Rooms`        vs canonical `ht_rooms_new`   (JOIN `legacy_room_no` / `room_no`)
 //! 3. Bookings:  `View_Booking_Ds` vs canonical `ht_bookings`    (JOIN `legacy_book_id`)
 //! 4. Check-ins: `View_CheckIn_Ds` vs canonical `ht_checkins`    (JOIN `legacy_cin_no`)
+//! 5. Payments: `HT_Receipt_H`    vs canonical `ht_payments`    (JOIN `legacy_receipt_no`
+//!    / `pay_reference`) — Phase 6-A, keyed on `Receipt_no`, and **DARK by
+//!    default**: it runs only when `RECONCILE_PAYMENTS_ARM_ENABLED=true`.
+//! 6. Guest registry: `HT_CheckIn_Other_People` vs canonical
+//!    `ht_guest_registry` (JOIN `ht_checkins.legacy_cin_no`) — Phase 6-B,
+//!    keyed on `Cin_no` and reconciled per FOLIO (the whole companion set of
+//!    one check-in), not per row: legacy edits are DELETE+reinsert with id
+//!    churn. Also **DARK by default**:
+//!    `RECONCILE_GUEST_REGISTRY_ARM_ENABLED=true`.
+//! 7. Mirror tables: the 8 CT-mirrored `legacy_mirror.*` tables plus
+//!    `ht_room_calendar`, compared by aggregate (COUNT / MAX(pk) / SUM of the
+//!    money total) with a per-PK diff only on mismatch — Phase 6-C, see
+//!    [`crate::scheduler::mirror_probe`]. Also **DARK by default**:
+//!    `RECONCILE_MIRROR_PROBE_ENABLED=true`.
+//! 8. Payment ledger: `HT_CheckIn_Pay` vs canonical `ht_payment_ledger`,
+//!    compared per FOLIO (`Cin_No`) on line count + itemized amount +
+//!    receipt-deduped active tender — Phase 6-D, see
+//!    [`crate::scheduler::payment_ledger_probe`]. Also **DARK by default**:
+//!    `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=true`.
 //!
 //! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
 //! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
@@ -41,25 +60,96 @@
 //! instead of re-firing it. The mirror's data columns are intentionally
 //! left stale — the CT watcher owns canonical state.
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::time::Instant;
 
 use tiberius::Query;
 
+use crate::db::mssql_timeout::{
+    query_with_timeout_pooled, simple_query_with_timeout_pooled, MssqlOpKind,
+};
 use crate::db::{DbPool, PgPool};
 // Issue #204 (bug #2): the durable self-healing arm of the auto-resolve
 // sweep re-drives the EXISTING CT upsert path, so it reaches for the same
 // mappers / row-abstraction / op-enum the watcher uses rather than writing
 // canonical fields by hand.
 use crate::notifications::slack::{SlackClient, SlackMessage};
+use crate::outbox::event::DomainEvent;
+// Phase 6-D: one literal for the probe's `ht_reconcile_log.table_name`, its
+// `sync_status.entity_type` and its `RECONCILE_RESOLVABLE_TABLES` entry, so
+// the three can never drift apart.
+use crate::scheduler::payment_ledger_probe::{LedgerEraFloor, PAYMENT_LEDGER_PROBE_KEY};
+// Track F5: the loyalty-channel writeback tripwire filters on the SAME
+// `book_channel` marker the channel service stamps on every hold. Imported
+// rather than re-typed as a literal so the detector cannot silently stop
+// matching if the marker is ever changed.
+use crate::service::channel::LOYALTY_CHANNEL;
 use crate::sync::change_op::ChangeOp;
+// Single-sourced `|` separator, shared with the mapper-side descriptor
+// tables that pin the gate ⊇ reconcile-hash invariant.
+use crate::sync::gate_guard::join_hash_segments;
 use crate::sync::mapper::MssqlChangeMapper;
+// Phase 6-B: the companion-folio projection is shared with the CT mapper so
+// the reconcile arm and the mapper cannot disagree about what a folio is,
+// and the canonical name re-concatenation is the SAME bytes the mapper's
+// echo-adoption match uses.
+use crate::sync::mappers::guest_registry::{
+    RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL,
+};
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
+
+// =============================================================================
+// Scheduler-side structured-event registry (issue #267)
+// =============================================================================
+//
+// `bin/sync.rs` owns `KNOWN_SYNC_EVENT_NAMES`, the registry for the CT
+// watcher's `sync.*` failure taxonomy. That registry is BINARY-local and
+// unreachable from here — a library module cannot depend on a `bin` target —
+// so the scheduler keeps its own list rather than one merged cross-binary
+// registry. Issue #267 asked for that call to be made explicitly: it stays
+// SPLIT, and not only because the merge is mechanically impossible. The two
+// populations have different contracts:
+//
+//   * watcher names are dot-namespaced (`sync.…`) and are additionally
+//     PERSISTED, prefixed, into `legacy_sync_status.last_error`, so an
+//     operator triaging a stalled table still sees the failure MODE after the
+//     log line has aged out;
+//   * scheduler names are log-only tripwires consumed by `/diagnose-alert`
+//     greps and dashboards. They are deliberately UNPREFIXED — renaming the
+//     live `force_converge_gate_skip` to fit someone else's namespace would
+//     break the exact grep contract this registry exists to protect.
+//
+// The two namespaces stay disjoint (no dots here — pinned below), so a Loki
+// filter of `^sync\.` still means "the CT watcher" and nothing else.
+//
+// Adding a new scheduler event: declare an `EV_…` const HERE, hand that const
+// (never a bare string literal) to the `tracing::…!` call site, and add it to
+// `KNOWN_SCHEDULER_EVENT_NAMES`. All three steps are mechanically enforced by
+// the registry lock tests at the bottom of this file — a raw literal at a
+// call site, or a const missing from the registry, fails the test gate.
+
+/// The auto-resolve sweep re-drove a row through the CT mapper, the mapper
+/// reported "nothing to do" AND canonical did not move, yet the row is still
+/// unconverged — i.e. the mapper's idempotency gate covers FEWER fields than
+/// the reconcile hash (a gate ⊄ hash violation). Such a row can never
+/// self-heal, and the watcher will never see a CT event for it either.
+/// Emitted by BOTH self-heal arms; the `arm` field discriminates
+/// (`value_drift` / `missing_pg`).
+pub(crate) const EV_FORCE_CONVERGE_GATE_SKIP: &str = "force_converge_gate_skip";
+
+/// Registry of every structured event this module emits. Membership-tested,
+/// not pattern-matched — order is not significant.
+///
+/// `#[allow(dead_code)]`: the array itself is referenced only by the registry
+/// lock tests (the `EV_*` constants it holds are used at their call sites).
+/// Same shape as `bin/sync.rs`'s `KNOWN_SYNC_EVENT_NAMES`.
+#[allow(dead_code)]
+const KNOWN_SCHEDULER_EVENT_NAMES: &[&str] = &[EV_FORCE_CONVERGE_GATE_SKIP];
 
 /// Default per-table drift-count threshold above which a Slack alert is
 /// fired on the next reconcile tick. 50 unresolved rows for a single
@@ -67,7 +157,30 @@ use crate::sync::row::MappableRow;
 /// floor (which should be 0) and below the noise level a genuine bulk
 /// catch-up scenario would produce. Override at deploy time with
 /// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`.
+///
+/// **This is a blast-radius dial, not a target** (2026-07-28 alert
+/// inventory). 21 days of production data peak at 33 unresolved rows/hr
+/// for a single table, so the burst alert has never fired — that is the
+/// designed state. Do NOT "tune it down until it fires": the level
+/// digest below already covers the single-row / slow-burn case, and this
+/// threshold exists purely to catch a bulk regression (mapper crash,
+/// schema break, retention overflow) before it floods the log. Lowering
+/// it converts a silent-by-design tripwire into a recurring digest.
 pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
+
+/// Default cooldown for the edge-triggered burst alert
+/// ([`check_drift_and_alert`]), per `(site, table)`.
+///
+/// 2026-07-28 alert inventory, defect C5: the burst alert had NO cooldown
+/// at all. Above threshold it re-fired on every 15-min reconcile tick,
+/// and HF Ville runs a second independent emitter (the worker reconcile
+/// behind `WORKER_RECONCILE_ENABLED`), so a sustained burst could produce
+/// ~8 identical messages/hour/table. One hour matches the alert's own
+/// rolling observation window, so each surviving message covers a
+/// distinct hour of observations instead of restating the same window
+/// four times. Override with `LEGACY_RECONCILE_BURST_COOLDOWN_HOURS`
+/// (per-site: `..._<SITE_ID_UPPER>`).
+pub const DEFAULT_BURST_ALERT_COOLDOWN_HOURS: i64 = 1;
 
 /// Track D / T7 HIGH-1 — level-triggered drift digest cooldown (per
 /// table). The edge-triggered alert above fires on a rolling-window
@@ -77,8 +190,30 @@ pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
 /// `LEVEL_DRIFT_COOLDOWN`. The two are complementary: the edge alert
 /// catches bulk regressions, the level alert catches single-row
 /// divergences that never trip 50/hr but still represent stuck state.
-pub const LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
-pub const LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
+///
+/// **Env-overridable since 2026-07-28** (alert inventory, defect A2):
+/// these were compiled-in `const`s, so retuning the ONE alert this
+/// channel actually receives required a full backend deploy. Resolved
+/// per tick by [`level_drift_thresholds_from_env`] with the standard
+/// per-site → global → default chain. Defaults are unchanged.
+pub const DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
+pub const DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
+
+/// Second, higher staleness threshold at which the level digest changes
+/// its title and tone from "unconverged" to "will not self-heal".
+///
+/// 2026-07-28 alert inventory, defect A1: day 1 and day 16 of the
+/// 16-day incident produced byte-identical Slack text on a fixed 24h
+/// rhythm — the fastest way to train an operator to dismiss an alert.
+/// Past this threshold the digest escalates under its own cooldown key
+/// ([`escalated_cooldown_key`]) so the transition is announced
+/// immediately instead of waiting out the primary 24h window.
+///
+/// 72h = three consecutive daily digests ignored. By then the
+/// auto-resolve sweep has had ~288 chances to close the row; it is not
+/// going to, and the fix is a re-ingest / `--bootstrap`, not patience.
+/// Override with `LEVEL_DRIFT_ESCALATE_HOURS` (per-site: `..._<SITE>`).
+pub const DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS: i64 = 72;
 
 /// Default per-tick CT watcher lag thresholds. Resolved at runtime via
 /// [`ct_lag_thresholds_from_env`]. The version threshold catches a
@@ -184,6 +319,133 @@ pub async fn run_sync(
         record_error(pg_pool, "checkins", &e.to_string()).await;
     }
 
+    // Phase 6-A: payments (`HT_Receipt_H` ↔ `ht_payments`). SHIPPED DARK —
+    // `RECONCILE_PAYMENTS_ARM_ENABLED` defaults false on every service, and
+    // the check lives HERE (not inside `sync_payments`) so a disabled arm
+    // issues literally zero MSSQL/PG queries. Runs AFTER check-ins: a
+    // payment's canonical parent is `ht_checkins`, so any parent repair a
+    // tick performs lands first. See `reconcile_payments_arm_enabled`.
+    if reconcile_payments_arm_enabled() {
+        if let Err(e) = sync_payments(legacy_pool, pg_pool).await {
+            tracing::error!(site = %site_id, "[Sync] Payment sync failed: {}", e);
+            record_error(pg_pool, "payments", &e.to_string()).await;
+        }
+    }
+
+    // Phase 6-B: guest registry / companion folios (`HT_CheckIn_Other_People`
+    // ↔ `ht_guest_registry`). SHIPPED DARK —
+    // `RECONCILE_GUEST_REGISTRY_ARM_ENABLED` defaults false on every service,
+    // and the check lives HERE (not inside `sync_guest_registry`) so a
+    // disabled arm issues literally zero MSSQL/PG queries. Runs AFTER
+    // check-ins for the same reason payments does: the parent is
+    // `ht_checkins`. See `reconcile_guest_registry_arm_enabled`.
+    if reconcile_guest_registry_arm_enabled() {
+        if let Err(e) = sync_guest_registry(legacy_pool, pg_pool, slack, site_id).await {
+            tracing::error!(site = %site_id, "[Sync] Guest-registry sync failed: {}", e);
+            record_error(pg_pool, "guest_registry", &e.to_string()).await;
+        }
+    }
+
+    // Phase 6-C: generic mirror-table probe (the 8 CT-mirrored
+    // `legacy_mirror.*` tables + `ht_room_calendar`). SHIPPED DARK —
+    // `RECONCILE_MIRROR_PROBE_ENABLED` defaults false on every service, and
+    // the check lives HERE (not inside `run_mirror_probe`) so a disabled
+    // probe issues literally zero MSSQL/PG queries. Runs BEFORE
+    // `reload_mirror_dimensions` on purpose: the probe set and the reload
+    // set are disjoint (the reload owns the 4 wholesale dimension mirrors),
+    // so ordering carries no data dependency, and keeping the probe next to
+    // the other reconcile arms is what makes the "one aggregate batch per
+    // side" cost visible in one place.
+    //
+    // The `record_error` counter needs `sync_status.entity_type =
+    // 'mirror_probe'` to EXIST — it is an `UPDATE … WHERE entity_type = $2`
+    // and would otherwise update zero rows, leaving only the log line.
+    // Migration 082 seeds it (and `init-db/init-hotelnew.sql` for a fresh
+    // database), exactly as 080/081 did for the payments and guest-registry
+    // arms.
+    //
+    // BOTH outcomes are written, as `payments` and `guest_registry` do:
+    // `record_success` is the ONLY thing that zeroes `consecutive_failures`
+    // and stamps `last_sync_at` (`last_error`/`last_error_at` keep the most
+    // recent failure). With only the error arm wired, `consecutive_failures`
+    // for `mirror_probe` would be a monotonic LIFETIME failure count (unique
+    // among the entity_types) and `last_sync_at` would stay NULL forever — a
+    // reading that is actively misleading rather than merely absent.
+    if reconcile_mirror_probe_enabled() {
+        match crate::scheduler::mirror_probe::run_mirror_probe(legacy_pool, pg_pool).await {
+            Ok(outcome) => {
+                // added=`restamped` (the calendar class-B heal arm is the only
+                //   canonical write the probe makes; 0 while its flag is off),
+                // updated=`recorded` (divergence rows written this tick),
+                // unchanged=`converged` (probes whose aggregates agreed).
+                record_success(
+                    pg_pool,
+                    "mirror_probe",
+                    outcome.restamped as i32,
+                    outcome.recorded as i32,
+                    outcome.converged as i32,
+                    outcome.duration_ms,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(site = %site_id, "[Sync] Mirror probe failed: {}", e);
+                record_error(pg_pool, "mirror_probe", &e.to_string()).await;
+            }
+        }
+    }
+
+    // Phase 6-D: per-FOLIO payment-ledger probe (`HT_CheckIn_Pay` ↔
+    // `ht_payment_ledger`). SHIPPED DARK —
+    // `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED` defaults false on every
+    // service, and the check lives HERE (not inside the probe) so a disabled
+    // probe issues literally zero MSSQL/PG queries. Runs AFTER the 6-A
+    // `payments` arm on purpose: that arm reconciles the RECEIPT artefact
+    // (`ht_payments`), this one the per-line tender ledger underneath it, so
+    // an operator reading a tick's log sees the receipt-level answer before
+    // the line-level one.
+    //
+    // Same `sync_status` requirement as 6-C: `record_error` is an
+    // `UPDATE … WHERE entity_type = $2`, so without the
+    // `entity_type = 'payment_ledger_probe'` row (migration 083, and
+    // `init-db/init-hotelnew.sql` for a fresh database) a probe failure
+    // updates zero rows and leaves only a log line. BOTH outcomes are
+    // written, because `record_success` is the ONLY thing that zeroes
+    // `consecutive_failures` and stamps `last_sync_at` (`last_error`/
+    // `last_error_at` keep the most recent failure).
+    if reconcile_payment_ledger_probe_enabled() {
+        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(
+            legacy_pool,
+            pg_pool,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // added=0 (the probe writes no canonical rows),
+                // updated=`recorded` (divergence rows written this tick),
+                // unchanged=`converged` (folios that agreed).
+                record_success(
+                    pg_pool,
+                    PAYMENT_LEDGER_PROBE_KEY,
+                    0,
+                    outcome.recorded as i32,
+                    outcome.converged as i32,
+                    outcome.duration_ms,
+                )
+                .await;
+                // Held-watermark tripwire. Called on EVERY successful tick,
+                // holding or not — a non-holding tick is what resets the
+                // streak, so this must not be inside a conditional.
+                note_payment_ledger_era_floor_hold(pg_pool, slack, site_id, outcome.era_floor)
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!(site = %site_id, "[Sync] Payment-ledger probe failed: {}", e);
+                record_error(pg_pool, PAYMENT_LEDGER_PROBE_KEY, &e.to_string()).await;
+            }
+        }
+    }
+
     // Phase 5.5a: full-table reload of legacy-only dimension tables into
     // legacy_mirror.*. Independent of the canonical reconcile above —
     // these tables are slow-changing reference data (pricing tiers,
@@ -228,6 +490,16 @@ pub async fn run_sync(
     // without aborting the reconcile loop.
     check_ct_watcher_lag(legacy_pool, pg_pool, site_id).await;
 
+    // ADR 0005 — periodic tripwire for the one condition the ADR accepts as
+    // a known gap: a hand-edited NULL clearing `HT_Book_H.Book_Cust_ID` /
+    // `HT_CheckIn_H.Cin_cust_no` (iHOTEL itself has no code path that writes
+    // one — ADR §3a). Default ON: read-only, zero-expected-noise (both
+    // counts were zero at both sites 2026-07-31); silence with
+    // `NULL_SENTINEL_TRIPWIRE_ENABLED=false` if that ever changes.
+    if null_sentinel_tripwire_enabled() {
+        check_null_sentinel_and_alert(legacy_pool, pg_pool, slack, site_id).await;
+    }
+
     tracing::info!(site = %site_id, "[Sync] Sync cycle complete");
 }
 
@@ -243,13 +515,22 @@ pub async fn run_sync(
 ///      all sites that don't have a per-site override.
 ///   3. [`DEFAULT_DRIFT_ALERT_THRESHOLD`] — compiled-in fallback (50).
 fn drift_alert_threshold_from_env(site_id: &str) -> i64 {
-    let per_site_var = format!(
-        "LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_{}",
-        site_id.to_uppercase()
-    );
-    parse_threshold_env(&per_site_var)
-        .or_else(|| parse_threshold_env("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"))
-        .unwrap_or(DEFAULT_DRIFT_ALERT_THRESHOLD)
+    threshold_from_env(
+        "LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD",
+        site_id,
+        DEFAULT_DRIFT_ALERT_THRESHOLD,
+    )
+}
+
+/// Per-`(site, table)` cooldown for the edge-triggered burst alert.
+/// Same resolution chain as [`drift_alert_threshold_from_env`], default
+/// [`DEFAULT_BURST_ALERT_COOLDOWN_HOURS`].
+fn burst_cooldown_hours_from_env(site_id: &str) -> i64 {
+    threshold_from_env(
+        "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS",
+        site_id,
+        DEFAULT_BURST_ALERT_COOLDOWN_HOURS,
+    )
 }
 
 /// Inner helper: parse a single env var into a positive `i64` threshold.
@@ -274,6 +555,217 @@ fn parse_threshold_env(var_name: &str) -> Option<i64> {
     }
 }
 
+/// Generalisation of the resolution order baked into
+/// [`drift_alert_threshold_from_env`]: per-site override, then global,
+/// then the compiled-in default. Kept as one helper so every knob in
+/// this module resolves identically instead of each one re-spelling the
+/// `or_else` chain.
+fn threshold_from_env(base_var: &str, site_id: &str, default: i64) -> i64 {
+    let per_site_var = format!("{base_var}_{}", site_id.to_uppercase());
+    parse_threshold_env(&per_site_var)
+        .or_else(|| parse_threshold_env(base_var))
+        .unwrap_or(default)
+}
+
+/// Resolved level-drift digest thresholds for one reconcile tick.
+/// Produced by [`level_drift_thresholds_from_env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelDriftThresholds {
+    /// A row unresolved for longer than this is "stale" and eligible for
+    /// the `:warning:` digest. `LEVEL_DRIFT_STALE_INTERVAL_HOURS`.
+    pub stale_hours: i64,
+    /// One digest per `(site, table)` per this many hours.
+    /// `LEVEL_DRIFT_COOLDOWN_HOURS`.
+    pub cooldown_hours: i64,
+    /// Oldest-row age at which the digest escalates to
+    /// "will not self-heal". `LEVEL_DRIFT_ESCALATE_HOURS`.
+    pub escalate_hours: i64,
+}
+
+impl LevelDriftThresholds {
+    /// Cooldown as a `Duration`, for [`cooldown_elapsed`].
+    fn cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_secs((self.cooldown_hours * 3600) as u64)
+    }
+}
+
+/// Resolve the level-drift digest thresholds from env (defect A2 of the
+/// 2026-07-28 alert inventory: these used to be compiled-in `const`s, so
+/// retuning the only alert this channel actually receives cost a deploy).
+///
+/// Same per-site → global → default chain as
+/// [`drift_alert_threshold_from_env`], via [`threshold_from_env`]:
+///   1. `LEVEL_DRIFT_STALE_INTERVAL_HOURS_<SITE_ID_UPPER>` etc.
+///   2. `LEVEL_DRIFT_STALE_INTERVAL_HOURS` etc.
+///   3. the `DEFAULT_LEVEL_DRIFT_*` constants.
+///
+/// Non-numeric / non-positive values are ignored with a warning by
+/// [`parse_threshold_env`], so an operator typo degrades to the previous
+/// tier rather than to zero.
+pub fn level_drift_thresholds_from_env(site_id: &str) -> LevelDriftThresholds {
+    let stale_hours = threshold_from_env(
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+    );
+    let cooldown_hours = threshold_from_env(
+        "LEVEL_DRIFT_COOLDOWN_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS,
+    );
+    let mut escalate_hours = threshold_from_env(
+        "LEVEL_DRIFT_ESCALATE_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS,
+    );
+    // An escalation threshold at or below the stale threshold would make
+    // EVERY stale table escalate on its first digest, collapsing the two
+    // tiers back into one voice — the exact defect this is fixing. Clamp
+    // loudly rather than silently degrade.
+    if escalate_hours <= stale_hours {
+        tracing::warn!(
+            site = %site_id,
+            escalate_hours,
+            stale_hours,
+            "[Sync] LEVEL_DRIFT_ESCALATE_HOURS must exceed the stale interval; \
+             clamping to stale + 1h"
+        );
+        escalate_hours = stale_hours + 1;
+    }
+    LevelDriftThresholds {
+        stale_hours,
+        cooldown_hours,
+        escalate_hours,
+    }
+}
+
+/// Severity tier of one table's level-drift digest, decided purely from
+/// the age of its OLDEST unresolved `ht_reconcile_log` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelDriftSeverity {
+    /// Past the stale interval, below the escalation threshold. The
+    /// familiar `:warning:` digest — "the sweep has not closed this yet".
+    Stale,
+    /// At or past the escalation threshold. Re-titled and re-toned: the
+    /// row is not going to converge on its own and needs a re-ingest or
+    /// `--bootstrap`. Rides its own cooldown key so the transition is
+    /// announced immediately rather than waiting out the primary window.
+    Escalated,
+}
+
+/// Pure classifier for [`LevelDriftSeverity`].
+///
+/// Boundary is inclusive (`>=`): an oldest-row age of exactly
+/// `escalate_hours` escalates. The caller floors the age to whole hours
+/// in SQL, so `>= 72` means "at least 72h old" with no rounding-up risk.
+pub fn level_drift_severity(oldest_age_hours: i64, escalate_hours: i64) -> LevelDriftSeverity {
+    if oldest_age_hours >= escalate_hours {
+        LevelDriftSeverity::Escalated
+    } else {
+        LevelDriftSeverity::Stale
+    }
+}
+
+/// Namespace separator for cooldown keys in
+/// `ht_level_drift_alert_cooldowns` that are NOT canonical entity names.
+///
+/// The cooldown table is keyed `(site_id, table_name)` and is shared by
+/// four emitters: the reconcile digest (real entity names — `bookings`,
+/// `customers`), the stale-checkin tripwire (the bare
+/// [`STALE_CHECKIN_COOLDOWN_KEY`] sentinel), `bin/sync.rs`'s
+/// retention-overflow pages (`ct_retention_overflow:<table>`), and now
+/// the burst alert and escalation tier here. Anything carrying this
+/// separator is by construction not an entity name, which is what makes
+/// the collision impossible rather than merely unlikely.
+const COOLDOWN_KEY_NAMESPACE_SEP: char = ':';
+
+/// Cooldown key for the ESCALATED tier of the level digest. Mirrors the
+/// `ct_retention_overflow:<table>` shape in `bin/sync.rs` so escalation
+/// keys can never collide with a canonical entity name — critically,
+/// `escalated:bookings` must never be mistaken for the table `bookings`
+/// by the all-clear path.
+pub fn escalated_cooldown_key(table: &str) -> String {
+    format!("escalated{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the edge-triggered burst alert
+/// ([`check_drift_and_alert`]). Same namespacing rationale as
+/// [`escalated_cooldown_key`].
+pub fn burst_cooldown_key(table: &str) -> String {
+    format!("burst{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the per-tick divergence-cap page — the "this arm was
+/// about to enqueue an implausible number of findings, so it wrote nothing"
+/// alert (see [`divergence_cap_exceeded`]).
+///
+/// Namespaced like its siblings so the sync-lag all-clear can never mistake
+/// `reconcile_cap:guest_registry` for the table `guest_registry` and delete
+/// its cooldown, which would un-throttle the page to once per tick. The
+/// `reconcile_cap` family is new and shares no prefix with
+/// `ct_retention_overflow:` / `escalated:` / `burst:` / `ct_watcher_lag:` /
+/// `shadow_mode:` / `boot_refusal:`.
+pub fn reconcile_cap_cooldown_key(table: &str) -> String {
+    format!("reconcile_cap{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the HELD-WATERMARK alert — "this arm's persisted
+/// `ht_reconcile_era_floor` row has been holding its scan forward for an
+/// hour, so either a pre-coverage row really was mirrored whole or the
+/// watermark is STALE" (see [`note_payment_ledger_era_floor_hold`]).
+///
+/// Namespaced like its siblings so the sync-lag all-clear can never mistake
+/// `era_floor_held:payment_ledger_probe` for the table
+/// `payment_ledger_probe` and delete its cooldown. The `era_floor_held`
+/// family is new and shares no prefix with `ct_retention_overflow:` /
+/// `escalated:` / `burst:` / `ct_watcher_lag:` / `shadow_mode:` /
+/// `boot_refusal:` / `null_sentinel:` / `reconcile_cap:` (pinned by
+/// [`era_floor_held_cooldown_key_is_namespaced_and_unique`]).
+pub fn era_floor_held_cooldown_key(table: &str) -> String {
+    format!("era_floor_held{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// How an alert actually reached (or failed to reach) an operator on a
+/// given tick. Feeds [`cooldown_should_be_marked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertDelivery {
+    /// Slack accepted the POST.
+    Sent,
+    /// Slack is not configured for this deployment; the `tracing` line IS
+    /// the delivery channel, so the cooldown still applies (otherwise the
+    /// log repeats every 15 minutes).
+    LoggedOnly,
+    /// Slack was configured and the POST failed.
+    Failed,
+}
+
+impl AlertDelivery {
+    /// Classify a `SlackClient::send_message` outcome. `None` = no client
+    /// configured.
+    fn from_send(result: Option<bool>) -> Self {
+        match result {
+            None => AlertDelivery::LoggedOnly,
+            Some(true) => AlertDelivery::Sent,
+            Some(false) => AlertDelivery::Failed,
+        }
+    }
+}
+
+/// Pure decision function: should this tick burn the cooldown?
+///
+/// 2026-07-28 alert inventory, defect A3: every cooldown in this module
+/// was marked BEFORE the Slack POST (and before the `slack.is_some()`
+/// check), so a webhook outage silenced the table for a full 24h anyway
+/// — and the paired all-clear could later fire as the closure of an
+/// alert nobody ever received. A failed send must leave the cooldown
+/// untouched so the next 15-min tick retries.
+pub fn cooldown_should_be_marked(delivery: AlertDelivery) -> bool {
+    match delivery {
+        AlertDelivery::Sent | AlertDelivery::LoggedOnly => true,
+        AlertDelivery::Failed => false,
+    }
+}
+
 /// Pure decision function: given per-table unresolved-drift counts in
 /// the alerting window, return the `(table_name, count)` pairs that
 /// breached the threshold (count strictly greater than threshold).
@@ -285,6 +777,24 @@ pub fn tables_breaching_threshold(counts: &[(String, i64)], threshold: i64) -> V
         .filter(|(_, n)| *n > threshold)
         .cloned()
         .collect()
+}
+
+/// Slack body for the edge-triggered sync-lag burst page. Pure — pulled
+/// out of [`check_drift_and_alert`] so the composition is unit-testable
+/// without a PG pool. Pager tier (issue #261): the caller wraps this in
+/// [`SlackMessage::with_site_text_paged`], not `with_site_text`.
+fn format_burst_alert_message(threshold: i64, body: &str, cooldown_hours: i64) -> String {
+    format!(
+        ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
+         The reconcile sweep observed more than {threshold} unconverged \
+         `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
+         Most clear on their own as the CT watcher / writeback catch up; this \
+         alert surfaces a burst that may indicate a real backlog:\n\
+         {body}\n\
+         _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert). \
+         Per-table cooldown {cooldown_hours}h — the log line still fires every \
+         tick._"
+    )
 }
 
 /// Phase 6 alerting: count unresolved `ht_reconcile_log` rows added in
@@ -307,6 +817,18 @@ pub fn tables_breaching_threshold(counts: &[(String, i64)], threshold: i64) -> V
 /// edge-trigger loses no observability. The hourly alert is now scoped
 /// to kinds where re-detection actually means something changed:
 /// `value`, `missing_pg`, `missing_mssql`.
+///
+/// **Per-table cooldown** (2026-07-28 alert inventory, defect C5): this
+/// alert previously had none, so while a table stayed above threshold it
+/// re-fired every 15-min tick — doubled on HF Ville, whose worker
+/// reconcile is a second independent emitter of the same message. The
+/// cooldown reuses the durable `ht_level_drift_alert_cooldowns` table
+/// under the namespaced [`burst_cooldown_key`], defaulting to
+/// [`DEFAULT_BURST_ALERT_COOLDOWN_HOURS`]. Note the eligibility read and
+/// the mark are not one atomic claim (unlike `bin/sync.rs`'s retention
+/// pages): the two emitters tick independently minutes apart, so the
+/// residual race is a single duplicate message — cheaper than trading
+/// away the mark-on-successful-send property below.
 async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
     let threshold = drift_alert_threshold_from_env(site_id);
 
@@ -345,7 +867,8 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, si
         return;
     }
 
-    // Always log; Slack is opportunistic.
+    // Always log every breach; the cooldown below throttles Slack only.
+    // An operator grepping the logs during an incident wants each tick.
     for (table, count) in &breaches {
         tracing::warn!(
             site = %site_id,
@@ -356,33 +879,61 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, si
         );
     }
 
-    let Some(slack) = slack else {
+    // Defect C5 — per-table cooldown so a sustained burst doesn't restate
+    // the same rolling window every 15 minutes (x2 emitters on HF Ville).
+    let cooldown_hours = burst_cooldown_hours_from_env(site_id);
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+    let mut to_alert: Vec<(String, i64)> = Vec::new();
+    for (table, count) in &breaches {
+        if level_alert_eligible_pg(pg_pool, site_id, &burst_cooldown_key(table), cooldown).await {
+            to_alert.push((table.clone(), *count));
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table,
+                count,
+                cooldown_hours,
+                "[Sync] Drift burst alert suppressed by cooldown"
+            );
+        }
+    }
+    if to_alert.is_empty() {
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text_paged(
+            site_id,
+            format_burst_alert_message(threshold, &body, cooldown_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; drift alert logged only ({} table(s) breaching)",
-            breaches.len()
+            to_alert.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let body = breaches
-        .iter()
-        .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
-             The reconcile sweep observed more than {threshold} unconverged \
-             `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
-             Most clear on their own as the CT watcher / writeback catch up; this \
-             alert surfaces a burst that may indicate a real backlog:\n\
-             {body}\n\
-             _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
-        ),
-    );
-    slack.send_message(&msg).await;
+    // Defect A3 — burn the cooldown only if the alert actually landed.
+    if cooldown_should_be_marked(delivery) {
+        for (table, _) in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &burst_cooldown_key(table)).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Drift burst alert POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
 }
 
 /// Track D / T7 HIGH-1 — pure decision function for the level-triggered
@@ -511,6 +1062,43 @@ async fn level_alert_cooldown_keys_pg(pg_pool: &PgPool, site_id: &str) -> Vec<St
     }
 }
 
+/// Does a cooldown row exist for this exact `(site_id, key)`? i.e. "did
+/// we alert about this at some point and never announce that it
+/// cleared?" — the precondition for firing a paired all-clear.
+///
+/// Used by the tripwires that own a single sentinel key rather than a set
+/// of entity names (currently the stale-checkin tripwire), where the
+/// bulk [`level_alert_cooldown_keys_pg`] read would be wasteful.
+///
+/// **Fails CLOSED** (`false` on PG error), the opposite of
+/// [`level_alert_eligible_pg`]: failing open there avoids silencing a
+/// real alert, whereas failing open here would invent an all-clear for a
+/// condition we cannot confirm ever alerted.
+async fn cooldown_row_exists_pg(pg_pool: &PgPool, site_id: &str, key: &str) -> bool {
+    let found = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(key)
+    .fetch_optional(pg_pool)
+    .await;
+
+    match found {
+        Ok(opt) => opt.is_some(),
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                key = %key,
+                error = %e,
+                "[Sync] Failed to read cooldown row — skipping the paired all-clear \
+                 this tick"
+            );
+            false
+        }
+    }
+}
+
 /// Drop the `(site_id, table_name)` cooldown row so a RECURRENCE alerts
 /// on the very next tick instead of being swallowed by a stale 24h
 /// window. Called only after the paired `:white_check_mark:` all-clear
@@ -547,7 +1135,42 @@ async fn clear_level_alert_cooldown_pg(pg_pool: &PgPool, site_id: &str, table_na
 /// against, so the sync-lag all-clear must never claim them recovered or
 /// clear their cooldown — doing so would let the stale-checkin alert
 /// refire every 15 minutes.
-const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
+///
+/// This list holds only the BARE sentinels. Namespaced keys (anything
+/// containing [`COOLDOWN_KEY_NAMESPACE_SEP`] — `escalated:…`, `burst:…`,
+/// and `bin/sync.rs`'s `ct_retention_overflow:…`) are excluded
+/// structurally by [`is_reconcile_table_key`] and don't need enumerating
+/// here; that is the whole point of the namespace.
+///
+/// The stale-checkin key stays here even though it now HAS its own
+/// all-clear (2026-07-28, defect C8): the closure is owned by
+/// [`check_stale_active_checkins_and_alert`], which is the only caller
+/// that can evaluate the condition. The reconcile sweep must keep its
+/// hands off it.
+/// Track F5 adds the second member: the loyalty writeback stall tripwire
+/// parks [`LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY`] in the same table on a 30
+/// MINUTE window. Letting the reconcile all-clear delete that row would be
+/// worse here than for the stale-checkin key — the window is short enough
+/// that the alert would effectively refire every tick during an outage.
+const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[
+    STALE_CHECKIN_COOLDOWN_KEY,
+    LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY,
+];
+
+/// Is this cooldown key a canonical `ht_reconcile_log` table name — i.e.
+/// something the sync-lag all-clear is entitled to declare recovered?
+///
+/// Two exclusions: the bare sentinels in [`NON_RECONCILE_COOLDOWN_KEYS`],
+/// and anything namespaced with [`COOLDOWN_KEY_NAMESPACE_SEP`]. The
+/// second was a latent bug before 2026-07-28 — `bin/sync.rs` has parked
+/// `ct_retention_overflow:<table>` rows in this shared table since the
+/// retention-page work, and the all-clear would happily list one as a
+/// "converged" reconcile table and DELETE its cooldown, un-throttling
+/// the retention pages. Adding `escalated:` / `burst:` keys here makes
+/// that structural rather than a list to remember to update.
+fn is_reconcile_table_key(key: &str) -> bool {
+    !NON_RECONCILE_COOLDOWN_KEYS.contains(&key) && !key.contains(COOLDOWN_KEY_NAMESPACE_SEP)
+}
 
 /// Pure decision helper for the sync-lag all-clear. Given the cooldown
 /// keys recorded for a site and the tables that STILL have unconverged
@@ -555,7 +1178,7 @@ const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
 /// that have recovered — i.e. we alerted about them at some point and
 /// they now have zero stale rows.
 ///
-/// Non-reconcile cooldown keys ([`NON_RECONCILE_COOLDOWN_KEYS`]) are
+/// Non-reconcile cooldown keys (see [`is_reconcile_table_key`]) are
 /// excluded: they are parked in the same table by other tripwires and
 /// carry no reconcile-row semantics. Output is de-duplicated and sorted
 /// so the Slack body and the log lines are deterministic.
@@ -564,13 +1187,29 @@ const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
 fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> Vec<String> {
     let mut recovered: Vec<String> = cooldown_keys
         .iter()
-        .filter(|k| !NON_RECONCILE_COOLDOWN_KEYS.contains(&k.as_str()))
+        .filter(|k| is_reconcile_table_key(k))
         .filter(|k| !still_stale_tables.iter().any(|s| s == *k))
         .cloned()
         .collect();
     recovered.sort();
     recovered.dedup();
     recovered
+}
+
+/// Slack body for the level-drift all-clear. Pure — unit-testable
+/// without a PG pool. All-clear tier (issue #261) — stays on
+/// `with_site_text`, never the pager mention.
+fn format_level_drift_all_clear_message(stale_hours: i64, body: &str, cooldown_hours: i64) -> String {
+    format!(
+        ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
+         Every `ht_reconcile_log` row older than \
+         {stale_hours}h has converged for:\n\
+         {body}\n\
+         _Closure of the_ `:warning:` _unconverged alert sent earlier. The \
+         per-table {cooldown_hours}h cooldown is reset, so a \
+         recurrence alerts on the next tick instead of waiting out a stale \
+         window._"
+    )
 }
 
 /// Paired recovery notification for [`check_level_drift_and_alert`].
@@ -595,6 +1234,7 @@ async fn check_level_drift_recovery_and_notify(
     slack: Option<&SlackClient>,
     site_id: &str,
     still_stale_tables: &[String],
+    thresholds: LevelDriftThresholds,
 ) {
     let cooldown_keys = level_alert_cooldown_keys_pg(pg_pool, site_id).await;
     let recovered = tables_recovered(&cooldown_keys, still_stale_tables);
@@ -609,17 +1249,20 @@ async fn check_level_drift_recovery_and_notify(
         return;
     }
 
+    let stale_hours = thresholds.stale_hours;
+    let cooldown_hours = thresholds.cooldown_hours;
+
     for table in &recovered {
         tracing::info!(
             site = %site_id,
             table,
-            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+            stale_hours,
             "[Sync] Sync-lag all-clear: table has no unconverged rows past threshold — \
              clearing level-alert cooldown"
         );
     }
 
-    if let Some(slack) = slack {
+    let delivery = if let Some(slack) = slack {
         let body = recovered
             .iter()
             .map(|t| format!("• `{t}`"))
@@ -627,29 +1270,90 @@ async fn check_level_drift_recovery_and_notify(
             .join("\n");
         let msg = SlackMessage::with_site_text(
             site_id,
-            format!(
-                ":white_check_mark: *Sync lag CLEARED* :white_check_mark:\n\
-                 Every `ht_reconcile_log` row older than \
-                 {LEVEL_DRIFT_STALE_INTERVAL_HOURS}h has converged for:\n\
-                 {body}\n\
-                 _Closure of the_ `:warning:` _sync-lag alert sent earlier. The \
-                 per-table {LEVEL_DRIFT_COOLDOWN_HOURS}h cooldown is reset, so a \
-                 recurrence alerts on the next tick instead of waiting out a stale \
-                 window._"
-            ),
+            format_level_drift_all_clear_message(stale_hours, &body, cooldown_hours),
         );
-        slack.send_message(&msg).await;
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; sync-lag all-clear logged only ({} table(s))",
             recovered.len()
         );
+        AlertDelivery::LoggedOnly
+    };
+
+    // Defect A3, all-clear side: clearing the cooldown is the act that
+    // ERASES the record that we ever alerted. Doing it after a failed
+    // POST loses the closure permanently — the operator never hears the
+    // `:warning:` was resolved and nothing will ever say so again. Keep
+    // the rows; the next tick re-detects recovery and retries.
+    if !cooldown_should_be_marked(delivery) {
+        tracing::warn!(
+            site = %site_id,
+            tables = recovered.len(),
+            "[Sync] Sync-lag all-clear POST failed — keeping cooldown rows so the \
+             next tick retries the closure"
+        );
+        return;
     }
 
     for table in &recovered {
         clear_level_alert_cooldown_pg(pg_pool, site_id, table).await;
+        // The escalated tier parks its own namespaced key
+        // ([`escalated_cooldown_key`]); it is invisible to
+        // `tables_recovered` by construction, so clear it alongside its
+        // parent table or a recurrence would stay escalation-suppressed
+        // for up to a full cooldown window. Unconditional DELETE — a
+        // missing row is a no-op.
+        clear_level_alert_cooldown_pg(pg_pool, site_id, &escalated_cooldown_key(table)).await;
     }
+}
+
+/// One row of the level-drift digest query: a table, how many of its
+/// `ht_reconcile_log` rows are still unresolved past the stale interval,
+/// and the whole-hour age of the OLDEST of them.
+///
+/// The age is what makes day 1 distinguishable from day 16 — see
+/// [`level_drift_severity`] and [`humanize_hours`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleTable {
+    pub table: String,
+    pub count: i64,
+    pub oldest_age_hours: i64,
+}
+
+/// Render an hour count for an operator. Under two days, plain hours
+/// (`7h`) — the familiar shape. Past that, lead with days because "388h"
+/// does not read as "this has been broken for sixteen days".
+pub fn humanize_hours(hours: i64) -> String {
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    let rem = hours % 24;
+    if rem == 0 {
+        format!("{days}d ({hours}h)")
+    } else {
+        format!("{days}d {rem}h ({hours}h)")
+    }
+}
+
+/// Split the digest rows into the `:warning:` tier and the escalated
+/// tier, preserving input order within each. Pure — the PG-free half of
+/// [`check_level_drift_and_alert`]'s decision.
+pub fn partition_level_drift(
+    rows: &[StaleTable],
+    escalate_hours: i64,
+) -> (Vec<StaleTable>, Vec<StaleTable>) {
+    let mut stale = Vec::new();
+    let mut escalated = Vec::new();
+    for row in rows {
+        match level_drift_severity(row.oldest_age_hours, escalate_hours) {
+            LevelDriftSeverity::Stale => stale.push(row.clone()),
+            LevelDriftSeverity::Escalated => escalated.push(row.clone()),
+        }
+    }
+    (stale, escalated)
 }
 
 /// Track D / T7 HIGH-1 — level-triggered drift digest. Complements the
@@ -660,31 +1364,55 @@ async fn check_level_drift_recovery_and_notify(
 /// divergences that never trip the volume threshold.
 ///
 /// Behaviour:
-/// - Counts unresolved rows per `table_name` where `detected_at` is
-///   older than `LEVEL_DRIFT_STALE_INTERVAL_HOURS` (default 4h).
-/// - For each table with ≥1 such row, emits a Slack alert if the
+/// - Counts unresolved rows per `table_name` where `detected_at` is older
+///   than the stale interval (`LEVEL_DRIFT_STALE_INTERVAL_HOURS`,
+///   default 4h), along with the age of the oldest such row.
+/// - Below the escalation threshold, emits the `:warning:` digest if the
 ///   per-table cooldown (`LEVEL_DRIFT_COOLDOWN_HOURS`, default 24h) has
-///   elapsed since the last level alert for that table+site.
+///   elapsed since the last level alert for that table+site. The body
+///   now carries the oldest-row age, so consecutive digests are visibly
+///   different messages rather than the same text on a 24h metronome.
+/// - At or past `LEVEL_DRIFT_ESCALATE_HOURS` (default 72h) the table
+///   moves to the escalated tier: different title, different ask ("this
+///   will not self-heal — re-ingest or bootstrap"), and its OWN cooldown
+///   key ([`escalated_cooldown_key`]) so the transition is announced on
+///   the next tick instead of waiting out the primary window. An
+///   escalated table does NOT also get the `:warning:` digest — one
+///   voice per table per tick.
 /// - Fires the paired all-clear for any table that HAS a cooldown row but
 ///   no longer has stale rows (see
 ///   [`check_level_drift_recovery_and_notify`]) — the alert used to be
 ///   fire-and-forget, so an operator who fixed the lag got silence and a
 ///   recurrence inside the 24h window was silent too.
-/// - Best-effort: a failed PG query or Slack POST only logs a warning.
+/// - Best-effort: a failed PG query or Slack POST only logs a warning,
+///   and a failed POST leaves the cooldown UNSET so the next tick retries.
 async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
-    let rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
-        "SELECT table_name, count(*) \
+    let thresholds = level_drift_thresholds_from_env(site_id);
+    let stale_hours = thresholds.stale_hours;
+
+    // `stale_hours` is an i64 validated `> 0` by `parse_threshold_env`,
+    // so the interpolation cannot carry operator input into the SQL.
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(format!(
+        "SELECT table_name, count(*), \
+                floor(extract(epoch from (now() - min(detected_at))) / 3600)::bigint \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
-            AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
+            AND detected_at < now() - interval '{stale_hours} hours' \
           GROUP BY table_name"
     )))
     .fetch_all(pg_pool)
     .await;
 
-    let counts = match rows {
-        Ok(r) => r,
+    let counts: Vec<StaleTable> = match rows {
+        Ok(r) => r
+            .into_iter()
+            .map(|(table, count, oldest_age_hours)| StaleTable {
+                table,
+                count,
+                oldest_age_hours,
+            })
+            .collect(),
         Err(e) => {
             tracing::warn!(
                 site = %site_id,
@@ -698,78 +1426,272 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     // Paired recovery notification — MUST run before the `counts.is_empty()`
     // early return below, because "no table has stale rows any more" is
     // exactly the everything-recovered case an operator needs to hear about.
-    let still_stale_tables: Vec<String> = counts.iter().map(|(t, _)| t.clone()).collect();
-    check_level_drift_recovery_and_notify(pg_pool, slack, site_id, &still_stale_tables).await;
+    let still_stale_tables: Vec<String> = counts.iter().map(|r| r.table.clone()).collect();
+    check_level_drift_recovery_and_notify(
+        pg_pool,
+        slack,
+        site_id,
+        &still_stale_tables,
+        thresholds,
+    )
+    .await;
 
     if counts.is_empty() {
         tracing::debug!(
             site = %site_id,
-            "[Sync] Level drift digest: no tables with unresolved rows older than 4h"
+            stale_hours,
+            "[Sync] Level drift digest: no tables with unresolved rows past the stale interval"
         );
         return;
     }
 
-    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
-    let mut to_alert: Vec<(String, i64)> = Vec::new();
-    for (table, count) in &counts {
-        if level_alert_eligible_pg(pg_pool, site_id, table, cooldown).await {
-            to_alert.push((table.clone(), *count));
-            mark_level_alert_sent_pg(pg_pool, site_id, table).await;
+    let (stale_tier, escalated_tier) = partition_level_drift(&counts, thresholds.escalate_hours);
+
+    // Escalated tier first: it rides its own cooldown key, so a table
+    // crossing the threshold is announced even if its primary 24h window
+    // is still open.
+    send_escalated_level_digest(pg_pool, slack, site_id, &escalated_tier, thresholds).await;
+    send_stale_level_digest(pg_pool, slack, site_id, &stale_tier, thresholds).await;
+}
+
+/// Slack body for the routine `:warning:` level-drift digest. Pure —
+/// unit-testable without a PG pool. Routine tier (issue #261): stays on
+/// `with_site_text`, never the pager mention — this is the alert the
+/// escalated `:bangbang:` tier exists precisely to distinguish itself
+/// from.
+fn format_stale_level_digest_message(
+    stale_hours: i64,
+    body: &str,
+    cooldown_hours: i64,
+    escalate_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Reconcile rows unconverged >{stale_hours}h* :warning:\n\
+         `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
+         over {stale_hours} hours. This is NOT sync lag — \
+         past this threshold it will not clear on its own:\n\
+         {body}\n\
+         _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
+         *dropped legacy change*: the record is absent from our app entirely and \
+         no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
+         whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
+         Per-table cooldown {cooldown_hours}h; an all-clear fires \
+         when the table clears. Past {escalate_hours}h this escalates._"
+    )
+}
+
+/// The familiar `:warning:` tier of [`check_level_drift_and_alert`].
+/// Cooldown-gated per table on the bare entity name (the key the
+/// all-clear diffs against).
+async fn send_stale_level_digest(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    tables: &[StaleTable],
+    thresholds: LevelDriftThresholds,
+) {
+    let stale_hours = thresholds.stale_hours;
+    let cooldown_hours = thresholds.cooldown_hours;
+    let escalate_hours = thresholds.escalate_hours;
+    let cooldown = thresholds.cooldown();
+
+    let mut to_alert: Vec<&StaleTable> = Vec::new();
+    for row in tables {
+        if level_alert_eligible_pg(pg_pool, site_id, &row.table, cooldown).await {
+            to_alert.push(row);
         } else {
             tracing::debug!(
                 site = %site_id,
-                table,
-                count,
+                table = %row.table,
+                count = row.count,
+                oldest_age_hours = row.oldest_age_hours,
                 "[Sync] Level drift alert suppressed by cooldown"
             );
         }
-    }
-
-    for (table, count) in &to_alert {
-        tracing::warn!(
-            site = %site_id,
-            table,
-            count,
-            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
-            "[Sync] Level drift alert: table has unresolved divergence older than threshold"
-        );
     }
 
     if to_alert.is_empty() {
         return;
     }
 
-    let Some(slack) = slack else {
+    for row in &to_alert {
+        tracing::warn!(
+            site = %site_id,
+            table = %row.table,
+            count = row.count,
+            oldest_age_hours = row.oldest_age_hours,
+            stale_hours,
+            "[Sync] Level drift alert: table has unresolved divergence older than threshold"
+        );
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|r| {
+                format!(
+                    "• `{}`: {} unresolved row(s), oldest {}",
+                    r.table,
+                    r.count,
+                    humanize_hours(r.oldest_age_hours)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_stale_level_digest_message(stale_hours, &body, cooldown_hours, escalate_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; level drift digest logged only ({} table(s))",
             to_alert.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let body = to_alert
-        .iter()
-        .map(|(t, n)| format!("• `{t}`: {n} unresolved row(s)"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":warning: *Reconcile rows unconverged >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
-             `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
-             over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours. This is NOT sync lag — \
-             past this threshold it will not clear on its own:\n\
-             {body}\n\
-             _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
-             *dropped legacy change*: the record is absent from our app entirely and \
-             no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
-             whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
-             Per-table cooldown {LEVEL_DRIFT_COOLDOWN_HOURS}h; an all-clear fires \
-             when the table clears._"
-        ),
-    );
-    slack.send_message(&msg).await;
+    // Defect A3 — mark AFTER a confirmed delivery. Marking first meant a
+    // webhook outage silenced the table for a full cooldown window and
+    // let the all-clear later close an alert nobody ever saw.
+    if cooldown_should_be_marked(delivery) {
+        for row in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &row.table).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Level drift digest POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
+}
+
+/// Slack body for the escalated `:bangbang:` digest. Pure — pulled out
+/// of [`send_escalated_level_digest`] so it's unit-testable without a PG
+/// pool. Pager tier (issue #261, re-scoped 2026-07-29): the caller wraps
+/// this in [`SlackMessage::with_site_text_paged`], the same condition
+/// that picks this `:bangbang:` framing over the `:warning:` digest.
+fn format_escalated_level_digest_message(escalate_hours: i64, body: &str) -> String {
+    format!(
+        ":bangbang: *Reconcile rows STUCK >{escalate_hours}h — will not self-heal* \
+         :bangbang:\n\
+         These `ht_reconcile_log` row(s) have survived every auto-resolve sweep \
+         for more than {escalate_hours} hours (a sweep runs every reconcile \
+         tick). Waiting is no longer a strategy — nothing in the pipeline is \
+         going to close them:\n\
+         {body}\n\
+         _The fix is re-ingest, not patience: for `missing_pg` re-drive the \
+         record through the CT path or run `sync --bootstrap` for the table; \
+         for `value` divergence re-apply from legacy. If the legacy change is \
+         past the 2-day CT retention window, bootstrap is the ONLY path. Do NOT \
+         blanket-set `resolved_at` — that hides the gap without landing the \
+         data. Triage: docs/runbook-sync.md §9b._"
+    )
+}
+
+/// The escalated tier of [`check_level_drift_and_alert`] (defect A1).
+///
+/// Fires for tables whose oldest unresolved row has passed
+/// `LEVEL_DRIFT_ESCALATE_HOURS`. Two things change versus the
+/// `:warning:` digest: the copy stops implying the sweep might still get
+/// there, and the cooldown lives under [`escalated_cooldown_key`] so
+/// crossing the threshold is not swallowed by a primary window that was
+/// refreshed hours earlier.
+///
+/// On a successful send this marks BOTH the escalation key and the bare
+/// table key. The bare key is what [`tables_recovered`] diffs against —
+/// a table that escalated on its very first digest (e.g. after a long
+/// worker outage) would otherwise never have a primary cooldown row and
+/// so would never get an all-clear.
+async fn send_escalated_level_digest(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    tables: &[StaleTable],
+    thresholds: LevelDriftThresholds,
+) {
+    if tables.is_empty() {
+        return;
+    }
+
+    let escalate_hours = thresholds.escalate_hours;
+    let cooldown = thresholds.cooldown();
+
+    let mut to_alert: Vec<&StaleTable> = Vec::new();
+    for row in tables {
+        let key = escalated_cooldown_key(&row.table);
+        if level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+            to_alert.push(row);
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table = %row.table,
+                count = row.count,
+                oldest_age_hours = row.oldest_age_hours,
+                "[Sync] Escalated level drift alert suppressed by cooldown"
+            );
+        }
+    }
+
+    if to_alert.is_empty() {
+        return;
+    }
+
+    for row in &to_alert {
+        tracing::error!(
+            site = %site_id,
+            table = %row.table,
+            count = row.count,
+            oldest_age_hours = row.oldest_age_hours,
+            escalate_hours,
+            "[Sync] Level drift ESCALATED: unresolved divergence will not self-heal"
+        );
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|r| {
+                format!(
+                    "• `{}`: {} unresolved row(s), oldest *{}*",
+                    r.table,
+                    r.count,
+                    humanize_hours(r.oldest_age_hours)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text_paged(
+            site_id,
+            format_escalated_level_digest_message(escalate_hours, &body),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; escalated level drift digest logged only ({} table(s))",
+            to_alert.len()
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        for row in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &escalated_cooldown_key(&row.table)).await;
+            // Keep the all-clear reachable — see the fn docstring.
+            mark_level_alert_sent_pg(pg_pool, site_id, &row.table).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Escalated level drift digest POST failed — leaving cooldown unset \
+             so the next tick retries"
+        );
+    }
 }
 
 /// Default days-past-expected-checkout before an `active` check-in is
@@ -780,6 +1702,11 @@ const STALE_CHECKIN_ALERT_DAYS_DEFAULT: i32 = 2;
 /// column) for the stale-checkin tripwire — reuses the level-drift cooldown
 /// table so the alert fires at most once per `LEVEL_DRIFT_COOLDOWN_HOURS`
 /// (default 24h) per site, even while a backlog persists.
+///
+/// A bare sentinel, not namespaced with [`COOLDOWN_KEY_NAMESPACE_SEP`],
+/// because it predates the namespace and is already enumerated in
+/// [`NON_RECONCILE_COOLDOWN_KEYS`]. Renaming it would strand every live
+/// cooldown row and re-fire the alert on both sites once.
 const STALE_CHECKIN_COOLDOWN_KEY: &str = "stale_active_checkin";
 
 /// Resolve the stale-checkin threshold (days) from `STALE_CHECKIN_ALERT_DAYS`,
@@ -807,6 +1734,24 @@ fn stale_checkin_alert_days() -> i32 {
 /// than `STALE_CHECKIN_ALERT_DAYS` (default 2) days in the past, fires ONE
 /// Slack alert per site gated by the shared 24h level-drift cooldown, and is
 /// best-effort throughout (a PG or Slack failure only logs a warning).
+///
+/// **Paired all-clear** (2026-07-28 alert inventory, defect C8): this was
+/// the one actionable alert in the channel with no closure signal — it
+/// is deliberately excluded from the reconcile sweep's all-clear via
+/// [`NON_RECONCILE_COOLDOWN_KEYS`], and nothing else told the operator
+/// their manual reconcile had taken. It now owns its closure: when the
+/// query comes back empty and a [`STALE_CHECKIN_COOLDOWN_KEY`] cooldown
+/// row exists, emit `:white_check_mark:` and drop the row.
+///
+/// That is the right half of the "give it one / say it has none" choice
+/// because recovery here is *directly observable from the same pure-PG
+/// query that raises the alert* — an empty result set IS the recovered
+/// state, no MSSQL round-trip, no hash comparison, no ambiguity. The
+/// alternative (documenting "no all-clear will come, check PG yourself")
+/// would write down a gap we can close in a dozen lines, on precisely
+/// the alert whose remedy is a hand-edited row an operator most needs
+/// confirmed. It also matches the three existing recovery-notification
+/// precedents in this codebase.
 pub async fn check_stale_active_checkins_and_alert(
     pg_pool: &PgPool,
     slack: Option<&SlackClient>,
@@ -839,12 +1784,19 @@ pub async fn check_stale_active_checkins_and_alert(
         }
     };
 
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
     if stale.is_empty() {
         tracing::debug!(
             site = %site_id,
             threshold_days = days,
             "[Sync] Stale-checkin tripwire: no active check-ins past expected checkout"
         );
+        // Defect C8 — paired all-clear. Fires only if we actually alerted
+        // at some point (a cooldown row exists), so a site that has never
+        // had a stale check-in stays silent forever.
+        notify_stale_checkin_all_clear(pg_pool, slack, site_id, days).await;
         return;
     }
 
@@ -856,9 +1808,7 @@ pub async fn check_stale_active_checkins_and_alert(
     );
 
     // Cooldown-gate the Slack alert (reuse the level-drift cooldown table so
-    // a persistent backlog doesn't refire every tick). Check eligibility AND
-    // mark in the same branch — if we're going to alert, we mark.
-    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
+    // a persistent backlog doesn't refire every tick).
     if !level_alert_eligible_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY, cooldown).await {
         tracing::debug!(
             site = %site_id,
@@ -867,49 +1817,638 @@ pub async fn check_stale_active_checkins_and_alert(
         return;
     }
 
-    let Some(slack) = slack else {
+    let delivery = if let Some(slack) = slack {
+        let now = chrono::Utc::now();
+        let shown = stale.len().min(15);
+        let body = stale
+            .iter()
+            .take(shown)
+            .map(|(cin_no, exp)| {
+                let overdue_days = (now - *exp).num_days();
+                format!("• `{cin_no}` — {overdue_days}d past expected checkout")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if stale.len() > shown {
+            format!("\n…and {} more", stale.len() - shown)
+        } else {
+            String::new()
+        };
+
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":hourglass_flowing_sand: *Stale active check-in(s) — likely dropped checkout* :hourglass_flowing_sand:\n\
+                 {count} canonical check-in(s) are still `active` more than {days} day(s) past their \
+                 expected checkout. This usually means a checkout CT event was dropped (past MSSQL \
+                 retention, so it won't self-heal) — the room shows occupied in the new app while \
+                 iHOTEL has it checked out:\n\
+                 {body}{more}\n\
+                 _Reconcile the row(s) to match iHOTEL (see the 2026-06-28 cin 19906 / room 114 \
+                 playbook). Pure-PG tripwire; per-site cooldown {cooldown_h}h. A \
+                 `:white_check_mark:` all-clear fires once no check-in is past threshold._",
+                count = stale.len(),
+                cooldown_h = cooldown_hours,
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; stale-checkin tripwire logged only ({} row(s))",
             stale.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let now = chrono::Utc::now();
-    let shown = stale.len().min(15);
-    let body = stale
-        .iter()
-        .take(shown)
-        .map(|(cin_no, exp)| {
-            let overdue_days = (now - *exp).num_days();
-            format!("• `{cin_no}` — {overdue_days}d past expected checkout")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let more = if stale.len() > shown {
-        format!("\n…and {} more", stale.len() - shown)
+    // Defect A3 — mark only on a confirmed delivery, so a webhook outage
+    // doesn't silence a dropped-checkout backlog for a full day.
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
     } else {
-        String::new()
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Stale-checkin alert POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
+}
+
+/// Paired all-clear for [`check_stale_active_checkins_and_alert`]
+/// (defect C8). Called on the tick where the tripwire query comes back
+/// empty; emits nothing unless a cooldown row proves we alerted earlier.
+///
+/// Clearing the cooldown row is what erases the "we alerted" record, so
+/// — as in [`check_level_drift_recovery_and_notify`] — it happens only
+/// after the closure has actually been delivered.
+async fn notify_stale_checkin_all_clear(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    days: i32,
+) {
+    if !cooldown_row_exists_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await {
+        return;
+    }
+
+    tracing::info!(
+        site = %site_id,
+        threshold_days = days,
+        "[Sync] Stale-checkin all-clear: no active check-ins past expected checkout — \
+         clearing tripwire cooldown"
+    );
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":white_check_mark: *Stale active check-in(s) CLEARED* :white_check_mark:\n\
+                 No canonical check-in is `active` more than {days} day(s) past its \
+                 expected checkout any more.\n\
+                 _Closure of the_ `:hourglass_flowing_sand:` _dropped-checkout alert sent \
+                 earlier. The per-site cooldown is reset, so a recurrence alerts on the \
+                 next tick instead of waiting out a stale window._"
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; stale-checkin all-clear logged only"
+        );
+        AlertDelivery::LoggedOnly
     };
 
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":hourglass_flowing_sand: *Stale active check-in(s) — likely dropped checkout* :hourglass_flowing_sand:\n\
-             {count} canonical check-in(s) are still `active` more than {days} day(s) past their \
-             expected checkout. This usually means a checkout CT event was dropped (past MSSQL \
-             retention, so it won't self-heal) — the room shows occupied in the new app while \
-             iHOTEL has it checked out:\n\
-             {body}{more}\n\
-             _Reconcile the row(s) to match iHOTEL (see the 2026-06-28 cin 19906 / room 114 \
-             playbook). Pure-PG tripwire; per-site cooldown {cooldown_h}h._",
-            count = stale.len(),
-            cooldown_h = LEVEL_DRIFT_COOLDOWN_HOURS,
-        ),
+    if cooldown_should_be_marked(delivery) {
+        clear_level_alert_cooldown_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Stale-checkin all-clear POST failed — keeping the cooldown row so \
+             the next tick retries the closure"
+        );
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Track F5 — loyalty-channel writeback-leg stall detector
+// ---------------------------------------------------------------------------
+//
+// The gap this closes (b8 overbooking analysis §3, defect 3). A loyalty hold
+// is the one canonical write whose VALUE depends on the legacy leg being up:
+// `docs/loyalty-channel.md` makes iHOTEL show the hold as `จอง` immediately
+// *"otherwise a receptionist would double-book the room during the 2h payment
+// window"*. The hold's TTL is 2 hours. Every pre-existing detector is slower
+// than that TTL or blind to a single row:
+//
+//   * level-drift digest — needs a row unconverged for 4h
+//     ([`DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS`]); 4h > 2h TTL, so the
+//     hold expires and vanishes before the digest can mention it;
+//   * burst page — needs 50 rows/hour ([`DEFAULT_DRIFT_ALERT_THRESHOLD`]);
+//     one stuck hold is 1;
+//   * queue-depth janitor — needs 500 pending jobs
+//     (`QUEUE_PENDING_ALERT_THRESHOLD`, `bin/writeback.rs`); one stuck hold
+//     is 1.
+//
+// So at 02:00, with the writeback leg down, a guest pays a 50% deposit for a
+// room iHOTEL does not know is taken, and nothing pages until long after the
+// hold has died.
+//
+// **Why this lives in the scheduler and not in `bin/writeback.rs`.** The
+// failure being detected is *the writeback worker is not draining the queue*,
+// and its most likely cause is that the worker process/container is down or
+// its MSSQL leg is unreachable. A detector hosted inside that worker shares
+// its fate: worker down ⇒ detector down ⇒ silence, which is precisely the
+// 02:00 case. The scheduler runs in the API process, which is a different
+// container with a different failure domain, and it already owns the other
+// pure-PG tripwire with exactly this shape
+// ([`check_stale_active_checkins_and_alert`]). The queue-depth janitor in
+// `bin/writeback.rs` stays where it is — it measures *bulk* backlog, which is
+// only meaningful from inside a running worker.
+//
+// **Confirmed failure, never a blip.** The alert needs a job row that EXISTS
+// (so PG committed — this is never "the hold was never created"), is older
+// than the threshold, and is in any state other than `done`. A healthy leg
+// applies a `create_booking` in seconds (NOTIFY-driven, 30s poll fallback),
+// so the 10-minute default is ~20× the healthy latency and well past the
+// worker's own retry backoff and its 5-minute stuck-claim steal window.
+
+/// Track F5 — default age (minutes) past which a not-yet-applied writeback
+/// job for a loyalty-channel booking is treated as a confirmed stall.
+///
+/// 10 minutes, per the b8 analysis's L7 recommendation. The floor is set by
+/// what the writeback worker does on its own before a human should be woken:
+/// NOTIFY delivery is sub-second, the poll fallback is 30s, retry backoff and
+/// the janitor's stuck-`in_progress` steal both settle inside 5 minutes. A job
+/// still unapplied at 10 minutes is not retrying — it is stuck. The ceiling is
+/// the 2h hold TTL: the alert must land with enough of the window left for
+/// reception to act, which 10 minutes does with ~1h50m to spare.
+///
+/// `i32` because it is bound straight into `make_interval(mins => $1)`, which
+/// PostgreSQL overloads only on `int` — a `bigint` bind raises
+/// `function make_interval(mins => bigint) does not exist` and silently
+/// disables the detector (the same trap documented at
+/// `QUEUE_STUCK_IN_PROGRESS_AGE_MINS` in `bin/writeback.rs`).
+///
+/// Override with `LOYALTY_WRITEBACK_STALL_ALERT_MINUTES`.
+pub const DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES: i32 = 10;
+
+/// Track F5 — default cooldown (minutes) between repeats of the stall alert
+/// for one site.
+///
+/// 30 minutes, deliberately much shorter than the 24h level-drift cooldown:
+/// the condition it reports is bounded by a 2h TTL, so a 24h window would
+/// collapse the whole incident into one message and a 4h window would allow
+/// at most one repeat. 30 minutes gives an unattended overnight outage ~4
+/// reminders inside a hold's life — enough to catch a night receptionist
+/// coming back to the desk, few enough not to train anyone to mute the
+/// channel. The paired all-clear (below) closes it out.
+///
+/// Override with `LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`.
+pub const DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES: i64 = 30;
+
+/// Cooldown sentinel for the stall alert, parked in the shared
+/// `ht_level_drift_alert_cooldowns` table alongside
+/// [`STALE_CHECKIN_COOLDOWN_KEY`].
+///
+/// A bare (non-namespaced) key, so it MUST be listed in
+/// [`NON_RECONCILE_COOLDOWN_KEYS`] — otherwise the reconcile sweep's
+/// all-clear would read it as a converged `ht_reconcile_log` table name and
+/// DELETE the row, un-throttling this alert to once per tick.
+const LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY: &str = "loyalty_writeback_stall";
+
+/// The single `writeback_jobs.status` that means "the legacy MSSQL write
+/// landed". Every other status — `pending`, `in_progress`, `failed`,
+/// `exhausted` — means iHOTEL has not seen this booking yet.
+///
+/// Written as "not `done`" rather than an allow-list of bad statuses on
+/// purpose: a future status added to the lifecycle should default to
+/// *alerting*, not to silence. The two easy-to-miss members of that set are
+/// the ones an allow-list of `('pending','failed')` would drop:
+///
+///   * `in_progress` — a worker that dies mid-claim leaves the row claimed
+///     forever until some worker returns to steal it. Worker down is exactly
+///     the scenario this detector exists for, so excluding `in_progress`
+///     would blind it to its own primary case.
+///   * `exhausted` — the terminal give-up state. `bin/writeback.rs` pages on
+///     it separately, but that alert says "a job died"; this one says "a
+///     guest who has paid a deposit holds a room iHOTEL believes is free".
+///     Different fact, different remedy, and when the worker is down no job
+///     ever *reaches* `exhausted` anyway.
+const WRITEBACK_APPLIED_STATUS: &str = "done";
+
+/// Resolve the stall threshold (minutes) from
+/// `LOYALTY_WRITEBACK_STALL_ALERT_MINUTES`, clamped to a floor of 1 minute.
+/// Falls back to [`DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES`] on a missing or
+/// unparseable value. Same shape as [`stale_checkin_alert_days`]; global-only
+/// (no per-site suffix) because the channel contract is property-independent.
+fn loyalty_writeback_stall_minutes() -> i32 {
+    env::var("LOYALTY_WRITEBACK_STALL_ALERT_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES)
+}
+
+/// Resolve the alert cooldown (minutes) from
+/// `LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`, clamped to a floor of 1
+/// minute. Falls back to
+/// [`DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`].
+fn loyalty_writeback_stall_cooldown_minutes() -> i64 {
+    env::var("LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES)
+}
+
+/// One not-yet-applied writeback job belonging to a loyalty-channel booking,
+/// as returned by [`fetch_stalled_loyalty_writebacks`]. Field order matches
+/// the SELECT list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledLoyaltyWriteback {
+    /// `ht_bookings.book_no` — the reference reception can type into iHOTEL.
+    pub book_no: String,
+    /// `writeback_jobs.intent`, e.g. `create_booking` / `cancel_booking`.
+    pub intent: String,
+    /// `writeback_jobs.status` — anything but [`WRITEBACK_APPLIED_STATUS`].
+    pub status: String,
+    /// Whole minutes since the job row was enqueued.
+    pub age_minutes: i64,
+    /// `ht_bookings.book_status` — `pending` while the booking is still an
+    /// unpaid hold, `confirmed` once the deposit has been verified.
+    ///
+    /// Carried purely so the Slack body can tell those two apart. It MUST be:
+    /// `confirm_booking_payment` flips the status but deliberately leaves
+    /// `book_hold_expires_at` in place (the expiry sweep is guarded on
+    /// `book_status='pending'`, so it does not need clearing). Reading the
+    /// timestamp alone would therefore label a PAID, confirmed booking as
+    /// "HOLD ALREADY EXPIRED" — telling a night receptionist that a guest
+    /// lost a room they have actually bought.
+    pub book_status: String,
+    /// `ht_bookings.book_hold_expires_at` — the payment deadline stamped on
+    /// every channel booking at creation. NOT cleared on confirmation, so it
+    /// is only meaningful while `book_status == 'pending'`; see above.
+    pub hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Pure renderer for the per-row hold suffix in the Slack body.
+///
+/// The three cases a night receptionist must be able to tell apart:
+///
+///   * still a live hold — show the minutes left, so they know how long the
+///     leg has to recover before the booking self-cancels;
+///   * an expired hold — the guest no longer holds the room, so a walk-in
+///     must NOT be turned away for it;
+///   * a confirmed booking — the guest has PAID. This one is never "expired"
+///     however old its `book_hold_expires_at` is, because
+///     `confirm_booking_payment` leaves that timestamp behind. Getting this
+///     wrong is worse than saying nothing: it invites the desk to resell a
+///     room that is genuinely sold.
+///
+/// Pure (clock injected) so all three branches are unit-testable.
+fn format_hold_suffix(
+    book_status: &str,
+    hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if book_status != CHANNEL_HOLD_STATUS {
+        // Confirmed (or cancelled) — the deadline no longer governs anything.
+        return format!(", booking is {book_status} — NOT a live hold");
+    }
+    match hold_expires_at {
+        Some(exp) => {
+            let left = (exp - now).num_minutes();
+            if left > 0 {
+                format!(", hold expires in {left}m")
+            } else {
+                // Never render a negative countdown: "expires in -12m" at
+                // 02:00 is a puzzle, not an instruction.
+                ", HOLD ALREADY EXPIRED".to_string()
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// `ht_bookings.book_status` of an unpaid loyalty hold. The expiry sweep is
+/// guarded on the same literal (`repository::channel::expired_hold_ids`).
+const CHANNEL_HOLD_STATUS: &str = "pending";
+
+/// Pure decision function — is this one job a confirmed loyalty-leg stall?
+///
+/// Every arm of the predicate is a deliberate noise control:
+///
+///   * `book_channel` must be exactly the loyalty marker. A stuck desk or
+///     OTA writeback is a real problem but NOT this alert's problem: it has
+///     no 2h fuse and it is covered by the existing digest/queue alerts.
+///   * `status` must not be [`WRITEBACK_APPLIED_STATUS`] — i.e. the legacy
+///     write provably has not landed.
+///   * the job must be at least `threshold_minutes` old, so an in-flight
+///     write on a healthy leg (sub-second to 30s) can never trip it.
+///
+/// Kept free of PG and of the clock so the thresholds can be driven directly
+/// in unit tests, matching [`ct_lag_breached`] and [`tables_recovered`].
+pub fn loyalty_writeback_is_stalled(
+    book_channel: Option<&str>,
+    job_status: &str,
+    job_age_minutes: i64,
+    threshold_minutes: i64,
+) -> bool {
+    let is_loyalty = book_channel.is_some_and(|c| c.trim() == LOYALTY_CHANNEL);
+    is_loyalty && job_status != WRITEBACK_APPLIED_STATUS && job_age_minutes >= threshold_minutes
+}
+
+/// Pure decision function — should this tick emit the paired all-clear?
+///
+/// Only when the backlog has actually drained AND we previously said
+/// something (a cooldown row proves it). Without the second arm a site that
+/// has never stalled would announce a recovery from nothing; without the
+/// first, a partial drain would claim the incident closed.
+pub fn loyalty_stall_all_clear_due(stalled_count: usize, alerted_earlier: bool) -> bool {
+    stalled_count == 0 && alerted_earlier
+}
+
+/// Slack body for the stall alert. Pure — pulled out so the operator-facing
+/// wording is unit-testable without a PG pool, as with
+/// [`format_burst_alert_message`].
+///
+/// Warning tier, not pager tier (issue #261): it goes out on
+/// `with_site_text`, no `<!channel>`. The condition is real and actionable
+/// but it is bounded by a 2h TTL and its remedy is a desk action, not a
+/// wake-the-engineer action — and a channel-mention at 02:00 for a single
+/// held room would be the fastest way to get this alert muted.
+fn format_loyalty_stall_message(
+    threshold_minutes: i32,
+    cooldown_minutes: i64,
+    body: &str,
+    count: usize,
+) -> String {
+    format!(
+        ":satellite_antenna: *Loyalty-channel writeback stalled — iHOTEL cannot see {count} \
+         app booking(s)* :satellite_antenna:\n\
+         {count} booking(s) made in the guest app committed to PostgreSQL but their legacy \
+         writeback job has not applied for more than {threshold_minutes} minute(s). iHOTEL does \
+         NOT show these rooms as `จอง`, so the desk can double-book them — and a hold that \
+         expires before the leg recovers disappears without ever reaching the room board:\n\
+         {body}\n\
+         _Runbook:_ `docs/runbooks/writeback-leg-degraded.md` _— check the writeback worker and \
+         the legacy leg first. Per-site cooldown {cooldown_minutes} min; a_ \
+         `:white_check_mark:` _all-clear fires once the backlog drains._"
+    )
+}
+
+/// Slack body for the paired all-clear. Pure, same reasons as above.
+fn format_loyalty_stall_all_clear_message(threshold_minutes: i32) -> String {
+    format!(
+        ":white_check_mark: *Loyalty-channel writeback RECOVERED* :white_check_mark:\n\
+         Every loyalty-channel booking's writeback job has applied — no job is older than \
+         {threshold_minutes} minute(s) without reaching iHOTEL. The app's holds are back on the \
+         iHOTEL room board.\n\
+         _Closure of the_ `:satellite_antenna:` _stall alert sent earlier. Check \
+         `docs/runbooks/writeback-leg-degraded.md` §5 for the bookings that were invisible \
+         during the outage — a hold that expired mid-outage may have left a stale_ `จอง` _row._"
+    )
+}
+
+/// Track F5 — loyalty-channel writeback-leg stall tripwire.
+///
+/// Pure-PG and read-only: it compares `writeback_jobs` against `ht_bookings`
+/// on this site's canonical database and touches neither MSSQL nor the queue.
+/// That is what lets it keep working while the legacy leg — the thing it is
+/// reporting on — is unreachable.
+///
+/// Fires ONE cooldown-gated Slack message listing the affected bookings, and
+/// owns its own `:white_check_mark:` closure when the backlog drains
+/// (the "pair failure with recovery" convention, 2026-07-28 alert inventory
+/// defect C8). Best-effort throughout: a PG or Slack failure logs a warning
+/// and leaves the cooldown untouched so the next tick retries.
+pub async fn check_loyalty_writeback_stall_and_alert(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    let threshold_minutes = loyalty_writeback_stall_minutes();
+    let cooldown_minutes = loyalty_writeback_stall_cooldown_minutes();
+    let cooldown = std::time::Duration::from_secs((cooldown_minutes * 60) as u64);
+
+    let stalled = match fetch_stalled_loyalty_writebacks(pg_pool, threshold_minutes).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] Failed to query loyalty-channel writeback stalls — observability degraded"
+            );
+            return;
+        }
+    };
+
+    if stalled.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            threshold_minutes,
+            "[Sync] Loyalty writeback tripwire: every channel booking's writeback has applied"
+        );
+        notify_loyalty_stall_all_clear(pg_pool, slack, site_id, threshold_minutes).await;
+        return;
+    }
+
+    tracing::warn!(
+        site = %site_id,
+        count = stalled.len(),
+        threshold_minutes,
+        "[Sync] Loyalty writeback tripwire: channel booking(s) not mirrored to iHOTEL \
+         (writeback leg degraded)"
     );
-    slack.send_message(&msg).await;
-    mark_level_alert_sent_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
+
+    if !level_alert_eligible_pg(
+        pg_pool,
+        site_id,
+        LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY,
+        cooldown,
+    )
+    .await
+    {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Loyalty writeback stall alert suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let now = chrono::Utc::now();
+        let shown = stalled.len().min(15);
+        let body = stalled
+            .iter()
+            .take(shown)
+            .map(|row| {
+                let hold = format_hold_suffix(&row.book_status, row.hold_expires_at, now);
+                format!(
+                    "• `{book_no}` — `{intent}` {status} for {age}m{hold}",
+                    book_no = row.book_no,
+                    intent = row.intent,
+                    status = row.status,
+                    age = row.age_minutes,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if stalled.len() > shown {
+            format!("\n…and {} more", stalled.len() - shown)
+        } else {
+            String::new()
+        };
+
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_loyalty_stall_message(
+                threshold_minutes,
+                cooldown_minutes,
+                &format!("{body}{more}"),
+                stalled.len(),
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; loyalty writeback stall logged only ({} row(s))",
+            stalled.len()
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    // Defect A3 — burn the cooldown only on a confirmed delivery, so a
+    // webhook outage can't silence a degraded leg for a full window.
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Loyalty writeback stall alert POST failed — leaving cooldown unset so \
+             the next tick retries"
+        );
+    }
+}
+
+/// Paired all-clear for [`check_loyalty_writeback_stall_and_alert`]. Emits
+/// nothing unless a cooldown row proves we alerted earlier, and clears that
+/// row only after the closure has actually been delivered — so a recurrence
+/// alerts on the very next tick instead of waiting out a stale window.
+async fn notify_loyalty_stall_all_clear(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    threshold_minutes: i32,
+) {
+    let alerted_earlier =
+        cooldown_row_exists_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    if !loyalty_stall_all_clear_due(0, alerted_earlier) {
+        return;
+    }
+
+    tracing::info!(
+        site = %site_id,
+        threshold_minutes,
+        "[Sync] Loyalty writeback all-clear: backlog drained — clearing tripwire cooldown"
+    );
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_loyalty_stall_all_clear_message(threshold_minutes),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; loyalty writeback all-clear logged only"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        clear_level_alert_cooldown_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Loyalty writeback all-clear POST failed — keeping the cooldown row so \
+             the next tick retries the closure"
+        );
+    }
+}
+
+/// One indexed round-trip for the stall set.
+///
+/// Joins on `aggregate_id`, which is the only key the two tables share:
+/// `writeback_jobs.aggregate_id` carries the booking's UUID for all three
+/// booking intents (`create_booking` / `modify_booking` / `cancel_booking`,
+/// see `WritebackIntent::aggregate_id`), and `ht_bookings.aggregate_id` is
+/// uniquely indexed (`ux_ht_bookings_aggregate_id`). The join therefore
+/// selects booking intents on its own — no `intent IN (…)` filter, so a
+/// booking intent added later is covered without touching this query.
+///
+/// Cancel intents are deliberately in scope alongside creates: a cancel that
+/// never reaches iHOTEL leaves a phantom `จอง` on the room board and reception
+/// holds a room that is actually free — the same class of harm, inverted.
+///
+/// Runs on the existing `ix_writeback_jobs_claim` partial index
+/// (`status IN ('pending','failed','in_progress')`) plus a lookup per row on
+/// `ux_ht_bookings_aggregate_id`; in steady state the driving side is empty,
+/// so no new index and no migration is needed.
+async fn fetch_stalled_loyalty_writebacks(
+    pg_pool: &PgPool,
+    threshold_minutes: i32,
+) -> Result<Vec<StalledLoyaltyWriteback>, sqlx::Error> {
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT b.book_no, \
+                j.intent, \
+                j.status, \
+                (EXTRACT(EPOCH FROM (now() - j.created_at)) / 60)::bigint AS age_minutes, \
+                b.book_status, \
+                b.book_hold_expires_at \
+           FROM writeback_jobs j \
+           JOIN ht_bookings b ON b.aggregate_id = j.aggregate_id \
+          WHERE j.status <> $1 \
+            AND j.created_at <= now() - make_interval(mins => $2) \
+            AND b.book_channel = $3 \
+          ORDER BY j.created_at \
+          LIMIT 100",
+    )
+    .bind(WRITEBACK_APPLIED_STATUS)
+    .bind(threshold_minutes)
+    .bind(LOYALTY_CHANNEL)
+    .fetch_all(pg_pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(
+                |(book_no, intent, status, age_minutes, book_status, hold_expires_at)| {
+                    StalledLoyaltyWriteback {
+                        book_no,
+                        intent,
+                        status,
+                        age_minutes,
+                        book_status,
+                        hold_expires_at,
+                    }
+                },
+            )
+            .collect()
+    })
 }
 
 /// Resolved CT-lag thresholds (versions + seconds) for a reconcile tick.
@@ -1083,11 +2622,9 @@ async fn read_mssql_ct_current_version(
     legacy_pool: &DbPool,
 ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = legacy_pool.get().await?;
-    let rows = Query::new("SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v")
-        .query(&mut conn)
-        .await?
-        .into_first_result()
-        .await?;
+    let sql = "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v";
+    let rows =
+        query_with_timeout_pooled(&mut conn, sql, Query::new(sql), MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -1307,8 +2844,292 @@ async fn check_ct_watcher_lag_per_table(legacy_pool: &DbPool, pg_pool: &PgPool, 
     }
 }
 
+// =============================================================================
+// ADR 0005 — NULL-clear sentinel tripwire (2026-07-31)
+// =============================================================================
+//
+// `docs/adr/0005-null-clear-sentinel-semantics.md` designs (but does not
+// build — that migration is deliberately not scheduled, ADR §7) a fix for
+// one specific gap: a `guarded: true` reconcile-gate term (`gate_guard.rs`)
+// cannot represent a legacy value going Some→None, because it treats every
+// `None` projection as "nothing to check" to avoid a COALESCE-vs-gate
+// infinite loop (ADR §4). For `legacy_cust_no` on bookings/checkins
+// (`HT_Book_H.Book_Cust_ID` / `HT_CheckIn_H.Cin_cust_no`) a genuine
+// Some→None clear produces an `ht_reconcile_log` row that can NEVER
+// auto-close (ADR §3a) — the guarded gate re-drives on every force-converge
+// attempt and always reports "already matches".
+//
+// The owner accepted that gap rather than build the tri-state migration
+// (ADR §5 — "the single most dangerous piece of machinery in this
+// codebase", two-site blast radius) because the ADR's §5 "Pre-flight audit"
+// SELECTs came back zero on both columns at both sites (2026-07-31) AND the
+// decompile (`docs/legacy-app/COMPAT_CHEATSHEET.md`) shows iHOTEL has no
+// code path that ever writes literal NULL there — every clear-like mutation
+// is the customer-delete cascade, which writes the reserved `'C0000'`
+// sentinel (Some→Some, already handled correctly by the guarded term). That
+// narrows the accepted risk to exactly one trigger: someone hand-edits
+// legacy MSSQL directly and introduces a NULL outside any iHOTEL code path.
+//
+// This tripwire does NOT implement the ADR's tri-state fix (no hash bytes,
+// no gate logic, no migration touched here). It only DETECTS the trigger
+// condition — a permanently-unfixable reconcile row is too weak a signal on
+// its own: `check_level_drift_and_alert` won't page for hours
+// (`LEVEL_DRIFT_STALE_INTERVAL_HOURS`, default 4h), and by the time the
+// row escalates the hand-edit that caused it is long gone from memory.
+//
+// VALUES only. A schema change on either column is already caught at
+// process startup by `writeback::fingerprint`'s column-shape hash — this
+// does not duplicate that.
+
+/// One guarded-term probe from ADR 0005 §2's enumeration. Both entries are
+/// the "In scope" rows of that table — `book_notes` (also guarded) is
+/// excluded because ADR §3b shows it is a *different*, already-silent class
+/// with its own small fix that never touches a hash, not a target for a
+/// reconcile-adjacent tripwire.
+struct NullSentinelProbe {
+    /// Short canonical entity name — the same literal
+    /// `ht_reconcile_log.table_name` / [`RECONCILE_RESOLVABLE_TABLES`] use,
+    /// reused here for the cooldown key so an operator can cross-reference
+    /// the two without a lookup table.
+    table_name: &'static str,
+    legacy_table: &'static str,
+    legacy_column: &'static str,
+}
+
+/// The two `legacy_cust_no` sites ADR 0005 §2 marks "In scope" for the
+/// Some→None gap (`booking.rs:806-813`, `checkin.rs:1481-1486`).
+const NULL_SENTINEL_PROBES: &[NullSentinelProbe] = &[
+    NullSentinelProbe {
+        table_name: "bookings",
+        legacy_table: "HT_Book_H",
+        legacy_column: "Book_Cust_ID",
+    },
+    NullSentinelProbe {
+        table_name: "checkins",
+        legacy_table: "HT_CheckIn_H",
+        legacy_column: "Cin_cust_no",
+    },
+];
+
+/// Is the periodic NULL-sentinel tripwire enabled? Default **ON** — unlike
+/// the Phase 6 reconcile arms above, this issues two read-only
+/// `SELECT COUNT(*)` probes and writes nothing to legacy or canonical, so it
+/// carries none of the risk the "ship dark" convention exists to manage
+/// (same posture as `CF_AUTO_LOGIN`, `config.rs`). Silence with
+/// `NULL_SENTINEL_TRIPWIRE_ENABLED=false` if it ever proves noisy — it
+/// shouldn't: the ADR's pre-flight audit found zero rows on both columns at
+/// both sites, and iHOTEL itself has no code path that writes a literal
+/// NULL there (ADR §3a).
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path.
+fn null_sentinel_tripwire_enabled() -> bool {
+    env::var("NULL_SENTINEL_TRIPWIRE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(true)
+}
+
+/// Namespaced cooldown key for a [`NullSentinelProbe`] page. `null_sentinel:`
+/// is a new family and shares no prefix with `ct_retention_overflow:` /
+/// `escalated:` / `burst:` / `ct_watcher_lag:` / `shadow_mode:` /
+/// `boot_refusal:` / `reconcile_cap:` (pinned by
+/// [`null_sentinel_cooldown_key_is_namespaced_and_unique`]).
+fn null_sentinel_cooldown_key(table_name: &str) -> String {
+    format!("null_sentinel{COOLDOWN_KEY_NAMESPACE_SEP}{table_name}")
+}
+
+/// Pure decision: does this probe's NULL count warrant a page? There is no
+/// volume threshold to tune — per ADR §3a there is no known live path to a
+/// NULL at all, so ANY count above zero is already the out-of-band event
+/// this tripwire exists to catch; one hand-edited row is exactly as
+/// actionable as a thousand.
+fn null_sentinel_alert_needed(null_count: i64) -> bool {
+    null_count > 0
+}
+
+/// Slack body for a NULL-sentinel page. Pure — pulled out of
+/// [`alert_null_sentinel_probe`] so composition is unit-testable without a
+/// PG pool or a live MSSQL connection.
+///
+/// Not pager-tier: [`alert_null_sentinel_probe`] wraps this in
+/// `SlackMessage::with_site_text`, not `_paged`. This finding is rare and
+/// actionable, but per `SlackMessage::with_site_text_paged`'s own doc
+/// comment the pager tier is reserved for things closer to an outage (the
+/// >72h escalated digest, sync-lag bursts, CT-lag, boot refusals) — nothing
+/// here is down, no data has stopped flowing, and an operator has hours
+/// (not minutes) before the row this produces even reaches the >72h
+/// escalation tier. A routine unmentioned Slack post is the right weight.
+fn format_null_sentinel_message(
+    probe: &NullSentinelProbe,
+    null_count: i64,
+    cooldown_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Legacy NULL-clear sentinel tripped — `{legacy_table}.{legacy_column}`* \
+         :warning:\n\
+         *{null_count}* row(s) in legacy `{legacy_table}` now have \
+         `{legacy_column} IS NULL`. This column feeds the `{table_name}` reconcile \
+         hash's `legacy_cust_no` gate term, which is *guarded* — it can only \
+         represent a legacy value staying the same or going from unset to set, \
+         never a genuine clear. A cleared row now produces (or will produce) an \
+         `ht_reconcile_log` divergence our sync CANNOT auto-converge: it will sit \
+         unresolved and, left alone, eventually hit the >72h `:bangbang:` \
+         escalation tier — permanently, until an operator intervenes by hand.\n\
+         iHOTEL itself has no known code path that writes a literal NULL to this \
+         column — every customer-delete cascade writes the reserved `'C0000'` \
+         sentinel instead (a value-to-value change the gate already handles \
+         correctly). This almost certainly means legacy MSSQL was edited by hand, \
+         outside iHOTEL.\n\
+         *Next steps:* identify the affected `{legacy_table}` row(s) (query the \
+         table directly — this alert doesn't carry row PKs) and, if the NULL was \
+         unintended, correct it by hand; separately check `ht_reconcile_log` for a \
+         stuck `{table_name}` row on the same legacy PK. See \
+         `docs/adr/0005-null-clear-sentinel-semantics.md` for the designed (but \
+         deliberately not yet built) fix — a versioned reconcile-hash migration. \
+         Per-table cooldown {cooldown_hours}h.",
+        legacy_table = probe.legacy_table,
+        legacy_column = probe.legacy_column,
+        table_name = probe.table_name,
+    )
+}
+
+/// Read `SELECT COUNT(*) FROM <legacy_table> WHERE <legacy_column> IS NULL`
+/// from legacy MSSQL. `probe` is always one of the two hardcoded
+/// [`NULL_SENTINEL_PROBES`] entries — never user input — so building the SQL
+/// with `format!` here is not an injection surface.
+async fn read_null_sentinel_count(
+    legacy_pool: &DbPool,
+    probe: &NullSentinelProbe,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE {} IS NULL",
+        probe.legacy_table, probe.legacy_column
+    );
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
+    let n: i32 = rows.first().and_then(|r| r.get(0)).unwrap_or(0);
+    Ok(n as i64)
+}
+
+/// Page (or log) a single [`NullSentinelProbe`] breach. Cooldown-gated
+/// through the shared `ht_level_drift_alert_cooldowns` table under
+/// [`null_sentinel_cooldown_key`], reusing the same
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window (default 24h, per-site overridable)
+/// as [`alert_guest_registry_divergence_cap`] rather than inventing a new
+/// knob: a hand-edited NULL doesn't change between ticks (the write already
+/// happened), so re-paging every 15 minutes gains nothing, and 24h matches
+/// every other "stuck state, not a burst" page in this module.
+///
+/// Eligibility is read via [`level_alert_eligible_pg`], which FAILS OPEN on
+/// a PG error (defaults to "eligible") — the same polarity `bin/sync.rs`'s
+/// `boot_refusal_should_send` chooses for a guard whose failure mode is
+/// silence about a real problem: "with no dedup backend we FAIL OPEN...
+/// their failure mode is silence... so a duplicate page beats a missing
+/// one." A stuck, unfixable reconcile row is exactly that shape of failure
+/// mode, so this reuses the fail-open helper rather than adding a
+/// fail-closed guard of its own. The cooldown is burned only on confirmed
+/// delivery ([`cooldown_should_be_marked`]), so a webhook outage cannot
+/// silence the probe for a full cycle either.
+async fn alert_null_sentinel_probe(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    probe: &NullSentinelProbe,
+    null_count: i64,
+) {
+    let key = null_sentinel_cooldown_key(probe.table_name);
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            table = probe.table_name,
+            "[Sync] NULL-sentinel page suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_null_sentinel_message(probe, null_count, cooldown_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            table = probe.table_name,
+            legacy_table = probe.legacy_table,
+            legacy_column = probe.legacy_column,
+            null_count,
+            "[Sync] Slack not configured; NULL-sentinel finding logged only — \
+             ADR 0005's accepted gap has been triggered"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            table = probe.table_name,
+            "[Sync] NULL-sentinel page POST failed — leaving the cooldown unset \
+             so the next tick retries"
+        );
+    }
+}
+
+/// ADR 0005's periodic tripwire, wired into [`run_sync`] (behind
+/// [`null_sentinel_tripwire_enabled`]). Runs both [`NULL_SENTINEL_PROBES`]
+/// every tick — two cheap `SELECT COUNT(*)`s, both measured fast against
+/// live production 2026-07-31. Zero on both is the steady state and logs at
+/// debug; any non-zero pages via [`alert_null_sentinel_probe`].
+///
+/// Best-effort, same posture as every sibling check in this module: a
+/// failed MSSQL query logs a warning for THAT probe and moves on — it never
+/// aborts the reconcile loop, and it never treats "can't reach legacy" as
+/// "assume a NULL and page" (a connectivity failure is a different problem
+/// with its own alerting path — the watchdog's probe-outage escalation).
+async fn check_null_sentinel_and_alert(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    for probe in NULL_SENTINEL_PROBES {
+        let null_count = match read_null_sentinel_count(legacy_pool, probe).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    site = %site_id,
+                    table = probe.table_name,
+                    legacy_table = probe.legacy_table,
+                    error = %e,
+                    "[Sync] NULL-sentinel probe query failed — observability \
+                     degraded for this tick"
+                );
+                continue;
+            }
+        };
+
+        if null_sentinel_alert_needed(null_count) {
+            alert_null_sentinel_probe(pg_pool, slack, site_id, probe, null_count).await;
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table = probe.table_name,
+                legacy_table = probe.legacy_table,
+                legacy_column = probe.legacy_column,
+                "[Sync] NULL-sentinel probe clean"
+            );
+        }
+    }
+}
+
 /// Compute SHA256 hash of a string
-fn sha256(input: &str) -> String {
+pub(crate) fn sha256(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -1618,7 +3439,14 @@ fn legacy_yesno_canonical(s: Option<&str>) -> &'static str {
 /// Hash inputs for the canonical-shape customer projection. Single-row
 /// per PK on both sides. Order + separator must stay byte-identical
 /// between the MSSQL and PG paths or the hashes won't line up.
-fn customer_canonical_hash(
+///
+/// Segments are joined by [`join_hash_segments`] rather than a
+/// `format!` template so the separator is single-sourced with the
+/// mapper-side descriptor table (`sync::mappers::customer::HASH_INPUTS`)
+/// that pins the gate ⊇ hash invariant. Byte-identical to the template
+/// it replaced — pinned by
+/// `customers_hash_bytes_unchanged_for_golden_inputs`.
+pub(crate) fn customer_canonical_hash(
     legacy_cust_no: &str,
     cust_firstname: &str,
     cust_type: Option<&str>,
@@ -1626,34 +3454,32 @@ fn customer_canonical_hash(
     cust_idcard: Option<&str>,
     cust_address: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}|{}|{}",
-        legacy_cust_no,
-        cust_firstname,
-        cust_type.unwrap_or(""),
-        cust_phone.unwrap_or(""),
-        cust_idcard.unwrap_or(""),
-        cust_address.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        legacy_cust_no.to_string(),
+        cust_firstname.to_string(),
+        cust_type.unwrap_or("").to_string(),
+        cust_phone.unwrap_or("").to_string(),
+        cust_idcard.unwrap_or("").to_string(),
+        cust_address.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for the canonical-shape room projection. Narrowed to
 /// fields the CT room mapper actually writes back (room_clean,
 /// room_maintenance, room_notes) — prices and other legacy-only
 /// columns are excluded because canonical doesn't mirror them.
-fn room_canonical_hash(
+pub(crate) fn room_canonical_hash(
     room_no: &str,
     room_clean_yesno: &str,
     room_maintenance_yesno: &str,
     room_notes: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}",
-        room_no,
-        room_clean_yesno,
-        room_maintenance_yesno,
-        room_notes.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        room_no.to_string(),
+        room_clean_yesno.to_string(),
+        room_maintenance_yesno.to_string(),
+        room_notes.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for one canonical-shape booking row. Single-row per
@@ -1663,19 +3489,18 @@ fn room_canonical_hash(
 /// is an integer ledger code while canonical `ht_bookings.book_status` is a
 /// translated English literal sourced from `HT_Book_H.Book_Status` — different
 /// fields. Status changes are surfaced by the CT watcher's domain events.
-fn booking_canonical_hash(
+pub(crate) fn booking_canonical_hash(
     legacy_book_id: &str,
     book_checkin_date: Option<&str>,
     book_checkout_date: Option<&str>,
     legacy_cust_no: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}",
-        legacy_book_id,
-        book_checkin_date.unwrap_or(""),
-        book_checkout_date.unwrap_or(""),
-        legacy_cust_no.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        legacy_book_id.to_string(),
+        book_checkin_date.unwrap_or("").to_string(),
+        book_checkout_date.unwrap_or("").to_string(),
+        legacy_cust_no.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for one canonical-shape check-in row. The CT checkin
@@ -1722,7 +3547,7 @@ fn booking_canonical_hash(
 /// the sentinel collapses the parity gap deterministically. When
 /// `cancelled = false`, the active-stay 5-field shape is unchanged
 /// — pre-2026-05-19 hash bytes are preserved bit-for-bit.
-fn checkin_canonical_hash(
+pub(crate) fn checkin_canonical_hash(
     legacy_cin_no: &str,
     legacy_room_no: Option<&str>,
     cin_checkin_time: Option<&str>,
@@ -1731,18 +3556,126 @@ fn checkin_canonical_hash(
     checked_out: bool,
     cancelled: bool,
 ) -> String {
+    // Shape selector — stays a pre-join early return so the sentinel
+    // never picks up segment bytes.
     if cancelled {
         return sha256(&format!("CANCELLED|{}", legacy_cin_no));
     }
-    sha256(&format!(
-        "{}|{}|{}|{}|{}|co={}",
-        legacy_cin_no,
-        legacy_room_no.unwrap_or(""),
-        cin_checkin_time.unwrap_or(""),
-        cin_checkout_time.unwrap_or(""),
-        legacy_cust_no.unwrap_or(""),
-        checked_out,
-    ))
+    // The `co=` prefix belongs to the checked-out SEGMENT, not to the
+    // separator — see `sync::mappers::checkin::HASH_INPUTS`.
+    sha256(&join_hash_segments(&[
+        legacy_cin_no.to_string(),
+        legacy_room_no.unwrap_or("").to_string(),
+        cin_checkin_time.unwrap_or("").to_string(),
+        cin_checkout_time.unwrap_or("").to_string(),
+        legacy_cust_no.unwrap_or("").to_string(),
+        format!("co={}", checked_out),
+    ]))
+}
+
+/// Render a money value into its reconcile-hash segment.
+///
+/// Two decimals on BOTH sides: canonical `ht_payments.pay_amount` is
+/// `DECIMAL(12,2)` while legacy `HT_Receipt_H.Receipt_Total` is a bare
+/// `float`, so the fixed precision is what makes the two comparable at
+/// all (a float `890.0000000001` must hash like `890.00`).
+///
+/// The `-0.0` normalisation is not cosmetic: IEEE `-0.0` renders as
+/// `"-0.00"` while `0.0` renders as `"0.00"`, and `-0.0 == 0.0` is true —
+/// so a zero-total receipt could otherwise hash differently on the two
+/// sides forever with nothing observable to fix.
+pub(crate) fn money_hash_segment(amount: f64) -> String {
+    let normalised = if amount == 0.0 { 0.0 } else { amount };
+    format!("{:.2}", normalised)
+}
+
+/// Render the void bit into its reconcile-hash segment. The `voided=`
+/// prefix belongs to the SEGMENT, not the separator — same convention as
+/// the check-in hash's `co=`.
+pub(crate) fn voided_hash_segment(voided: bool) -> String {
+    format!("voided={}", voided)
+}
+
+/// Hash inputs for one canonical-shape payment (legacy `HT_Receipt_H`)
+/// row. Phase 6-A; keyed on `Receipt_no`.
+///
+/// **Why `Receipt_no` and NOT `Pay_No`:** `Pay_No` is a pointer into the
+/// per-line `HT_CheckIn_Pay` ledger (many lines share one), whereas
+/// `Receipt_no` is the receipt artefact's own unique business key — and
+/// it is what `apply_receipt_upsert` resolves canonical rows by
+/// (`legacy_receipt_no` / `pay_reference`).
+///
+/// **Deliberately excluded** (each would be permanent, unfixable sync
+/// lag rather than signal):
+/// * `pay_date` — `RECEIPT_UPSERT_UPDATE_SQL` COALESCEs it, so an
+///   app-originated payment keeps its own creation instant and can never
+///   converge on legacy `Receipt_Date`;
+/// * `pay_method` — `HT_Receipt_H` doesn't carry the tender (that lives
+///   in the matching `HT_CheckIn_Pay` line), so the mapper defaults the
+///   column to `'cash'` and never mirrors it in either direction.
+///
+/// **Known one-way asymmetry, deliberately hashed:** canonical void is
+/// PG-only (`repository/payment.rs::void`, no writeback recipe) and the
+/// mapper's `pay_voided` fold is MONOTONIC, so a canonically-voided
+/// payment whose legacy `status_name` is still `'ปกติ'` diverges here and
+/// CANNOT self-heal. That is a genuine cross-app money-reporting
+/// disagreement (iHOTEL's shift report still counts the receipt, ours
+/// doesn't), so it is signal — but expect such rows to need operator
+/// action, not patience. This is one reason `payments` is deliberately
+/// absent from [`FORCE_CONVERGE_VALUE_DRIFT_TABLES`].
+///
+/// **That shape needs an explicit carve-out to stay OBSERVABLE, and has
+/// one** (2026-07-28 review). A PG-only void never moves the LEGACY hash,
+/// and `sync_payments` short-circuits on `acked == mssql_hash` *before* it
+/// fetches the canonical row — so without help, only the canonical-only
+/// voids that already existed at first-enable would ever be reported, and
+/// a void performed in our app after a receipt was acked as converged
+/// would be invisible to the arm forever.
+/// [`load_canonically_voided_receipt_keys`] closes that: it lifts the
+/// currently-voided canonical receipt keys in ONE batched read per tick,
+/// and [`payment_ack_short_circuit_bypassed`] re-opens the comparison for
+/// exactly the asymmetric pair (canonical voided ∧ legacy not cancelled).
+/// Do not "simplify" that bypass back into a plain ack short-circuit — the
+/// money path is only continuously monitored because of it.
+pub(crate) fn payment_canonical_hash(
+    receipt_no: &str,
+    amount: f64,
+    voided: bool,
+    legacy_cin_no: Option<&str>,
+) -> String {
+    sha256(&join_hash_segments(&[
+        receipt_no.to_string(),
+        money_hash_segment(amount),
+        voided_hash_segment(voided),
+        legacy_cin_no.unwrap_or("").to_string(),
+    ]))
+}
+
+/// Hash inputs for one canonical-shape companion FOLIO (legacy
+/// `HT_CheckIn_Other_People` rows sharing a `Cin_no`). Phase 6-B; keyed on
+/// `Cin_no`.
+///
+/// **Why the folio is the unit.** iHOTEL edits companions by
+/// DELETE-then-REINSERT (`FrmCheckIn.cs:9975`), minting a new IDENTITY per
+/// edit, and the CT mapper mirrors that faithfully. A per-ROW arm keyed on
+/// that id would therefore report two divergences on every correctly-applied
+/// edit — one for the retired id (which can never converge) and one for the
+/// new one — while a folio hash is invariant under the churn and moves only
+/// when the companion CONTENT does. See
+/// [`crate::sync::mappers::guest_registry::RegistryFolioProjection`].
+///
+/// The body is `cin_no | <sorted "{name}|{country}" lines joined by \n>`,
+/// with ids on both sides excluded. An EMPTY folio (a check-in with no
+/// companions) is a real, hashable state, not an absent row — that is what
+/// lets a folio whose companions were legitimately deleted on both sides
+/// auto-resolve rather than sit open forever.
+pub(crate) fn guest_registry_canonical_hash(
+    folio: &crate::sync::mappers::guest_registry::RegistryFolioProjection,
+) -> String {
+    sha256(&join_hash_segments(&[
+        folio.legacy_cin_no.clone(),
+        folio.companions_segment(),
+    ]))
 }
 
 /// Track D / T7 CRIT-1 — discriminator for `ht_reconcile_log.divergence_kind`.
@@ -1864,7 +3797,7 @@ pub fn classify_divergence(
 /// Cardinality is real drift but it doesn't get materially more drifted
 /// with every re-detection — one row per (PK, hash) is enough.
 #[allow(clippy::too_many_arguments)]
-async fn record_divergence(
+pub(crate) async fn record_divergence(
     pg_pool: &PgPool,
     table_name: &str,
     legacy_pk: &str,
@@ -1979,6 +3912,73 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
     legacy_pk.split_once('|').unwrap_or((legacy_pk, ""))
 }
 
+/// Every `ht_reconcile_log.table_name` that BOTH resolve dispatches
+/// below must handle.
+///
+/// A detected entity with no resolve arm is undetectably broken: the
+/// sweep falls through to `_ => Ok(None)`, `current_legacy_hash` and
+/// `current_pg_hash` both come back `None`, and every row for that
+/// entity sits open forever. That is exactly what happened to `rooms`
+/// (live evidence 2026-05-18). The `debug_assert!` in each wildcard arm
+/// turns "someone added detection without a resolve arm" into a test
+/// failure instead of a silent backlog, and
+/// `gate_guard::tests::resolvable_tables_const_covers_every_contract_entity`
+/// pins this list against the entity registry.
+///
+/// Phase 6-C appends the mirror-probe keys. They are NOT entity contracts
+/// (no CT mapper idempotency gate to be a superset of — the mirror mappers
+/// DELETE+INSERT unconditionally); they are resolvable because
+/// [`crate::scheduler::mirror_probe::probe_for_table`] backs both dispatch
+/// arms below. Leaving them OUT of this list would not trip any
+/// `debug_assert!` — the assert only fires for listed-but-undispatched
+/// names — and that is precisely why it was not done: the rows would sit
+/// open forever and, being selected by age alone, would eventually own the
+/// sweep's whole 500-row batch. Phase 6-D appends the payment-ledger probe
+/// key on exactly the same terms (`payment_ledger_probe::is_payment_ledger_probe`
+/// backs both dispatch arms).
+/// `gate_guard::tests::every_resolvable_table_is_a_contract_entity_or_a_probe`
+/// keeps the two populations explicit.
+pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
+    "customers",
+    "bookings",
+    "checkins",
+    "rooms",
+    "payments",
+    "guest_registry",
+    // Phase 6-C mirror probes — pinned against
+    // `mirror_probe::mirror_probe_keys()` by a unit test below.
+    "mirror_ht_cupon",
+    "mirror_ht_checkin_product",
+    "mirror_ht_deposit",
+    "mirror_ht_changed_room",
+    "mirror_ht_bill_debt_h",
+    "mirror_ht_bill_debt_ds",
+    "mirror_ht_rooms_cancel",
+    "mirror_ht_book_pro",
+    // Issues #273/#282: DETECTION is keyed off `rcal_legacy_id` entirely
+    // and SET-DIFFS the business key `(room_no, night)` — see
+    // `probe_room_calendar_business_key` — running the SAME
+    // `compare_room_calendar_pairs` classification RESOLUTION uses
+    // (`compute_room_calendar_deficit_hash` / `room_calendar_converged_hash`).
+    // The two can no longer disagree about "converged", which is what makes
+    // recording safe: a row this arm opens measures a night a re-drive CAN
+    // land, not an id-binding artefact that nothing can. Canonical surplus
+    // is deliberately NOT recorded (issue #281 owns it). No remediation
+    // ships here — a recorded row stays open (real sync lag, same as
+    // `guest_registry` / `payment_ledger_probe`) until a backfill lands the
+    // nights. Pinned by `ROOM_CALENDAR_PROBE_KEY`; see the calendar-arm
+    // section.
+    "mirror_ht_room_calendar",
+    // Phase 6-D payment-ledger probe. Same population as the 6-C probes (not
+    // an entity contract — `mirror_payment_ledger` DELETEs the folio and
+    // re-INSERTs it unconditionally, so there is no idempotency gate for a
+    // hash to be a superset of), and resolvable for the same reason: its rows
+    // ARE closeable (re-drive with the `backfill_payment_ledger` bin, then the
+    // sweep sees equal hashes), so they must never be left un-dispatched.
+    // Pinned against `PAYMENT_LEDGER_PROBE_KEY` by a unit test below.
+    "payment_ledger_probe",
+];
+
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
 /// row's `(table_name, legacy_pk)` pair. Returns `Ok(None)` if no
 /// canonical row exists today (still drifted), or `Ok(Some(hash))`
@@ -1986,8 +3986,9 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 ///
 /// Dispatches on the same table-name vocabulary the reconcile loop
 /// writes into `ht_reconcile_log.table_name` ("customers", "bookings",
-/// "checkins", "rooms"). Other table names return `Ok(None)` so the
-/// row stays in the queue for operator review.
+/// "checkins", "rooms" — see [`RECONCILE_RESOLVABLE_TABLES`]). Other
+/// table names return `Ok(None)` so the row stays in the queue for
+/// operator review.
 async fn compute_current_pg_hash(
     pg_pool: &PgPool,
     table_name: &str,
@@ -2059,7 +4060,75 @@ async fn compute_current_pg_hash(
                 )
             }))
         }
-        _ => Ok(None),
+        "payments" => {
+            // Phase 6-A. `legacy_pk` is the receipt's `Receipt_no`; the
+            // canonical probe mirrors `apply_receipt_upsert`'s own
+            // `(legacy_receipt_no = $1 OR pay_reference = $1)` shape so
+            // the sweep resolves the SAME row the mapper would write.
+            let canonical = fetch_canonical_payment(pg_pool, legacy_pk).await?;
+            Ok(canonical.map(|c| {
+                payment_canonical_hash(
+                    legacy_pk,
+                    c.pay_amount,
+                    c.is_voided(),
+                    c.legacy_cin_no.as_deref(),
+                )
+            }))
+        }
+        "guest_registry" => {
+            // Phase 6-B. `legacy_pk` is the folio's `Cin_no`. `Ok(None)`
+            // ONLY when the parent check-in is absent from canonical — a
+            // folio that exists but holds no companions hashes as the
+            // EMPTY folio, so a companion set deleted on both sides
+            // converges instead of sitting open forever.
+            Ok(fetch_canonical_registry_folio(pg_pool, legacy_pk)
+                .await?
+                .as_ref()
+                .map(guest_registry_canonical_hash))
+        }
+        // Issues #273/#282 — the calendar's `<aggregate>` row resolves on a
+        // `(room, night)` SET-DIFF. Deliberately AHEAD of the generic probe
+        // arm below: that arm recomputes the `rcal_legacy_id`-keyed
+        // aggregate, which is never-equal by construction (the mapper NULLs
+        // the id on an allocator rebind and nothing restores it), so a
+        // calendar row dispatched there could never converge. Per-PK calendar
+        // rows — which the probe cannot produce, it is `per_pk: false` — fall
+        // through to the generic arm unchanged.
+        //
+        // No query: the canonical side's contribution to a set-diff is "no
+        // legacy night is missing from canonical" (`room_calendar_converged_hash`)
+        // and the comparison that can decide that lives in the LEGACY arm,
+        // which holds both pools. See the calendar-arm section docs.
+        t if t == ROOM_CALENDAR_PROBE_KEY
+            && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
+        {
+            Ok(Some(room_calendar_converged_hash()))
+        }
+        // Phase 6-C. `legacy_pk` is either a real mirrored key or the
+        // `<aggregate>` sentinel. Never `Ok(None)` for a registered probe:
+        // an ABSENT key hashes to `mirror_absent_hash` so a row deleted on
+        // both sides converges instead of sitting open forever.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
+            crate::scheduler::mirror_probe::resolve_pg_hash(pg_pool, probe, legacy_pk).await
+        }
+        // Phase 6-D. `legacy_pk` is either a `Cin_No` or the `<aggregate>`
+        // sentinel. Never `Ok(None)`: an absent folio hashes to
+        // `folio_absent_hash` so a folio deleted on both sides converges.
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => {
+            crate::scheduler::payment_ledger_probe::resolve_pg_hash(pg_pool, legacy_pk).await
+        }
+        _ => {
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
+                "resolve arm missing for {table_name} in compute_current_pg_hash \
+                 — the entity is listed as resolvable but falls through to the \
+                 wildcard, so every reconcile row for it stays open forever \
+                 (2026-05-18, rooms)"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -2089,8 +4158,16 @@ async fn compute_current_pg_hash(
 /// projections (`fetch_legacy_customer_hash`, `fetch_legacy_booking_hash`,
 /// `fetch_legacy_room_hash`) — the same unification is a follow-on for
 /// those entities.
+///
+/// **Why this takes `pg_pool`** (Phase 6-C): a mirror probe's `<aggregate>`
+/// row is only comparable inside the mirror's own coverage floor, and that
+/// floor is a `MIN(pk)` over the MIRROR side. Re-deriving it here each sweep
+/// — rather than freezing it onto the reconcile row — means a floor that
+/// MOVES because the mirror finally received its missing history is picked
+/// up on the next tick. No other arm reads the pool.
 async fn compute_current_legacy_hash(
     legacy_pool: &DbPool,
+    pg_pool: &PgPool,
     table_name: &str,
     legacy_pk: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2102,7 +4179,56 @@ async fn compute_current_legacy_hash(
         }
         "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
-        _ => Ok(None),
+        "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
+        "guest_registry" => fetch_legacy_registry_folio_hash(legacy_pool, legacy_pk).await,
+        // Issues #273/#282 — calendar set-diff arm. Sibling of the
+        // `compute_current_pg_hash` arm and ordered ahead of the generic
+        // probe arm for the same reason (the id-keyed aggregate is
+        // never-equal by construction). This is the side that runs the whole
+        // comparison: it reads `pg_pool` for the era floor AND for the
+        // canonical pair set, and hashes what is still missing.
+        t if t == ROOM_CALENDAR_PROBE_KEY
+            && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
+        {
+            Ok(Some(
+                compute_room_calendar_deficit_hash(legacy_pool, pg_pool).await?,
+            ))
+        }
+        // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
+        // arm; same absent-is-a-real-hash contract.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
+            crate::scheduler::mirror_probe::resolve_legacy_hash(
+                legacy_pool,
+                pg_pool,
+                probe,
+                legacy_pk,
+            )
+            .await
+        }
+        // Phase 6-D — payment-ledger probe. Sibling of the
+        // `compute_current_pg_hash` arm; same absent-is-a-real-hash contract,
+        // and it reads `pg_pool` for the same reason (the `<aggregate>` row's
+        // coverage floor is a `MIN` over the CANONICAL side).
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => {
+            crate::scheduler::payment_ledger_probe::resolve_legacy_hash(
+                legacy_pool,
+                pg_pool,
+                legacy_pk,
+            )
+            .await
+        }
+        _ => {
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
+                "resolve arm missing for {table_name} in \
+                 compute_current_legacy_hash — the entity is listed as \
+                 resolvable but falls through to the wildcard, so every \
+                 reconcile row for it stays open forever (2026-05-18, rooms)"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -2159,9 +4285,9 @@ async fn fetch_legacy_customer_hash(
         "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
         projection = CUSTOMERS_RECONCILE_PROJECTION,
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(cust_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -2199,9 +4325,9 @@ async fn fetch_legacy_booking_hash(
         "SELECT {projection} FROM View_Booking_Ds WHERE Book_No = @P1",
         projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(book_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
 
     let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
     for row in &rows {
@@ -2257,9 +4383,9 @@ async fn fetch_legacy_room_hash(
         "SELECT {projection} FROM HT_Rooms WHERE Room_no = @P1",
         projection = ROOMS_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(room_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -2276,6 +4402,952 @@ async fn fetch_legacy_room_hash(
         legacy_yesno_canonical(room_manternace.as_deref()),
         room_details.as_deref(),
     )))
+}
+
+/// Single-PK MSSQL re-projection for payments (Phase 6-A). Mirrors
+/// `sync_payments`' per-row hash construction so the auto-resolve sweep
+/// compares like-for-like under the CURRENT projection. `Ok(None)` when
+/// the receipt no longer exists on the legacy side, or when it has lost
+/// its `Receipt_ref` (the bulk scan excludes those rows too — a
+/// no-check-in receipt is a deliberate mapper skip, not sync lag).
+///
+/// The canonical-era floor ([`PAYMENTS_ERA_FLOOR_SQL`]) is deliberately NOT
+/// applied here: this path re-projects a receipt the scan ALREADY admitted
+/// and logged, so it must reproduce that row's hash unconditionally. Adding
+/// the floor would make an in-flight row un-re-projectable if the floor ever
+/// moved forward.
+async fn fetch_legacy_payment_hash(
+    legacy_pool: &DbPool,
+    receipt_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_Receipt_H WHERE Receipt_no = @P1",
+        projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql.as_str());
+    q.bind(receipt_no);
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let Some(projected) = project_legacy_receipt_row(row) else {
+        return Ok(None);
+    };
+    Ok(Some(projected.hash()))
+}
+
+/// Single-PK MSSQL re-projection for a companion FOLIO (Phase 6-B).
+/// Mirrors `sync_guest_registry`'s per-folio hash construction so the
+/// auto-resolve sweep compares like-for-like under the CURRENT projection.
+///
+/// Deliberately returns `Ok(Some(<empty-folio hash>))` — never `Ok(None)` —
+/// when the `Cin_no` has no companion rows left. Unlike the flat entities,
+/// "no rows" here is a legitimate FOLIO STATE (most check-ins have no
+/// companions), not a vanished row: iHOTEL's DELETE+reinsert edit passes
+/// through it, and a companion set deleted on BOTH sides has genuinely
+/// converged. Returning `None` would make that convergence unrepresentable
+/// and every such row would sit open forever. The scope gate stays honest
+/// because the CANONICAL arm still returns `None` when the parent check-in
+/// is absent, so a bogus `legacy_pk` can never "converge" as empty/empty.
+///
+/// The canonical-era floor is deliberately NOT applied here, same as
+/// payments: this path re-projects a folio the scan ALREADY admitted.
+async fn fetch_legacy_registry_folio_hash(
+    legacy_pool: &DbPool,
+    cin_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_CheckIn_Other_People WHERE Cin_no = @P1",
+        projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql.as_str());
+    q.bind(cin_no);
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
+    let mut folio = RegistryFolioProjection::empty(cin_no);
+    for row in &rows {
+        push_legacy_companion(&mut folio, row);
+    }
+    Ok(Some(guest_registry_canonical_hash(&folio)))
+}
+
+// =============================================================================
+// Calendar arm (issues #273 / #282 / #281) — `(room, night)` SET-DIFF for
+// `mirror_ht_room_calendar`
+// =============================================================================
+//
+// ## Why this cannot be a count comparison
+//
+// `HT_Room_Status` is mirrored into `ht_room_calendar` one row per night. The
+// mapper UPSERTs on the BUSINESS key `(rcal_room_id, rcal_date)` and captures
+// `HT_Room_Status.id` in `rcal_legacy_id` as a back-pointer that is
+// deliberately NOT the conflict target: when iHOTEL's `MAX(id)+1` allocator
+// rebinds an id onto a different slot, the mapper's id-reuse pre-clear
+// (`sync/mappers/room_calendar.rs:185-192`) NULLs the pointer on whichever
+// canonical row still held it, and nothing restores it.
+//
+// Two live ticks proved that COUNTing that population cannot decide
+// convergence:
+//
+// * **2026-08-04, HF Hotel — issue #282, a FALSE positive.** The arm was
+//   enabled (`6add0e9`) and fired on the first tick: `missing_pg`, legacy
+//   4509 vs pg 4506, window 2025-04-13 .. 2026-08-05. Set-diffing the pairs
+//   resolved the delta to exactly three slots — room 405, nights 2026-05-11,
+//   -12, -13 — present on BOTH sides with the right status and the right
+//   check-in (222), carrying only `rcal_legacy_id IS NULL`. The canonical
+//   count said `WHERE rcal_legacy_id IS NOT NULL`, so it could not see them.
+//   Zero genuine gaps; reverted the same day (`36827dd`).
+// * **2026-08-10, HF Ville — a TRUE positive.** `missing_pg`, legacy 1663 vs
+//   pg 1659. Four `(107, night)` slots (2026-07-28, 08-05, 08-06, 08-08) were
+//   absent from `ht_room_calendar` ENTIRELY — a selective silent drop whose CT
+//   versions had already aged past `CHANGE_TRACKING_MIN_VALID_VERSION`, so no
+//   tick could ever redeliver them
+//   (`docs/coexistence/sync-incident-log.md`). THIS class must keep firing.
+//
+// One number cannot separate those, because the NULL-`rcal_legacy_id`
+// population splits in two and DRIFTS as the allocator rebinds ids:
+//
+// | class | does legacy hold the slot? | what it means                       | this arm                |
+// |-------|----------------------------|-------------------------------------|-------------------------|
+// | **A** | no                         | genuine canonical surplus (#281)    | logged, NEVER recorded  |
+// | **B** | yes, under a rebound id    | only the back-pointer is stale      | converged + re-stamped  |
+//
+// Room 405's week carried both at once on 2026-08-04 (`05-11..13` class B,
+// `05-14`/`05-15` class A), which is why the unit fixture is modelled on it.
+// Live re-measurement 2026-08-10: HF Hotel 3 class B / 137 class A, HF Ville
+// 0 class B / 75 class A, deficit ZERO at both sites.
+//
+// ## What this arm compares
+//
+// The full `(room_no, night)` SET on each side, inside the mirror's own era:
+//
+// * canonical — EVERY tile, joined to `ht_rooms_new` for its `room_no`, with
+//   NO `rcal_legacy_id` filter (that filter IS the #282 bug), carrying the
+//   back-pointer's nullability per pair. `room_no` matching is EXACT, the
+//   same rule `sync::resolve::resolve_room_id` uses (`room_no = $1`) — a
+//   `TRIM`/`LOWER` here would make the classifier disagree with the mapper
+//   about which slot a legacy row belongs to;
+// * legacy — `HT_Room_Status` GROUPed into distinct `(room_no, night)` pairs
+//   with the DETERMINISTIC `MIN(id)` per pair. Legacy permits duplicate rows
+//   for one slot (live: ids 4223/4224/4225 all on room 201, night
+//   2026-06-30; 20 such slots at HF Hotel, 6 at Ville) while canonical is
+//   UNIQUE on `(rcal_room_id, rcal_date)`, so the pair set — not the row
+//   count — is the only comparable thing, and the re-stamp below needs one
+//   reproducible id out of the duplicates.
+//
+// Classification, and what each class costs:
+//
+// * **legacy-only pair** → genuine `missing_pg`. ONE aggregate reconcile row,
+//   the same row shape and STABLE dedupe sentinel as before, with a bounded
+//   sample of the missing pairs in the JSON snapshots for triage.
+// * **canonical-only pair** → class A. LOGGED with a count and a bounded
+//   sample (at INFO — the population is durable and carries no operator
+//   action, and this arm runs every 15 minutes), NEVER recorded (issue
+//   #281): no re-drive can conjure a legacy
+//   night that is not there, so such a row is unclosable by construction and
+//   would pin the 4h digest and the >72h `:bangbang:` escalation tier at both
+//   sites forever — which is exactly what forced the 2026-07-31 Ville revert.
+// * **pair on both sides with `rcal_legacy_id` NULL** → class B. CONVERGED —
+//   the night IS mirrored, only the pointer is stale — and queued for the
+//   heal arm, which re-stamps the back-pointer so the class shrinks instead
+//   of being tolerated forever.
+//
+// Cost: one era-floor aggregate plus two full key scans per tick (~4.7k pairs
+// at HF Hotel, ~1.7k at Ville) — the same order as the payment-ledger probe's
+// 20k folios — diffed in Rust over two `BTreeMap`s.
+//
+// ## Deliberately blind to surplus, and saying so
+//
+// "Converged" here means "canonical holds every in-era legacy night", NOT
+// "the two sides are equal". A canonical-only pair never opens a row — not
+// even when it still carries a legacy id (which would be a lost `D` event
+// rather than a #281 orphan; zero of those at either site on 2026-08-10).
+// That case is logged separately and loudly and stays out of the ledger until
+// #281 ships a surplus-side sweep that can actually close it. Silence from
+// this arm therefore means "no legacy night is missing", NOT "canonical is
+// clean".
+//
+// ## Era floor
+//
+// Still `MIN(rcal_date)` over MIRRORED rows only, derived every tick, never
+// configured (the `PAYMENTS_ERA_FLOOR_SQL` lesson), and it bounds BOTH scans.
+// Deriving it from the mirrored population rather than from every tile is
+// load-bearing: a class-A tile older than the mirror's first mirrored night
+// would otherwise drag legacy history into a window the mirror never covered,
+// and every night in that window would read as a genuine deficit.
+//
+// ## Closure — one definition of "converged"
+//
+// Detection and closure must answer "converged?" identically or a recorded
+// row churns (open → close → re-open, forever). Both now run the SAME
+// [`compare_room_calendar_pairs`] classification, and the convergence channel
+// is the DEFICIT hash: the legacy-side resolve arm re-runs the comparison and
+// hashes the legacy-only pair set, while the canonical side contributes the
+// hash of the EMPTY deficit ([`room_calendar_converged_hash`]). They are
+// equal exactly when nothing is missing — which is what lets the sweep
+// self-close the row once the missing nights are backfilled, and what keeps
+// it closed while class A grows and class B churns underneath. The canonical
+// arm needs no query at all for the same reason it needs no count: canonical
+// contributes the pair SET, and the comparison that reads it lives on the
+// side that holds both pools.
+
+/// `ht_reconcile_log.table_name` of the Phase 6-C calendar mirror probe.
+///
+/// One literal shared by the resolve dispatches and the tests so they cannot
+/// drift from the probe registry; pinned against
+/// `mirror_probe::probe_for_table` by
+/// `room_calendar_probe_key_matches_the_registered_mirror_probe`.
+pub(crate) const ROOM_CALENDAR_PROBE_KEY: &str = "mirror_ht_room_calendar";
+
+/// Most `(room, night)` pairs quoted in one log line or JSON snapshot.
+///
+/// The samples exist for triage, not enumeration — the counts alongside them
+/// are always the true totals. Same order of magnitude as
+/// `mirror_probe::MIRROR_PROBE_MAX_PK_FINDINGS`, and bounded for the same
+/// reason: an unbounded array would put thousands of pairs into
+/// `ht_reconcile_log.mssql_row_json` on a site whose mirror is empty.
+pub(crate) const ROOM_CALENDAR_MAX_SAMPLE: usize = 20;
+
+/// Most class-B back-pointers the heal arm re-stamps in ONE tick.
+///
+/// Not a starvation risk: a re-stamped pair stops being a candidate, so the
+/// next tick reaches the next slice. The cap only bounds how much canonical
+/// write traffic one tick can issue when the arm is first enabled on a site
+/// with a long-accumulated class B.
+const ROOM_CALENDAR_RESTAMP_MAX_PER_TICK: usize = 100;
+
+/// Era floor for BOTH sides of the comparison: the first night the mirror
+/// actually mirrors.
+///
+/// `WHERE rcal_legacy_id IS NOT NULL` belongs HERE and nowhere else. As a
+/// FLOOR it is right — the mirrored population defines the coverage boundary,
+/// so legacy history predating it is out of scope and cannot build a
+/// permanently unresolvable backlog. As a comparison SCOPE it was issue
+/// #282 — it hid class-B tiles from the canonical side and manufactured a
+/// deficit that did not exist.
+const ROOM_CALENDAR_ERA_FLOOR_SQL: &str =
+    "SELECT MIN(rcal_date) FROM ht_room_calendar WHERE rcal_legacy_id IS NOT NULL";
+
+/// Canonical `(room_no, night)` pair scan — EVERY in-era tile, mirrored or
+/// detached, with its `rcal_id` (the re-stamp target) and the nullability of
+/// its back-pointer.
+///
+/// The join to `ht_rooms_new` resolves `room_no`, which is the half of the
+/// business key legacy speaks; it is an inner join because `rcal_room_id` is
+/// FK-constrained to that table. `room_no` is `UNIQUE` and canonical is
+/// `UNIQUE (rcal_room_id, rcal_date)`, so `(room_no, night)` identifies at
+/// most one row and the map below cannot silently collapse two tiles.
+///
+/// The floor is a BOUND parameter and `NULL` means "no mirrored coverage at
+/// all" — then every tile is in scope, matching the unfloored legacy scan.
+const ROOM_CALENDAR_PAIRS_PG_SQL: &str = "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
+       FROM ht_room_calendar c \
+       JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
+      WHERE $1::date IS NULL OR c.rcal_date >= $1::date";
+
+/// Re-stamp ONE class-B back-pointer (the heal arm's only statement).
+///
+/// Three guards, all load-bearing:
+///
+/// * `rcal_id = $2` — the exact tile the classifier resolved, never a
+///   business-key re-lookup that could have moved since;
+/// * `rcal_legacy_id IS NULL` — idempotent, and it cannot clobber a pointer
+///   the CT mapper stamped between the scan and this write;
+/// * `NOT EXISTS (… other.rcal_legacy_id = $1)` — the partial unique index
+///   `ux_ht_room_calendar_legacy_id` would otherwise raise on an id that has
+///   already been rebound onto another slot. Losing that race costs zero rows
+///   (`rows_affected = 0`, logged as skipped); the CT path owns rebinds.
+const ROOM_CALENDAR_RESTAMP_SQL: &str = "UPDATE ht_room_calendar \
+        SET rcal_legacy_id = $1, rcal_updated_at = NOW() \
+      WHERE rcal_id = $2 \
+        AND rcal_legacy_id IS NULL \
+        AND NOT EXISTS (SELECT 1 FROM ht_room_calendar other \
+                         WHERE other.rcal_legacy_id = $1)";
+
+/// Legacy `(room_no, night)` pair scan, floored at the mirror's coverage.
+///
+/// `GROUP BY` rather than `SELECT DISTINCT` because the re-stamp needs one
+/// deterministic id per slot: `HT_Room_Status` permits duplicate rows for one
+/// `(room, night)` (ids 4223/4224/4225 on room 201, night 2026-06-30) and
+/// `MIN(id)` picks the same one on every tick, so a heal that is retried
+/// after a crash re-stamps the same value. `row_count` rides along so the log
+/// can say the slot was ambiguous.
+///
+/// `MIN` here vs `MAX` in `bin/backfill_room_calendar`'s `dedup_worklist_sql`
+/// is deliberate, not drift. That bin re-PROJECTS the tile's data and wants
+/// the row CT would have delivered last, which is the newest id. This arm
+/// only re-binds a POINTER, and the newest id is precisely the one iHOTEL's
+/// `MAX(id)+1` allocator can rebind next (it reuses an id after the top row
+/// is deleted), so the oldest id is the more stable pointer. Neither choice
+/// can conflict: the pointer is nobody's conflict target, and a later
+/// backfill's `ON CONFLICT … DO UPDATE` simply overwrites it.
+///
+/// `floored = false` (an EMPTY mirror) scans the whole legacy table on
+/// purpose — with no coverage at all, "legacy has N nights and we have none"
+/// IS the finding, and it lands as one bounded aggregate row. Same contract
+/// as `mirror_probe::legacy_floor_filter`.
+///
+/// `CAST(room_date AS DATE)` normalises the legacy `datetime` (naive local
+/// Thai) down to the night, which is what the canonical `DATE` column holds;
+/// style 23 returns ISO `varchar(10)` so both sides key on byte-identical
+/// `YYYY-MM-DD` text. Plain `'…'` literals only — never `N'…'`.
+pub(crate) fn room_calendar_pairs_legacy_sql(floored: bool) -> String {
+    let floor = if floored {
+        " AND CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT room_no, CONVERT(varchar(10), CAST(room_date AS DATE), 23) AS night, \
+         MIN(CAST(id AS BIGINT)) AS legacy_id, COUNT_BIG(*) AS row_count \
+           FROM HT_Room_Status \
+          WHERE room_no IS NOT NULL AND room_date IS NOT NULL{floor} \
+          GROUP BY room_no, CAST(room_date AS DATE)"
+    )
+}
+
+/// The business key both sides share: `(room_no, ISO night)`.
+///
+/// A tuple so `BTreeMap`/`BTreeSet` order it lexicographically for free —
+/// which is what makes every sample, log line and hash below deterministic
+/// tick over tick, and therefore dedupe-friendly.
+pub(crate) type RoomCalendarPair = (String, String);
+
+/// Canonical side of one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CanonicalCalendarTile {
+    /// The tile's own PK — the re-stamp target.
+    pub(crate) rcal_id: i64,
+    /// `None` is the detached state the mapper's pre-clear leaves behind; it
+    /// says NOTHING about whether legacy still holds the slot (that is
+    /// precisely the class A / class B question).
+    pub(crate) legacy_id: Option<i64>,
+}
+
+/// Legacy side of one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyCalendarNight {
+    /// `MIN(id)` over the rows on this slot — deterministic under duplicates.
+    pub(crate) legacy_id: i64,
+    /// How many legacy rows share the slot (`> 1` is legal in iHOTEL).
+    pub(crate) row_count: i64,
+}
+
+/// One night legacy has and canonical does not — the only class this arm
+/// records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarMissingNight {
+    pub(crate) room_no: String,
+    pub(crate) night: String,
+    pub(crate) legacy_id: i64,
+}
+
+/// One class-B back-pointer the heal arm can re-stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarRestamp {
+    pub(crate) rcal_id: i64,
+    pub(crate) legacy_id: i64,
+    pub(crate) room_no: String,
+    pub(crate) night: String,
+    /// `> 1` when legacy holds duplicates for the slot — the id chosen is
+    /// `MIN`, and this is what says so in the log.
+    pub(crate) legacy_rows: i64,
+}
+
+/// Everything one comparison of the two pair sets found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RoomCalendarClassification {
+    /// Distinct in-era legacy `(room, night)` pairs.
+    pub(crate) legacy_pairs: usize,
+    /// In-era canonical tiles (mirrored AND detached).
+    pub(crate) canonical_pairs: usize,
+    /// Pairs on both sides whose canonical tile carries a legacy id. The id
+    /// need not be the legacy `MIN` — under duplicates the mapper may hold
+    /// any of them, and the slot is mirrored either way.
+    pub(crate) matched_bound: usize,
+    /// Legacy-only pairs → genuine `missing_pg`, sorted.
+    pub(crate) missing_pg: Vec<RoomCalendarMissingNight>,
+    /// Class A: canonical-only, back-pointer already NULL (issue #281).
+    pub(crate) surplus_detached: Vec<RoomCalendarPair>,
+    /// Canonical-only while STILL carrying a legacy id — a lost `D` event
+    /// rather than a #281 orphan. Logged apart because the two need different
+    /// remediations; neither is recorded.
+    pub(crate) surplus_bound: Vec<RoomCalendarPair>,
+    /// Class B: on both sides, back-pointer NULL, id free to re-stamp.
+    pub(crate) restamp: Vec<RoomCalendarRestamp>,
+    /// Class B whose legacy id is already bound to a DIFFERENT canonical row
+    /// — re-stamping would violate `ux_ht_room_calendar_legacy_id`, so the CT
+    /// path keeps ownership of the rebind. Converged all the same.
+    pub(crate) restamp_conflicts: Vec<RoomCalendarPair>,
+    /// The floor both scans ran under, echoed for the log/JSON.
+    pub(crate) era_floor: Option<NaiveDate>,
+}
+
+impl RoomCalendarClassification {
+    /// The ONE convergence question this arm asks: does canonical hold every
+    /// in-era legacy night? Surplus of either kind is deliberately not part
+    /// of it — see the section docs.
+    pub(crate) fn is_converged(&self) -> bool {
+        self.missing_pg.is_empty()
+    }
+
+    /// `None` when converged. Never `Cardinality` (the hourly drift digest
+    /// filters that kind out, so it would go unpaged) and never
+    /// `MissingMssql`: a surplus pair is never recorded, so there is no
+    /// direction to report it in.
+    pub(crate) fn divergence_kind(&self) -> Option<DivergenceKind> {
+        (!self.is_converged()).then_some(DivergenceKind::MissingPg)
+    }
+
+    /// Legacy pairs canonical DOES hold — the honest "pg count" for a row
+    /// whose delta must equal the deficit.
+    pub(crate) fn covered_pairs(&self) -> usize {
+        self.legacy_pairs.saturating_sub(self.missing_pg.len())
+    }
+
+    /// The convergence channel — see [`room_calendar_deficit_hash`].
+    pub(crate) fn deficit_hash(&self) -> String {
+        room_calendar_deficit_hash(&self.missing_pg)
+    }
+
+    fn missing_sample(&self) -> Vec<serde_json::Value> {
+        self.missing_pg
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|m| json!({ "room_no": m.room_no, "night": m.night, "legacy_id": m.legacy_id }))
+            .collect()
+    }
+
+    fn missing_pair_sample(&self) -> Vec<String> {
+        self.missing_pg
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|m| format!("{}@{}", m.room_no, m.night))
+            .collect()
+    }
+
+    fn pair_sample(pairs: &[RoomCalendarPair]) -> Vec<String> {
+        pairs
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|(room, night)| format!("{room}@{night}"))
+            .collect()
+    }
+}
+
+/// Hash of the DEFICIT — the sorted set of in-era legacy `(room, night)`
+/// pairs canonical does not hold.
+///
+/// This is the whole convergence channel between detection and the
+/// auto-resolve sweep. It is content-addressed rather than a count so that a
+/// deficit which merely CHANGES (one night backfilled, another dropped) can
+/// never be mistaken for the one that was recorded; and it hashes the EMPTY
+/// set to a real, non-empty value ([`room_calendar_converged_hash`]) because
+/// `should_auto_resolve` closes a row only on two equal non-empty hashes.
+///
+/// The `"pair_deficit"` discriminator makes it provably incapable of
+/// colliding with `mirror_probe::mirror_aggregate_hash` for the same probe
+/// key — that one measures the id-keyed aggregate, which is never-equal by
+/// construction, and mistaking the two mid-migration would close a row on the
+/// wrong comparison.
+pub(crate) fn room_calendar_deficit_hash(missing: &[RoomCalendarMissingNight]) -> String {
+    let mut segments = Vec::with_capacity(missing.len() + 4);
+    segments.push(ROOM_CALENDAR_PROBE_KEY.to_string());
+    segments.push(crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK.to_string());
+    segments.push("pair_deficit".to_string());
+    segments.push(missing.len().to_string());
+    for m in missing {
+        segments.push(format!("{}@{}", m.room_no, m.night));
+    }
+    sha256(&join_hash_segments(&segments))
+}
+
+/// The canonical side's contribution to the comparison: "no legacy night is
+/// missing from canonical".
+///
+/// Constant on purpose. The classification is inherently two-sided, and the
+/// resolve dispatch that holds BOTH pools is the legacy one
+/// ([`compute_room_calendar_deficit_hash`]); the canonical arm therefore
+/// states the target rather than re-deriving it from a query that could not
+/// answer the question alone. Equality with the live deficit hash IS
+/// convergence.
+pub(crate) fn room_calendar_converged_hash() -> String {
+    room_calendar_deficit_hash(&[])
+}
+
+/// Pure classifier — no I/O, so the fixtures below can drive every class.
+///
+/// Iteration is over two `BTreeMap`s, so every output vector is sorted and
+/// stable: the samples in a recorded row do not churn between ticks (which is
+/// what lets `record_divergence`'s dedupe suppress the repeat) and the deficit
+/// hash is reproducible.
+pub(crate) fn classify_room_calendar_pairs(
+    legacy: &BTreeMap<RoomCalendarPair, LegacyCalendarNight>,
+    canonical: &BTreeMap<RoomCalendarPair, CanonicalCalendarTile>,
+) -> RoomCalendarClassification {
+    // Every legacy id canonical already points at. A re-stamp onto a second
+    // row would trip `ux_ht_room_calendar_legacy_id`; catching it here keeps
+    // the heal arm's failure mode "skipped and logged" instead of "UPDATE
+    // raises". The statement itself re-checks under the same predicate, for
+    // the race between this scan and the write.
+    let bound: BTreeSet<i64> = canonical.values().filter_map(|t| t.legacy_id).collect();
+
+    let mut out = RoomCalendarClassification {
+        legacy_pairs: legacy.len(),
+        canonical_pairs: canonical.len(),
+        ..Default::default()
+    };
+
+    for (pair, night) in legacy {
+        match canonical.get(pair) {
+            // Legacy holds the night, canonical does not — the 2026-08-10
+            // Ville class, and the only one worth an `ht_reconcile_log` row.
+            None => out.missing_pg.push(RoomCalendarMissingNight {
+                room_no: pair.0.clone(),
+                night: pair.1.clone(),
+                legacy_id: night.legacy_id,
+            }),
+            // Mirrored and bound. Note the ids need not match: under legacy
+            // duplicates the tile may point at any of them.
+            Some(tile) if tile.legacy_id.is_some() => out.matched_bound += 1,
+            // CLASS B — the night is mirrored, only the pointer is stale.
+            Some(tile) => {
+                if bound.contains(&night.legacy_id) {
+                    out.restamp_conflicts.push(pair.clone());
+                } else {
+                    out.restamp.push(RoomCalendarRestamp {
+                        rcal_id: tile.rcal_id,
+                        legacy_id: night.legacy_id,
+                        room_no: pair.0.clone(),
+                        night: pair.1.clone(),
+                        legacy_rows: night.row_count,
+                    });
+                }
+            }
+        }
+    }
+
+    for (pair, tile) in canonical {
+        if legacy.contains_key(pair) {
+            continue;
+        }
+        if tile.legacy_id.is_some() {
+            out.surplus_bound.push(pair.clone());
+        } else {
+            // CLASS A — issue #281. Never recorded.
+            out.surplus_detached.push(pair.clone());
+        }
+    }
+
+    out
+}
+
+/// The mirror's own coverage boundary, re-derived every tick so a floor that
+/// MOVES (because the mirror finally received its missing history) is picked
+/// up instead of pinning the comparison to a stale boundary.
+async fn fetch_room_calendar_era_floor(pg_pool: &PgPool) -> Result<Option<NaiveDate>, sqlx::Error> {
+    let (floor,) = sqlx::query_as::<_, (Option<NaiveDate>,)>(ROOM_CALENDAR_ERA_FLOOR_SQL)
+        .fetch_one(pg_pool)
+        .await?;
+    Ok(floor)
+}
+
+/// Canonical pair set, floored. See [`ROOM_CALENDAR_PAIRS_PG_SQL`].
+async fn fetch_room_calendar_pairs_pg(
+    pg_pool: &PgPool,
+    floor: Option<NaiveDate>,
+) -> Result<BTreeMap<RoomCalendarPair, CanonicalCalendarTile>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
+        .bind(floor)
+        .fetch_all(pg_pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(room_no, night, rcal_id, legacy_id)| {
+            (
+                (room_no, night.to_string()),
+                CanonicalCalendarTile {
+                    rcal_id,
+                    legacy_id: legacy_id.map(i64::from),
+                },
+            )
+        })
+        .collect())
+}
+
+/// Legacy pair set, floored. See [`room_calendar_pairs_legacy_sql`].
+async fn fetch_room_calendar_pairs_legacy(
+    legacy_pool: &DbPool,
+    floor: Option<NaiveDate>,
+) -> Result<BTreeMap<RoomCalendarPair, LegacyCalendarNight>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let floor_text = floor.map(|d| d.to_string());
+    let sql = room_calendar_pairs_legacy_sql(floor_text.is_some());
+
+    let mut conn = legacy_pool.get().await?;
+    let mut q = Query::new(sql.as_str());
+    if let Some(f) = floor_text.as_deref() {
+        q.bind(f);
+    }
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
+    drop(conn);
+
+    let mut out = BTreeMap::new();
+    for r in &rows {
+        let (Some(room_no), Some(night)) = (r.get::<&str, _>("room_no"), r.get::<&str, _>("night"))
+        else {
+            continue;
+        };
+        let Some(legacy_id) = r.try_get::<i64, _>("legacy_id").ok().flatten() else {
+            continue;
+        };
+        out.insert(
+            (room_no.to_string(), night.to_string()),
+            LegacyCalendarNight {
+                legacy_id,
+                row_count: r.try_get::<i64, _>("row_count").ok().flatten().unwrap_or(1),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// ONE comparison of the two pair sets — the single definition of "converged"
+/// that detection and closure both read.
+///
+/// Scan ORDER is deliberate: legacy first, canonical second. A tile written
+/// between the two reads then shows up on the canonical side (at worst a
+/// class-A surplus, which is only logged) instead of as a legacy-only pair
+/// that would record a divergence and be closed again next tick. The skew
+/// window biases toward SILENCE.
+pub(crate) async fn compare_room_calendar_pairs(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<RoomCalendarClassification, Box<dyn std::error::Error + Send + Sync>> {
+    let floor = fetch_room_calendar_era_floor(pg_pool).await?;
+    let legacy = fetch_room_calendar_pairs_legacy(legacy_pool, floor).await?;
+    let canonical = fetch_room_calendar_pairs_pg(pg_pool, floor).await?;
+
+    let mut classification = classify_room_calendar_pairs(&legacy, &canonical);
+    classification.era_floor = floor;
+    Ok(classification)
+}
+
+/// Legacy-side resolve arm for the calendar's `<aggregate>` row: re-run the
+/// comparison and hash what is still missing.
+///
+/// Cost: one floor aggregate + two key scans per sweep, and only while an
+/// open calendar aggregate row exists — `record_divergence`'s dedupe allows
+/// at most one per site, so this cannot grow with table size.
+///
+/// Errors propagate to `auto_resolve_reconcile_log`, which already logs and
+/// `continue`s per row: one arm's failure costs one row this tick, never the
+/// cycle (the sibling error-isolation contract).
+async fn compute_room_calendar_deficit_hash(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(compare_room_calendar_pairs(legacy_pool, pg_pool)
+        .await?
+        .deficit_hash())
+}
+
+// =============================================================================
+// Calendar DETECTION + the class-B heal arm
+// =============================================================================
+
+/// Outcome of one calendar probe tick, folded into
+/// [`crate::scheduler::mirror_probe::MirrorProbeOutcome`] by the caller
+/// exactly like a generic probe's per-key result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoomCalendarProbeOutcome {
+    /// Canonical holds every in-era legacy night — no row written. Class A
+    /// and class B do not affect this verdict; both are logged.
+    Converged,
+    /// Legacy nights are missing from canonical; a divergence was written (or
+    /// an already-open one deduped, per `record_divergence`'s NOT EXISTS
+    /// guard) — never a per-PK row, always the `<aggregate>` sentinel.
+    Diverged,
+}
+
+/// What one detection pass produced: the verdict, plus the class-B repairs it
+/// merely OBSERVED.
+///
+/// Detection stays an auditor — it issues no canonical write. The candidates
+/// travel to `mirror_probe::run_mirror_probe`, which invokes the heal arm as
+/// its own separately-flagged step. (A class-B tile never opens an
+/// `ht_reconcile_log` row — it is converged — so the auto-resolve sweep can
+/// never see it, which is why the heal cannot live there.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarProbeReport {
+    pub(crate) outcome: RoomCalendarProbeOutcome,
+    pub(crate) restamp: Vec<RoomCalendarRestamp>,
+}
+
+/// Issue #282 — calendar DETECTION as a `(room, night)` set-diff.
+///
+/// Recording uses the same STABLE SENTINEL convention as every other
+/// aggregate probe row
+/// ([`crate::scheduler::mirror_probe::mirror_aggregate_sentinel`]), not the
+/// live deficit hash: `should_auto_resolve` never reads the stored hash for
+/// this row (closure re-runs the comparison fresh — see
+/// [`compute_room_calendar_deficit_hash`]), so the stored hash only gates
+/// `record_divergence`'s dedupe. A LIVE hash would move as soon as the
+/// deficit changed by one night and mint a fresh row — precisely the failure
+/// mode the sentinel convention exists to avoid.
+pub(crate) async fn probe_room_calendar_business_key(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<RoomCalendarProbeReport, Box<dyn std::error::Error + Send + Sync>> {
+    let classification = compare_room_calendar_pairs(legacy_pool, pg_pool).await?;
+
+    // CLASS A — issue #281. Logged with a count and a bounded sample, never
+    // recorded: no re-drive can conjure a legacy night that is not there, so
+    // an `ht_reconcile_log` row here would be unclosable and would pin the 4h
+    // digest and the >72h escalation tier forever.
+    //
+    // INFO, not WARN, on purpose: the sweep runs every 15 minutes and this
+    // population is durable (137 tiles at HF Hotel, 75 at Ville on
+    // 2026-08-10) with no operator action attached, so warning about it four
+    // times an hour would erode WARN for the classes that DO need attention.
+    if !classification.surplus_detached.is_empty() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            surplus = classification.surplus_detached.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.surplus_detached),
+            "[Sync] Mirror probe: canonical-only calendar tiles (detached, no legacy \
+             counterpart) — LOGGED, NOT recorded: unclosable by construction, tracked \
+             as issue #281"
+        );
+    }
+    // The same direction but the tile still carries a legacy id — a lost `D`
+    // event, not a #281 orphan. Zero of these at either site on 2026-08-10;
+    // if it ever fires, it needs a different remediation (delete the tile),
+    // so it gets its own line rather than being folded into the count above.
+    if !classification.surplus_bound.is_empty() {
+        tracing::warn!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            surplus_bound = classification.surplus_bound.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.surplus_bound),
+            "[Sync] Mirror probe: canonical calendar tiles STILL BOUND to a legacy id \
+             legacy no longer holds (lost D event) — LOGGED, NOT recorded (issue #281 \
+             owns the surplus side)"
+        );
+    }
+    if !classification.restamp_conflicts.is_empty() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            conflicts = classification.restamp_conflicts.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.restamp_conflicts),
+            "[Sync] Mirror probe: class-B tiles whose legacy id is already bound \
+             elsewhere — converged, re-stamp left to the CT path"
+        );
+    }
+
+    let Some(kind) = classification.divergence_kind() else {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            legacy_pairs = classification.legacy_pairs,
+            canonical_pairs = classification.canonical_pairs,
+            matched = classification.matched_bound,
+            class_b = classification.restamp.len(),
+            class_a = classification.surplus_detached.len(),
+            floor = ?classification.era_floor,
+            "[Sync] Mirror probe: calendar converged — canonical holds every in-era \
+             legacy night"
+        );
+        return Ok(RoomCalendarProbeReport {
+            outcome: RoomCalendarProbeOutcome::Converged,
+            restamp: classification.restamp,
+        });
+    };
+
+    let sentinel =
+        crate::scheduler::mirror_probe::mirror_aggregate_sentinel(ROOM_CALENDAR_PROBE_KEY);
+    // Always `missing_pg` — surplus is never recorded — so the sentinel sits
+    // on the legacy side, the one that actually has the rows.
+    let (mssql_hash, pg_row_hash) = (Some(sentinel.clone()), None::<String>);
+
+    tracing::warn!(
+        probe = ROOM_CALENDAR_PROBE_KEY,
+        legacy_pairs = classification.legacy_pairs,
+        covered = classification.covered_pairs(),
+        missing = classification.missing_pg.len(),
+        sample = ?classification.missing_pair_sample(),
+        floor = ?classification.era_floor,
+        kind = kind.as_str(),
+        "[Sync] Mirror probe: calendar nights present in iHOTEL and ABSENT from \
+         canonical (set-diff on (room, night) — issue #282)"
+    );
+
+    record_divergence(
+        pg_pool,
+        ROOM_CALENDAR_PROBE_KEY,
+        crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK,
+        pg_row_hash.as_deref(),
+        mssql_hash.as_deref(),
+        json!({
+            "scope": "aggregate",
+            "key_kind": "pair_set",
+            "legacy_table": "HT_Room_Status",
+            "pair_count": classification.legacy_pairs,
+            "missing_from_pg": classification.missing_pg.len(),
+            "missing_sample": classification.missing_sample(),
+            "era_floor": classification.era_floor.map(|d| d.to_string()),
+        }),
+        Some(json!({
+            "scope": "aggregate",
+            "key_kind": "pair_set",
+            "mirror_table": "ht_room_calendar",
+            "pair_count": classification.canonical_pairs,
+            "covered_legacy_pairs": classification.covered_pairs(),
+            "matched_bound": classification.matched_bound,
+            "detached_but_present": classification.restamp.len()
+                + classification.restamp_conflicts.len(),
+            "surplus_detached": classification.surplus_detached.len(),
+            "surplus_bound": classification.surplus_bound.len(),
+        })),
+        kind,
+        classification.legacy_pairs.min(i32::MAX as usize) as i32,
+        classification.covered_pairs().min(i32::MAX as usize) as i32,
+    )
+    .await;
+
+    Ok(RoomCalendarProbeReport {
+        outcome: RoomCalendarProbeOutcome::Diverged,
+        restamp: classification.restamp,
+    })
+}
+
+/// Issue #282 — is the class-B back-pointer heal enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"` the arm issues ZERO
+/// canonical writes and only logs how many candidates it saw, so detection
+/// behaviour is byte-for-byte what it would be without the heal.
+///
+/// Deliberately a SEPARATE flag from [`reconcile_force_converge_enabled`]:
+/// that one is already `true` in production at both sites, so folding a new
+/// canonical-write class into it would ship this ON with no coordinated flip
+/// — the same reasoning that gave [`reconcile_reingest_missing_pg_enabled`]
+/// its own switch.
+///
+/// The `== "true"` comparison is strict on purpose — `"TRUE"`, `"1"` and
+/// `" true"` all evaluate false, matching every other feature flag in the
+/// sync path.
+fn room_calendar_restamp_enabled() -> bool {
+    env::var("RECONCILE_CALENDAR_RESTAMP_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// What one heal pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RoomCalendarRestampOutcome {
+    /// Back-pointers actually re-stamped (canonical rows written).
+    pub(crate) restamped: usize,
+    /// Candidates that did not take: the id was rebound between the scan and
+    /// the write, the CT path stamped the tile first, or the UPDATE failed.
+    pub(crate) skipped: usize,
+}
+
+/// Class-B heal: bind a detached tile back to the legacy row that occupies
+/// the same `(room, night)`.
+///
+/// This is a canonical-only write — nothing is sent to the legacy database —
+/// and it writes exactly what the CT mapper's `ON CONFLICT … DO UPDATE` would
+/// write on the next genuine edit to that night. Without it the class is
+/// merely tolerated and grows with ordinary iHOTEL room-move traffic; with
+/// it the population shrinks every tick.
+///
+/// Failures are per-candidate and NEVER fail the tick: a skipped re-stamp
+/// loses nothing (the tile stays class B, converged, and is re-offered next
+/// tick), whereas failing the probe on it would mask the detection result
+/// this arm exists to serve.
+pub(crate) async fn restamp_room_calendar_backpointers(
+    pg_pool: &PgPool,
+    candidates: &[RoomCalendarRestamp],
+) -> RoomCalendarRestampOutcome {
+    let mut outcome = RoomCalendarRestampOutcome::default();
+    if candidates.is_empty() {
+        return outcome;
+    }
+    if !room_calendar_restamp_enabled() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            candidates = candidates.len(),
+            "[Sync] Calendar back-pointer heal is DARK \
+             (RECONCILE_CALENDAR_RESTAMP_ENABLED) — class-B tiles left detached"
+        );
+        return outcome;
+    }
+
+    for candidate in candidates.iter().take(ROOM_CALENDAR_RESTAMP_MAX_PER_TICK) {
+        // `rcal_legacy_id` is INTEGER; a legacy id beyond `i32` would be a
+        // corrupt read, not a tile to heal.
+        let Ok(legacy_id) = i32::try_from(candidate.legacy_id) else {
+            outcome.skipped += 1;
+            tracing::warn!(
+                probe = ROOM_CALENDAR_PROBE_KEY,
+                rcal_id = candidate.rcal_id,
+                legacy_id = candidate.legacy_id,
+                "[Sync] Calendar back-pointer heal: legacy id does not fit INTEGER — skipped"
+            );
+            continue;
+        };
+        match sqlx::query(ROOM_CALENDAR_RESTAMP_SQL)
+            .bind(legacy_id)
+            .bind(candidate.rcal_id)
+            .execute(pg_pool)
+            .await
+        {
+            Ok(result) if result.rows_affected() == 1 => {
+                outcome.restamped += 1;
+                tracing::info!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    room_no = %candidate.room_no,
+                    night = %candidate.night,
+                    legacy_rows = candidate.legacy_rows,
+                    "[Sync] Calendar back-pointer re-stamped (class B, issue #282)"
+                );
+            }
+            Ok(_) => {
+                outcome.skipped += 1;
+                tracing::info!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    "[Sync] Calendar back-pointer heal: id already bound elsewhere or \
+                     tile re-stamped by the CT path — skipped"
+                );
+            }
+            Err(e) => {
+                outcome.skipped += 1;
+                tracing::warn!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    error = %e,
+                    "[Sync] Calendar back-pointer heal: UPDATE failed — skipped, the \
+                     tile stays converged and is re-offered next tick"
+                );
+            }
+        }
+    }
+
+    if candidates.len() > ROOM_CALENDAR_RESTAMP_MAX_PER_TICK {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            candidates = candidates.len(),
+            cap = ROOM_CALENDAR_RESTAMP_MAX_PER_TICK,
+            "[Sync] Calendar back-pointer heal: candidate list exceeds the per-tick \
+             cap — the remainder is re-offered next tick"
+        );
+    }
+
+    outcome
 }
 
 /// Issue #204 (bug #2) — is the durable self-healing arm of the
@@ -2311,6 +5383,338 @@ fn reconcile_reingest_missing_pg_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Phase 6-A — is the `payments` reconcile arm enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls `sync_payments`, so the arm issues ZERO MSSQL and ZERO PG
+/// queries and `ht_reconcile_log` can never gain a `payments` row —
+/// behaviour is byte-for-byte identical to before the arm existed. The
+/// resolve dispatches and the ack table are inert without detection.
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// The first enabled tick re-hashes every IN-ERA receipt with a
+/// `Receipt_ref`, so a one-time find is expected — but only a small one:
+/// [`PAYMENTS_ERA_FLOOR_SQL`] keeps the pre-mirror history (>20k receipts
+/// at HF Hotel) out of scope entirely, because those rows could never
+/// converge and would jam the whole sweep. Pre-set
+/// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` accordingly.
+///
+/// Be honest about what lands: `payments` is in NEITHER self-heal list, so
+/// a `missing_pg` find here does NOT age out on its own — it stays open
+/// until an operator acts, and the >72h escalation tier will eventually
+/// fire on it. Treat every one as a real dropped receipt ingest.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_payments_arm_enabled() -> bool {
+    env::var("RECONCILE_PAYMENTS_ARM_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-B — is the `guest_registry` (companion folio) reconcile arm
+/// enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls `sync_guest_registry`, so the arm issues ZERO MSSQL and ZERO
+/// PG queries and `ht_reconcile_log` can never gain a `guest_registry` row —
+/// behaviour is byte-for-byte identical to before the arm existed. The
+/// resolve dispatches and the ack table are inert without detection.
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// The first enabled tick hashes every IN-ERA folio, so a one-time find is
+/// expected — a small one, because [`GUEST_REGISTRY_ERA_FLOOR_SQL`] keeps
+/// the pre-mirror history out of scope. Live 2026-07-28: HF Hotel 830 in-era
+/// legacy folios vs 818 canonical (≈12 finds); HF Ville 574 vs 545 (≈29).
+/// Unfloored those would have been ~19.6k and ~1.6k folios that can never
+/// converge.
+///
+/// Be honest about what lands: `guest_registry` is in NEITHER self-heal
+/// list, so a find does NOT age out on its own — it stays open until an
+/// operator acts, and the >72h escalation tier will eventually fire on it.
+/// Every one is a real TM.30 companion-registry disagreement.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_guest_registry_arm_enabled() -> bool {
+    env::var("RECONCILE_GUEST_REGISTRY_ARM_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-C — is the generic mirror-table probe enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls [`crate::scheduler::mirror_probe::run_mirror_probe`], so the
+/// probe issues ZERO MSSQL and ZERO PG queries and `ht_reconcile_log` can
+/// never gain a `mirror_*` row — behaviour is byte-for-byte identical to
+/// before the probe existed. The resolve dispatches are inert without
+/// detection, and the probe has no ack table of its own (nothing to seed).
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// Live read-only counts 2026-07-28 say the first enabled tick is quiet on
+/// 8 of the 9 probes at BOTH sites once the `MIN(mirror pk)` coverage floor
+/// is applied — including `HT_Rooms_Cancel`, whose mirror was never
+/// bootstrap-snapshotted (315 legacy rows → 13 in-era, matching the 13
+/// mirrored).
+///
+/// The 9th, `ht_room_calendar`, is NOT quiet — as of issue #273 (remainder)
+/// its detection is re-keyed onto the same business key
+/// (`probe_room_calendar_business_key`) the closure arm resolves on, and
+/// `observe_only` is `false`. The gap is genuine and, at last measurement
+/// (2026-07-28), survives the business key too: HF Hotel counted 1546
+/// legacy nights vs 1420 canonical (a `missing_pg` aggregate row). The
+/// id-keyed figures quoted historically for this table (1507 vs 1298 at HF
+/// Hotel, 1302 vs 1071 at Ville) are a DIFFERENT comparison and must not be
+/// read as the business-key gap — Ville's business-key gap has not been
+/// independently measured; re-check live counts before the flip rather than
+/// assuming it. Expect the first enabled tick to open exactly ONE aggregate
+/// `mirror_ht_room_calendar` row per site with an open business-key gap (or
+/// zero if Ville's business key happens to be converged), staying open —
+/// same as `guest_registry` / `payment_ledger_probe` — until a future
+/// re-drive path closes it or the >72h `:bangbang:` escalation tier fires.
+/// Pre-set `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` or flip in an
+/// announced window with that expectation communicated, not a "quiet
+/// ledger" one.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_mirror_probe_enabled() -> bool {
+    env::var("RECONCILE_MIRROR_PROBE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-D — is the per-folio payment-ledger probe enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls
+/// [`crate::scheduler::payment_ledger_probe::run_payment_ledger_probe`], so
+/// the probe issues ZERO MSSQL and ZERO PG queries and `ht_reconcile_log`
+/// can never gain a `payment_ledger_probe` row — behaviour is byte-for-byte
+/// identical to before the probe existed. The resolve dispatches are inert
+/// without detection, and the probe has no ack table of its own (nothing to
+/// seed).
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// Live read-only counts 2026-07-28 say what to expect, once the
+/// `MIN(ledger_legacy_id)` coverage floor is applied: **HF Ville is EXACTLY
+/// converged** (1,016 in-era folios, identical line counts, itemized amounts
+/// AND receipt-deduped tenders on both sides), and **HF Hotel opens exactly
+/// 19 rows**, all `missing_pg`, all contiguous at the era boundary
+/// (`CH26-004952`…`CH26-004971`, minus `CH26-004960`) — folios whose
+/// payments the Track J7e backfill never reached, i.e. money
+/// `round_report` under-counts today. Zero `value` and zero
+/// `missing_mssql` at either site.
+///
+/// Those 19 are CLOSEABLE, which is why this arm records rather than merely
+/// observes (contrast `mirror_ht_room_calendar`): re-drive them with
+/// `cargo run --release --bin backfill_payment_ledger` and the next
+/// auto-resolve sweep sees equal hashes. But be honest about the interim —
+/// `payment_ledger_probe` is in NEITHER self-heal list, so nothing closes
+/// them on its own and the >72h `:bangbang:` escalation tier WILL fire if
+/// they are left. Pre-set `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>`
+/// or flip in an announced window.
+///
+/// **Enable-order constraint (migration 084's ratchet).** Do NOT turn this
+/// flag on at a site before that site's `backfill_payment_ledger --all` has
+/// COMPLETED. The first enabled tick SEEDS
+/// `ht_reconcile_era_floor.era_floor_id` from whatever coverage exists at
+/// that moment and the ratchet then holds it, so a floor seeded from a
+/// narrow, date-windowed coverage window would keep excluding the older
+/// folios a later `--all` backfill lands — forever, and invisibly. As of
+/// 2026-08-01 Ville's `--all` HAS run; HF Hotel's is scheduled for that
+/// night and has NOT, which is why HF Hotel stays dark. If a watermark was
+/// seeded before a coverage-widening backfill, the remedy is
+/// `DELETE FROM ht_reconcile_era_floor WHERE table_name =
+/// 'payment_ledger_probe'` on that site's canonical database — the next tick
+/// re-derives it, and only a DELETE can lower a floor.
+/// [`note_payment_ledger_era_floor_hold`] is the tripwire that says this has
+/// happened.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_payment_ledger_probe_enabled() -> bool {
+    env::var("RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// How many CONSECUTIVE probe ticks the coverage floor must be observed
+/// HELD (`effective > derived`) before that is worth an operator's
+/// attention.
+///
+/// **4.** A hold lasting ONE tick is the ratchet doing its job — a folio was
+/// mirrored whole, the scan did not widen, nothing to do — and paging on it
+/// would train operators to ignore the alert. At the 15-minute reconcile
+/// cadence (`jobs.rs`'s `0 */15 * * * *` cron and the 900s default of
+/// `WORKER_RECONCILE_INTERVAL_SECS`) four ticks is ~1 hour, which is long
+/// enough that the two remaining explanations are both worth acting on: a
+/// genuine pre-coverage mirror (understand what wrote it) or a STALE
+/// watermark left behind by a coverage-widening backfill (delete the row).
+/// It is the same "has resisted several sweeps" arithmetic
+/// [`FORCE_CONVERGE_MIN_AGE_SECS`] uses for the same cadence.
+pub(crate) const ERA_FLOOR_HELD_ALERT_TICKS: u32 = 4;
+
+/// Consecutive ticks, per site, that the payment-ledger coverage floor has
+/// been observed HELD.
+///
+/// Process-local on purpose, and the weaker half of the guard: the DEDUPE
+/// that matters is the shared `ht_level_drift_alert_cooldowns` row (which is
+/// exactly why migration 053 moved cooldowns out of a process-local map), so
+/// two processes ticking the same site cannot double-page. All this counter
+/// decides is WHEN the first page becomes eligible, and its failure mode on
+/// restart is a page delayed by up to [`ERA_FLOOR_HELD_ALERT_TICKS`] ticks —
+/// never a missed one, because a genuine hold persists until coverage or the
+/// floor row changes. Keyed by site anyway so a process that ever ticks two
+/// sites cannot conflate their streaks.
+static ERA_FLOOR_HOLD_STREAKS: std::sync::Mutex<BTreeMap<String, u32>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Record this tick's observation and return the CURRENT consecutive-hold
+/// streak. A non-holding tick clears the site's streak — the condition has
+/// to be unbroken, or an intermittent hold would eventually add up to a
+/// page.
+fn note_era_floor_hold_streak(site_id: &str, holding: bool) -> u32 {
+    let mut streaks = ERA_FLOOR_HOLD_STREAKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !holding {
+        streaks.remove(site_id);
+        return 0;
+    }
+    let streak = streaks.entry(site_id.to_string()).or_insert(0);
+    *streak = streak.saturating_add(1);
+    *streak
+}
+
+/// `>=`, not `==`: past the threshold every tick stays eligible and the
+/// per-site cooldown does the throttling. Pinning it to the exact tick would
+/// mean a hold that outlives one cooldown window is never re-announced.
+fn era_floor_hold_is_alertable(streak: u32) -> bool {
+    streak >= ERA_FLOOR_HELD_ALERT_TICKS
+}
+
+/// The held-watermark alert body. Pure so the composition is unit-testable
+/// (both floors, the site, and the escape hatch must all be in it) — same
+/// idiom as [`format_null_sentinel_message`].
+///
+/// Deliberately NOT pager-tier: nothing is broken or unrecoverable, the
+/// probe keeps working, and the two explanations are both "look at this
+/// today", not "wake someone up". It renders through
+/// `SlackMessage::with_site_text`, never `with_site_text_paged`.
+fn format_era_floor_held_message(
+    site_id: &str,
+    derived: i64,
+    effective: i64,
+    ticks: u32,
+    cooldown_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Payment-ledger coverage floor is being HELD by its watermark* \
+         :warning:\n\
+         At *{site_id}*, the `{probe}` probe has scanned for *{ticks}* consecutive \
+         ticks (~{minutes} min) with a persisted watermark ABOVE the floor its own \
+         mirror implies:\n\
+         • effective floor (what BOTH scans use): `{effective}`\n\
+         • derived floor (`MIN(ledger_legacy_id)` over `ht_payment_ledger`): \
+         `{derived}`\n\
+         The ratchet is doing what it was built to do — the scan did not widen — \
+         but a hold this long has exactly two explanations and they need \
+         different responses.\n\
+         *1. A pre-coverage folio really was mirrored whole* (an iHOTEL edit on an \
+         old folio, or a date-windowed `backfill_payment_ledger --days=N` run). \
+         Nothing to fix; the derived floor stays low until coverage genuinely \
+         widens. This is the 2026-07-30 incident shape.\n\
+         *2. The watermark is STALE* — it was seeded BEFORE a coverage-widening \
+         `--all` backfill, so the probe is now excluding folios the mirror \
+         actually holds, and they can never be reconciled. Escape hatch, on this \
+         site's canonical database: `DELETE FROM ht_reconcile_era_floor WHERE \
+         table_name = '{probe}';` — the next tick re-derives the floor from live \
+         data. (Moving it FORWARD by hand also sticks; the upsert clamps with \
+         GREATEST. Only a DELETE can lower it.)\n\
+         _Tell them apart with `ht_reconcile_era_floor.updated_at` for this row \
+         against when that site's last `--all` backfill ran. Per-site cooldown \
+         {cooldown_hours}h._",
+        probe = PAYMENT_LEDGER_PROBE_KEY,
+        minutes = u64::from(ticks) * 15,
+    )
+}
+
+/// Observe one payment-ledger probe tick's coverage floor and, once a hold
+/// has PERSISTED across [`ERA_FLOOR_HELD_ALERT_TICKS`] ticks, say so in
+/// Slack.
+///
+/// Called from [`run_sync`] on every successful probe tick — including the
+/// non-holding ones, which is what resets the streak. A `tracing::info!`
+/// line for the same condition is emitted per-tick inside
+/// `payment_ledger_era_floor`; this is the escalation of that line from
+/// "visible if you go looking" to "an operator is told".
+///
+/// Cooldown-gated through the shared `ht_level_drift_alert_cooldowns` table
+/// under [`era_floor_held_cooldown_key`], with the same per-site
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window (default 24h) as the other reconcile
+/// pages, and — like them — the cooldown is burned only on a confirmed
+/// delivery, so a webhook outage cannot silence it for a day.
+pub(crate) async fn note_payment_ledger_era_floor_hold(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    era_floor: LedgerEraFloor,
+) {
+    let streak = note_era_floor_hold_streak(site_id, era_floor.watermark_holding());
+    if !era_floor_hold_is_alertable(streak) {
+        return;
+    }
+    // `watermark_holding()` implies both halves are `Some`; destructure
+    // rather than unwrap so a future change to that predicate degrades to
+    // silence instead of a panic inside the reconcile tick.
+    let (Some(derived), Some(effective)) = (era_floor.derived, era_floor.effective) else {
+        return;
+    };
+
+    let key = era_floor_held_cooldown_key(PAYMENT_LEDGER_PROBE_KEY);
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Payment-ledger held-watermark alert suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_era_floor_held_message(site_id, derived, effective, streak, cooldown_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            derived_floor = derived,
+            effective_floor = effective,
+            ticks = streak,
+            "[Sync] Slack not configured; payment-ledger held-watermark finding \
+             logged only — if the watermark is stale, DELETE FROM \
+             ht_reconcile_era_floor WHERE table_name = 'payment_ledger_probe'"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Payment-ledger held-watermark alert POST failed — leaving the \
+             cooldown unset so the next tick retries"
+        );
+    }
+}
+
 /// Issue #204 (bug #2) — minimum age (seconds) an unresolved
 /// `ht_reconcile_log` row must have before the force-converge arm will touch
 /// it. A younger row is likely just waiting on an in-flight CT event, so we
@@ -2334,9 +5738,9 @@ async fn fetch_legacy_customer_base_row(
         "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
         projection = crate::sync::mappers::customer::EAGER_FETCH_COLUMNS.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(cust_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     Ok(rows.into_iter().next())
 }
 
@@ -2356,9 +5760,9 @@ async fn fetch_legacy_room_base_row(
                Room_Group, Room_Power_OPEN, Room_Power_CLOSE, Room_Power_STATUS, \
                Room_Polity FROM HT_Rooms WHERE Room_no = @P1"
         .to_string();
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(room_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     Ok(rows.into_iter().next())
 }
 
@@ -2380,9 +5784,23 @@ async fn fetch_legacy_room_base_row(
 /// The sweep is a silent backstop; a genuine subsequent CT edit re-emits the
 /// normal `CustomerModified` / room event.
 ///
-/// Returns `Ok(true)` when a re-projection was attempted and committed,
-/// `Ok(false)` when the legacy row no longer exists (or the table is outside
-/// the supported set) so there is nothing to project from.
+/// Returns a [`ForceConvergeOutcome`], NOT a bool — and that distinction is
+/// the whole point (2026-07-28). The mapper contract makes `Ok(None)`
+/// ambiguous: it is EITHER an idempotency-gate skip (the mapper decided
+/// nothing changed) OR a real write that produces no domain event. The
+/// previous bool collapsed both onto `Ok(true)` = "attempted and committed",
+/// so a gate skip — the very blind spot that let the divergence become
+/// invisible in the first place — was reported to the sweep as a successful
+/// repair. The sweep then logged "repaired" and, next tick, "still not
+/// converged", forever: one blind spot disabling detection AND self-heal at
+/// once while reporting success. [`ForceConvergeOutcome::MapperNoop`] keeps
+/// the ambiguity honest at this boundary; the sweep resolves it with
+/// evidence (did the canonical hash actually move?) via
+/// [`classify_force_converge`].
+///
+/// `SourceRowAbsent` / `UnsupportedTable` are the old `Ok(false)` cases (the
+/// legacy row no longer exists, or the table is outside the supported set)
+/// so there is nothing to project from.
 ///
 /// `op` is the `ChangeOp` handed to the mapper. The value-drift caller passes
 /// `ChangeOp::Update` (the canonical row exists, we're correcting its
@@ -2405,32 +5823,32 @@ async fn force_converge_reconcile_row(
     table_name: &str,
     legacy_pk: &str,
     op: ChangeOp,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ForceConvergeOutcome, Box<dyn std::error::Error + Send + Sync>> {
     match table_name {
         "customers" => {
             let Some(row) = fetch_legacy_customer_base_row(legacy_pool, legacy_pk).await? else {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             };
             let mut tx = pg_pool.begin().await?;
             // apply runs the full UPSERT + the mapper's idempotency check, so
             // it inserts when canonical is absent and updates in place when
             // it is not.
-            let _evt = CustomerMapper
+            let evt = CustomerMapper
                 .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         "rooms" => {
             let Some(row) = fetch_legacy_room_base_row(legacy_pool, legacy_pk).await? else {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             };
             let mut tx = pg_pool.begin().await?;
-            let _evt = RoomMasterMapper
+            let evt = RoomMasterMapper
                 .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         "bookings" => {
             // `ht_reconcile_log.legacy_pk` for bookings is the composite
@@ -2444,10 +5862,10 @@ async fn force_converge_reconcile_row(
             let aggregate =
                 crate::sync::parent_loader::load_booking_aggregate(legacy_pool, book_no).await?;
             if !aggregate.is_present() {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             }
             let mut tx = pg_pool.begin().await?;
-            let _evt = crate::sync::mappers::apply_booking_aggregate(
+            let evt = crate::sync::mappers::apply_booking_aggregate(
                 &mut tx,
                 Some(legacy_pool),
                 &aggregate,
@@ -2455,16 +5873,110 @@ async fn force_converge_reconcile_row(
             )
             .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         // checkins are multi-row aggregates whose self-heal is still out of
         // scope — leave them to the normal paths / operator review.
-        _ => Ok(false),
+        _ => Ok(ForceConvergeOutcome::UnsupportedTable),
     }
+}
+
+/// What one [`force_converge_reconcile_row`] attempt actually did.
+///
+/// The two "the mapper ran" variants are deliberately NOT collapsed:
+///
+/// * `Wrote` ⇔ the mapper returned `Ok(Some(event))` — canonical state
+///   definitely changed (the event itself is still dropped; see the
+///   `force_converge_reconcile_row` doc).
+/// * `MapperNoop` ⇔ `Ok(None)`, which
+///   [`crate::sync::mapper::MssqlChangeMapper::apply`] defines as "nothing to
+///   publish AND nothing left to do". That covers BOTH an idempotency-gate
+///   skip (`customer::apply_upsert` returns before the UPSERT when every
+///   compared column already matches) AND legitimate writes that produce no
+///   event (`room::apply_room_upsert` always UPSERTs but only emits on a
+///   `room_clean` flip; cancel / soft-delete paths). So `MapperNoop` on its
+///   own is NOT evidence of a gate skip — see [`classify_force_converge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceConvergeOutcome {
+    /// Mapper returned `Ok(Some(event))` — canonical was written.
+    Wrote,
+    /// Mapper returned `Ok(None)`. Ambiguous by the mapper contract.
+    MapperNoop,
+    /// The legacy row (or the booking aggregate header) no longer exists,
+    /// so there is nothing to re-project from.
+    SourceRowAbsent,
+    /// `table_name` is outside the set this self-heal supports.
+    UnsupportedTable,
+}
+
+impl ForceConvergeOutcome {
+    /// Classify what a mapper's `apply` returned. Kept as a constructor so
+    /// every arm of `force_converge_reconcile_row` maps `Ok(Some(_))` /
+    /// `Ok(None)` the same way.
+    fn from_mapper_event(evt: Option<&DomainEvent>) -> Self {
+        match evt {
+            Some(_) => Self::Wrote,
+            None => Self::MapperNoop,
+        }
+    }
+
+    /// True when the mapper actually ran to completion and the transaction
+    /// committed (whether or not it wrote). Both shapes get the convergence
+    /// re-test; only the absent/unsupported shapes skip it — matching the
+    /// pre-2026-07-28 `Ok(true)` / `Ok(false)` split exactly.
+    fn mapper_ran(self) -> bool {
+        matches!(self, Self::Wrote | Self::MapperNoop)
+    }
+}
+
+/// Pure tripwire decision for both self-heal arms: was this "successful
+/// repair" actually a MAPPER GATE SKIP that wrote nothing and fixed nothing?
+///
+/// Returns `true` ⇔ ALL THREE hold:
+/// 1. `outcome == MapperNoop` — the mapper returned `Ok(None)`;
+/// 2. `!pg_hash_moved` — the reprojected canonical hash is IDENTICAL to the
+///    one measured before the apply, i.e. nothing moved;
+/// 3. `!converged` — the row is still unconverged.
+///
+/// Condition 2 is what makes this correct rather than a naive
+/// "`Ok(None)` ⇒ gate-skipped" test. Legitimate event-less writes (rooms'
+/// non-clean-flip UPSERT, cancel paths) also return `Ok(None)`, but they
+/// move the canonical hash, so they never trip this. What remains is the
+/// pathological shape: the mapper decided "already identical" while the
+/// reconcile hash still says "different" — a **gate ⊂ hash violation**,
+/// where the mapper's idempotency comparison covers strictly fewer fields
+/// than the reconcile projection hashes. Such a row can never self-heal and
+/// can never be detected by the CT watcher either; the sweep would otherwise
+/// log a successful repair every tick forever.
+///
+/// (A `Wrote` that leaves the row unconverged is a DIFFERENT class — the
+/// mapper wrote but the two projections still disagree — and is left to the
+/// existing "still diverge, leaving row open for operator review" warn.)
+fn classify_force_converge(
+    outcome: ForceConvergeOutcome,
+    pg_hash_moved: bool,
+    converged: bool,
+) -> bool {
+    matches!(outcome, ForceConvergeOutcome::MapperNoop) && !pg_hash_moved && !converged
 }
 
 /// Tables the #204 value-drift force-converge arm will repair. Single-PK
 /// mappers whose `apply` is safe to re-drive idempotently.
+///
+/// **`payments` is deliberately absent** (Phase 6-A): detection ships
+/// first and must soak before any self-heal is wired. `payments` also has
+/// nothing to gain from the gate-skip machinery — `apply_receipt_upsert`
+/// is a lookup-then-unconditional UPDATE, so it cannot be gate-blinded —
+/// and one of its divergence shapes (canonical-only void, see
+/// [`payment_canonical_hash`]) is a genuine cross-app disagreement that
+/// re-driving the legacy row would silently ERASE rather than repair.
+/// Adding it here is a separate, coordinated decision (plan 6-D).
+///
+/// **`guest_registry` is deliberately absent too** (Phase 6-B), and its
+/// self-heal would be a bigger step than payments': the folio arm's repair
+/// is not a single-row re-drive at all — it would have to DELETE canonical
+/// companion rows that legacy no longer has, i.e. destroy TM.30 registry
+/// state from a sweep. Detection soaks first; plan 6-D decides the rest.
 const FORCE_CONVERGE_VALUE_DRIFT_TABLES: &[&str] = &["customers", "rooms"];
 
 /// Tables the `missing_pg` re-ingest arm will repair. Customers first-class
@@ -2535,20 +6047,51 @@ type ReconcileCandidate = (i64, String, String, Option<String>, f64);
 
 /// FK-dependency rank for the auto-resolve sweep's candidate ordering.
 /// Lower runs first, so a parent is always re-ingested before anything that
-/// points at it: customers → rooms → bookings → checkins.
+/// points at it: customers → rooms → bookings → checkins →
+/// payments / guest_registry.
 ///
 /// **This ordering is load-bearing, not cosmetic.** `apply_booking_aggregate`
 /// needs the booking's customer to exist in canonical (it eager-mirrors on a
 /// miss and ERRORS if even that fails); check-ins point at rooms and
-/// bookings. Healing a dependent before its parent within one sweep pass
-/// turns a repairable row into an error.
+/// bookings; a payment points at its check-in (`ht_payments.pay_cin_id`, and
+/// `apply_receipt_upsert` ERRORS on an unresolvable parent). Healing a
+/// dependent before its parent within one sweep pass turns a repairable row
+/// into an error.
 fn reconcile_table_fk_rank(table_name: &str) -> u8 {
     match table_name {
         "customers" => 0,
         "rooms" => 1,
         "bookings" => 2,
         "checkins" => 3,
-        _ => 4,
+        "payments" => 4,
+        // Phase 6-B. A companion folio hangs off its check-in
+        // (`ht_guest_registry.guest_cin_id`, and the CT mapper ERRORS on an
+        // unresolvable parent), so it must never be healed before check-ins.
+        // Sibling of `payments`; the two do not depend on each other.
+        "guest_registry" => 5,
+        // Phase 6-C mirror probes. They are OBSERVED, never healed — no
+        // self-heal list contains them — so their rank only decides sweep
+        // ordering. Last, so no probe row can delay a repairable entity
+        // row's turn in the 500-row batch.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => 6,
+        // Phase 6-D payment-ledger probe. OBSERVED, never healed (it is in
+        // neither self-heal list), so its rank only decides sweep ordering —
+        // last, alongside the 6-C probes, so no probe row can delay a
+        // repairable entity row's turn in the 500-row batch.
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => 6,
+        other => {
+            // A resolvable entity that falls through here is unranked, so
+            // it sorts after everything and its FK parents lose their
+            // guaranteed head start. Same class of omission the two
+            // resolve dispatches guard.
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&other),
+                "FK rank missing for {other} in reconcile_table_fk_rank — \
+                 the entity is listed as resolvable but falls through to the \
+                 wildcard, so the sweep may heal it before its parents"
+            );
+            7
+        }
     }
 }
 
@@ -2594,6 +6137,15 @@ fn sort_reconcile_candidates(rows: &mut [ReconcileCandidate]) {
 /// Bounded to 500 rows per tick so a backlog can't stall the
 /// reconcile loop. Best-effort per row — a single MSSQL or PG
 /// failure logs and continues to the next.
+///
+/// **No per-table fairness — a known, load-bearing property.** The batch is
+/// selected by `detected_at` alone. An entity that accumulates a large
+/// backlog of rows that can NEVER close (a divergence kind with no self-heal
+/// arm) would therefore occupy every subsequent 500-row batch and starve all
+/// other tables out of the sweep completely. That is why a new reconcile arm
+/// must not be able to manufacture permanently-unresolvable rows in bulk —
+/// see [`PAYMENTS_ERA_FLOOR_SQL`] for the payments case that made this
+/// concrete, and the live numbers behind it.
 ///
 /// **Issue #204 (bug #2) — durable self-healing arm (ship dark).** By
 /// default this sweep is observational-only: it resolves a row ONLY when
@@ -2665,7 +6217,7 @@ async fn auto_resolve_reconcile_log(
     let mut resolved = 0usize;
     for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
         let current_legacy_hash =
-            match compute_current_legacy_hash(legacy_pool, &table_name, &legacy_pk).await {
+            match compute_current_legacy_hash(legacy_pool, pg_pool, &table_name, &legacy_pk).await {
                 Ok(opt) => opt,
                 Err(e) => {
                     tracing::warn!(
@@ -2744,7 +6296,7 @@ async fn auto_resolve_reconcile_log(
                 )
                 .await
                 {
-                    Ok(true) => {
+                    Ok(outcome) if outcome.mapper_ran() => {
                         // The mapper re-projected the current legacy row into
                         // canonical. The legacy hash is unchanged (we projected
                         // FROM it), so only the canonical hash can have moved —
@@ -2765,12 +6317,20 @@ async fn auto_resolve_reconcile_log(
                                     continue;
                                 }
                             };
-                        if should_auto_resolve(
+                        // Did the apply actually move canonical? This is the
+                        // evidence that separates a mapper gate skip from a
+                        // legitimate event-less write — see
+                        // [`classify_force_converge`].
+                        let pg_hash_moved =
+                            reprojected_pg_hash.as_deref() != current_pg_hash.as_deref();
+                        let converged = should_auto_resolve(
                             &table_name,
                             current_legacy_hash.as_deref(),
                             reprojected_pg_hash.as_deref(),
                             recorded_mssql_hash.as_deref(),
-                        ) {
+                        );
+                        let gate_skip = classify_force_converge(outcome, pg_hash_moved, converged);
+                        if converged {
                             tracing::info!(
                                 site = %site_id,
                                 id,
@@ -2780,12 +6340,42 @@ async fn auto_resolve_reconcile_log(
                                  row into canonical; hashes now converge — marking resolved"
                             );
                             // Fall through (no `continue`) to the resolved UPDATE.
+                        } else if gate_skip {
+                            // Live tripwire for a gate ⊂ hash violation: the
+                            // mapper's idempotency check said "identical" while
+                            // the reconcile projection still says "different",
+                            // so this row can NEVER self-heal and the watcher
+                            // will never see a CT event for it either. Emitted
+                            // INSTEAD of the generic warn below (one line per
+                            // row per tick — no alert storm), with a stable
+                            // event name for `/diagnose-alert` to grep —
+                            // [`EV_FORCE_CONVERGE_GATE_SKIP`], registered in
+                            // [`KNOWN_SCHEDULER_EVENT_NAMES`] (issue #267).
+                            tracing::warn!(
+                                event_name = EV_FORCE_CONVERGE_GATE_SKIP,
+                                arm = "value_drift",
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                age_secs,
+                                current_legacy_hash = ?current_legacy_hash,
+                                current_pg_hash = ?current_pg_hash,
+                                "[Sync] Force-converge (#204): mapper skipped the write \
+                                 (Ok(None)) and canonical did not move, yet the row is \
+                                 still unconverged — the mapper's idempotency gate covers \
+                                 fewer fields than the reconcile hash; self-heal cannot \
+                                 repair this row"
+                            );
+                            continue;
                         } else {
                             tracing::warn!(
                                 site = %site_id,
                                 id,
                                 table_name = %table_name,
                                 legacy_pk = %legacy_pk,
+                                mapper_outcome = ?outcome,
+                                pg_hash_moved,
                                 current_legacy_hash = ?current_legacy_hash,
                                 reprojected_pg_hash = ?reprojected_pg_hash,
                                 "[Sync] Force-converge (#204): canonical re-projected but \
@@ -2794,7 +6384,7 @@ async fn auto_resolve_reconcile_log(
                             continue;
                         }
                     }
-                    Ok(false) => {
+                    Ok(_) => {
                         // Legacy row no longer exists (or unsupported table) —
                         // nothing to project from.
                         tracing::debug!(
@@ -2854,7 +6444,7 @@ async fn auto_resolve_reconcile_log(
                 )
                 .await
                 {
-                    Ok(true) => {
+                    Ok(outcome) if outcome.mapper_ran() => {
                         // Only the canonical side can have moved (we projected
                         // FROM the legacy row), so re-fetch it and re-test.
                         let reprojected_pg_hash =
@@ -2873,12 +6463,20 @@ async fn auto_resolve_reconcile_log(
                                     continue;
                                 }
                             };
-                        if should_auto_resolve(
+                        // `current_pg_hash` is `None` on this arm by
+                        // construction (that is what "missing_pg" means), so
+                        // "moved" here reads as "canonical now exists / has a
+                        // hash at all".
+                        let pg_hash_moved =
+                            reprojected_pg_hash.as_deref() != current_pg_hash.as_deref();
+                        let converged = should_auto_resolve(
                             &table_name,
                             current_legacy_hash.as_deref(),
                             reprojected_pg_hash.as_deref(),
                             recorded_mssql_hash.as_deref(),
-                        ) {
+                        );
+                        let gate_skip = classify_force_converge(outcome, pg_hash_moved, converged);
+                        if converged {
                             tracing::info!(
                                 site = %site_id,
                                 id,
@@ -2890,12 +6488,34 @@ async fn auto_resolve_reconcile_log(
                                  converge — marking resolved"
                             );
                             // Fall through (no `continue`) to the resolved UPDATE.
+                        } else if gate_skip {
+                            // Same tripwire as the value-drift arm, and a much
+                            // sharper signal here: the canonical row was ABSENT,
+                            // so a mapper that wrote nothing and moved nothing
+                            // means the re-ingest silently did not happen.
+                            tracing::warn!(
+                                event_name = EV_FORCE_CONVERGE_GATE_SKIP,
+                                arm = "missing_pg",
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                age_secs,
+                                current_legacy_hash = ?current_legacy_hash,
+                                current_pg_hash = ?current_pg_hash,
+                                "[Sync] Re-ingest (missing_pg): mapper returned Ok(None) and \
+                                 canonical did not move, yet the row is still unconverged — \
+                                 the re-ingest wrote nothing; self-heal cannot repair this row"
+                            );
+                            continue;
                         } else {
                             tracing::warn!(
                                 site = %site_id,
                                 id,
                                 table_name = %table_name,
                                 legacy_pk = %legacy_pk,
+                                mapper_outcome = ?outcome,
+                                pg_hash_moved,
                                 current_legacy_hash = ?current_legacy_hash,
                                 reprojected_pg_hash = ?reprojected_pg_hash,
                                 "[Sync] Re-ingest (missing_pg): canonical re-ingested but \
@@ -2905,7 +6525,7 @@ async fn auto_resolve_reconcile_log(
                             continue;
                         }
                     }
-                    Ok(false) => {
+                    Ok(_) => {
                         // The legacy row vanished between the hash probe and
                         // this re-fetch (or the aggregate header is gone).
                         // Distinct message on purpose — `/diagnose-alert`
@@ -3268,11 +6888,7 @@ async fn sync_customers(
         "SELECT {projection} FROM HT_Customers",
         projection = CUSTOMERS_RECONCILE_PROJECTION,
     );
-    let rows = conn
-        .simple_query(&select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
@@ -3631,11 +7247,8 @@ async fn sync_rooms(
         "SELECT {projection} FROM HT_Rooms ORDER BY Room_no",
         projection = ROOMS_RECONCILE_PROJECTION.join(", "),
     );
-    let rows = conn
-        .simple_query(&rooms_select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows =
+        simple_query_with_timeout_pooled(&mut conn, &rooms_select_sql, MssqlOpKind::Read).await?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
@@ -3824,6 +7437,29 @@ async fn sync_rooms(
 /// `View_Booking_Ds` joins `HT_Book_H` (header) with `HT_Book_Ds`
 /// (per-room detail), so every column in this projection must exist on
 /// one of those two base tables.
+/// NOT a dual-source hash — checked on the live server 2026-07-28, closing a
+/// concern raised (plausibly, but wrongly) from the truncated view definition
+/// in `docs/legacy-spike/schema/01-baseline-schema.txt:682`.
+///
+/// The worry was that the bookings idempotency gate compares header-derived
+/// dates (`derive_stay_range` off `HT_Book_H`) while this reconcile hash reads
+/// dates off the representative `View_Booking_Ds` LINE — which would let
+/// iHOTEL's `SAVE_EDIT` move the hash without moving any gated field, i.e. a
+/// gate ⊂ hash violation invisible to `sync::gate_guard`'s name-level check.
+///
+/// `sys.sql_modules` says otherwise — the view takes these two columns from the
+/// JOINED HEADER, not from the detail rows:
+///
+/// ```text
+/// CREATE VIEW [View_Booking_Ds] AS SELECT HT_Book_Ds.Book_No, …,
+///   HT_Book_H.Book_Date_in, HT_Book_H.Book_Date_out, …
+/// FROM HT_Book_Ds INNER JOIN HT_Book_H ON HT_Book_Ds.Book_No = HT_Book_H.Book_ID
+/// ```
+///
+/// So gate and hash read the SAME source and no unification is needed.
+/// (`HT_Book_Ds` has no `Book_Date_in`/`Book_Date_out` columns at all — its
+/// per-line dates are `Book_Room_Start`/`Book_Room_End`, which this projection
+/// deliberately does not read.)
 const BOOKINGS_RECONCILE_PROJECTION: &[&str] = &[
     "Book_No",
     "Book_Date",
@@ -3849,10 +7485,7 @@ async fn sync_bookings(
         "SELECT {projection} FROM View_Booking_Ds",
         projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
     );
-    let rows = conn
-        .simple_query(&bookings_select_sql)
-        .await?
-        .into_first_result()
+    let rows = simple_query_with_timeout_pooled(&mut conn, &bookings_select_sql, MssqlOpKind::Read)
         .await?;
 
     let mut added = 0i32;
@@ -4303,17 +7936,16 @@ async fn sync_checkins(
     // ghost as `missing_pg`, producing 200+ false-positive drift rows
     // per tick.
     let mut conn = legacy_pool.get().await?;
-    let pk_rows = conn
-        .simple_query(
-            "SELECT DISTINCT h.Cin_no FROM HT_CheckIn_H h \
-              WHERE EXISTS ( \
-                  SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no \
-              ) \
-              ORDER BY h.Cin_no",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let pk_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT DISTINCT h.Cin_no FROM HT_CheckIn_H h \
+          WHERE EXISTS ( \
+              SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no \
+          ) \
+          ORDER BY h.Cin_no",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let cin_nos: Vec<String> = pk_rows
         .iter()
         .filter_map(|r| r.get::<&str, _>("Cin_no").map(String::from))
@@ -4814,6 +8446,1349 @@ async fn upsert_checkin_mirror(
             *added += 1;
         }
     }
+    Ok(())
+}
+
+// =============================================================================
+// Payment (receipt) Sync — Phase 6-A, DARK behind RECONCILE_PAYMENTS_ARM_ENABLED
+// =============================================================================
+
+/// Legacy `HT_Receipt_H` projection for the payment reconcile hash.
+///
+/// Held as a slice const so Track J1's projection-lock test can pin every
+/// column against the authoritative schema dump, and so the bulk scan and
+/// the per-PK auto-resolve re-fetch cannot drift apart.
+///
+/// `Receipt_Date` and the VAT columns are deliberately NOT here — see
+/// [`payment_canonical_hash`] for why `pay_date` / `pay_method` are
+/// excluded from the hash. (`Receipt_Date` IS used in the scan's WHERE
+/// clause as the canonical-era floor — see [`PAYMENTS_ERA_FLOOR_SQL`] —
+/// which is a scope filter, not a hash input.)
+const PAYMENTS_RECONCILE_PROJECTION: &[&str] = &[
+    "Receipt_no",
+    "Receipt_Total",
+    "Receipt_ref",
+    "status_name",
+];
+
+/// The scan filter for the bulk payments sweep.
+///
+/// A receipt with no `Receipt_ref` carries no `Cin_no`, and
+/// `payment::apply_receipt_upsert` skips it deliberately (canonical
+/// `ht_payments.pay_cin_id` is NOT NULL — there is nowhere to land it).
+/// Including those rows would manufacture a permanent `missing_pg` row per
+/// no-check-in sale: a deliberate design skip reported as sync lag, which
+/// is exactly the false-positive class the arm exists to avoid.
+const PAYMENTS_RECONCILE_SCAN_FILTER: &str = "Receipt_ref IS NOT NULL AND Receipt_ref <> ''";
+
+/// Derive the canonical-coverage floor for the payments scan, in
+/// LEGACY-LOCAL time (Thai / GMT+7, stored naive) — the era boundary below
+/// which a legacy receipt provably has no canonical counterpart and never
+/// will. `NULL` when `ht_payments` is empty (no coverage at all).
+///
+/// **Why this exists — 2026-07-28 review, BLOCKING find.** `ht_payments` is
+/// populated by the CT watcher, which only ever saw receipts from the day CT
+/// was enabled on `HT_Receipt_H`; there is no historical backfill. Live
+/// read-only counts that day: HF Hotel legacy `HT_Receipt_H` had 21,566 rows
+/// passing [`PAYMENTS_RECONCILE_SCAN_FILTER`] (2021 → 2026) against 1,154
+/// canonical payments, ALL dated 2026-04-27 or later. Unfloored, the first
+/// enabled tick would classify >20,400 pre-era receipts as
+/// [`DivergenceKind::MissingPg`] — a kind that is NOT `is_silenceable()`, so
+/// it is never acked, while `payments` is deliberately absent from
+/// [`REINGEST_MISSING_PG_TABLES`], so [`should_auto_resolve`] can never close
+/// it either. That backlog is PERMANENT, not transient. It would:
+///
+/// * re-issue ~20.4k [`CANONICAL_PAYMENT_PROBE_SQL`] probes plus ~20.4k
+///   dedupe INSERTs every tick, forever — not the advertised one-MSSQL-query
+///   + a-few-batched-PG-reads steady state;
+/// * pin the 4h `check_level_drift_and_alert` digest and the >72h escalation
+///   tier on `payments` permanently;
+/// * starve every OTHER entity out of [`auto_resolve_reconcile_log`], whose
+///   500-row batch is selected by `detected_at` alone with no per-table
+///   fairness — once the payments rows own the oldest band, customers /
+///   rooms / bookings / checkins stop being swept at all.
+///
+/// The prescribed Ville-first canary could NOT have surfaced this: HF Ville
+/// has 105 ref-carrying legacy receipts against 4 canonical payments, so its
+/// 48h soak lands ~101 rows and stays green by construction.
+///
+/// Pre-era receipts are out of the mirror's scope in exactly the same sense
+/// as a receipt with no `Receipt_ref`: a deliberate design skip, not sync
+/// lag. With the floor applied the same live data yields 1,167 in-era legacy
+/// receipts against 1,154 canonical rows — a ~13-row first-enable find an
+/// operator can actually act on.
+///
+/// The floor is DERIVED, never configured. `MIN(pay_date)` is by
+/// construction the oldest receipt the mirror has ever landed
+/// (`apply_receipt_upsert` seeds `pay_date` from `Receipt_Date` and COALESCEs
+/// it forever after), so nothing that could still converge sorts below it.
+/// `date_trunc('day', …)` widens to the start of that day so the boundary
+/// includes the whole first day rather than cutting mid-afternoon.
+///
+/// **NO timezone shift is applied, and adding one would be a bug** (2026-07-28
+/// review, second pass). `ht_payments.pay_date` is a bare `TIMESTAMP` carrying
+/// the legacy value VERBATIM: `project_receipt` reads `Receipt_Date` with a
+/// plain `try_get_datetime` and no conversion, and `apply_receipt_upsert`'s own
+/// fallback is explicitly Bangkok wall-clock ("a `naive_utc()` fallback here
+/// landed 7h early — 2026-06-11 audit"). So both sides of this comparison are
+/// already the same naive Thai basis. (`naive_thai_to_utc` belongs to a
+/// DIFFERENT column with a different convention: `Cin_Pay_Date` →
+/// `ht_payment_ledger.ledger_pay_date`, which is `TIMESTAMPTZ`. Conflating the
+/// two conventions is what put a spurious `+ INTERVAL '7 hours'` here.)
+/// Verified live read-only: hotelnew `MIN(pay_date)` = `2026-04-27 16:39:21`
+/// (`pay_reference` `B2604-0285`) and legacy `HT_Receipt_H.Receipt_Date` for
+/// that receipt = `2026-04-27T16:39:21`, byte-identical.
+///
+/// A shift here would move the floor in the NARROWING direction and silently
+/// drop the mirror's whole first day of coverage — precisely the
+/// partial-ingest boundary where the genuine `missing_pg` finds live. It was
+/// masked at both sites only because `date_trunc('day')` happened to absorb it
+/// (HF Hotel 16:39 + 7h = 23:39, same day, 21 minutes of margin); any site
+/// whose oldest mirrored receipt lands at or after 17:00 Thai loses a full day.
+/// Unshifted is also the safe direction if an APP-created row ever became the
+/// `MIN`: `repository/payment.rs` omits `pay_date` on INSERT so the column
+/// `DEFAULT NOW()` applies on a UTC-basis server clock, which errs wide (floor
+/// too early → extra rows scanned) rather than narrow (rows silently dropped).
+const PAYMENTS_ERA_FLOOR_SQL: &str = "SELECT date_trunc('day', MIN(pay_date)) FROM ht_payments";
+
+async fn payments_reconcile_era_floor(
+    pg_pool: &PgPool,
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<NaiveDateTime>>(PAYMENTS_ERA_FLOOR_SQL)
+        .fetch_one(pg_pool)
+        .await
+}
+
+/// Compose the bulk scan's `WHERE` clause for a given canonical era floor.
+///
+/// Rows with a NULL `Receipt_Date` are deliberately KEPT: such a receipt
+/// cannot be placed inside or outside the era, it is vanishingly rare (0 of
+/// 21,566 at HF Hotel and 0 of 105 at HF Ville, verified 2026-07-28), and the
+/// mapper WOULD land it (`p.receipt_date.unwrap_or(now)`) — so dropping it
+/// would re-create the silent-skip class the floor exists to remove.
+///
+/// The literal is rendered `YYYY-MM-DDTHH:MM:SS`, the language-independent
+/// ODBC/ISO form, so the comparison can't be re-read under a different server
+/// `DATEFORMAT`. No injection surface: the value is a `NaiveDateTime`
+/// PostgreSQL itself produced, formatted here.
+fn payments_reconcile_scan_filter(era_floor: NaiveDateTime) -> String {
+    format!(
+        "{base} AND (Receipt_Date IS NULL OR Receipt_Date >= '{floor}')",
+        base = PAYMENTS_RECONCILE_SCAN_FILTER,
+        floor = era_floor.format("%Y-%m-%dT%H:%M:%S"),
+    )
+}
+
+/// One legacy receipt as projected for reconciliation. Mirrors the CT
+/// mapper's `ReceiptProjection` field-for-field on the hashed subset, so
+/// the descriptor table in `sync::mappers::payment` and this loop cannot
+/// disagree about the body.
+struct LegacyReceiptRow {
+    receipt_no: String,
+    receipt_total: f64,
+    legacy_cin_no: Option<String>,
+    status_name: Option<String>,
+}
+
+impl LegacyReceiptRow {
+    fn voided(&self) -> bool {
+        // Single-sourced with the mapper's own void decision so detection
+        // and application can never disagree on the cancel literal.
+        crate::sync::mappers::payment::receipt_status_is_cancelled(self.status_name.as_deref())
+    }
+
+    fn hash(&self) -> String {
+        payment_canonical_hash(
+            &self.receipt_no,
+            self.receipt_total,
+            self.voided(),
+            self.legacy_cin_no.as_deref(),
+        )
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "Receipt_no": self.receipt_no,
+            "Receipt_Total": self.receipt_total,
+            "Receipt_ref": self.legacy_cin_no,
+            "status_name": self.status_name,
+        })
+    }
+}
+
+/// Project one `HT_Receipt_H` row under [`PAYMENTS_RECONCILE_PROJECTION`].
+/// Returns `None` for a row that is not reconcilable — no `Receipt_no`
+/// (the business key), or an empty/absent `Receipt_ref` (the deliberate
+/// mapper skip). Shared by the bulk scan and the per-PK re-fetch so the
+/// two apply IDENTICAL admission rules.
+fn project_legacy_receipt_row(row: &tiberius::Row) -> Option<LegacyReceiptRow> {
+    let receipt_no = row.get::<&str, _>("Receipt_no")?.to_string();
+    if receipt_no.is_empty() {
+        return None;
+    }
+    let legacy_cin_no = row
+        .get::<&str, _>("Receipt_ref")
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())?;
+    Some(LegacyReceiptRow {
+        receipt_no,
+        // `Receipt_Total` is `float NOT NULL DEFAULT 0` in the live
+        // schema; a NULL would only appear via a hand-edit, and 0.0 is
+        // the honest projection of "no total recorded".
+        receipt_total: row.get::<f64, _>("Receipt_Total").unwrap_or(0.0),
+        legacy_cin_no: Some(legacy_cin_no),
+        status_name: row.get::<&str, _>("status_name").map(str::to_string),
+    })
+}
+
+/// Canonical-side projection of a payment row for hashing. Resolved by
+/// `Receipt_no` through the SAME two columns `apply_receipt_upsert`
+/// probes.
+struct CanonicalPaymentRow {
+    pay_amount: f64,
+    pay_voided: Option<bool>,
+    /// From the parent check-in (`ht_checkins.legacy_cin_no`), which is
+    /// what legacy `Receipt_ref` holds. LEFT-joined: a payment whose
+    /// parent row has vanished still projects (with `None`) and lands as
+    /// value drift rather than being misreported as `missing_pg`.
+    legacy_cin_no: Option<String>,
+}
+
+impl CanonicalPaymentRow {
+    /// `pay_voided` is nullable (`BOOLEAN DEFAULT false`); NULL means
+    /// "never voided", matching the `COALESCE(pay_voided, false)` the
+    /// mapper's UPDATE and every `WHERE pay_voided = false` reader use.
+    fn is_voided(&self) -> bool {
+        self.pay_voided.unwrap_or(false)
+    }
+}
+
+/// Resolve the canonical payment for a legacy `Receipt_no`.
+///
+/// The predicate + ORDER BY mirror
+/// `payment::apply_receipt_upsert`'s existing-row probe exactly, minus its
+/// `pay_cin_id` term (which the sweep does not have, and does not need —
+/// `Receipt_no` is unique within the legacy app):
+///
+/// * `legacy_receipt_no` — stamped by OUR writeback back-population when
+///   the payment originated in THIS app;
+/// * `pay_reference` — set when the payment originated in iHOTEL and was
+///   first imported here.
+///
+/// Probing only one column would report the other origin's rows as
+/// `missing_pg` forever — the same defect that produced the 2026-06-30
+/// HF Ville phantom-duplicate echo, in detection form. The `ORDER BY`
+/// makes the app-originated row win deterministically if a legacy orphan
+/// duplicate still exists.
+///
+/// Hoisted to a const so the shape guard executes the EXACT statement the
+/// sweep runs, rather than a re-typed copy that could drift (same reason
+/// `payment::RECEIPT_UPSERT_UPDATE_SQL` is a const).
+const CANONICAL_PAYMENT_PROBE_SQL: &str =
+    "SELECT p.pay_amount::float8, p.pay_voided, c.legacy_cin_no \
+       FROM ht_payments p \
+       LEFT JOIN ht_checkins c ON c.cin_id = p.pay_cin_id \
+      WHERE p.legacy_receipt_no = $1 OR p.pay_reference = $1 \
+      ORDER BY (p.legacy_receipt_no = $1) DESC NULLS LAST, p.pay_id ASC \
+      LIMIT 1";
+
+async fn fetch_canonical_payment(
+    pg_pool: &PgPool,
+    receipt_no: &str,
+) -> Result<Option<CanonicalPaymentRow>, sqlx::Error> {
+    sqlx::query_as::<_, (f64, Option<bool>, Option<String>)>(CANONICAL_PAYMENT_PROBE_SQL)
+        .bind(receipt_no)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
+            pay_amount: amount,
+            pay_voided: voided,
+            legacy_cin_no: cin_no,
+        })
+    })
+}
+
+/// Best-effort ack: record the `mssql_hash` we last reconciled for this
+/// receipt so the next tick short-circuits before the per-PK canonical
+/// fetch. Cache-only — never mutates canonical state; a failed write just
+/// re-fires the same comparison next tick.
+async fn ack_receipt_mirror(pg_pool: &PgPool, receipt_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_receipts_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE receipt_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(receipt_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_receipts_legacy (receipt_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (receipt_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                    synced_at = EXCLUDED.synced_at",
+        )
+        .bind(receipt_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+/// Read the WHOLE ack cache in ONE query.
+///
+/// The efficiency contract for this arm is: one bulk MSSQL SELECT + one
+/// batched ack read + a per-PK canonical fetch ONLY for keys whose hash
+/// moved. Per-PK ack SELECTs (what `sync_customers` / `sync_checkins` do)
+/// would add one PG round-trip per receipt — tens of thousands per tick
+/// for a table that is append-only and therefore almost entirely acked in
+/// steady state.
+async fn load_receipt_ack_cache(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT receipt_no, sync_hash FROM ht_receipts_legacy WHERE sync_hash IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|hash| (k, hash)))
+        .collect())
+}
+
+/// Receipt keys whose CANONICAL payment currently carries the void bit,
+/// read in ONE batched query per tick.
+///
+/// This is what keeps the canonical-only void shape observable past the
+/// first enabled tick — see [`payment_canonical_hash`] for the full
+/// argument and [`payment_ack_short_circuit_bypassed`] for the rule.
+///
+/// BOTH lookup columns are unioned because [`CANONICAL_PAYMENT_PROBE_SQL`]
+/// resolves on either (`legacy_receipt_no = $1 OR pay_reference = $1`) and
+/// one row can carry two different values. Over-inclusion is harmless: the
+/// worst case is one extra canonical probe for a receipt that then agrees.
+///
+/// Voided payments are a small minority of a small table, so this stays
+/// well inside the arm's efficiency contract (one bulk MSSQL SELECT + a
+/// couple of batched PG reads per tick).
+async fn load_canonically_voided_receipt_keys(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT legacy_receipt_no FROM ht_payments \
+          WHERE COALESCE(pay_voided, false) AND legacy_receipt_no IS NOT NULL \
+         UNION \
+         SELECT pay_reference FROM ht_payments \
+          WHERE COALESCE(pay_voided, false) AND pay_reference IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Must the ack short-circuit be BYPASSED for this receipt?
+///
+/// True for exactly one divergence shape: canonical says voided, legacy
+/// still says normal. That shape cannot move the legacy hash, so an acked
+/// receipt would otherwise never be re-compared and the divergence would be
+/// invisible forever (see [`payment_canonical_hash`]).
+///
+/// Deliberately NOT `canonical_voided != legacy_voided`: when legacy is the
+/// one carrying the cancel literal, the legacy hash HAS moved, so the plain
+/// ack comparison already re-opens the receipt on its own.
+fn payment_ack_short_circuit_bypassed(canonical_voided: bool, legacy_voided: bool) -> bool {
+    canonical_voided && !legacy_voided
+}
+
+/// Phase 6-A payments reconcile arm. Compares legacy `HT_Receipt_H`
+/// against canonical `ht_payments`, keyed on `Receipt_no`.
+///
+/// Only ever called when [`reconcile_payments_arm_enabled`] is true — with
+/// the flag off (the shipped default on every service) this function is
+/// never entered, so the arm issues no queries at all.
+///
+/// Shape (see [`load_receipt_ack_cache`] for the efficiency contract):
+/// 0. ONE PG read for the canonical era floor ([`PAYMENTS_ERA_FLOOR_SQL`]) —
+///    receipts older than the mirror's own coverage are out of scope, exactly
+///    like ref-less ones, and scanning them would build a permanently
+///    unresolvable `missing_pg` backlog;
+/// 1. ONE bulk MSSQL SELECT over the filtered receipt set;
+/// 2. ONE batched read of the `ht_receipts_legacy` ack cache, plus ONE
+///    batched read of the canonically-voided receipt keys
+///    ([`load_canonically_voided_receipt_keys`]);
+/// 3. per-PK canonical fetch ONLY for receipts whose legacy hash differs
+///    from the acked one, or which hit the canonical-only-void carve-out.
+///
+/// `ReconcileMode::Upsert` is not honoured here: that pre-5.5 escape hatch
+/// mirrored data columns into `ht_*_legacy`, and `ht_receipts_legacy` is a
+/// pure ack cache with no data columns to mirror. The arm is diff-only by
+/// construction.
+async fn sync_payments(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    tracing::info!("[Sync] Syncing payments (receipts)...");
+
+    // Canonical coverage floor FIRST. With `ht_payments` empty the arm has
+    // no coverage at all, and scanning legacy would classify the ENTIRE
+    // receipt history as `missing_pg` — permanently unresolvable, since
+    // `payments` is in neither self-heal list. Report a clean zero tick
+    // instead of manufacturing a backlog. See `PAYMENTS_ERA_FLOOR_SQL`.
+    let Some(era_floor) = payments_reconcile_era_floor(pg_pool).await? else {
+        tracing::warn!(
+            "[Sync] sync_payments: ht_payments is empty — no canonical coverage \
+             to reconcile against; skipping the legacy scan this tick"
+        );
+        let duration_ms = start.elapsed().as_millis() as i32;
+        record_success(pg_pool, "payments", 0, 0, 0, duration_ms).await;
+        return Ok(());
+    };
+
+    let mut conn = legacy_pool.get().await?;
+    let select_sql = format!(
+        "SELECT {projection} FROM HT_Receipt_H WHERE {filter} ORDER BY Receipt_no",
+        projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
+        filter = payments_reconcile_scan_filter(era_floor),
+    );
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
+    // Free the pool slot — nothing below touches MSSQL again.
+    drop(conn);
+
+    let acked = load_receipt_ack_cache(pg_pool).await?;
+    let canonically_voided = load_canonically_voided_receipt_keys(pg_pool).await?;
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+    let mut skipped = 0i32;
+
+    for row in &rows {
+        let Some(legacy) = project_legacy_receipt_row(row) else {
+            // Not reconcilable (no business key / no `Receipt_ref`). The
+            // filter above already excludes the ref-less case; this is the
+            // belt-and-braces arm.
+            skipped += 1;
+            continue;
+        };
+        let mssql_hash = legacy.hash();
+
+        // Dedupe: identical hash as last acknowledged means the drift (if
+        // any) is already in `ht_reconcile_log`. This is what keeps the
+        // steady-state cost at one MSSQL query + a few batched PG reads.
+        //
+        // ONE carve-out: a canonical-only void never moves the LEGACY hash,
+        // so an acked receipt would never be re-compared and the money-path
+        // divergence would go unseen forever. Re-open exactly that pair.
+        let void_carve_out = payment_ack_short_circuit_bypassed(
+            canonically_voided.contains(&legacy.receipt_no),
+            legacy.voided(),
+        );
+        if !void_carve_out && acked.get(&legacy.receipt_no) == Some(&mssql_hash) {
+            unchanged += 1;
+            continue;
+        }
+
+        let canonical = fetch_canonical_payment(pg_pool, &legacy.receipt_no).await?;
+        let canonical_hash = canonical.as_ref().map(|c| {
+            payment_canonical_hash(
+                &legacy.receipt_no,
+                c.pay_amount,
+                c.is_voided(),
+                c.legacy_cin_no.as_deref(),
+            )
+        });
+
+        if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+            ack_receipt_mirror(pg_pool, &legacy.receipt_no, &mssql_hash).await;
+            unchanged += 1;
+            continue;
+        }
+
+        // Receipts are 1:1 on both sides (`Receipt_no` is unique in the
+        // legacy app, and the canonical probe resolves at most one row),
+        // so the counts are 0/1 by construction and `Cardinality` is not
+        // reachable — the `pg_row_count == 0` case IS the `missing_pg`
+        // path.
+        let legacy_row_count: i32 = 1;
+        let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+        let kind = classify_divergence(
+            canonical_hash.as_deref(),
+            Some(&mssql_hash),
+            legacy_row_count,
+            pg_row_count,
+        );
+        let pg_json = canonical.as_ref().map(|c| {
+            json!({
+                "pay_amount": c.pay_amount,
+                "pay_voided": c.is_voided(),
+                "legacy_cin_no": c.legacy_cin_no,
+            })
+        });
+        record_divergence(
+            pg_pool,
+            "payments",
+            &legacy.receipt_no,
+            canonical_hash.as_deref(),
+            Some(&mssql_hash),
+            legacy.json(),
+            pg_json,
+            kind,
+            legacy_row_count,
+            pg_row_count,
+        )
+        .await;
+        // Track D / T7 CRIT-1: value drift acks (one row per distinct
+        // legacy state); `missing_pg` never does, so it re-fires every
+        // tick until canonical actually catches up.
+        if kind.is_silenceable() {
+            ack_receipt_mirror(pg_pool, &legacy.receipt_no, &mssql_hash).await;
+        }
+        if canonical.is_none() {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "[Sync] sync_payments: {} receipts were not reconcilable \
+             (missing Receipt_no / Receipt_ref despite the scan filter)",
+            skipped,
+        );
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        era_floor = %era_floor,
+        scanned = rows.len(),
+        "[Sync] Payments: {} missing-canonical, {} drifted, {} unchanged in {}ms \
+         (in-era scan from {})",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+        era_floor,
+    );
+    record_success(pg_pool, "payments", added, updated, unchanged, duration_ms).await;
+
+    Ok(())
+}
+
+// =============================================================================
+// Guest-registry (companion folio) Sync — Phase 6-B, DARK behind
+// RECONCILE_GUEST_REGISTRY_ARM_ENABLED
+// =============================================================================
+
+/// Legacy `HT_CheckIn_Other_People` projection for the folio reconcile
+/// hash. Same three columns the CT mapper reads, minus the IDENTITY `id`
+/// (excluded from the hash on purpose — see
+/// [`guest_registry_canonical_hash`]).
+///
+/// Held as a slice const so Track J1's projection-lock test can pin every
+/// column against the authoritative schema dump, and so the bulk scan and
+/// the per-PK auto-resolve re-fetch cannot drift apart. The iHOTEL typo
+/// `Cin_contry` (sic) is preserved verbatim, and `Cin_no` is LOWERCASE-n
+/// here (`HT_CheckIn_Ds` is the one with `Cin_No`).
+const GUEST_REGISTRY_RECONCILE_PROJECTION: &[&str] = &["Cin_no", "Cin_name", "Cin_contry"];
+
+/// Canonical-side companion filter: mirrored companions only.
+///
+/// `HT_CheckIn_Other_People` holds ONLY companions — the primary guest
+/// lives on the check-in header — and the CT mapper inserts
+/// `guest_is_primary = false` for every row it lands. The check-in
+/// registration feature (migration 070, Thai-ID capture) writes PRIMARY
+/// rows into the same canonical table, so without this filter every
+/// registered primary guest would look like an extra companion the legacy
+/// side is missing. `COALESCE` because the column is nullable
+/// (`BOOLEAN DEFAULT false`) and a bare `= false` would silently drop a
+/// NULL row out of the canonical folio, reporting it as a legacy-only
+/// companion forever.
+const CANONICAL_COMPANION_PRIMARY_FILTER: &str = "COALESCE(guest_is_primary, false) = false";
+
+/// The two canonical companion fields, projected into the shape the legacy
+/// side produces: the re-concatenated display name and the COALESCEd
+/// country.
+///
+/// The name expression is single-sourced from
+/// [`crate::sync::mappers::guest_registry::CANONICAL_COMPANION_NAME_SQL`] —
+/// the SAME bytes the mapper's echo-adoption match uses. If the two ever
+/// diverged, a companion our app created and the writeback echoed back
+/// would be adopted correctly by the mapper yet hash differently here:
+/// permanent, unfixable sync lag on a legally load-bearing table.
+fn canonical_companion_projection() -> String {
+    format!(
+        "{name} AS companion_name, COALESCE(guest_nationality, '') AS companion_country",
+        name = CANONICAL_COMPANION_NAME_SQL,
+    )
+}
+
+/// Derive the canonical-coverage floor for the guest-registry scan, as a
+/// check-in timestamp. `NULL` when canonical holds no mirrored companion at
+/// all (no coverage).
+///
+/// **Why this exists** — the same BLOCKING class the payments arm hit.
+/// `ht_guest_registry` is CT-populated with no historical backfill (Track
+/// E1 enabled CT on `HT_CheckIn_Other_People` in May 2026), while
+/// `ht_checkins` IS fully backfilled to 2021. So every pre-CT folio has a
+/// canonical parent check-in but no canonical companions, and would be
+/// reported as a divergence that can NEVER close. Live counts 2026-07-28:
+/// HF Hotel 20,434 legacy companion rows across 20,423 folios vs 819
+/// canonical companions (oldest parent check-in 2026-05-13); HF Ville 2,185
+/// / 2,184 vs 545 (oldest 2026-05-13). Unfloored, the first enabled tick
+/// would manufacture ~19.6k + ~1.6k permanently-open rows, re-log them on
+/// every tick, pin the 4h digest and the >72h escalation tier on
+/// `guest_registry`, and starve every other entity out of
+/// [`auto_resolve_reconcile_log`]'s age-only 500-row batch. Floored, the
+/// same live data yields 830 in-era legacy folios vs 818 canonical at HF
+/// Hotel (≈12 actionable finds) and 574 vs 545 at Ville (≈29).
+///
+/// The floor is DERIVED, never configured: `MIN(cin_checkin_time)` over the
+/// check-ins that actually carry a MIRRORED companion IS the oldest folio
+/// the mirror has ever landed, so nothing that could still converge sorts
+/// below it. `date_trunc('day', …)` widens to the start of that day so the
+/// boundary includes the mirror's whole first day rather than cutting
+/// mid-afternoon.
+///
+/// **`guest_legacy_id IS NOT NULL` is load-bearing, not decoration.**
+/// "Mirrored" means *stamped with a legacy IDENTITY by the CT mapper*.
+/// Canonical holds non-primary companions with NO legacy counterpart —
+/// `POST /api/checkins/{id}/guests` and the migration-070 registration
+/// capture both write them, and `TM30_COMPANION_WRITEBACK_ENABLED` is
+/// compose-default false, so nothing pushes them to legacy. Counting those
+/// as "coverage" would claim an era the mirror never actually covered.
+///
+/// **The result is CLAMPED to a persisted, non-decreasing watermark** — see
+/// [`clamped_era_floor`] and [`RECONCILE_ERA_FLOOR_UPSERT_SQL`]. A raw
+/// `MIN()` is a low-water mark on the PARENT's check-in time, and it can be
+/// dragged backwards by ONE row: iHOTEL's DELETE+REINSERT companion edit
+/// (`FrmCheckIn.cs:9975`) applied to any historical folio makes the CT
+/// mapper mirror one companion whose parent check-in is e.g. 2023 (the
+/// mapper resolves the parent by `legacy_cin_no` with no era restriction,
+/// and `ht_checkins` is backfilled to 2021). That single row would move the
+/// floor to 2023, admit ~all 20,423 legacy folios instead of 830, and make
+/// the next tick enqueue ~19.6k permanently-open rows — the exact flood
+/// this floor exists to prevent. The persisted watermark makes the scope
+/// monotonically NARROWING; [`divergence_cap_exceeded`] is the second belt,
+/// for the case where the very first (bootstrap) reading is already wrong.
+///
+/// **No timezone shift, by construction** — unlike the payments floor this
+/// one never crosses a DB boundary: it is derived from
+/// `ht_checkins.cin_checkin_time` and compared against that same column, so
+/// both sides are the same naive Thai basis whatever that basis is. The
+/// legacy side is filtered by KEY membership (`Cin_no` ∈ the in-era
+/// canonical set), never by a legacy date, so there is no second clock.
+fn guest_registry_era_floor_sql() -> String {
+    format!(
+        "SELECT date_trunc('day', MIN(ht_checkins.cin_checkin_time)) \
+           FROM ht_guest_registry \
+           JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id \
+          WHERE {primary} \
+            AND ht_guest_registry.guest_legacy_id IS NOT NULL",
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    )
+}
+
+/// `ht_reconcile_era_floor` key for this arm. Same literal as the
+/// `ht_reconcile_log.table_name` / `sync_status.entity_type` the arm reports
+/// under, so one operator query joins all three.
+///
+/// `pub(crate)` only so the sibling
+/// [`crate::scheduler::payment_ledger_probe`] arm — which owns the OTHER row
+/// in the same table — can pin by test that the two keys cannot collide on
+/// the primary key.
+pub(crate) const GUEST_REGISTRY_ERA_FLOOR_KEY: &str = "guest_registry";
+
+/// Persist-and-clamp in ONE statement: the durable floor only ever moves
+/// FORWARD.
+///
+/// `GREATEST` lives in SQL rather than in Rust on purpose — the backend
+/// scheduler and `bin/sync` can both run a tick against the same database,
+/// so the monotonic guarantee has to hold under concurrency, not just
+/// within one process. `RETURNING` hands back the post-clamp value, so the
+/// read and the write are the same round trip.
+///
+/// An operator CAN still move the floor forward by hand
+/// (`UPDATE ht_reconcile_era_floor SET era_floor = … WHERE table_name =
+/// 'guest_registry'`) — that is the documented remedy when a bootstrap
+/// reading came out too low — and `GREATEST` makes the edit stick.
+const RECONCILE_ERA_FLOOR_UPSERT_SQL: &str =
+    "INSERT INTO ht_reconcile_era_floor (table_name, era_floor) VALUES ($1, $2) \
+     ON CONFLICT (table_name) DO UPDATE \
+        SET era_floor = GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor), \
+            updated_at = NOW() \
+     RETURNING era_floor";
+
+/// Read the durable floor without writing — used only when the derived
+/// floor is NULL (nothing to clamp with).
+const RECONCILE_ERA_FLOOR_SELECT_SQL: &str =
+    "SELECT era_floor FROM ht_reconcile_era_floor WHERE table_name = $1";
+
+/// The clamp semantics, as a pure function (the SQL above enforces the same
+/// rule atomically; this is the spec the tests pin).
+///
+/// * both present → the HIGHER one. A derived floor that dropped below the
+///   watermark is exactly the one-old-row drag described on
+///   [`guest_registry_era_floor_sql`]; ignore it.
+/// * persisted only (derived went NULL — every mirrored companion deleted,
+///   or the table truncated) → KEEP the watermark. Widening back to "no
+///   coverage" would be the same flood by another route; the in-era folios
+///   then all read as divergent and [`divergence_cap_exceeded`] raises a
+///   page, which is the correct response to a mirror that vanished.
+/// * neither → `None`: no coverage was ever established, and the arm skips
+///   the legacy scan entirely.
+///
+/// Generic over the floor's BASIS, and `pub(crate)`, because
+/// `ht_reconcile_era_floor` now carries two of them (migration 084):
+/// `era_floor` (`NaiveDateTime`, this arm) and `era_floor_id` (`i64`, the
+/// sibling [`crate::scheduler::payment_ledger_probe`] arm, whose mirror is
+/// keyed on a legacy IDENTITY and whose date column would have to cross the
+/// naive-Thai/`TIMESTAMPTZ` boundary). One rule, single-sourced — a second
+/// hand-written copy is exactly how the two arms would drift apart.
+pub(crate) fn clamped_era_floor<T: Ord>(persisted: Option<T>, derived: Option<T>) -> Option<T> {
+    match (persisted, derived) {
+        (Some(p), Some(d)) => Some(p.max(d)),
+        (Some(p), None) => Some(p),
+        (None, d) => d,
+    }
+}
+
+async fn guest_registry_era_floor(
+    pg_pool: &PgPool,
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+    // `AssertSqlSafe`: the statement is assembled from compile-time consts
+    // only (no runtime value reaches it) — same audit note as the sibling
+    // canonical-folio statements below.
+    let derived = sqlx::query_scalar::<_, Option<NaiveDateTime>>(sqlx::AssertSqlSafe(
+        guest_registry_era_floor_sql(),
+    ))
+    .fetch_one(pg_pool)
+    .await?;
+
+    // `Option<NaiveDateTime>` INSIDE the row, not just around it: migration
+    // 084 dropped the `NOT NULL` on `era_floor` so the sibling ID-basis arm
+    // can own a row without inventing a fake timestamp. Decoding a
+    // non-Option here would turn any NULL row — an ID-basis row that somehow
+    // acquired this key, or a hand-edit — into a `ColumnDecode` error that
+    // fails the whole guest-registry tick. A NULL reads as "nothing
+    // persisted", which is exactly what `clamped_era_floor` already handles.
+    let persisted = match derived {
+        Some(d) => {
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .bind(d)
+                .fetch_optional(pg_pool)
+                .await?
+                .flatten()
+        }
+        None => {
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .fetch_optional(pg_pool)
+                .await?
+                .flatten()
+        }
+    };
+
+    let effective = clamped_era_floor(persisted, derived);
+
+    // Say it out loud when the watermark is HOLDING the scope forward: that
+    // means a historical folio just gained a mirrored companion, which is a
+    // legitimate iHOTEL edit but would otherwise silently widen the scan by
+    // years.
+    match (effective, derived) {
+        (Some(e), Some(d)) if e > d => tracing::info!(
+            derived_floor = %d,
+            effective_floor = %e,
+            "[Sync] sync_guest_registry: derived coverage floor sits BEHIND the \
+             persisted watermark (a pre-era folio gained a mirrored companion) — \
+             holding the watermark; scope stays monotonically narrowing"
+        ),
+        (Some(e), None) => tracing::warn!(
+            effective_floor = %e,
+            "[Sync] sync_guest_registry: canonical now holds NO mirrored companion \
+             at all, but a coverage watermark exists — keeping it. Expect a \
+             divergence-cap page if the mirror really was lost"
+        ),
+        _ => {}
+    }
+
+    Ok(effective)
+}
+
+/// The in-era folio KEY set: every canonical check-in from the coverage
+/// floor onward.
+///
+/// This is the arm's scope gate, and it does double duty:
+///
+/// * it drops pre-coverage folios (see [`guest_registry_era_floor_sql`]);
+/// * it drops folios whose parent check-in is absent from canonical
+///   entirely. Those are a CHECK-INS problem — `sync_checkins` already
+///   reports them as `missing_pg` — and the companion mapper could not land
+///   them anyway (it ERRORS on an unresolvable parent FK). Reporting them
+///   here too would double-count one root cause and manufacture rows this
+///   arm can never close.
+///
+/// `cin_checkin_time` is `NOT NULL` in the canonical schema, so there is no
+/// NULL arm to reason about (verified live 2026-07-28: 0 NULLs at HF Hotel).
+const IN_ERA_CHECKIN_KEYS_SQL: &str = "SELECT legacy_cin_no FROM ht_checkins \
+      WHERE legacy_cin_no IS NOT NULL AND cin_checkin_time >= $1";
+
+async fn load_in_era_checkin_keys(
+    pg_pool: &PgPool,
+    era_floor: NaiveDateTime,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, String>(IN_ERA_CHECKIN_KEYS_SQL)
+        .bind(era_floor)
+        .fetch_all(pg_pool)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Every canonical companion folio in the coverage era, in ONE query.
+///
+/// Joins companion → check-in (never the reverse), so a duplicate
+/// `legacy_cin_no` on `ht_checkins` cannot duplicate companion lines.
+fn canonical_registry_folios_sql() -> String {
+    format!(
+        "SELECT ht_checkins.legacy_cin_no, {projection} \
+           FROM ht_guest_registry \
+           JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id \
+          WHERE {primary} \
+            AND ht_checkins.legacy_cin_no IS NOT NULL \
+            AND ht_checkins.cin_checkin_time >= $1",
+        projection = canonical_companion_projection(),
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    )
+}
+
+async fn load_canonical_registry_folios(
+    pg_pool: &PgPool,
+    era_floor: NaiveDateTime,
+) -> Result<BTreeMap<String, RegistryFolioProjection>, sqlx::Error> {
+    // `AssertSqlSafe`: built purely from compile-time consts
+    // (`canonical_companion_projection` / `CANONICAL_COMPANION_PRIMARY_FILTER`);
+    // the only runtime value is the era floor, which is BOUND as `$1`.
+    let rows = sqlx::query_as::<_, (String, Option<String>, String)>(sqlx::AssertSqlSafe(
+        canonical_registry_folios_sql(),
+    ))
+    .bind(era_floor)
+    .fetch_all(pg_pool)
+    .await?;
+    let mut folios: BTreeMap<String, RegistryFolioProjection> = BTreeMap::new();
+    for (cin_no, name, country) in rows {
+        folios
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no))
+            .push_companion(name.as_deref().unwrap_or_default(), Some(country.as_str()));
+    }
+    Ok(folios)
+}
+
+/// Resolve the canonical check-in id for a legacy `Cin_no`.
+///
+/// Byte-identical to the companion mapper's own parent lookup
+/// (`guest_registry.rs`), so the sweep resolves the SAME folio the mapper
+/// would write into.
+const CANONICAL_CHECKIN_ID_PROBE_SQL: &str =
+    "SELECT cin_id FROM ht_checkins WHERE legacy_cin_no = $1 LIMIT 1";
+
+/// Per-PK canonical folio for the auto-resolve sweep.
+///
+/// `Ok(None)` ⇔ the parent check-in is absent from canonical: the folio is
+/// out of this arm's scope (see [`IN_ERA_CHECKIN_KEYS_SQL`]) and the row
+/// stays open for operator review. A folio that EXISTS but holds no
+/// companions returns `Ok(Some(<empty folio>))`, which is what lets a
+/// companion set deleted on both sides converge.
+async fn fetch_canonical_registry_folio(
+    pg_pool: &PgPool,
+    cin_no: &str,
+) -> Result<Option<RegistryFolioProjection>, sqlx::Error> {
+    let cin_id: Option<i32> = sqlx::query_scalar(CANONICAL_CHECKIN_ID_PROBE_SQL)
+        .bind(cin_no)
+        .fetch_optional(pg_pool)
+        .await?;
+    let Some(cin_id) = cin_id else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT {projection} FROM ht_guest_registry \
+          WHERE guest_cin_id = $1 AND {primary}",
+        projection = canonical_companion_projection(),
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    );
+    // `AssertSqlSafe`: consts only; `cin_id` is bound as `$1`.
+    let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
+        .bind(cin_id)
+        .fetch_all(pg_pool)
+        .await?;
+    let mut folio = RegistryFolioProjection::empty(cin_no);
+    for (name, country) in rows {
+        folio.push_companion(name.as_deref().unwrap_or_default(), Some(country.as_str()));
+    }
+    Ok(Some(folio))
+}
+
+/// Project one legacy companion row into a folio. Shared by the bulk scan
+/// and the per-PK re-fetch so the two apply IDENTICAL admission rules.
+/// A NULL `Cin_name` lands as the empty string — exactly what the CT mapper
+/// stores (`cin_name.unwrap_or_default()`), so a blank "Other People" row
+/// saved by a receptionist tabbing through hashes the same on both sides.
+fn push_legacy_companion(folio: &mut RegistryFolioProjection, row: &tiberius::Row) {
+    folio.push_companion(
+        row.get::<&str, _>("Cin_name").unwrap_or_default(),
+        row.get::<&str, _>("Cin_contry"),
+    );
+}
+
+fn registry_folio_json(folio: &RegistryFolioProjection) -> serde_json::Value {
+    json!({
+        "Cin_no": folio.legacy_cin_no,
+        "companions": folio.companion_lines(),
+        "companion_count": folio.len(),
+    })
+}
+
+/// Best-effort ack: record the `mssql_hash` this arm last reconciled for a
+/// folio. Cache-only — never mutates canonical state; a failed write just
+/// re-runs the (already in-memory) comparison next tick.
+async fn ack_guest_registry_mirror(pg_pool: &PgPool, cin_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_guest_registry_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE cin_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(cin_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_guest_registry_legacy (cin_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (cin_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                synced_at = EXCLUDED.synced_at",
+        )
+        .bind(cin_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+/// Read the WHOLE ack cache in ONE query, same efficiency contract as the
+/// payments arm's.
+async fn load_guest_registry_ack_cache(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT cin_no, sync_hash FROM ht_guest_registry_legacy WHERE sync_hash IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|hash| (k, hash)))
+        .collect())
+}
+
+/// Should this folio's ack row be (re)written?
+///
+/// **The ack cache in this arm suppresses WRITES; it never gates
+/// DETECTION** — and that difference is deliberate. Its siblings ack to
+/// skip a per-PK canonical fetch, which is why the payments arm needed an
+/// explicit carve-out to keep canonical-only voids observable
+/// ([`payment_ack_short_circuit_bypassed`]). Here BOTH sides are already
+/// resident in memory (two batched reads), so gating the comparison on the
+/// ack would buy nothing and would re-create that blind spot in a worse
+/// form: any canonical-side change that leaves the LEGACY hash untouched —
+/// a companion deleted from `ht_guest_registry`, a primary-flag flip, a
+/// dropped CT delete — would become invisible forever on a table that
+/// exists to satisfy a legal reporting obligation. So the loop compares
+/// every in-scope folio on every tick and the ack row is written only when
+/// the legacy hash has actually moved, which keeps the steady state at ~0
+/// writes without costing a single observation.
+fn guest_registry_ack_needs_write(acked: Option<&String>, mssql_hash: &str) -> bool {
+    acked.map(String::as_str) != Some(mssql_hash)
+}
+
+/// Ceiling on how many divergences ONE `guest_registry` tick may enqueue.
+///
+/// 500 is not a round number picked for looks: it is
+/// [`auto_resolve_reconcile_log`]'s per-tick `LIMIT 500`. Enqueuing more
+/// findings in a tick than the sweep can even LOOK at in a tick is the
+/// mechanism behind every flood incident this module has had — the backlog
+/// never drains, the age-ordered batch fills with one entity, and every
+/// other entity is starved out of both the sweep and the digest.
+///
+/// Steady-state expectation is 1–2 orders of magnitude below it: live
+/// 2026-07-28, floored, HF Hotel has ~12 findings across 830 in-era folios
+/// and HF Ville ~29 across 574.
+const GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT: i64 = 500;
+
+/// Resolve the per-tick divergence cap. Same per-site → global → default
+/// chain as every other knob here ([`threshold_from_env`]), so a site
+/// working through a genuine one-time backlog can be raised on its own:
+/// `RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES_HFVILLE=…`.
+fn guest_registry_divergence_cap(site_id: &str) -> i64 {
+    threshold_from_env(
+        "RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES",
+        site_id,
+        GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT,
+    )
+}
+
+/// Would this tick enqueue more findings than the cap allows?
+///
+/// The arm compares BOTH sides in memory before it writes anything, so a
+/// breach aborts the whole tick — no `record_divergence`, no ack writes —
+/// instead of truncating the batch. Truncating would be worse than useless:
+/// it would write an arbitrary 500 of the findings, leave the rest
+/// invisible, and still pin the digest on `guest_registry`.
+///
+/// What a breach actually means, in order of likelihood: the coverage floor
+/// has been dragged backwards (see [`guest_registry_era_floor_sql`] — the
+/// persisted watermark should now prevent this), the companion mirror has
+/// stopped ingesting, or the legacy table was bulk-edited. None of those are
+/// fixed by writing 19.6k rows.
+fn divergence_cap_exceeded(divergent: usize, cap: i64) -> bool {
+    divergent as i64 > cap
+}
+
+/// Page an operator that a `guest_registry` tick was ABORTED by the
+/// divergence cap, and say exactly which knob unblocks it.
+///
+/// Cooldown-gated through the shared `ht_level_drift_alert_cooldowns` table
+/// under [`reconcile_cap_cooldown_key`] with the same per-site
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window as the other reconcile pages, and —
+/// like them — the cooldown is burned only on a confirmed delivery, so a
+/// webhook outage cannot silence a stuck arm for a day.
+async fn alert_guest_registry_divergence_cap(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    divergent: usize,
+    in_scope: usize,
+    cap: i64,
+    era_floor: NaiveDateTime,
+) {
+    let key = reconcile_cap_cooldown_key("guest_registry");
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Guest-registry divergence-cap page suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":octagonal_sign: *Guest-registry reconcile ABORTED — divergence cap* \
+                 :octagonal_sign:\n\
+                 The companion-folio arm found *{divergent}* diverging folios out of \
+                 {in_scope} in scope this tick, above the per-tick cap of {cap}. \
+                 *Nothing was written* — no `ht_reconcile_log` rows, no ack rows — \
+                 because a batch that size can never drain (the auto-resolve sweep \
+                 looks at 500 rows per tick) and would starve every other entity out \
+                 of the sweep and the digest.\n\
+                 Coverage floor in force: `{era_floor}`.\n\
+                 _Likely causes, in order: the coverage floor was dragged backwards by \
+                 a companion edit on a pre-era folio (check \
+                 `ht_reconcile_era_floor` where `table_name='guest_registry'` and move \
+                 it FORWARD by hand — the upsert clamps with GREATEST, so the edit \
+                 sticks); the companion CT mapper has stopped ingesting; or \
+                 `HT_CheckIn_Other_People` was bulk-edited. Raise \
+                 `RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES` only once you know the \
+                 backlog is real, or set `RECONCILE_GUEST_REGISTRY_ARM_ENABLED=false` \
+                 to stand the arm down. Per-site cooldown {cooldown_h}h._",
+                cooldown_h = cooldown_hours,
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; guest-registry divergence-cap abort logged only"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Guest-registry divergence-cap page POST failed — leaving the \
+             cooldown unset so the next tick retries"
+        );
+    }
+}
+
+/// Phase 6-B guest-registry reconcile arm. Compares legacy
+/// `HT_CheckIn_Other_People` against canonical `ht_guest_registry` per
+/// FOLIO (all companions sharing one `Cin_no`), keyed on `Cin_no`.
+///
+/// Only ever called when [`reconcile_guest_registry_arm_enabled`] is true —
+/// with the flag off (the shipped default on every service) this function
+/// is never entered, so the arm issues no queries at all.
+///
+/// Shape — 1 MSSQL query + 5 PG queries per tick, plus one ack write per
+/// folio whose legacy state actually moved:
+/// 0. the canonical coverage floor ([`guest_registry_era_floor_sql`]),
+///    clamped against its durable watermark in a second, combined
+///    read-write statement ([`RECONCILE_ERA_FLOOR_UPSERT_SQL`]);
+/// 1. the in-era folio key set ([`IN_ERA_CHECKIN_KEYS_SQL`]) — the scope gate;
+/// 2. every canonical companion in the era, grouped into folios;
+/// 3. ONE bulk MSSQL scan of `HT_CheckIn_Other_People`, grouped into folios
+///    and filtered against the key set;
+/// 4. the ack cache.
+///
+/// The comparison runs over the UNION of both key sets, so a folio that
+/// exists ONLY canonically (legacy companions all deleted, our CT delete
+/// dropped or a companion we created that never reached legacy) is caught
+/// too — a legacy-only scan would be blind to it.
+///
+/// **Compare-all-then-write, never write-as-you-go.** Both sides are
+/// already in memory, so the tick decides its ENTIRE output before the
+/// first row is enqueued. That is what lets [`divergence_cap_exceeded`]
+/// abort a pathological tick outright instead of truncating it halfway
+/// through a flood of `record_divergence` INSERTs and per-folio ack
+/// round-trips.
+///
+/// `ReconcileMode::Upsert` is not honoured here, same as payments:
+/// `ht_guest_registry_legacy` is a pure ack cache with no data columns to
+/// mirror. The arm is diff-only by construction.
+async fn sync_guest_registry(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    tracing::info!("[Sync] Syncing guest registry (companion folios)...");
+
+    // Canonical coverage floor FIRST. With no mirrored companion at all the
+    // arm has no coverage, and scanning legacy would classify the ENTIRE
+    // companion history as divergent — permanently unresolvable, since
+    // `guest_registry` is in neither self-heal list. Report a clean zero
+    // tick instead of manufacturing a backlog.
+    let Some(era_floor) = guest_registry_era_floor(pg_pool).await? else {
+        tracing::warn!(
+            "[Sync] sync_guest_registry: ht_guest_registry holds no mirrored \
+             companion — no canonical coverage to reconcile against; skipping \
+             the legacy scan this tick"
+        );
+        let duration_ms = start.elapsed().as_millis() as i32;
+        record_success(pg_pool, "guest_registry", 0, 0, 0, duration_ms).await;
+        return Ok(());
+    };
+
+    let in_era_keys = load_in_era_checkin_keys(pg_pool, era_floor).await?;
+    let mut canonical = load_canonical_registry_folios(pg_pool, era_floor).await?;
+
+    // ONE bulk legacy scan. `HT_CheckIn_Other_People` carries no date
+    // column, so the era filter cannot be pushed into this WHERE — the
+    // folios are filtered by KEY membership below instead. The table is
+    // narrow and small (20,434 rows at HF Hotel, 2,185 at Ville on
+    // 2026-07-28), so one full scan per 15-min tick is far cheaper than the
+    // per-PK loads `sync_checkins` already runs.
+    let mut conn = legacy_pool.get().await?;
+    let select_sql = format!(
+        "SELECT {projection} FROM HT_CheckIn_Other_People",
+        projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
+    );
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
+    // Free the pool slot — nothing below touches MSSQL again.
+    drop(conn);
+
+    let mut legacy: BTreeMap<String, RegistryFolioProjection> = BTreeMap::new();
+    let mut skipped = 0i32;
+    let mut out_of_era = 0i32;
+    for row in &rows {
+        // A NULL/empty `Cin_no` is an orphan companion row the CT mapper
+        // skips with a warning — there is no folio to attach it to.
+        let Some(cin_no) = row.get::<&str, _>("Cin_no").filter(|s| !s.is_empty()) else {
+            skipped += 1;
+            continue;
+        };
+        if !in_era_keys.contains(cin_no) {
+            out_of_era += 1;
+            continue;
+        }
+        push_legacy_companion(
+            legacy
+                .entry(cin_no.to_string())
+                .or_insert_with(|| RegistryFolioProjection::empty(cin_no)),
+            row,
+        );
+    }
+
+    let acked = load_guest_registry_ack_cache(pg_pool).await?;
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    // Union of both key sets — see the doc comment on why a legacy-only
+    // walk would be blind to a canonical-only folio. `BTreeSet` keys are
+    // sorted, so the merged iteration order is deterministic.
+    let keys: std::collections::BTreeSet<String> =
+        legacy.keys().chain(canonical.keys()).cloned().collect();
+
+    // Materialise the union on BOTH sides: a key present on one side only
+    // gets an explicit EMPTY folio on the other. Empty is a real hashable
+    // state, not an absent row (that is what lets a companion set deleted
+    // everywhere converge), so this changes no hash — it just means the
+    // comparison below never has to synthesise a temporary.
+    for cin_no in &keys {
+        legacy
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no.as_str()));
+        canonical
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no.as_str()));
+    }
+
+    // PASS 1 — pure comparison, ZERO writes, so the tick's whole output is
+    // known before any of it is committed. See `divergence_cap_exceeded`.
+    let mut comparisons: Vec<(&str, String, String)> = Vec::with_capacity(keys.len());
+    let mut divergent = 0usize;
+    for cin_no in &keys {
+        let mssql_hash = guest_registry_canonical_hash(&legacy[cin_no.as_str()]);
+        let pg_hash = guest_registry_canonical_hash(&canonical[cin_no.as_str()]);
+        if pg_hash != mssql_hash {
+            divergent += 1;
+        }
+        comparisons.push((cin_no.as_str(), pg_hash, mssql_hash));
+    }
+
+    // The circuit breaker. A tick this loud is a SCOPE bug (floor dragged
+    // backwards) or a dead mirror, never a backlog worth writing down —
+    // abort before the first INSERT and page instead.
+    let cap = guest_registry_divergence_cap(site_id);
+    if divergence_cap_exceeded(divergent, cap) {
+        let detail = format!(
+            "guest-registry reconcile aborted: {divergent} diverging folios of \
+             {in_scope} in scope exceeds the per-tick cap of {cap} (coverage floor \
+             {era_floor}); nothing written",
+            in_scope = comparisons.len(),
+        );
+        tracing::error!(
+            site = %site_id,
+            divergent,
+            in_scope = comparisons.len(),
+            cap,
+            era_floor = %era_floor,
+            "[Sync] {}",
+            detail,
+        );
+        alert_guest_registry_divergence_cap(
+            pg_pool,
+            slack,
+            site_id,
+            divergent,
+            comparisons.len(),
+            cap,
+            era_floor,
+        )
+        .await;
+        record_error(pg_pool, "guest_registry", &detail).await;
+        return Ok(());
+    }
+
+    // PASS 2 — the writes, now known to be bounded.
+    for (cin_no, pg_hash, mssql_hash) in &comparisons {
+        let cin_no = *cin_no;
+        let legacy_folio = &legacy[cin_no];
+        let canonical_folio = &canonical[cin_no];
+
+        if guest_registry_ack_needs_write(acked.get(cin_no), mssql_hash) {
+            ack_guest_registry_mirror(pg_pool, cin_no, mssql_hash).await;
+        }
+
+        if pg_hash == mssql_hash {
+            unchanged += 1;
+            continue;
+        }
+
+        // The FOLIO is the row: it exists on both sides by construction
+        // (the key set is canonical check-ins, and an absent companion set
+        // is the empty folio, not a missing row), so the counts are 1/1 and
+        // [`classify_divergence`] yields `Value`. The per-side companion
+        // counts an operator actually needs are in the JSON payloads.
+        // `Cardinality` / `MissingPg` are unreachable here by design —
+        // `missing_pg` would be a never-silenced, never-closing row for the
+        // ordinary "iHOTEL added a companion we haven't ingested yet" case.
+        let kind = classify_divergence(Some(&pg_hash), Some(&mssql_hash), 1, 1);
+        record_divergence(
+            pg_pool,
+            "guest_registry",
+            cin_no,
+            Some(&pg_hash),
+            Some(&mssql_hash),
+            registry_folio_json(legacy_folio),
+            Some(registry_folio_json(canonical_folio)),
+            kind,
+            1,
+            1,
+        )
+        .await;
+
+        if canonical_folio.is_empty() {
+            // Legacy has companions, canonical has none: the TM.30
+            // under-count shape Track E1 exists to prevent.
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "[Sync] sync_guest_registry: {} companion rows have a NULL/empty \
+             Cin_no and belong to no folio",
+            skipped,
+        );
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        era_floor = %era_floor,
+        scanned = rows.len(),
+        out_of_era,
+        "[Sync] Guest registry: {} folios missing every canonical companion, \
+         {} drifted, {} unchanged in {}ms (in-era folios from {})",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+        era_floor,
+    );
+    record_success(
+        pg_pool,
+        "guest_registry",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -5585,11 +10560,14 @@ mod tests {
 
     #[test]
     fn room_canonical_hash_matches_when_canonical_mirrors_legacy() {
-        // Legacy "yes" → canonical true → reverse to "yes". Hashes align.
-        let mssql = room_canonical_hash("101", "yes", "no", Some("ocean view"));
+        // room_clean is INVERTED: legacy "no" = no cleaning needed = canonical
+        // true (IS clean). room_maintenance is NOT inverted. Pairing canonical
+        // `true` with legacy "yes" — as this test did before 20edf18 — encodes
+        // the very polarity bug that fix removed.
+        let mssql = room_canonical_hash("101", "no", "no", Some("ocean view"));
         let canonical = room_canonical_hash(
             "101",
-            bool_to_yesno(Some(true)),
+            clean_bool_to_legacy_yesno(Some(true)),
             bool_to_yesno(Some(false)),
             Some("ocean view"),
         );
@@ -5598,13 +10576,13 @@ mod tests {
 
     #[test]
     fn room_canonical_hash_diverges_when_canonical_clean_lags_behind() {
-        // Operator marked the room dirty in legacy ("no") but the CT
-        // mapper hasn't yet flipped canonical.room_clean to false →
-        // drift fires.
-        let mssql = room_canonical_hash("101", "no", "no", None);
+        // Legacy says the room NEEDS cleaning ("yes" = dirty) but the CT
+        // mapper hasn't yet flipped canonical.room_clean to false, so
+        // canonical still claims clean → divergence fires.
+        let mssql = room_canonical_hash("101", "yes", "no", None);
         let canonical = room_canonical_hash(
             "101",
-            bool_to_yesno(Some(true)),
+            clean_bool_to_legacy_yesno(Some(true)),
             bool_to_yesno(Some(false)),
             None,
         );
@@ -5633,7 +10611,8 @@ mod tests {
     #[test]
     fn rooms_pg_dispatch_composition_converges_with_legacy_projection() {
         // A canonical row the CT mapper would have written after the
-        // legacy state converged (clean=yes, maintenance=no, no notes).
+        // legacy state converged: legacy Room_Clean="no" (no cleaning
+        // needed) → canonical room_clean=true; maintenance "no" → false.
         let canonical_row = CanonicalRoomRow {
             room_clean: Some(true),
             room_maintenance: Some(false),
@@ -5641,7 +10620,7 @@ mod tests {
         };
         let pg_hash = room_canonical_hash(
             "A2-1",
-            bool_to_yesno(canonical_row.room_clean),
+            clean_bool_to_legacy_yesno(canonical_row.room_clean),
             bool_to_yesno(canonical_row.room_maintenance),
             canonical_row.room_notes.as_deref(),
         );
@@ -5651,7 +10630,7 @@ mod tests {
         // collapse to the same `'yes' | 'no' | ""` tokens used above.
         let legacy_hash = room_canonical_hash(
             "A2-1",
-            legacy_yesno_canonical(Some("yes")),
+            legacy_yesno_canonical(Some("no")),
             legacy_yesno_canonical(Some("no")),
             None,
         );
@@ -5663,11 +10642,15 @@ mod tests {
         );
     }
 
-    /// Round-trips every legal `(canonical bool, legacy literal)` pair.
-    /// Lock test that catches a future regression in either
-    /// `bool_to_yesno` or `legacy_yesno_canonical` — both arms of the
-    /// auto-resolve sweep depend on these being exact inverses for
-    /// the rooms arm to ever converge.
+    /// Round-trips every legal `(canonical bool, legacy literal)` pair for
+    /// the NON-inverted fields. Lock test for `bool_to_yesno` ↔
+    /// `legacy_yesno_canonical`.
+    ///
+    /// This pairing is correct for `room_maintenance` and WRONG for
+    /// `room_clean`, which is inverted (legacy "yes" = needs cleaning =
+    /// canonical false) and uses `clean_bool_to_legacy_yesno` — see
+    /// `room_clean_projections_agree_across_detection_and_auto_resolve`.
+    /// Do not cite this test as licence to use `bool_to_yesno` on clean.
     #[test]
     fn rooms_dispatch_yesno_round_trip_is_total() {
         for (canonical, legacy_literal) in [
@@ -5699,7 +10682,7 @@ mod tests {
         };
         let pg_hash = room_canonical_hash(
             "A2-1",
-            bool_to_yesno(canonical_row.room_clean),
+            clean_bool_to_legacy_yesno(canonical_row.room_clean),
             bool_to_yesno(canonical_row.room_maintenance),
             canonical_row.room_notes.as_deref(),
         );
@@ -6912,6 +11895,1039 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Phase 6-A — payments reconcile arm (DARK). Pure tests only; the
+    // MSSQL/PG halves are pinned by shape guards + the descriptor-table
+    // golden vector in `sync::mappers::payment`.
+    // -------------------------------------------------------------------
+
+    /// Ships DARK. The default MUST be off on every service, and the
+    /// literal comparison is strict — `"TRUE"` / `"1"` / `" true"` are all
+    /// off, matching every other flag in the sync path.
+    #[test]
+    fn payments_arm_flag_defaults_off_and_is_strict() {
+        assert!(
+            !with_env_vars(&[("RECONCILE_PAYMENTS_ARM_ENABLED", None)], || {
+                reconcile_payments_arm_enabled()
+            }),
+            "the payments arm must default OFF — enabling is a coordinated action"
+        );
+        assert!(with_env_vars(
+            &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some("true"))],
+            || { reconcile_payments_arm_enabled() }
+        ));
+        for sloppy in ["TRUE", "1", "yes", " true", "True"] {
+            assert!(
+                !with_env_vars(
+                    &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))],
+                    || { reconcile_payments_arm_enabled() }
+                ),
+                "`{sloppy}` must NOT enable the arm"
+            );
+        }
+    }
+
+    /// The arm ships detection-only. Wiring it into either self-heal list
+    /// is a separate, coordinated decision (plan 6-D) — and one of its
+    /// divergence shapes (canonical-only void) would be ERASED rather than
+    /// repaired by re-driving the legacy row.
+    #[test]
+    fn payments_is_not_wired_into_either_self_heal_arm() {
+        assert!(
+            !FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&"payments"),
+            "payments detection must soak before any force-converge is wired"
+        );
+        assert!(
+            !REINGEST_MISSING_PG_TABLES.contains(&"payments"),
+            "payments must not be re-ingested by the missing_pg arm"
+        );
+        // …and the pure gates agree, even with the self-heal flags ON.
+        assert!(!force_converge_value_drift_eligible(
+            "payments",
+            Some(LEGACY_HASH),
+            Some(PG_HASH),
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            "payments",
+            Some(LEGACY_HASH),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+    }
+
+    /// A payment's canonical parent is its check-in, so the sweep must
+    /// heal check-ins BEFORE payments within a batch (`apply_receipt_upsert`
+    /// ERRORS on an unresolvable parent).
+    #[test]
+    fn payments_rank_after_their_parent_checkin() {
+        assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("payments"));
+        assert!(reconcile_table_fk_rank("payments") < reconcile_table_fk_rank("something_new"));
+    }
+
+    /// Hash-body pin at the scheduler boundary (the mapper-side descriptor
+    /// carries the byte-for-byte golden vector). Both sides of the arm call
+    /// THIS function, so a converged receipt must hash identically whether
+    /// projected from `HT_Receipt_H` or from `ht_payments`.
+    #[test]
+    fn payment_canonical_hash_matches_when_canonical_mirrors_legacy() {
+        let legacy = LegacyReceiptRow {
+            receipt_no: "B2604-0265".into(),
+            receipt_total: 890.0,
+            legacy_cin_no: Some("CH26-005228".into()),
+            status_name: Some("ปกติ".into()),
+        };
+        let canonical = CanonicalPaymentRow {
+            pay_amount: 890.0,
+            pay_voided: Some(false),
+            legacy_cin_no: Some("CH26-005228".into()),
+        };
+        assert_eq!(
+            legacy.hash(),
+            payment_canonical_hash(
+                &legacy.receipt_no,
+                canonical.pay_amount,
+                canonical.is_voided(),
+                canonical.legacy_cin_no.as_deref(),
+            ),
+        );
+    }
+
+    /// NULL `pay_voided` (the column is nullable, `DEFAULT false`) must
+    /// read as NOT voided — the same `COALESCE(pay_voided, false)` the
+    /// mapper's UPDATE and every money reader use. Treating NULL as
+    /// "unknown" here would manufacture drift on every pre-void row.
+    #[test]
+    fn canonical_null_pay_voided_hashes_as_not_voided() {
+        let null_voided = CanonicalPaymentRow {
+            pay_amount: 500.0,
+            pay_voided: None,
+            legacy_cin_no: Some("CH26-000001".into()),
+        };
+        let explicit_false = CanonicalPaymentRow {
+            pay_amount: 500.0,
+            pay_voided: Some(false),
+            legacy_cin_no: Some("CH26-000001".into()),
+        };
+        assert_eq!(null_voided.is_voided(), explicit_false.is_voided());
+    }
+
+    /// The void bit is a real hash input: a legacy cancel that canonical
+    /// hasn't applied MUST diverge, and vice versa. This is the arm's whole
+    /// reason for existing on the money path.
+    #[test]
+    fn payment_canonical_hash_diverges_on_void_state() {
+        let normal = payment_canonical_hash("B1", 890.0, false, Some("CH1"));
+        let voided = payment_canonical_hash("B1", 890.0, true, Some("CH1"));
+        assert_ne!(normal, voided);
+    }
+
+    /// Amount drift is hashed at 2dp — legacy `Receipt_Total` is a bare
+    /// `float`, canonical `pay_amount` a `DECIMAL(12,2)`, so float noise
+    /// below the satang must NOT diverge while a real satang difference
+    /// must.
+    #[test]
+    fn payment_amount_segment_is_two_decimals_and_zero_is_signless() {
+        assert_eq!(
+            payment_canonical_hash("B1", 890.0, false, None),
+            payment_canonical_hash("B1", 890.000000001, false, None),
+            "float noise below 2dp must not manufacture drift"
+        );
+        assert_ne!(
+            payment_canonical_hash("B1", 890.00, false, None),
+            payment_canonical_hash("B1", 890.01, false, None),
+            "a one-satang difference is real drift"
+        );
+        // IEEE -0.0 renders as "-0.00" without normalisation, which would
+        // make a zero-total receipt permanently unconvergeable.
+        assert_eq!(money_hash_segment(-0.0), "0.00");
+        assert_eq!(money_hash_segment(0.0), "0.00");
+    }
+
+    /// `Receipt_ref` carries the parent `Cin_no`; a re-pointed receipt is
+    /// real drift (iHOTEL's customer-delete cascade touches this family).
+    #[test]
+    fn payment_canonical_hash_diverges_on_parent_checkin() {
+        assert_ne!(
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000001")),
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000002")),
+        );
+        // A canonical payment whose parent check-in row has vanished
+        // (LEFT JOIN → None) must not hash like one that is correctly
+        // parented.
+        assert_ne!(
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000001")),
+            payment_canonical_hash("B1", 890.0, false, None),
+        );
+    }
+
+    /// SQL-shape pin for the canonical probe. It MUST mirror
+    /// `payment::apply_receipt_upsert`'s existing-row lookup: probing only
+    /// `pay_reference` would report every app-originated payment as
+    /// `missing_pg` forever (the detection-side form of the 2026-06-30
+    /// HF Ville phantom-duplicate echo).
+    #[test]
+    fn canonical_payment_probe_matches_the_mapper_lookup_shape() {
+        // Pins the EXACT statement `fetch_canonical_payment` executes.
+        let sql = CANONICAL_PAYMENT_PROBE_SQL;
+        assert!(sql.contains("p.legacy_receipt_no = $1 OR p.pay_reference = $1"));
+        assert!(sql.contains("ORDER BY (p.legacy_receipt_no = $1) DESC NULLS LAST"));
+        assert!(
+            sql.contains("LEFT JOIN ht_checkins"),
+            "an INNER JOIN would misreport a parentless payment as missing_pg"
+        );
+    }
+
+    /// Scan-filter pin: no-check-in receipts are a DELIBERATE mapper skip
+    /// (`ht_payments.pay_cin_id` is NOT NULL), so including them would
+    /// manufacture one permanent `missing_pg` row per counter sale.
+    #[test]
+    fn payments_scan_filter_excludes_receipts_without_a_checkin_ref() {
+        assert_eq!(
+            PAYMENTS_RECONCILE_SCAN_FILTER,
+            "Receipt_ref IS NOT NULL AND Receipt_ref <> ''"
+        );
+    }
+
+    /// The BLOCKING find of the 2026-07-28 review: without a canonical-era
+    /// floor the arm hashes 21,566 HF Hotel receipts against 1,154 canonical
+    /// payments, manufacturing >20k `missing_pg` rows that can NEVER close
+    /// (not silenceable, not re-ingestable) and starving the auto-resolve
+    /// sweep. The composed filter must carry the floor.
+    #[test]
+    fn payments_scan_filter_is_floored_at_the_canonical_era() {
+        let floor = chrono::NaiveDate::from_ymd_opt(2026, 4, 27)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let filter = payments_reconcile_scan_filter(floor);
+        assert!(
+            filter.starts_with(PAYMENTS_RECONCILE_SCAN_FILTER),
+            "the era floor must NARROW the ref filter, not replace it: {filter}"
+        );
+        assert!(
+            filter.contains("Receipt_Date >= '2026-04-27T00:00:00'"),
+            "floor literal must be the language-independent ODBC/ISO form: {filter}"
+        );
+        assert!(
+            filter.contains("Receipt_Date IS NULL OR"),
+            "a dateless receipt cannot be placed in or out of the era and the \
+             mapper would still land it — dropping it re-creates a silent skip"
+        );
+    }
+
+    /// The floor is DERIVED from canonical coverage and compared against
+    /// `Receipt_Date` with NO timezone shift, because `ht_payments.pay_date`
+    /// already holds the legacy value verbatim (`project_receipt` does a plain
+    /// `try_get_datetime("Receipt_Date")`; the upsert's fallback is Bangkok
+    /// wall-clock on purpose). `naive_thai_to_utc` applies to a different
+    /// column (`Cin_Pay_Date` → `ledger_pay_date`, TIMESTAMPTZ) — conflating
+    /// them once put a `+ INTERVAL '7 hours'` here, which moved the floor in
+    /// the NARROWING direction and could drop the mirror's entire first day.
+    /// The day truncation IS load-bearing: without it the floor cuts
+    /// mid-afternoon on the mirror's very first day.
+    #[test]
+    fn payments_era_floor_sql_is_canonical_derived_and_unshifted() {
+        assert!(PAYMENTS_ERA_FLOOR_SQL.contains("MIN(pay_date)"));
+        assert!(PAYMENTS_ERA_FLOOR_SQL.contains("FROM ht_payments"));
+        assert!(
+            !PAYMENTS_ERA_FLOOR_SQL.contains("INTERVAL"),
+            "pay_date is already the legacy naive-Thai value verbatim — any \
+             offset here narrows the floor and silently drops in-era receipts"
+        );
+        assert!(
+            PAYMENTS_ERA_FLOOR_SQL.contains("date_trunc('day'"),
+            "widen to the start of the day so the mirror's first day is fully covered"
+        );
+    }
+
+    /// A canonical-only void never moves the LEGACY hash, so the ack
+    /// short-circuit would hide it forever once a receipt is acked. The
+    /// carve-out re-opens exactly that pair — and nothing else, because every
+    /// other transition does move the legacy hash.
+    #[test]
+    fn ack_short_circuit_bypassed_only_for_canonical_only_void() {
+        assert!(
+            payment_ack_short_circuit_bypassed(true, false),
+            "canonical voided + legacy normal is the one shape the legacy hash \
+             cannot express — it must bypass the ack"
+        );
+        assert!(
+            !payment_ack_short_circuit_bypassed(false, true),
+            "a legacy cancel already moves the legacy hash; no bypass needed"
+        );
+        assert!(!payment_ack_short_circuit_bypassed(false, false));
+        assert!(
+            !payment_ack_short_circuit_bypassed(true, true),
+            "both sides voided means the hashes agree — bypassing would only \
+             buy a wasted canonical probe every tick"
+        );
+    }
+
+    /// Track J1 — projection lock. `Receipt_Date` / VAT columns must stay
+    /// OUT (see `payment_canonical_hash` on why `pay_date` is excluded).
+    #[test]
+    fn payments_reconcile_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(PAYMENTS_RECONCILE_PROJECTION, "HT_Receipt_H");
+        assert!(
+            !PAYMENTS_RECONCILE_PROJECTION.contains(&"Receipt_Date"),
+            "pay_date is COALESCE-preserved for app rows — hashing it is permanent false drift"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6-B — guest-registry (companion folio) reconcile arm (DARK).
+    // Pure tests only; the byte-parity golden vector for the folio hash
+    // lives with the descriptor table in `sync::mappers::guest_registry`.
+    // -------------------------------------------------------------------
+
+    fn test_folio(cin_no: &str, companions: &[(&str, Option<&str>)]) -> RegistryFolioProjection {
+        let mut f = RegistryFolioProjection::empty(cin_no);
+        for (name, country) in companions {
+            f.push_companion(name, *country);
+        }
+        f
+    }
+
+    /// Ships DARK. The default MUST be off on every service, and the
+    /// literal comparison is strict — `"TRUE"` / `"1"` / `" true"` are all
+    /// off, matching every other flag in the sync path.
+    #[test]
+    fn guest_registry_arm_flag_defaults_off_and_is_strict() {
+        assert!(
+            !with_env_vars(&[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", None)], || {
+                reconcile_guest_registry_arm_enabled()
+            }),
+            "the guest-registry arm must default OFF — enabling is a coordinated action"
+        );
+        assert!(with_env_vars(
+            &[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", Some("true"))],
+            || { reconcile_guest_registry_arm_enabled() }
+        ));
+        for sloppy in ["TRUE", "1", "yes", " true", "True"] {
+            assert!(
+                !with_env_vars(
+                    &[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", Some(sloppy))],
+                    || { reconcile_guest_registry_arm_enabled() }
+                ),
+                "`{sloppy}` must NOT enable the arm"
+            );
+        }
+    }
+
+    /// The arm ships detection-only. Wiring the folio into a self-heal arm
+    /// is a bigger step than for the flat entities: repairing a folio means
+    /// DELETING canonical companion rows legacy no longer has, i.e. a sweep
+    /// destroying TM.30 registry state.
+    #[test]
+    fn guest_registry_is_not_wired_into_either_self_heal_arm() {
+        assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&"guest_registry"));
+        assert!(!REINGEST_MISSING_PG_TABLES.contains(&"guest_registry"));
+        assert!(!force_converge_value_drift_eligible(
+            "guest_registry",
+            Some(LEGACY_HASH),
+            Some(PG_HASH),
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            "guest_registry",
+            Some(LEGACY_HASH),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+    }
+
+    /// A companion folio hangs off its check-in, so the sweep must heal
+    /// check-ins BEFORE it (the CT mapper ERRORS on an unresolvable parent).
+    #[test]
+    fn guest_registry_ranks_after_its_parent_checkin() {
+        assert!(
+            reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry")
+        );
+        assert!(
+            reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank("something_new"),
+            "the wildcard must stay strictly after every ranked entity"
+        );
+    }
+
+    /// The whole point of the folio unit: iHOTEL's DELETE+reinsert edit
+    /// churns ids, so a per-row arm would false-positive on every edit.
+    /// Hashing the folio must be invariant under that churn — the hash is
+    /// built from names + countries only.
+    #[test]
+    fn folio_hash_is_invariant_under_legacy_id_churn() {
+        // Same companion content, re-saved in iHOTEL (new IDENTITY, new
+        // canonical guest_id): nothing in the hash body can express an id.
+        let before = test_folio("CH26-005228", &[("Somchai Jaidee", Some("TH"))]);
+        let after_reinsert = test_folio("CH26-005228", &[("Somchai Jaidee", Some("TH"))]);
+        assert_eq!(
+            guest_registry_canonical_hash(&before),
+            guest_registry_canonical_hash(&after_reinsert),
+        );
+        // …and a genuine content edit DOES move it.
+        let edited = test_folio("CH26-005228", &[("Somchai Jaidee-Suk", Some("TH"))]);
+        assert_ne!(
+            guest_registry_canonical_hash(&before),
+            guest_registry_canonical_hash(&edited),
+        );
+    }
+
+    /// A folio is one row on each side by construction, so the arm records
+    /// `value` drift — never `cardinality` (never silenced, never closed)
+    /// and never `missing_pg` for the ordinary "canonical hasn't ingested
+    /// the new companion yet" case, which WOULD be a permanently open row.
+    #[test]
+    fn folio_divergence_always_classifies_as_value_drift() {
+        let legacy = test_folio("CH26-005228", &[("Somchai", None)]);
+        let canonical = RegistryFolioProjection::empty("CH26-005228");
+        let mssql_hash = guest_registry_canonical_hash(&legacy);
+        let pg_hash = guest_registry_canonical_hash(&canonical);
+        assert_ne!(mssql_hash, pg_hash);
+        let kind = classify_divergence(Some(&pg_hash), Some(&mssql_hash), 1, 1);
+        assert_eq!(kind, DivergenceKind::Value);
+        assert!(
+            kind.is_silenceable(),
+            "folio drift must be ackable — the arm re-compares it on every \
+             tick regardless, and the log row stays unresolved either way"
+        );
+    }
+
+    /// The ack cache suppresses WRITES; it must never gate detection. If it
+    /// did, a canonical-side change that leaves the legacy hash untouched
+    /// (a companion deleted from `ht_guest_registry`, a dropped CT delete)
+    /// would be invisible forever — the payments arm needed an explicit
+    /// carve-out for exactly that shape, and this arm avoids needing one by
+    /// keeping both sides in memory.
+    #[test]
+    fn ack_is_written_only_when_the_legacy_hash_moves() {
+        let hash = guest_registry_canonical_hash(&test_folio("CH1", &[("A", None)]));
+        assert!(
+            guest_registry_ack_needs_write(None, &hash),
+            "an unseen folio must be acked"
+        );
+        assert!(
+            !guest_registry_ack_needs_write(Some(&hash), &hash),
+            "a stable folio must not re-write its ack row every tick"
+        );
+        let moved = guest_registry_canonical_hash(&test_folio("CH1", &[("B", None)]));
+        assert!(guest_registry_ack_needs_write(Some(&hash), &moved));
+    }
+
+    /// SQL-shape pins for the canonical side. The name expression MUST be
+    /// the mapper's own (single-sourced), the primary-guest filter MUST be
+    /// present and NULL-safe, and the era floor MUST be canonical-derived
+    /// with no timezone shift and a day truncation.
+    #[test]
+    fn canonical_registry_sql_shapes_are_pinned() {
+        let folios = canonical_registry_folios_sql();
+        assert!(
+            folios.contains(CANONICAL_COMPANION_NAME_SQL),
+            "the canonical projection must reuse the mapper's name expression \
+             verbatim, else an app-created companion hashes differently on the \
+             two sides forever: {folios}"
+        );
+        assert!(
+            folios.contains(CANONICAL_COMPANION_PRIMARY_FILTER),
+            "a registered PRIMARY guest is not a companion: {folios}"
+        );
+        assert_eq!(
+            CANONICAL_COMPANION_PRIMARY_FILTER,
+            "COALESCE(guest_is_primary, false) = false",
+            "the column is nullable; a bare `= false` drops NULL rows out of \
+             the canonical folio and reports them as legacy-only forever"
+        );
+        assert!(
+            folios.contains("JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"),
+            "join companion → check-in, never the reverse: a duplicate \
+             legacy_cin_no would otherwise duplicate companion lines: {folios}"
+        );
+        assert!(folios.contains("ht_checkins.cin_checkin_time >= $1"), "{folios}");
+
+        let floor = guest_registry_era_floor_sql();
+        assert!(floor.contains("MIN(ht_checkins.cin_checkin_time)"), "{floor}");
+        assert!(floor.contains("FROM ht_guest_registry"), "{floor}");
+        assert!(
+            floor.contains("date_trunc('day'"),
+            "widen to the start of the day so the mirror's first day is fully \
+             covered: {floor}"
+        );
+        assert!(
+            !floor.contains("INTERVAL"),
+            "the floor is derived from and compared against the SAME canonical \
+             column — any offset here narrows it and silently drops in-era \
+             folios: {floor}"
+        );
+        assert!(
+            floor.contains(CANONICAL_COMPANION_PRIMARY_FILTER),
+            "coverage is measured over companions, not registered primaries: {floor}"
+        );
+        assert!(
+            floor.contains("ht_guest_registry.guest_legacy_id IS NOT NULL"),
+            "\"mirrored\" means STAMPED BY THE CT MAPPER. App-authored companions \
+             (POST /api/checkins/{{id}}/guests, the migration-070 registration \
+             capture) have no legacy counterpart at all while \
+             TM30_COMPANION_WRITEBACK_ENABLED is false, so counting them as \
+             coverage claims an era the mirror never covered: {floor}"
+        );
+    }
+
+    /// The floor is a low-water mark on the PARENT's check-in time, so ONE
+    /// pre-era folio gaining a mirrored companion (iHOTEL's DELETE+REINSERT
+    /// edit on a 2023 folio — the mapper resolves the parent by
+    /// `legacy_cin_no` with no era restriction) would drag it back years and
+    /// admit ~all 20,423 legacy folios instead of 830. The persisted
+    /// watermark is what makes scope monotonically NARROWING.
+    #[test]
+    fn era_floor_is_clamped_to_a_non_decreasing_watermark() {
+        let old = chrono::NaiveDate::from_ymd_opt(2023, 4, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let era = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            clamped_era_floor(Some(era), Some(old)),
+            Some(era),
+            "a derived floor BELOW the watermark is the one-old-companion drag; \
+             it must not widen the scan"
+        );
+        assert_eq!(
+            clamped_era_floor(Some(old), Some(era)),
+            Some(era),
+            "a derived floor ABOVE the watermark is genuine narrowing and wins"
+        );
+        assert_eq!(
+            clamped_era_floor(None, Some(era)),
+            Some(era),
+            "first tick: the derived value seeds the watermark"
+        );
+        assert_eq!(
+            clamped_era_floor(Some(era), None),
+            Some(era),
+            "every mirrored companion vanishing must NOT reopen the whole history \
+             — hold the watermark and let the divergence cap page"
+        );
+        // Explicit `None::<NaiveDateTime>`: the clamp is generic over the
+        // floor basis (migration 084 added an ID basis for the
+        // payment-ledger arm), so a bare `None` has nothing to infer from.
+        assert_eq!(
+            clamped_era_floor(None, None::<NaiveDateTime>),
+            None,
+            "no coverage was ever established ⇒ the arm skips the legacy scan"
+        );
+    }
+
+    /// The clamp has to hold across PROCESSES (the backend scheduler and
+    /// `bin/sync` can tick the same database), so `GREATEST` lives in SQL
+    /// and the read is the same round trip as the write. A hand-edited
+    /// floor moved FORWARD is the documented remedy for a bad bootstrap
+    /// reading, and `GREATEST` is what makes that edit stick.
+    #[test]
+    fn era_floor_watermark_sql_is_monotonic_and_single_round_trip() {
+        assert!(
+            RECONCILE_ERA_FLOOR_UPSERT_SQL.contains(
+                "GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"
+            ),
+            "without GREATEST the upsert would happily write a LOWER floor: \
+             {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
+        );
+        assert!(
+            RECONCILE_ERA_FLOOR_UPSERT_SQL.ends_with("RETURNING era_floor"),
+            "the post-clamp value must come back from the same statement, else a \
+             concurrent tick's value is silently ignored: \
+             {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
+        );
+        assert!(RECONCILE_ERA_FLOOR_SELECT_SQL.contains("FROM ht_reconcile_era_floor"));
+        assert_eq!(
+            GUEST_REGISTRY_ERA_FLOOR_KEY, "guest_registry",
+            "same literal as ht_reconcile_log.table_name / sync_status.entity_type, \
+             so one operator query joins all three"
+        );
+    }
+
+    /// The circuit breaker. Anything past the cap is a scope bug or a dead
+    /// mirror, not a backlog: the tick must abort whole, never truncate.
+    #[test]
+    fn divergence_cap_trips_only_strictly_above_the_cap() {
+        assert!(!divergence_cap_exceeded(0, 500));
+        assert!(!divergence_cap_exceeded(499, 500));
+        assert!(
+            !divergence_cap_exceeded(500, 500),
+            "the cap is a ceiling the tick may reach, not one it may not touch"
+        );
+        assert!(divergence_cap_exceeded(501, 500));
+        // The flood this exists for: floor dragged to 2023 at HF Hotel.
+        assert!(divergence_cap_exceeded(19_600, 500));
+    }
+
+    /// The default is not a taste call: enqueuing more findings per tick
+    /// than `auto_resolve_reconcile_log` can even LOOK at per tick is the
+    /// mechanism behind every flood incident here — the backlog never
+    /// drains and the age-ordered batch starves every other entity. 500 is
+    /// that sweep's own `LIMIT`; if it ever moves, move this with it.
+    #[test]
+    fn divergence_cap_default_matches_the_auto_resolve_batch() {
+        assert_eq!(GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT, 500);
+        // …and it must dwarf the steady state: 830 in-era folios at HF
+        // Hotel with ~12 findings, 574 with ~29 at Ville (live 2026-07-28).
+        assert!(GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT > 29 * 10);
+    }
+
+    /// Resolution chain + strict positivity: a zero or negative cap would
+    /// make `divergence_cap_exceeded` trip on a perfectly healthy tick and
+    /// wedge the arm shut.
+    #[test]
+    fn divergence_cap_resolves_per_site_and_stays_positive() {
+        assert!(guest_registry_divergence_cap("hfhotel") > 0);
+        assert_eq!(
+            guest_registry_divergence_cap("hfville"),
+            GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT,
+            "unset ⇒ the compiled-in default on every site"
+        );
+    }
+
+    /// A cap breach is announced under its own namespaced key, so the
+    /// sync-lag all-clear can never mistake it for the table
+    /// `guest_registry`, delete its cooldown and un-throttle the page to
+    /// once per tick.
+    #[test]
+    fn reconcile_cap_cooldown_key_is_namespaced_and_unique() {
+        let key = reconcile_cap_cooldown_key("guest_registry");
+        assert_eq!(key, "reconcile_cap:guest_registry");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("reconcile_cap:"),
+                "the reconcile_cap family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ADR 0005 — NULL-clear sentinel tripwire
+    // -------------------------------------------------------------------
+
+    /// Namespacing pin, same shape as
+    /// [`reconcile_cap_cooldown_key_is_namespaced_and_unique`]: the new
+    /// `null_sentinel:` family must not collide with any existing family
+    /// (including `reconcile_cap:`, the newest one before this task) and
+    /// must read as NOT a bare reconcile-table key.
+    #[test]
+    fn null_sentinel_cooldown_key_is_namespaced_and_unique() {
+        let key = null_sentinel_cooldown_key("bookings");
+        assert_eq!(key, "null_sentinel:bookings");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+            "reconcile_cap:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("null_sentinel:"),
+                "the null_sentinel family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6-D — payment-ledger coverage floor HELD by its watermark
+    // -------------------------------------------------------------------
+
+    /// Namespacing pin, same shape as its two predecessors: the new
+    /// `era_floor_held:` family must not collide with any existing family
+    /// and must read as NOT a bare reconcile-table key — otherwise the
+    /// sync-lag all-clear would mistake
+    /// `era_floor_held:payment_ledger_probe` for the entity
+    /// `payment_ledger_probe`, clear its cooldown, and un-throttle the page
+    /// to once per tick.
+    #[test]
+    fn era_floor_held_cooldown_key_is_namespaced_and_unique() {
+        let key = era_floor_held_cooldown_key(PAYMENT_LEDGER_PROBE_KEY);
+        assert_eq!(key, "era_floor_held:payment_ledger_probe");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+            "null_sentinel:",
+            "reconcile_cap:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("era_floor_held:"),
+                "the era_floor_held family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    /// The hold must be CONSECUTIVE, and only the sustained one alerts. One
+    /// held tick is the ratchet working as designed; an hour of it is either
+    /// a real pre-coverage mirror or a stale watermark.
+    #[test]
+    fn only_a_sustained_era_floor_hold_becomes_alertable() {
+        // Unique site key per test: the streak map is a process-global
+        // static shared with every other test in this binary.
+        let site = "test-site-sustained-hold";
+        for tick in 1..ERA_FLOOR_HELD_ALERT_TICKS {
+            let streak = note_era_floor_hold_streak(site, true);
+            assert_eq!(streak, tick);
+            assert!(
+                !era_floor_hold_is_alertable(streak),
+                "a hold of {tick} tick(s) is the ratchet working, not a page"
+            );
+        }
+        let streak = note_era_floor_hold_streak(site, true);
+        assert_eq!(streak, ERA_FLOOR_HELD_ALERT_TICKS);
+        assert!(era_floor_hold_is_alertable(streak));
+        // Still eligible past the threshold — the per-site cooldown does the
+        // throttling, so a hold that outlives one window is re-announced.
+        assert!(era_floor_hold_is_alertable(note_era_floor_hold_streak(
+            site, true
+        )));
+
+        // One non-holding tick resets it: an intermittent hold must never
+        // accumulate into a page.
+        assert_eq!(note_era_floor_hold_streak(site, false), 0);
+        assert_eq!(note_era_floor_hold_streak(site, true), 1);
+        assert!(!era_floor_hold_is_alertable(1));
+    }
+
+    /// Two sites ticking in one process must not share a streak.
+    #[test]
+    fn era_floor_hold_streaks_are_per_site() {
+        let a = "test-site-hold-a";
+        let b = "test-site-hold-b";
+        assert_eq!(note_era_floor_hold_streak(a, true), 1);
+        assert_eq!(note_era_floor_hold_streak(a, true), 2);
+        assert_eq!(
+            note_era_floor_hold_streak(b, true),
+            1,
+            "site B's first hold must not inherit site A's streak"
+        );
+        assert_eq!(note_era_floor_hold_streak(b, false), 0);
+        assert_eq!(
+            note_era_floor_hold_streak(a, true),
+            3,
+            "site B clearing must not clear site A"
+        );
+    }
+
+    /// The alert has to be actionable on its own: BOTH floors (so the reader
+    /// can see the size of the gap), the site, and the one escape hatch that
+    /// can actually lower a watermark — a DELETE of the row.
+    #[test]
+    fn era_floor_held_message_names_both_floors_and_the_escape_hatch() {
+        let body = format_era_floor_held_message("hfhotel", 39113, 40470, 4, 24);
+        assert!(body.contains("39113"), "derived floor missing: {body:?}");
+        assert!(body.contains("40470"), "effective floor missing: {body:?}");
+        assert!(body.contains("hfhotel"), "site missing: {body:?}");
+        assert!(
+            body.contains("DELETE FROM ht_reconcile_era_floor WHERE table_name = \
+                           'payment_ledger_probe';"),
+            "the delete-row escape hatch must be spelled out: {body:?}"
+        );
+        assert!(
+            body.contains("--all"),
+            "must name the coverage-widening backfill that makes a watermark \
+             stale: {body:?}"
+        );
+        assert!(body.contains("24h"), "must state the cooldown: {body:?}");
+    }
+
+    /// Pager-tier decision, pinned like the NULL-sentinel one: a held
+    /// watermark is a "look at this today" finding, not an outage — the
+    /// probe keeps working and the scan does not widen. It must render
+    /// through `with_site_text`, never carrying the `<!channel>` mention.
+    #[test]
+    fn era_floor_held_message_is_not_pager_tier() {
+        let body = format_era_floor_held_message("hfville", 39113, 40470, 4, 24);
+        let msg = SlackMessage::with_site_text("hfville", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "held-watermark alert is not pager-tier: {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// The tripwire only works if it is fed on EVERY successful probe tick:
+    /// a non-holding tick is what clears the streak, so a call site that
+    /// only fired it when something looked wrong would let an intermittent
+    /// hold accumulate into a page.
+    #[test]
+    fn run_sync_feeds_the_era_floor_tripwire_on_every_probe_tick() {
+        let src = include_str!("sync.rs");
+        let at = src
+            .find("payment_ledger_probe::run_payment_ledger_probe(")
+            .expect("run_sync must call the probe");
+        let call_site = &src[at..(at + 1600).min(src.len())];
+        assert!(
+            call_site.contains("note_payment_ledger_era_floor_hold(pg_pool, slack, site_id"),
+            "the probe call site must feed the held-watermark tripwire"
+        );
+        assert!(
+            call_site.contains("outcome.era_floor"),
+            "the tripwire must be fed the tick's OWN floor, both halves"
+        );
+    }
+
+    /// The pure decision this tripwire is built on: zero is quiet, anything
+    /// above zero pages. No volume threshold — one hand-edited row is
+    /// exactly as actionable as a thousand (ADR §3a: no known live path to
+    /// a NULL at all, so any count is already out-of-band).
+    #[test]
+    fn null_sentinel_alert_needed_zero_vs_nonzero() {
+        assert!(!null_sentinel_alert_needed(0));
+        assert!(null_sentinel_alert_needed(1));
+        assert!(null_sentinel_alert_needed(1_000));
+    }
+
+    /// Cooldown suppression, exercised through the same generic
+    /// [`cooldown_elapsed`] machinery every other family in this module
+    /// relies on (this tripwire adds no bespoke cooldown logic — see
+    /// [`alert_null_sentinel_probe`]'s doc comment for why reusing
+    /// [`level_alert_eligible_pg`] was the deliberate choice). A page just
+    /// sent is still inside a 24h window; one from >24h ago is eligible
+    /// again.
+    #[test]
+    fn null_sentinel_cooldown_suppresses_repeat_alert_inside_window() {
+        let now = chrono::Utc::now();
+        let cooldown = std::time::Duration::from_secs(24 * 3600);
+        assert!(
+            !cooldown_elapsed(Some(now), now, cooldown),
+            "a page sent moments ago must not be eligible again immediately"
+        );
+        let just_outside = now - chrono::Duration::hours(24) - chrono::Duration::minutes(1);
+        assert!(
+            cooldown_elapsed(Some(just_outside), now, cooldown),
+            "a page from just past the 24h window must be eligible again"
+        );
+    }
+
+    /// Composition pin: the message names the exact table/column, states
+    /// the count, explains that our sync cannot converge the resulting
+    /// reconcile row, calls out the likely manual-edit cause, and points at
+    /// the ADR for the designed fix. All five are load-bearing for an
+    /// operator with zero context (the task's own bar).
+    #[test]
+    fn null_sentinel_message_is_actionable_to_a_cold_operator() {
+        let probe = &NULL_SENTINEL_PROBES[0];
+        assert_eq!(probe.table_name, "bookings");
+        let body = format_null_sentinel_message(probe, 3, 24);
+        assert!(body.contains("HT_Book_H"), "must name the legacy table: {body:?}");
+        assert!(body.contains("Book_Cust_ID"), "must name the legacy column: {body:?}");
+        assert!(body.contains("*3*"), "must state the count: {body:?}");
+        assert!(
+            body.to_lowercase().contains("cannot"),
+            "must say our sync cannot converge the row: {body:?}"
+        );
+        assert!(
+            body.to_lowercase().contains("hand") || body.to_lowercase().contains("manual"),
+            "must call out a likely manual DB edit: {body:?}"
+        );
+        assert!(
+            body.contains("docs/adr/0005-null-clear-sentinel-semantics.md"),
+            "must point at the ADR for the designed fix: {body:?}"
+        );
+        assert!(body.contains("24h"), "must state the cooldown: {body:?}");
+    }
+
+    /// Second probe sanity: the checkins entry names the right legacy
+    /// table/column pair, distinct from the bookings entry above.
+    #[test]
+    fn null_sentinel_checkins_probe_names_the_right_column() {
+        let probe = &NULL_SENTINEL_PROBES[1];
+        assert_eq!(probe.table_name, "checkins");
+        assert_eq!(probe.legacy_table, "HT_CheckIn_H");
+        assert_eq!(probe.legacy_column, "Cin_cust_no");
+    }
+
+    /// Pager-tier decision, pinned the same way the burst / escalated /
+    /// boot-refusal pager sends are pinned (`with_site_text_paged` leads
+    /// with `<!channel> `). This finding is deliberately NOT pager-tier —
+    /// rare and actionable, but not an outage (see
+    /// [`format_null_sentinel_message`]'s doc comment) — so it must render
+    /// through `with_site_text`, never carrying the mention.
+    #[test]
+    fn null_sentinel_message_composition_has_no_channel_mention() {
+        let body = format_null_sentinel_message(&NULL_SENTINEL_PROBES[0], 1, 24);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "NULL-sentinel page is not pager-tier and must stay unmentioned: {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// Default-enabled flag, per the task's explicit call: this is a
+    /// read-only, zero-expected-noise probe, so unlike every Phase 6
+    /// reconcile arm it ships ON by default (opt OUT via
+    /// `NULL_SENTINEL_TRIPWIRE_ENABLED=false`, not opt in). Uses
+    /// [`with_env_vars`] (the same lock-guarded helper the other flag
+    /// tests in this module use) so this doesn't race a parallel test
+    /// mutating the same process-wide env var.
+    #[test]
+    fn null_sentinel_tripwire_defaults_enabled() {
+        assert!(
+            with_env_vars(&[("NULL_SENTINEL_TRIPWIRE_ENABLED", None)], || {
+                null_sentinel_tripwire_enabled()
+            }),
+            "the tripwire must default ON — it is read-only and writes nothing"
+        );
+        assert!(!with_env_vars(
+            &[("NULL_SENTINEL_TRIPWIRE_ENABLED", Some("false"))],
+            || { null_sentinel_tripwire_enabled() }
+        ));
+    }
+
+    /// The scope gate. Pre-coverage folios and folios with no canonical
+    /// parent are BOTH out of scope: the first can never converge (no
+    /// historical backfill of `ht_guest_registry`), the second is a
+    /// check-ins problem `sync_checkins` already reports.
+    #[test]
+    fn in_era_key_set_sql_is_the_scope_gate() {
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("FROM ht_checkins"));
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("legacy_cin_no IS NOT NULL"));
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("cin_checkin_time >= $1"));
+        // The per-PK canonical probe resolves its parent the same way the
+        // CT mapper does, so the sweep lands on the same folio.
+        assert_eq!(
+            CANONICAL_CHECKIN_ID_PROBE_SQL,
+            "SELECT cin_id FROM ht_checkins WHERE legacy_cin_no = $1 LIMIT 1"
+        );
+    }
+
+    /// Track J1 — projection lock. The IDENTITY `id` must stay OUT (it is
+    /// the very thing the folio unit exists to ignore), the iHOTEL typo
+    /// `Cin_contry` stays verbatim, and `Cin_no` is the lowercase-n variant.
+    #[test]
+    fn guest_registry_reconcile_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(
+            GUEST_REGISTRY_RECONCILE_PROJECTION,
+            "HT_CheckIn_Other_People"
+        );
+        assert!(
+            !GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"id"),
+            "hashing the legacy IDENTITY re-creates the DELETE+reinsert false \
+             positive the folio unit exists to remove"
+        );
+        assert!(GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_contry"));
+        assert!(!GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_country"));
+        assert!(!GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_No"));
+    }
+
+    // -------------------------------------------------------------------
+    // Force-converge outcome classification — the gate ⊂ hash tripwire
+    // (2026-07-28). Pure, no DB.
+    // -------------------------------------------------------------------
+
+    /// The amplifier this fix exists for: the mapper's idempotency gate
+    /// decided "already identical" (`Ok(None)`), canonical did not move, and
+    /// the row is STILL unconverged. Pre-fix this was reported to the sweep
+    /// as a successful repair (`Ok(true)`), so every tick logged "repaired"
+    /// and then "still not converged", forever, while the underlying
+    /// divergence stayed invisible to both detection AND self-heal.
+    #[test]
+    fn gate_skip_flagged_when_mapper_noop_and_hash_static() {
+        assert!(classify_force_converge(
+            ForceConvergeOutcome::MapperNoop,
+            false, // canonical hash unchanged across the apply
+            false, // and the row is still unconverged
+        ));
+
+        // Converged is the dominant condition: if the row DID converge (a
+        // concurrent CT event landed between the probe and the apply), the
+        // sweep closes it and there is nothing to warn about.
+        assert!(
+            !classify_force_converge(ForceConvergeOutcome::MapperNoop, false, true),
+            "a converged row is a resolved row, never a tripwire"
+        );
+
+        // The non-mapper outcomes already have their own log lines
+        // (`legacy row absent` / unsupported table) and must never be
+        // reported as gate skips.
+        for outcome in [
+            ForceConvergeOutcome::SourceRowAbsent,
+            ForceConvergeOutcome::UnsupportedTable,
+        ] {
+            assert!(
+                !classify_force_converge(outcome, false, false),
+                "{outcome:?} is not a mapper gate skip"
+            );
+            assert!(
+                !outcome.mapper_ran(),
+                "{outcome:?} must skip the convergence re-test, as the old Ok(false) did"
+            );
+        }
+    }
+
+    /// A mapper that DID write (`Ok(Some(event))`) but left the row
+    /// unconverged is a different class — the two projections genuinely
+    /// disagree — and keeps the pre-existing "leaving row open for operator
+    /// review" warn. It must not be mislabelled as a gate skip, whether or
+    /// not the canonical hash moved.
+    #[test]
+    fn wrote_but_unconverged_stays_open_without_gate_skip_flag() {
+        for pg_hash_moved in [true, false] {
+            assert!(
+                !classify_force_converge(ForceConvergeOutcome::Wrote, pg_hash_moved, false),
+                "a real write is never a gate skip (pg_hash_moved={pg_hash_moved})"
+            );
+        }
+        // …and it still takes the convergence re-test path, so a successful
+        // re-ingest continues to close its ledger row.
+        assert!(ForceConvergeOutcome::Wrote.mapper_ran());
+        assert!(ForceConvergeOutcome::MapperNoop.mapper_ran());
+    }
+
+    /// The subtlety that makes a bare "`Ok(None)` ⇒ gate-skipped" test
+    /// wrong: several write paths legitimately return `Ok(None)` — the room
+    /// mapper always UPSERTs but only emits an event on a `room_clean` flip,
+    /// and the cancel / soft-delete paths write without an event. Those DO
+    /// move the canonical hash, which is exactly how they are told apart
+    /// from a gate skip.
+    #[test]
+    fn noop_with_hash_movement_is_not_a_gate_skip() {
+        assert!(
+            !classify_force_converge(ForceConvergeOutcome::MapperNoop, true, false),
+            "an event-less write that moved canonical is a legitimate repair, \
+             not a gate skip — it just hasn't converged yet"
+        );
+        assert!(!classify_force_converge(
+            ForceConvergeOutcome::MapperNoop,
+            true,
+            true
+        ));
+        // `from_mapper_event` is the single place `Ok(Some)`/`Ok(None)` is
+        // interpreted; pin the `None` half here (the `Some` half needs a
+        // real `DomainEvent`, which the mapper tests already cover).
+        assert_eq!(
+            ForceConvergeOutcome::from_mapper_event(None),
+            ForceConvergeOutcome::MapperNoop
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Auto-resolve sweep candidate ordering — the FK guarantee.
     // -------------------------------------------------------------------
 
@@ -6925,6 +12941,954 @@ mod tests {
         assert!(reconcile_table_fk_rank("rooms") < reconcile_table_fk_rank("bookings"));
         assert!(reconcile_table_fk_rank("bookings") < reconcile_table_fk_rank("checkins"));
         assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("something_new"));
+    }
+
+    /// Phase 6-C. Every mirror probe key must be RESOLVABLE — listed here
+    /// AND dispatched by both `compute_current_*_hash` — or its rows sit
+    /// open forever and, being selected by age alone, eventually own the
+    /// sweep's whole 500-row batch (the 2026-05-18 `rooms` failure mode).
+    #[test]
+    fn resolvable_tables_lists_every_mirror_probe_key() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(
+                RECONCILE_RESOLVABLE_TABLES.contains(&key),
+                "mirror probe `{key}` is not in RECONCILE_RESOLVABLE_TABLES"
+            );
+        }
+    }
+
+    /// A probe is ranked LAST but still ranked: falling through to the
+    /// wildcard would fire the `debug_assert!` for a listed-but-unranked
+    /// table, which is a test failure, not a silent demotion.
+    #[test]
+    fn reconcile_fk_rank_ranks_mirror_probes_after_every_entity() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(
+                reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank(key),
+                "{key} must sort after every healable entity"
+            );
+            assert!(
+                reconcile_table_fk_rank(key) < reconcile_table_fk_rank("something_new"),
+                "{key} must still be ranked ahead of the unranked wildcard"
+            );
+        }
+    }
+
+    /// The probe writes nothing but `ht_reconcile_log`: no probe key may
+    /// appear in either self-heal list, or the sweep would start re-driving
+    /// opaque mirror rows (plan 6-D, a separate coordinated decision).
+    #[test]
+    fn mirror_probes_are_in_neither_self_heal_list() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&key));
+            assert!(!REINGEST_MISSING_PG_TABLES.contains(&key));
+            assert!(!force_converge_value_drift_eligible(
+                key,
+                Some("a"),
+                Some("b"),
+                f64::MAX,
+                true
+            ));
+            assert!(!reingest_missing_pg_eligible(
+                key,
+                Some("a"),
+                None,
+                f64::MAX,
+                true
+            ));
+        }
+    }
+
+    // =====================================================================
+    // Issues #273 / #282 / #281 — calendar `(room, night)` set-diff arm
+    // =====================================================================
+
+    /// The key literal this module dispatches on must still be the one the
+    /// probe registry uses. A rename on either side would silently route
+    /// calendar rows back to the never-equal id-keyed arm.
+    #[test]
+    fn room_calendar_probe_key_matches_the_registered_mirror_probe() {
+        let probe = crate::scheduler::mirror_probe::probe_for_table(ROOM_CALENDAR_PROBE_KEY)
+            .expect("the calendar probe must still be registered under this key");
+        assert_eq!(probe.mirror_table, "ht_room_calendar");
+        assert_eq!(probe.legacy_table, "HT_Room_Status");
+        assert!(
+            RECONCILE_RESOLVABLE_TABLES.contains(&ROOM_CALENDAR_PROBE_KEY),
+            "a dispatched-but-unlisted probe key is invisible to the \
+             resolvable-list guards"
+        );
+    }
+
+    /// The calendar arm introduces NO new `ht_reconcile_log.table_name` and
+    /// no new hashed entity: it RE-KEYS the existing probe. So there is
+    /// nothing to register with `gate_guard` (whose contract binds CT-mapper
+    /// idempotency gates to reconcile hashes — no probe has one) and
+    /// `RECONCILE_RESOLVABLE_TABLES` needs no new entry. This pins that the
+    /// mirror population did not grow.
+    #[test]
+    fn calendar_closure_arm_adds_no_new_resolvable_table() {
+        let listed = RECONCILE_RESOLVABLE_TABLES
+            .iter()
+            .filter(|t| t.starts_with("mirror_"))
+            .count();
+        assert_eq!(
+            listed,
+            crate::scheduler::mirror_probe::mirror_probe_keys().len(),
+            "the calendar arm must re-key an EXISTING probe, not register a \
+             new reconcile entity"
+        );
+    }
+
+    // ── fixtures ─────────────────────────────────────────────────────────
+
+    fn legacy_pairs(
+        rows: &[(&str, &str, i64, i64)],
+    ) -> BTreeMap<RoomCalendarPair, LegacyCalendarNight> {
+        rows.iter()
+            .map(|(room, night, legacy_id, row_count)| {
+                (
+                    (room.to_string(), night.to_string()),
+                    LegacyCalendarNight {
+                        legacy_id: *legacy_id,
+                        row_count: *row_count,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn canonical_pairs(
+        rows: &[(&str, &str, i64, Option<i64>)],
+    ) -> BTreeMap<RoomCalendarPair, CanonicalCalendarTile> {
+        rows.iter()
+            .map(|(room, night, rcal_id, legacy_id)| {
+                (
+                    (room.to_string(), night.to_string()),
+                    CanonicalCalendarTile {
+                        rcal_id: *rcal_id,
+                        legacy_id: *legacy_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// HF Ville, 2026-08-10 (`docs/coexistence/sync-incident-log.md`): four
+    /// `(107, night)` slots present in `HT_Room_Status` and absent from
+    /// `ht_room_calendar` entirely, CT aged out past redelivery.
+    fn ville_dropped_nights() -> [(&'static str, &'static str, i64, i64); 4] {
+        [
+            ("107", "2026-07-28", 4692, 1),
+            ("107", "2026-08-05", 4799, 1),
+            ("107", "2026-08-06", 4815, 1),
+            ("107", "2026-08-08", 4832, 1),
+        ]
+    }
+
+    // ── the classifier ───────────────────────────────────────────────────
+
+    /// THE class the arm exists for (2026-08-10, HF Ville): nights legacy has
+    /// and canonical does not. Must be `missing_pg`, must NOT be silenced by
+    /// anything the #282 fix introduced.
+    #[test]
+    fn room_calendar_genuine_missing_night_is_missing_pg() {
+        let mut legacy_rows = vec![("107", "2026-07-27", 4648, 1)];
+        legacy_rows.extend(ville_dropped_nights());
+        let legacy = legacy_pairs(&legacy_rows);
+        // Canonical holds only the night that DID sync.
+        let canonical = canonical_pairs(&[("107", "2026-07-27", 900, Some(4648))]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(!c.is_converged());
+        assert_eq!(c.divergence_kind(), Some(DivergenceKind::MissingPg));
+        assert_eq!(c.missing_pg.len(), 4);
+        assert_eq!(c.covered_pairs(), 1);
+        assert_eq!(
+            c.missing_pg
+                .iter()
+                .map(|m| (m.night.as_str(), m.legacy_id))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-07-28", 4692),
+                ("2026-08-05", 4799),
+                ("2026-08-06", 4815),
+                ("2026-08-08", 4832),
+            ],
+            "the missing set carries the legacy ids the operator needs, in a \
+             stable order"
+        );
+        assert!(c.restamp.is_empty());
+        assert!(c.surplus_detached.is_empty());
+        assert_ne!(c.deficit_hash(), room_calendar_converged_hash());
+    }
+
+    /// Issue #282, the false positive. A pair present on BOTH sides whose
+    /// canonical tile merely lost its back-pointer is CONVERGED — and it is
+    /// queued for the heal arm rather than tolerated.
+    #[test]
+    fn room_calendar_class_b_pair_is_converged_and_queues_a_restamp() {
+        let legacy = legacy_pairs(&[("405", "2026-05-11", 50980, 1)]);
+        let canonical = canonical_pairs(&[("405", "2026-05-11", 48, None)]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(
+            c.is_converged(),
+            "the night IS mirrored — only the id back-pointer is stale (#282)"
+        );
+        assert_eq!(c.divergence_kind(), None);
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+        assert_eq!(
+            c.restamp,
+            vec![RoomCalendarRestamp {
+                rcal_id: 48,
+                legacy_id: 50980,
+                room_no: "405".to_string(),
+                night: "2026-05-11".to_string(),
+                legacy_rows: 1,
+            }]
+        );
+        assert!(c.restamp_conflicts.is_empty());
+        assert_eq!(c.matched_bound, 0);
+    }
+
+    /// Legacy permits duplicate rows for one slot (live: ids 4223/4224/4225
+    /// all on room 201, night 2026-06-30). The re-stamp must pick the SAME
+    /// one every tick, or a retried heal writes a different id than the one
+    /// it reported.
+    #[test]
+    fn room_calendar_restamp_picks_the_min_legacy_id_when_the_slot_is_duplicated() {
+        // `MIN(id)` is applied by the SQL; the classifier must carry it
+        // through untouched and report the ambiguity.
+        let legacy = legacy_pairs(&[("201", "2026-06-30", 4223, 3)]);
+        let canonical = canonical_pairs(&[("201", "2026-06-30", 700, None)]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(c.restamp.len(), 1);
+        assert_eq!(c.restamp[0].legacy_id, 4223);
+        assert_eq!(c.restamp[0].legacy_rows, 3);
+        assert!(
+            room_calendar_pairs_legacy_sql(true).contains("MIN(CAST(id AS BIGINT))"),
+            "the legacy scan must be the one that picks MIN — a Rust-side \
+             pick over an unaggregated scan would depend on row order"
+        );
+    }
+
+    /// The partial unique index `ux_ht_room_calendar_legacy_id` allows one
+    /// canonical row per legacy id. A class-B tile whose legacy id is already
+    /// bound elsewhere must be left to the CT path — still converged, never a
+    /// re-stamp candidate.
+    #[test]
+    fn room_calendar_restamp_is_skipped_when_the_legacy_id_is_bound_elsewhere() {
+        let legacy = legacy_pairs(&[
+            ("405", "2026-05-11", 50980, 1),
+            ("406", "2026-05-11", 50981, 1),
+        ]);
+        // 50980 already points at room 406's tile (the allocator rebound it).
+        let canonical = canonical_pairs(&[
+            ("405", "2026-05-11", 48, None),
+            ("406", "2026-05-11", 49, Some(50980)),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged(), "both nights are mirrored");
+        assert!(
+            c.restamp.is_empty(),
+            "re-stamping a bound id would violate ux_ht_room_calendar_legacy_id"
+        );
+        assert_eq!(
+            c.restamp_conflicts,
+            vec![("405".to_string(), "2026-05-11".to_string())]
+        );
+    }
+
+    /// Class A (issue #281): a canonical tile with no legacy counterpart at
+    /// all. It is REPORTED in the classification (so the probe can log it)
+    /// and it must NOT make the comparison diverge — a row for it could never
+    /// be closed, which is what forced the 2026-07-31 Ville revert.
+    #[test]
+    fn room_calendar_class_a_surplus_is_classified_but_never_diverges() {
+        let legacy = legacy_pairs(&[("303", "2026-05-13", 50000, 1)]);
+        let canonical = canonical_pairs(&[
+            ("303", "2026-05-13", 86, Some(50000)),
+            ("303", "2026-05-14", 87, None),
+            ("303", "2026-05-15", 88, None),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(c.divergence_kind(), None);
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+        assert_eq!(
+            c.surplus_detached,
+            vec![
+                ("303".to_string(), "2026-05-14".to_string()),
+                ("303".to_string(), "2026-05-15".to_string()),
+            ]
+        );
+        assert!(c.surplus_bound.is_empty());
+        assert_eq!(c.matched_bound, 1);
+    }
+
+    /// A canonical-only pair that STILL carries a legacy id is a different
+    /// animal (a lost `D` event, not a #281 orphan) and is reported apart —
+    /// but it is still not recorded: the surplus side has no closure path
+    /// until #281 ships one.
+    #[test]
+    fn room_calendar_bound_surplus_is_reported_apart_and_still_not_a_divergence() {
+        let legacy = legacy_pairs(&[]);
+        let canonical = canonical_pairs(&[("311", "2026-05-30", 1571, Some(41000))]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(
+            c.surplus_bound,
+            vec![("311".to_string(), "2026-05-30".to_string())]
+        );
+        assert!(c.surplus_detached.is_empty());
+    }
+
+    /// THE #282 fixture: room 405's week as it stood live on 2026-08-04 —
+    /// `05-11..13` class B, `05-14`/`05-15` class A, in one comparison. A
+    /// correct implementation stays SILENT on B, LOGS A, and records nothing.
+    /// The pre-fix count comparison (mirrored-rows-only) is asserted red in
+    /// the same test so the regression cannot come back unnoticed.
+    #[test]
+    fn room_calendar_405_week_is_silent_on_class_b_and_records_nothing() {
+        let legacy = legacy_pairs(&[
+            ("405", "2026-05-11", 50980, 1),
+            ("405", "2026-05-12", 50981, 1),
+            ("405", "2026-05-13", 50982, 1),
+        ]);
+        let canonical = canonical_pairs(&[
+            ("405", "2026-05-11", 48, None),
+            ("405", "2026-05-12", 49, None),
+            ("405", "2026-05-13", 50, None),
+            ("405", "2026-05-14", 51, None),
+            ("405", "2026-05-15", 52, None),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(
+            c.is_converged(),
+            "every legacy night is mirrored — the 2026-08-04 `missing_pg` was \
+             an artefact of counting only bound tiles (#282)"
+        );
+        assert_eq!(c.restamp.len(), 3, "class B: 05-11..13");
+        assert_eq!(c.surplus_detached.len(), 2, "class A: 05-14, 05-15");
+        assert!(c.missing_pg.is_empty());
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+
+        // PRE-FIX: the canonical side counted `rcal_legacy_id IS NOT NULL`
+        // only — 3 legacy nights vs 0 mirrored — and fabricated a deficit.
+        let bound_only = canonical
+            .values()
+            .filter(|t| t.legacy_id.is_some())
+            .count();
+        assert_eq!(bound_only, 0);
+        assert!(
+            legacy.len() > bound_only,
+            "this inequality IS the false missing_pg the count comparison \
+             reported live on 2026-08-04"
+        );
+    }
+
+    /// Sweep-closure invariant: the deficit the probe records must be the
+    /// same thing the auto-resolve sweep re-measures, so backfilling the
+    /// missing nights CLOSES the row. Both landing shapes are covered — with
+    /// the legacy id stamped (a `backfill_room_calendar` re-drive) and
+    /// without it (a tile that lands detached) — because either one means the
+    /// night is mirrored.
+    #[test]
+    fn room_calendar_row_closes_once_the_missing_nights_land() {
+        let legacy = legacy_pairs(&ville_dropped_nights());
+        let converged_hash = room_calendar_converged_hash();
+
+        let before = classify_room_calendar_pairs(&legacy, &canonical_pairs(&[]));
+        assert_eq!(before.missing_pg.len(), 4);
+        assert!(!should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&before.deficit_hash()),
+            Some(&converged_hash),
+            None
+        ));
+
+        for landed_id in [Some(4692), None] {
+            let after = classify_room_calendar_pairs(
+                &legacy,
+                &canonical_pairs(&[
+                    ("107", "2026-07-28", 1001, landed_id),
+                    ("107", "2026-08-05", 1002, Some(4799)),
+                    ("107", "2026-08-06", 1003, Some(4815)),
+                    ("107", "2026-08-08", 1004, Some(4832)),
+                ]),
+            );
+            assert!(after.is_converged());
+            assert_eq!(after.deficit_hash(), converged_hash);
+            assert!(
+                should_auto_resolve(
+                    ROOM_CALENDAR_PROBE_KEY,
+                    Some(&after.deficit_hash()),
+                    Some(&converged_hash),
+                    None
+                ),
+                "a backfilled night must close the row whether or not it \
+                 landed with its legacy id stamped"
+            );
+        }
+    }
+
+    /// THE property that eliminates the record/resolve churn loop: for every
+    /// fixture, detection's "converged?" answer (`is_converged`) and
+    /// `should_auto_resolve`'s verdict on the very hashes the two resolve
+    /// arms produce must agree. Before the arm shared one classification the
+    /// two asked different questions, so resolve could close a row detection
+    /// immediately re-opened.
+    #[test]
+    fn detection_and_resolution_agree_on_convergence_for_every_fixture() {
+        let converged_hash = room_calendar_converged_hash();
+        let cases: Vec<(&str, RoomCalendarClassification)> = vec![
+            (
+                "empty on both sides",
+                classify_room_calendar_pairs(&legacy_pairs(&[]), &canonical_pairs(&[])),
+            ),
+            (
+                "fully mirrored",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("301", "2025-04-13", 39707, 1)]),
+                    &canonical_pairs(&[("301", "2025-04-13", 6425, Some(39707))]),
+                ),
+            ),
+            (
+                "class B only (#282, HF Hotel 2026-08-04)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("405", "2026-05-11", 50980, 1)]),
+                    &canonical_pairs(&[("405", "2026-05-11", 48, None)]),
+                ),
+            ),
+            (
+                "class A only (#281, both sites)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[]),
+                    &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
+                ),
+            ),
+            (
+                "genuine deficit (HF Ville 2026-08-10)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&ville_dropped_nights()),
+                    &canonical_pairs(&[]),
+                ),
+            ),
+            (
+                "deficit alongside both surplus classes",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("107", "2026-08-05", 4799, 1), ("405", "2026-05-11", 50980, 1)]),
+                    &canonical_pairs(&[
+                        ("405", "2026-05-11", 48, None),
+                        ("303", "2026-05-14", 87, None),
+                    ]),
+                ),
+            ),
+        ];
+
+        for (name, c) in cases {
+            let resolution_says_converged = should_auto_resolve(
+                ROOM_CALENDAR_PROBE_KEY,
+                Some(&c.deficit_hash()),
+                Some(&converged_hash),
+                None,
+            );
+            assert_eq!(
+                resolution_says_converged,
+                c.is_converged(),
+                "detection and resolution disagree for `{name}` — this IS the \
+                 churn-loop hazard the shared classification exists to close"
+            );
+        }
+    }
+
+    /// The convergence channel: content-addressed, empty-set-is-a-real-hash,
+    /// and incapable of colliding with the id-keyed aggregate hash the
+    /// generic probe computes for the same key (they measure different
+    /// things; a collision would let a mixed-binary fleet close a row on the
+    /// wrong comparison).
+    #[test]
+    fn room_calendar_deficit_hash_is_content_addressed_and_collision_free() {
+        let one = |room: &str, night: &str, id: i64| RoomCalendarMissingNight {
+            room_no: room.to_string(),
+            night: night.to_string(),
+            legacy_id: id,
+        };
+        let converged = room_calendar_converged_hash();
+        assert!(!converged.is_empty(), "an empty deficit is a REAL hash");
+        assert_eq!(converged, room_calendar_deficit_hash(&[]));
+
+        let a = room_calendar_deficit_hash(&[one("107", "2026-08-05", 4799)]);
+        let b = room_calendar_deficit_hash(&[one("107", "2026-08-06", 4815)]);
+        assert_ne!(a, converged);
+        assert_ne!(
+            a, b,
+            "same-sized but DIFFERENT deficits must not hash alike — one \
+             night backfilled while another drops is not convergence"
+        );
+        assert_ne!(
+            a,
+            room_calendar_deficit_hash(&[
+                one("107", "2026-08-05", 4799),
+                one("107", "2026-08-06", 4815)
+            ])
+        );
+        assert_ne!(
+            converged,
+            crate::scheduler::mirror_probe::mirror_aggregate_hash(
+                ROOM_CALENDAR_PROBE_KEY,
+                0,
+                None,
+                None
+            )
+        );
+    }
+
+    /// Never `Cardinality` (the hourly drift digest filters that kind out, so
+    /// it would go unpaged) and never `MissingMssql` (surplus is deliberately
+    /// not recorded — issue #281 owns that side).
+    #[test]
+    fn room_calendar_divergence_is_missing_pg_or_nothing() {
+        for c in [
+            classify_room_calendar_pairs(&legacy_pairs(&ville_dropped_nights()), &canonical_pairs(&[])),
+            classify_room_calendar_pairs(
+                &legacy_pairs(&[]),
+                &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
+            ),
+            classify_room_calendar_pairs(&legacy_pairs(&[]), &canonical_pairs(&[])),
+        ] {
+            match c.divergence_kind() {
+                None => assert!(c.is_converged()),
+                Some(kind) => assert_eq!(kind, DivergenceKind::MissingPg),
+            }
+        }
+    }
+
+    // ── SQL shape ────────────────────────────────────────────────────────
+
+    /// The era floor is DERIVED from the MIRRORED population (`MIN(rcal_date)`
+    /// where the back-pointer survives), never configured and never a rolling
+    /// window — the `PAYMENTS_ERA_FLOOR_SQL` lesson. Scoping the FLOOR to
+    /// mirrored rows is right (a detached tile older than the mirror's first
+    /// mirrored night would drag legacy history into a window the mirror
+    /// never covered); scoping the COMPARISON to them was issue #282.
+    #[test]
+    fn room_calendar_era_floor_is_derived_from_the_mirrored_population() {
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("MIN(rcal_date)"));
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("FROM ht_room_calendar"));
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("WHERE rcal_legacy_id IS NOT NULL"));
+        assert!(
+            !ROOM_CALENDAR_ERA_FLOOR_SQL.contains("INTERVAL"),
+            "the floor must be the mirror's own coverage boundary, not a \
+             rolling window"
+        );
+    }
+
+    /// Issue #282 — THE fix. The canonical PAIR scan must see EVERY in-era
+    /// tile, detached ones included: a tile with a NULL back-pointer may well
+    /// be a night legacy still holds (class B), and filtering it out is what
+    /// fabricated the 2026-08-04 `missing_pg`.
+    #[test]
+    fn room_calendar_pair_scan_sees_detached_tiles_too() {
+        let sql: String = ROOM_CALENDAR_PAIRS_PG_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !sql.contains("rcal_legacy_id IS NOT NULL"),
+            "the pair scan must NOT be scoped to bound tiles — that filter \
+             hid class-B nights and fabricated a deficit (#282): {sql}"
+        );
+        assert!(
+            sql.contains("c.rcal_legacy_id"),
+            "the scan must carry the back-pointer's nullability per pair so \
+             class A and class B can be told apart: {sql}"
+        );
+        assert!(
+            sql.contains("c.rcal_id"),
+            "the re-stamp needs the tile's own PK as its target: {sql}"
+        );
+        assert!(
+            sql.contains("JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id"),
+            "room_no is the half of the business key legacy speaks: {sql}"
+        );
+        assert!(
+            !sql.contains("TRIM(") && !sql.contains("LOWER("),
+            "room_no matching must stay EXACT — `resolve::resolve_room_id` \
+             uses `room_no = $1`, and a normalisation here would disagree \
+             with the mapper about which slot a legacy row belongs to: {sql}"
+        );
+        assert!(
+            sql.contains("$1::date IS NULL OR c.rcal_date >= $1::date"),
+            "the floor is a BOUND parameter and NULL means `no mirrored \
+             coverage — compare everything`: {sql}"
+        );
+    }
+
+    /// The legacy side must collapse to distinct `(room_no, night)` pairs:
+    /// canonical is UNIQUE on `(rcal_room_id, rcal_date)` while
+    /// `HT_Room_Status` is not, so a raw row scan would report the legacy
+    /// allocator's duplicates as a permanent deficit. `GROUP BY` (not
+    /// `DISTINCT`) because the re-stamp needs one deterministic id per slot.
+    #[test]
+    fn room_calendar_legacy_sql_groups_pairs_and_pushes_the_floor() {
+        let floored = room_calendar_pairs_legacy_sql(true);
+        assert!(floored.contains("GROUP BY room_no, CAST(room_date AS DATE)"));
+        assert!(floored.contains("MIN(CAST(id AS BIGINT)) AS legacy_id"));
+        assert!(floored.contains("COUNT_BIG(*) AS row_count"));
+        assert!(floored.contains("CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"));
+        assert!(
+            floored.contains("CONVERT(varchar(10), CAST(room_date AS DATE), 23)"),
+            "the night must come back as ISO text so both sides key on \
+             byte-identical YYYY-MM-DD"
+        );
+        assert!(
+            !floored.contains("N'"),
+            "no `N'…'` literals against the legacy DB — TIS-620 corruption"
+        );
+
+        let unfloored = room_calendar_pairs_legacy_sql(false);
+        assert!(
+            !unfloored.contains("@P1"),
+            "an empty mirror binds no floor — it scans the whole table on \
+             purpose"
+        );
+        assert!(unfloored.contains("GROUP BY room_no, CAST(room_date AS DATE)"));
+    }
+
+    /// The heal arm's single statement must be incapable of violating
+    /// `ux_ht_room_calendar_legacy_id` and incapable of clobbering a pointer
+    /// the CT mapper stamped between the scan and the write.
+    #[test]
+    fn room_calendar_restamp_sql_cannot_break_the_partial_unique_index() {
+        let sql: String = ROOM_CALENDAR_RESTAMP_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sql.starts_with("UPDATE ht_room_calendar SET rcal_legacy_id = $1"));
+        assert!(
+            sql.contains("rcal_updated_at = NOW()"),
+            "a healed tile must look edited: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE rcal_id = $2"),
+            "the target is the exact tile the classifier resolved: {sql}"
+        );
+        assert!(
+            sql.contains("AND rcal_legacy_id IS NULL"),
+            "idempotent, and it must not overwrite a pointer the CT path \
+             stamped in the meantime: {sql}"
+        );
+        assert!(
+            sql.contains("NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"),
+            "the id must not already be bound to another row — the partial \
+             unique index would raise: {sql}"
+        );
+    }
+
+    /// The heal writes canonical state, so it ships DARK on its own switch —
+    /// NOT folded into `RECONCILE_FORCE_CONVERGE_ENABLED`, which is already
+    /// `true` in production at both sites and would have shipped this on with
+    /// no coordinated flip (the `reconcile_reingest_missing_pg_enabled`
+    /// precedent).
+    #[test]
+    fn calendar_restamp_flag_defaults_off_and_is_strict() {
+        const FLAG: &str = "RECONCILE_CALENDAR_RESTAMP_ENABLED";
+        assert!(!with_self_heal_flag_env(FLAG, None, {
+            room_calendar_restamp_enabled
+        }));
+        assert!(!with_self_heal_flag_env(FLAG, Some("TRUE"), {
+            room_calendar_restamp_enabled
+        }));
+        assert!(!with_self_heal_flag_env(FLAG, Some("1"), {
+            room_calendar_restamp_enabled
+        }));
+        assert!(with_self_heal_flag_env(FLAG, Some("true"), {
+            room_calendar_restamp_enabled
+        }));
+        assert_ne!(
+            FLAG, FORCE_CONVERGE_FLAG,
+            "a brand-new canonical-write class must not ride an already-live \
+             flag"
+        );
+    }
+
+    // ── wiring ───────────────────────────────────────────────────────────
+
+    /// Detection and closure must read ONE comparison. If either grew its own
+    /// query, a row one opened could become one the other can never close —
+    /// the exact failure this arm exists to kill.
+    #[test]
+    fn room_calendar_detection_and_closure_share_one_comparison() {
+        let src = scheduler_source_before_tests();
+        for func in [
+            "async fn compute_room_calendar_deficit_hash(",
+            "pub(crate) async fn probe_room_calendar_business_key(",
+        ] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &src[start..];
+            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+            assert!(
+                body.contains("compare_room_calendar_pairs(legacy_pool, pg_pool)"),
+                "{func} must go through the SHARED comparison, so detection \
+                 and closure cannot disagree about `converged`"
+            );
+            assert!(
+                !body.contains("FROM ht_room_calendar"),
+                "{func} must not carry its own query — one shared definition \
+                 of the pair sets, or a recorded row becomes unclosable"
+            );
+        }
+        // The canonical resolve arm answers with the target of that same
+        // comparison rather than a query of its own.
+        let pg_arm_at = src
+            .find("async fn compute_current_pg_hash(")
+            .expect("the canonical dispatch must exist");
+        let rest = &src[pg_arm_at..];
+        let pg_arm = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+        assert!(
+            pg_arm.contains("Ok(Some(room_calendar_converged_hash()))"),
+            "the canonical side of a set-diff contributes the EMPTY deficit; \
+             the comparison itself lives in the arm that holds both pools"
+        );
+    }
+
+    /// ORDER IS LOAD-BEARING. The calendar arm must precede the generic
+    /// `probe_for_table` arm in BOTH resolve dispatches — Rust match arms
+    /// are tried top-down, so a calendar row would otherwise be swallowed by
+    /// the generic id-keyed arm and could never converge. It must also be
+    /// scoped to the `<aggregate>` PK so a per-PK row still falls through.
+    #[test]
+    fn room_calendar_arm_precedes_the_generic_probe_arm_in_both_dispatches() {
+        let src = scheduler_source_before_tests();
+        for func in [
+            "async fn compute_current_pg_hash(",
+            "async fn compute_current_legacy_hash(",
+        ] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &src[start..];
+            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+
+            let calendar_at = body
+                .find("ROOM_CALENDAR_PROBE_KEY")
+                .unwrap_or_else(|| panic!("{func} must dispatch the calendar arm"));
+            let generic_at = body
+                .find("mirror_probe::probe_for_table(t).is_some()")
+                .unwrap_or_else(|| panic!("{func} must still dispatch the generic probe arm"));
+            assert!(
+                calendar_at < generic_at,
+                "{func}: the calendar arm must come BEFORE the generic probe \
+                 arm, or the never-equal id-keyed aggregate wins and the row \
+                 can never close"
+            );
+            assert!(
+                body[calendar_at..generic_at].contains("MIRROR_AGGREGATE_PK"),
+                "{func}: the calendar arm must be scoped to the `<aggregate>` \
+                 PK so a per-PK row still falls through to the generic arm"
+            );
+        }
+    }
+
+    /// "No re-mint of a still-open row": what prevents `record_divergence`
+    /// from inserting a second row for an UNCHANGED mismatch is that the
+    /// stored `mssql_hash` / `pg_hash` are the STABLE sentinel
+    /// (`mirror_probe::mirror_aggregate_sentinel`), never the live deficit
+    /// hash — `record_divergence`'s `NOT EXISTS (…) AND mssql_hash IS NOT
+    /// DISTINCT FROM $4` dedupe then matches the row already open from the
+    /// previous tick. A live hash would move the moment one more night went
+    /// missing and mint a fresh row. Source-scanned because this is a
+    /// property of what gets PASSED to `record_divergence`.
+    #[test]
+    fn calendar_detection_records_the_stable_sentinel_not_the_live_hash() {
+        let src = scheduler_source_before_tests();
+        let start = src
+            .find("pub(crate) async fn probe_room_calendar_business_key(")
+            .expect("detection fn must exist");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("mirror_aggregate_sentinel(ROOM_CALENDAR_PROBE_KEY)"),
+            "detection must record the STABLE sentinel, or a merely-changed \
+             deficit mints a fresh row"
+        );
+        let record_at = body
+            .find("record_divergence(")
+            .expect("detection must call record_divergence");
+        let call = &body[record_at..(record_at + 400).min(body.len())];
+        assert!(
+            call.contains("pg_row_hash.as_deref()") && call.contains("mssql_hash.as_deref()"),
+            "record_divergence must be called with the sentinel-derived \
+             `pg_row_hash` / `mssql_hash` locals: {call}"
+        );
+        let words: std::collections::HashSet<&str> = call
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .collect();
+        assert!(
+            !words.contains("deficit_hash"),
+            "record_divergence must not be called with the live deficit hash: {call}"
+        );
+    }
+
+    // =====================================================================
+    // Issue #267 — scheduler-side event_name registry
+    // =====================================================================
+
+    /// Source of THIS module up to the test module. Scanning further would
+    /// match the very literals these registry tests are built from (the
+    /// `include_str!` self-reference trap, same as `scheduler::mirror`).
+    fn scheduler_source_before_tests() -> &'static str {
+        let full = include_str!("sync.rs");
+        let cut = full
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist");
+        &full[..cut]
+    }
+
+    /// Shape lock. Names must be greppable from any locale, and the
+    /// scheduler namespace must stay DISJOINT from the watcher's dotted
+    /// `sync.…` taxonomy so a Loki filter of `^sync\.` still means "the CT
+    /// watcher" and nothing else.
+    #[test]
+    fn known_scheduler_event_names_are_unique_and_greppable() {
+        let unique: std::collections::HashSet<&str> =
+            KNOWN_SCHEDULER_EVENT_NAMES.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            "KNOWN_SCHEDULER_EVENT_NAMES has duplicate entries — each name \
+             must appear exactly once"
+        );
+        assert!(
+            !KNOWN_SCHEDULER_EVENT_NAMES.is_empty(),
+            "registry emptied — a refactor deleted the array contents"
+        );
+        for name in KNOWN_SCHEDULER_EVENT_NAMES {
+            assert!(!name.is_empty(), "empty event name in the registry");
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "event name `{name}` must be lowercase snake_case ASCII"
+            );
+            assert!(
+                !name.contains('.'),
+                "event name `{name}` uses a dot — dots are reserved for the \
+                 watcher's `sync.…` namespace in bin/sync.rs, and the two \
+                 registries must stay disjoint"
+            );
+        }
+    }
+
+    /// THE LOCK (issue #267), half one: every `EV_…` constant declared in
+    /// this module must be registered, and the registry must hold nothing
+    /// else. Adding a new event constant without registering it fails here.
+    #[test]
+    fn every_scheduler_event_name_constant_is_registered() {
+        let src = scheduler_source_before_tests();
+        let mut declared: Vec<String> = Vec::new();
+        for (i, _) in src.match_indices("const EV_") {
+            let after = &src[i..];
+            let eq = after
+                .find(" = \"")
+                .expect("an EV_ constant must bind a plain string literal");
+            let value = &after[eq + 4..];
+            let end = value.find('"').expect("unterminated EV_ literal");
+            declared.push(value[..end].to_string());
+        }
+        assert!(
+            !declared.is_empty(),
+            "no EV_ constants found — the scan or the constants moved"
+        );
+        for name in &declared {
+            assert!(
+                KNOWN_SCHEDULER_EVENT_NAMES.contains(&name.as_str()),
+                "event name `{name}` is declared but NOT in \
+                 KNOWN_SCHEDULER_EVENT_NAMES — a grep-based consumer \
+                 (/diagnose-alert, dashboards) would have no registry entry \
+                 to check against"
+            );
+        }
+        assert_eq!(
+            declared.len(),
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            "registry size {} does not match the {} declared EV_ constants — \
+             it holds a name nothing emits, or lost one that something does",
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            declared.len()
+        );
+    }
+
+    /// THE LOCK, half two: no emission site may name its event with a raw
+    /// string literal. Together with the half above this is what makes an
+    /// UNREGISTERED addition fail — a literal trips this test, a new
+    /// constant trips the other one.
+    #[test]
+    fn every_scheduler_event_emission_uses_a_registered_constant() {
+        let src = scheduler_source_before_tests();
+        let attr = "event_name";
+        let all = src.matches(&format!("{attr} = ")).count();
+        let via_const = src.matches(&format!("{attr} = EV_")).count();
+        assert!(
+            all >= 2,
+            "expected ≥2 structured event emissions in this module; found \
+             {all} — the region may have been refactored away"
+        );
+        assert_eq!(
+            all, via_const,
+            "{} emission site(s) name their event with a raw string literal \
+             instead of a registered EV_ constant. A typo or rename there is \
+             invisible to the registry and silently breaks the \
+             /diagnose-alert grep contract (issue #267).",
+            all - via_const
+        );
+    }
+
+    /// Phase 6-D. The payment-ledger probe registers through the SAME three
+    /// mechanisms 6-C chose — resolvable, ranked, dispatched — because a
+    /// probe row that nothing can close sits open forever and, being
+    /// selected by age alone, eventually owns the sweep's whole 500-row
+    /// batch (the 2026-05-18 `rooms` failure mode). Note the wildcard
+    /// `debug_assert!` would NOT have caught an omission here: it only fires
+    /// for listed-but-undispatched names.
+    #[test]
+    fn payment_ledger_probe_is_resolvable_ranked_last_and_never_self_healed() {
+        assert!(
+            RECONCILE_RESOLVABLE_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY),
+            "the payment-ledger probe is not in RECONCILE_RESOLVABLE_TABLES"
+        );
+        assert!(
+            reconcile_table_fk_rank("guest_registry")
+                < reconcile_table_fk_rank(PAYMENT_LEDGER_PROBE_KEY),
+            "the probe must sort after every healable entity"
+        );
+        assert!(
+            reconcile_table_fk_rank(PAYMENT_LEDGER_PROBE_KEY)
+                < reconcile_table_fk_rank("something_new"),
+            "the probe must still be ranked ahead of the unranked wildcard"
+        );
+        // DETECTION ONLY. Per-arm self-heal extensions come after this arm's
+        // detection has soaked in production, never in the same change.
+        assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY));
+        assert!(!REINGEST_MISSING_PG_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY));
+        assert!(!force_converge_value_drift_eligible(
+            PAYMENT_LEDGER_PROBE_KEY,
+            Some("a"),
+            Some("b"),
+            f64::MAX,
+            true
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            PAYMENT_LEDGER_PROBE_KEY,
+            Some("a"),
+            None,
+            f64::MAX,
+            true
+        ));
     }
 
     /// The live FK shape: booking `R002066` references customer `C2413`.
@@ -7036,6 +14000,437 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // 2026-07-28 alert inventory — escalation tier, env-tunable
+    // thresholds, cooldown-on-successful-send, namespaced cooldown keys.
+    // -------------------------------------------------------------------
+
+    /// Defect A1. Below the escalation threshold the digest keeps its
+    /// familiar `:warning:` voice; at or past it, the tone changes.
+    /// Pinned at the boundary because an off-by-one here either fires the
+    /// "will not self-heal" copy a day early (crying wolf) or never
+    /// (the defect).
+    #[test]
+    fn escalation_does_not_fire_below_the_second_threshold() {
+        for age in [0_i64, 4, 24, 48, 71] {
+            assert_eq!(
+                level_drift_severity(age, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS),
+                LevelDriftSeverity::Stale,
+                "age {age}h is below the {DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS}h escalation \
+                 threshold and must stay in the :warning: tier"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_fires_at_and_past_the_second_threshold() {
+        for age in [72_i64, 73, 388] {
+            assert_eq!(
+                level_drift_severity(age, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS),
+                LevelDriftSeverity::Escalated,
+                "age {age}h has passed the escalation threshold"
+            );
+        }
+    }
+
+    /// The escalation threshold is env-tunable, so the classifier must
+    /// track the passed-in value, not the compiled-in default.
+    #[test]
+    fn escalation_boundary_tracks_the_configured_threshold() {
+        assert_eq!(level_drift_severity(11, 12), LevelDriftSeverity::Stale);
+        assert_eq!(level_drift_severity(12, 12), LevelDriftSeverity::Escalated);
+    }
+
+    fn stale_row(table: &str, count: i64, oldest_age_hours: i64) -> StaleTable {
+        StaleTable {
+            table: table.to_string(),
+            count,
+            oldest_age_hours,
+        }
+    }
+
+    /// A table lands in exactly ONE tier — an escalated table must not
+    /// also get the `:warning:` digest, or the channel gets two messages
+    /// per table per day about the same rows.
+    #[test]
+    fn partition_level_drift_splits_tiers_without_overlap() {
+        let rows = vec![
+            stale_row("bookings", 3, 388),
+            stale_row("customers", 1, 6),
+            stale_row("checkins", 9, 72),
+        ];
+        let (stale, escalated) = partition_level_drift(&rows, 72);
+        assert_eq!(stale, vec![stale_row("customers", 1, 6)]);
+        assert_eq!(
+            escalated,
+            vec![stale_row("bookings", 3, 388), stale_row("checkins", 9, 72)],
+            "input order is preserved within a tier"
+        );
+    }
+
+    // --- Issue #261 (re-scoped 2026-07-29) — pager-tier `<!channel>` mention ---
+    //
+    // No second webhook: on the shared Slack webhook, ONLY the pager tier
+    // (>72h escalated digest, sync-lag burst, CT-lag pager, boot-refusal)
+    // leads with `<!channel> ` so it breaks through mentions-only
+    // notification prefs. Routine digests and all-clears must stay quiet.
+    // These pin the ACTUAL composition each send site produces, using the
+    // same `format_*` + `with_site_text[_paged]` calls as the real code.
+
+    /// The >72h escalated digest (`:bangbang:`) is the pager tier's
+    /// namesake in the issue — must lead with the exact mention.
+    #[test]
+    fn escalated_level_digest_composition_leads_with_channel_mention() {
+        let body = format_escalated_level_digest_message(72, "• `bookings`: 3 unresolved row(s), oldest *388h*");
+        let msg = SlackMessage::with_site_text_paged("hfhotel", body);
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "escalated digest must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":bangbang:"));
+    }
+
+    /// The routine `:warning:` digest is the alert the escalated tier
+    /// exists to distinguish itself from — it must NEVER carry the
+    /// mention, or the re-scope's whole "most sends stay quiet" premise
+    /// breaks.
+    #[test]
+    fn stale_level_digest_composition_has_no_channel_mention() {
+        let body = format_stale_level_digest_message(4, "• `customers`: 1 unresolved row(s), oldest 6h", 24, 72);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "routine :warning: digest must stay unmentioned; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// The reconcile all-clear (`:white_check_mark:`) must stay
+    /// unmentioned — all-clears are explicitly excluded by the re-scope.
+    #[test]
+    fn level_drift_all_clear_composition_has_no_channel_mention() {
+        let body = format_level_drift_all_clear_message(4, "• `customers`", 24);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(!msg.text.contains("<!channel>"), "got {:?}", msg.text);
+        assert!(msg.text.contains(":white_check_mark:"));
+    }
+
+    /// `:rotating_light:` sync-lag burst pages are named explicitly in
+    /// the re-scope.
+    #[test]
+    fn burst_alert_composition_leads_with_channel_mention() {
+        let body = format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
+        let msg = SlackMessage::with_site_text_paged("hfville", body);
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "burst page must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":rotating_light:"));
+    }
+
+    /// Day 1 and day 16 must not render identically — the whole point of
+    /// carrying the oldest-row age in the body.
+    #[test]
+    fn humanize_hours_distinguishes_day_one_from_day_sixteen() {
+        assert_eq!(humanize_hours(7), "7h");
+        assert_eq!(humanize_hours(47), "47h");
+        assert_eq!(humanize_hours(48), "2d (48h)");
+        assert_eq!(humanize_hours(388), "16d 4h (388h)");
+        assert_ne!(humanize_hours(7), humanize_hours(388));
+    }
+
+    // --- Cooldown key namespacing ---------------------------------------
+
+    /// The escalation key must be structurally incapable of colliding
+    /// with a canonical entity name in the shared
+    /// `ht_level_drift_alert_cooldowns` table — the same guarantee
+    /// `bin/sync.rs` gets from `ct_retention_overflow:<table>`.
+    #[test]
+    fn escalated_cooldown_key_cannot_collide_with_an_entity_name() {
+        // `guest_registry` (Phase 6-B) is the first entity name carrying an
+        // underscore — it must still read as a bare reconcile table key
+        // (no `:`), and must not collide with any namespaced family.
+        for table in ["bookings", "customers", "checkins", "rooms", "guest_registry"] {
+            let key = escalated_cooldown_key(table);
+            assert_ne!(key, table, "escalation key must not equal the entity name");
+            assert!(
+                key.contains(COOLDOWN_KEY_NAMESPACE_SEP),
+                "escalation key must carry the namespace separator: {key}"
+            );
+            assert!(
+                !is_reconcile_table_key(&key),
+                "{key} must not be treated as a reconcile table name"
+            );
+            assert!(
+                is_reconcile_table_key(table),
+                "the bare entity name {table} IS a reconcile table name"
+            );
+        }
+        assert_eq!(escalated_cooldown_key("bookings"), "escalated:bookings");
+    }
+
+    #[test]
+    fn burst_cooldown_key_cannot_collide_with_an_entity_name() {
+        let key = burst_cooldown_key("bookings");
+        assert_eq!(key, "burst:bookings");
+        assert!(!is_reconcile_table_key(&key));
+    }
+
+    /// The all-clear diffs cooldown keys against still-stale table names.
+    /// A namespaced key never matches a table name, so without this
+    /// filter it would be reported "converged" and its cooldown DELETED
+    /// — silently un-throttling the alert it belongs to.
+    ///
+    /// The `bin/sync.rs` literals below are the other half of a
+    /// cross-file contract (its `*_KEY_PREFIX` / `*_COOLDOWN_KEY`
+    /// constants, private to that binary, hence literals here). They have
+    /// shared this table since the retention-page work and the all-clear
+    /// has been eligible to delete them the whole time.
+    #[test]
+    fn all_clear_never_claims_namespaced_cooldown_keys() {
+        let recovered = tables_recovered(
+            &owned(&[
+                "customers",
+                "escalated:bookings",
+                "burst:checkins",
+                "reconcile_cap:guest_registry",
+                // Parked by bin/sync.rs in the same shared table.
+                "ct_retention_overflow:HT_Customers",
+                "ct_watcher_lag:global",
+                "shadow_mode:ceiling",
+                "boot_refusal:ct_gap",
+                STALE_CHECKIN_COOLDOWN_KEY,
+            ]),
+            &owned(&["bookings"]),
+        );
+        assert_eq!(
+            recovered,
+            owned(&["customers"]),
+            "only bare reconcile table names may be declared converged"
+        );
+    }
+
+    // --- Env-overridable level-drift thresholds (defect A2) --------------
+
+    const LEVEL_DRIFT_ENV_VARS: &[&str] = &[
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS",
+        "LEVEL_DRIFT_COOLDOWN_HOURS",
+        "LEVEL_DRIFT_ESCALATE_HOURS",
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_COOLDOWN_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_ESCALATE_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS_HFVILLE",
+        "LEVEL_DRIFT_COOLDOWN_HOURS_HFVILLE",
+        "LEVEL_DRIFT_ESCALATE_HOURS_HFVILLE",
+    ];
+
+    /// Env-isolation helper in the `with_mode_env` / `with_threshold_envs`
+    /// idiom. Clears the whole level-drift var family first so an ambient
+    /// value can't flip an assertion, sets the requested ones, then
+    /// restores every prior value.
+    fn with_level_drift_env<T, F: FnOnce() -> T>(set: &[(&str, &str)], f: F) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let prior: Vec<(&str, Option<String>)> = LEVEL_DRIFT_ENV_VARS
+            .iter()
+            .map(|name| (*name, env::var(name).ok()))
+            .collect();
+        for name in LEVEL_DRIFT_ENV_VARS {
+            env::remove_var(name);
+        }
+        for (name, value) in set {
+            env::set_var(name, value);
+        }
+        let out = f();
+        for (name, value) in prior {
+            match value {
+                Some(v) => env::set_var(name, v),
+                None => env::remove_var(name),
+            }
+        }
+        out
+    }
+
+    /// Defaults are explicitly unchanged by the env work — a deploy with
+    /// no new vars set must behave exactly as it did before.
+    #[test]
+    fn level_drift_thresholds_default_when_env_unset() {
+        let t = with_level_drift_env(&[], || level_drift_thresholds_from_env("hfhotel"));
+        assert_eq!(t.stale_hours, 4);
+        assert_eq!(t.cooldown_hours, 24);
+        assert_eq!(t.escalate_hours, 72);
+        assert_eq!(t.stale_hours, DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS);
+        assert_eq!(t.cooldown_hours, DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS);
+        assert_eq!(t.escalate_hours, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS);
+    }
+
+    #[test]
+    fn level_drift_thresholds_read_the_global_env_vars() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "8"),
+                ("LEVEL_DRIFT_COOLDOWN_HOURS", "12"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "96"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!((t.stale_hours, t.cooldown_hours, t.escalate_hours), (8, 12, 96));
+    }
+
+    /// Per-site override wins over the global, and does not leak to the
+    /// other site — same contract as the drift-alert threshold (#69).
+    #[test]
+    fn level_drift_thresholds_per_site_override_wins_and_does_not_leak() {
+        let set = [
+            ("LEVEL_DRIFT_COOLDOWN_HOURS", "24"),
+            ("LEVEL_DRIFT_COOLDOWN_HOURS_HFVILLE", "6"),
+        ];
+        let ville = with_level_drift_env(&set, || level_drift_thresholds_from_env("hfville"));
+        assert_eq!(ville.cooldown_hours, 6, "per-site override must win");
+        let hotel = with_level_drift_env(&set, || level_drift_thresholds_from_env("hfhotel"));
+        assert_eq!(
+            hotel.cooldown_hours, 24,
+            "HF Hotel must not pick up HF Ville's override"
+        );
+    }
+
+    /// Operator typos degrade to the next tier down, never to zero — a
+    /// zero cooldown would turn the digest into a 15-minute metronome.
+    #[test]
+    fn level_drift_thresholds_fall_back_on_invalid_values() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "not-a-number"),
+                ("LEVEL_DRIFT_COOLDOWN_HOURS", "0"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "-5"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!(t.stale_hours, DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS);
+        assert_eq!(t.cooldown_hours, DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS);
+        assert_eq!(t.escalate_hours, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS);
+    }
+
+    #[test]
+    fn level_drift_thresholds_per_site_garbage_falls_through_to_global() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "96"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS_HFVILLE", "abc"),
+            ],
+            || level_drift_thresholds_from_env("hfville"),
+        );
+        assert_eq!(t.escalate_hours, 96);
+    }
+
+    /// An escalation threshold at or below the stale interval would
+    /// escalate every table on its first digest, collapsing the two tiers
+    /// back into the single unchanging voice this work removes.
+    #[test]
+    fn level_drift_escalate_threshold_is_clamped_above_the_stale_interval() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "10"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "4"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!(t.stale_hours, 10);
+        assert_eq!(t.escalate_hours, 11, "clamped to stale + 1h");
+        assert_eq!(
+            level_drift_severity(t.stale_hours, t.escalate_hours),
+            LevelDriftSeverity::Stale,
+            "a row that only just crossed the stale interval must not escalate"
+        );
+    }
+
+    #[test]
+    fn level_drift_cooldown_duration_matches_the_configured_hours() {
+        let t = with_level_drift_env(&[("LEVEL_DRIFT_COOLDOWN_HOURS", "6")], || {
+            level_drift_thresholds_from_env("hfhotel")
+        });
+        assert_eq!(t.cooldown(), std::time::Duration::from_secs(6 * 3600));
+    }
+
+    // --- Cooldown burns only on a successful send (defect A3) ------------
+
+    /// A failed webhook must NOT silence the table: the cooldown stays
+    /// unset so the next 15-minute tick retries. Pre-fix the mark ran
+    /// before the POST, so an outage bought 24h of silence and the
+    /// all-clear could later close an alert nobody received.
+    #[test]
+    fn cooldown_is_not_marked_when_the_send_fails() {
+        assert_eq!(AlertDelivery::from_send(Some(false)), AlertDelivery::Failed);
+        assert!(!cooldown_should_be_marked(AlertDelivery::Failed));
+    }
+
+    #[test]
+    fn cooldown_is_marked_when_the_send_succeeds() {
+        assert_eq!(AlertDelivery::from_send(Some(true)), AlertDelivery::Sent);
+        assert!(cooldown_should_be_marked(AlertDelivery::Sent));
+    }
+
+    /// No Slack client configured is not a failure — the `tracing` line
+    /// IS the delivery, so the cooldown still throttles it. Otherwise a
+    /// log-only deployment repeats the warning every 15 minutes.
+    #[test]
+    fn cooldown_is_marked_in_log_only_deployments() {
+        assert_eq!(AlertDelivery::from_send(None), AlertDelivery::LoggedOnly);
+        assert!(cooldown_should_be_marked(AlertDelivery::LoggedOnly));
+    }
+
+    // --- Burst-alert cooldown (defect C5) --------------------------------
+
+    /// The burst threshold is a blast-radius dial, not a target: 21 days
+    /// of production peak at 33 rows/hr, so it has never fired and should
+    /// not be "tuned down until it does". Pinned so a drive-by change has
+    /// to argue with a test.
+    #[test]
+    fn burst_alert_threshold_default_is_unchanged() {
+        assert_eq!(DEFAULT_DRIFT_ALERT_THRESHOLD, 50);
+        // 33 is the observed 21-day production peak. It must stay BELOW
+        // the threshold: the alert is designed never to fire in normal
+        // operation, and the level digest already covers the slow-burn
+        // case this would otherwise duplicate.
+        assert!(
+            tables_breaching_threshold(&counts(&[("checkins", 33)]), DEFAULT_DRIFT_ALERT_THRESHOLD)
+                .is_empty(),
+            "the observed production peak must not trip the burst alert"
+        );
+    }
+
+    #[test]
+    fn burst_cooldown_hours_defaults_and_honours_per_site_override() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let global = "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS";
+        let per_site = "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS_HFVILLE";
+        let prior = (env::var(global).ok(), env::var(per_site).ok());
+        env::remove_var(global);
+        env::remove_var(per_site);
+        assert_eq!(
+            burst_cooldown_hours_from_env("hfhotel"),
+            DEFAULT_BURST_ALERT_COOLDOWN_HOURS
+        );
+        env::set_var(global, "3");
+        env::set_var(per_site, "12");
+        assert_eq!(burst_cooldown_hours_from_env("hfhotel"), 3);
+        assert_eq!(burst_cooldown_hours_from_env("hfville"), 12);
+        match prior.0 {
+            Some(v) => env::set_var(global, v),
+            None => env::remove_var(global),
+        }
+        match prior.1 {
+            Some(v) => env::set_var(per_site, v),
+            None => env::remove_var(per_site),
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Per-table CT watermark health check (R3 TODO resolution).
     // -------------------------------------------------------------------
 
@@ -7138,5 +14533,369 @@ mod tests {
         ];
         let (first, _, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
         assert_eq!(first.table_name, "HT_Customers");
+    }
+    // -------------------------------------------------------------------
+    // Track F5 — loyalty-channel writeback-leg stall tripwire
+    // -------------------------------------------------------------------
+
+    /// Statuses `writeback_jobs` can hold that all mean "iHOTEL has not seen
+    /// this booking". Enumerated in the test rather than in `src` so a new
+    /// lifecycle status added without thought fails here, not in production.
+    const NOT_APPLIED_STATUSES: &[&str] = &["pending", "in_progress", "failed", "exhausted"];
+
+    /// The core "not before N minutes" contract. A hold whose writeback is
+    /// merely in flight must never page: the healthy leg applies in seconds,
+    /// and the whole point of the threshold is that everything below it is
+    /// indistinguishable from normal latency.
+    #[test]
+    fn loyalty_stall_does_not_fire_before_the_threshold() {
+        for age in [0, 1, 5, 9] {
+            assert!(
+                !loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", age, 10),
+                "a {age}-minute-old pending job is still inside the 10-minute window"
+            );
+        }
+    }
+
+    /// …and fires from the threshold onward. `>=`, not `>`, so "alert after
+    /// 10 minutes" means the tick that observes minute 10.
+    #[test]
+    fn loyalty_stall_fires_at_and_after_the_threshold() {
+        for age in [10, 11, 60, 240] {
+            assert!(
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", age, 10),
+                "a {age}-minute-old pending job is a confirmed stall at threshold 10"
+            );
+        }
+    }
+
+    /// Every non-`done` status counts. `in_progress` and `exhausted` are the
+    /// two an allow-list of `('pending','failed')` would silently drop — and
+    /// `in_progress` is the state a worker that dies mid-claim leaves behind,
+    /// i.e. the detector's own primary scenario.
+    #[test]
+    fn loyalty_stall_covers_every_not_applied_status() {
+        for status in NOT_APPLIED_STATUSES {
+            assert!(
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), status, 30, 10),
+                "status `{status}` means the legacy write has not landed"
+            );
+        }
+    }
+
+    /// The one status that must stay silent: the write landed.
+    #[test]
+    fn loyalty_stall_ignores_applied_jobs() {
+        assert!(!loyalty_writeback_is_stalled(
+            Some(LOYALTY_CHANNEL),
+            WRITEBACK_APPLIED_STATUS,
+            10_000,
+            10
+        ));
+    }
+
+    /// Non-loyalty jobs are ignored however old and however broken. A stuck
+    /// desk / OTA / walk-in writeback is a real problem, but it carries no 2h
+    /// fuse and it belongs to the existing digest + queue-depth alerts.
+    /// Widening this predicate would turn a bounded tripwire into a second
+    /// copy of the queue-depth alert.
+    #[test]
+    fn loyalty_stall_ignores_non_loyalty_jobs() {
+        for channel in [Some("ota"), Some("walkin"), Some("desk"), Some(""), None] {
+            for status in NOT_APPLIED_STATUSES {
+                assert!(
+                    !loyalty_writeback_is_stalled(channel, status, 1_440, 10),
+                    "channel {channel:?} / status {status} is out of scope for the F5 tripwire"
+                );
+            }
+        }
+    }
+
+    /// A `book_channel` that only *contains* the marker is not the marker —
+    /// guards against a future `'loyalty-import'` style value quietly joining
+    /// the alert's scope.
+    #[test]
+    fn loyalty_stall_matches_the_channel_marker_exactly() {
+        assert!(!loyalty_writeback_is_stalled(
+            Some("loyalty-import"),
+            "pending",
+            60,
+            10
+        ));
+        // Whitespace padding from a hand-edited row still matches.
+        assert!(loyalty_writeback_is_stalled(
+            Some(" loyalty "),
+            "pending",
+            60,
+            10
+        ));
+    }
+
+    /// End-to-end timeline over the two pure decisions the live tick
+    /// composes: "is it stalled?" and "has the cooldown elapsed?".
+    ///
+    /// Drives 2-minute ticks (the registered cadence) across a 90-minute
+    /// outage with the shipped defaults (threshold 10 min, cooldown 30 min)
+    /// and asserts the exact set of minutes that page. This is the test that
+    /// pins "fires ONCE after N minutes, not before, and not again inside the
+    /// cooldown" as one property rather than three separate ones.
+    #[test]
+    fn loyalty_stall_fires_once_then_respects_the_cooldown() {
+        let threshold = DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES as i64;
+        let cooldown_mins = DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES;
+        let cooldown = std::time::Duration::from_secs((cooldown_mins * 60) as u64);
+
+        let enqueued = chrono::Utc::now();
+        let mut last_alerted: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut fired_at_minute: Vec<i64> = Vec::new();
+
+        for tick in 0..=45 {
+            let minute = tick * 2;
+            let now = enqueued + chrono::Duration::minutes(minute);
+            let stalled =
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", minute, threshold);
+            if stalled && cooldown_elapsed(last_alerted, now, cooldown) {
+                fired_at_minute.push(minute);
+                last_alerted = Some(now);
+            }
+        }
+
+        // Minute 10 is the first tick at-or-past the threshold; then one
+        // reminder every 30 minutes for as long as the leg stays down.
+        assert_eq!(fired_at_minute, vec![10, 40, 70]);
+    }
+
+    /// The all-clear is a closure, not an announcement: it needs BOTH a
+    /// drained backlog and proof that we said something earlier.
+    #[test]
+    fn loyalty_stall_all_clear_fires_once_after_a_real_alert() {
+        // Drained + we alerted ⇒ closure is due.
+        assert!(loyalty_stall_all_clear_due(0, true));
+        // …and it fires exactly once, because the caller clears the cooldown
+        // row on delivery, which flips `alerted_earlier` to false.
+        assert!(!loyalty_stall_all_clear_due(0, false));
+    }
+
+    /// A site that has never stalled must never emit a recovery. This is the
+    /// arm that stops the tripwire posting a `:white_check_mark:` every two
+    /// minutes, forever, on a healthy deployment.
+    #[test]
+    fn loyalty_stall_all_clear_stays_silent_without_a_prior_alert() {
+        assert!(!loyalty_stall_all_clear_due(0, false));
+    }
+
+    /// A partial drain is not a recovery.
+    #[test]
+    fn loyalty_stall_all_clear_stays_silent_while_rows_remain() {
+        assert!(!loyalty_stall_all_clear_due(1, true));
+        assert!(!loyalty_stall_all_clear_due(7, true));
+    }
+
+    /// Env-isolation helper for the F5 threshold tests. Same shape as
+    /// `with_ct_lag_envs` above.
+    fn with_loyalty_stall_envs<T, F: FnOnce() -> T>(
+        minutes: Option<&str>,
+        cooldown: Option<&str>,
+        f: F,
+    ) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+
+        const MINUTES_VAR: &str = "LOYALTY_WRITEBACK_STALL_ALERT_MINUTES";
+        const COOLDOWN_VAR: &str = "LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES";
+
+        let prior_minutes = env::var(MINUTES_VAR).ok();
+        let prior_cooldown = env::var(COOLDOWN_VAR).ok();
+
+        match minutes {
+            Some(v) => env::set_var(MINUTES_VAR, v),
+            None => env::remove_var(MINUTES_VAR),
+        }
+        match cooldown {
+            Some(v) => env::set_var(COOLDOWN_VAR, v),
+            None => env::remove_var(COOLDOWN_VAR),
+        }
+
+        let out = f();
+
+        match prior_minutes {
+            Some(v) => env::set_var(MINUTES_VAR, v),
+            None => env::remove_var(MINUTES_VAR),
+        }
+        match prior_cooldown {
+            Some(v) => env::set_var(COOLDOWN_VAR, v),
+            None => env::remove_var(COOLDOWN_VAR),
+        }
+
+        out
+    }
+
+    #[test]
+    fn loyalty_stall_thresholds_default_when_envs_unset() {
+        let (m, c) = with_loyalty_stall_envs(None, None, || {
+            (
+                loyalty_writeback_stall_minutes(),
+                loyalty_writeback_stall_cooldown_minutes(),
+            )
+        });
+        assert_eq!(m, DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES);
+        assert_eq!(m, 10, "the documented F5 default is 10 minutes");
+        assert_eq!(c, DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES);
+        assert_eq!(c, 30, "the documented F5 default cooldown is 30 minutes");
+    }
+
+    #[test]
+    fn loyalty_stall_thresholds_honour_env_overrides() {
+        let (m, c) = with_loyalty_stall_envs(Some("3"), Some("15"), || {
+            (
+                loyalty_writeback_stall_minutes(),
+                loyalty_writeback_stall_cooldown_minutes(),
+            )
+        });
+        assert_eq!(m, 3);
+        assert_eq!(c, 15);
+    }
+
+    /// Garbage, zero and negatives fall back to the defaults rather than
+    /// disabling the tripwire or turning it into a per-tick firehose — a
+    /// `0`-minute threshold would alert on every job the instant it is
+    /// enqueued.
+    #[test]
+    fn loyalty_stall_thresholds_reject_garbage_and_non_positive_values() {
+        for bad in ["0", "-5", "", "  ", "ten", "10m"] {
+            let (m, c) = with_loyalty_stall_envs(Some(bad), Some(bad), || {
+                (
+                    loyalty_writeback_stall_minutes(),
+                    loyalty_writeback_stall_cooldown_minutes(),
+                )
+            });
+            assert_eq!(
+                m, DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES,
+                "`{bad}` must not become the threshold"
+            );
+            assert_eq!(
+                c, DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES,
+                "`{bad}` must not become the cooldown"
+            );
+        }
+    }
+
+    /// The cooldown key is a BARE sentinel in the shared cooldown table, so
+    /// the reconcile all-clear must be structurally forbidden from treating
+    /// it as a converged `ht_reconcile_log` table and deleting its row.
+    /// Without this the alert would refire every two minutes during an
+    /// outage.
+    #[test]
+    fn loyalty_stall_cooldown_key_is_excluded_from_the_reconcile_all_clear() {
+        assert!(!is_reconcile_table_key(
+            LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY
+        ));
+        assert!(NON_RECONCILE_COOLDOWN_KEYS.contains(&LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY));
+        // And the sweep must not list it as a "recovered table".
+        let recovered = tables_recovered(&[LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY.to_string()], &[]);
+        assert!(recovered.is_empty());
+    }
+
+    /// A PAID, confirmed booking must NEVER be rendered as an expired hold.
+    ///
+    /// `confirm_booking_payment` flips `book_status` to `confirmed` but leaves
+    /// `book_hold_expires_at` in place (the expiry sweep is guarded on the
+    /// status, so it has no reason to clear it). Reading the timestamp alone
+    /// would tell a night receptionist that a guest who has paid a deposit
+    /// lost their room — inviting the desk to resell a room that is genuinely
+    /// sold. This is the single most harmful thing this alert could say.
+    #[test]
+    fn hold_suffix_never_calls_a_confirmed_booking_expired() {
+        let now = chrono::Utc::now();
+        let long_past = now - chrono::Duration::hours(6);
+        let suffix = format_hold_suffix("confirmed", Some(long_past), now);
+        assert!(
+            !suffix.contains("EXPIRED"),
+            "a paid booking must never read as an expired hold, got: {suffix}"
+        );
+        assert!(suffix.contains("NOT a live hold"));
+        assert!(suffix.contains("confirmed"));
+    }
+
+    /// A live hold shows the minutes remaining, so the operator knows how long
+    /// the leg has to recover before the booking self-cancels.
+    #[test]
+    fn hold_suffix_counts_down_a_live_hold() {
+        let now = chrono::Utc::now();
+        let suffix = format_hold_suffix(
+            CHANNEL_HOLD_STATUS,
+            Some(now + chrono::Duration::minutes(108)),
+            now,
+        );
+        assert_eq!(suffix, ", hold expires in 108m");
+    }
+
+    /// An expired hold says so plainly, and never as a negative countdown —
+    /// "expires in -12m" at 02:00 is a puzzle, not an instruction.
+    #[test]
+    fn hold_suffix_reports_an_expired_hold_without_a_negative_countdown() {
+        let now = chrono::Utc::now();
+        let suffix = format_hold_suffix(
+            CHANNEL_HOLD_STATUS,
+            Some(now - chrono::Duration::minutes(12)),
+            now,
+        );
+        assert_eq!(suffix, ", HOLD ALREADY EXPIRED");
+        assert!(!suffix.contains('-'));
+    }
+
+    /// A pending booking with no deadline stamped adds nothing rather than
+    /// inventing a state.
+    #[test]
+    fn hold_suffix_is_empty_when_no_deadline_is_stamped() {
+        let now = chrono::Utc::now();
+        assert_eq!(format_hold_suffix(CHANNEL_HOLD_STATUS, None, now), "");
+    }
+
+    /// The hold-status literal must match the one the expiry sweep is guarded
+    /// on (`repository::channel::expired_hold_ids`), or the two disagree about
+    /// what a live hold is.
+    #[test]
+    fn channel_hold_status_matches_the_sweep_guard() {
+        assert_eq!(CHANNEL_HOLD_STATUS, "pending");
+    }
+
+    /// The operator-facing text must carry the three things that make it
+    /// actionable at 02:00 without reading code: what the desk sees (iHOTEL
+    /// does NOT show `จอง`), where to go (the runbook), and that a closure is
+    /// coming so nobody sits watching the channel.
+    #[test]
+    fn loyalty_stall_alert_text_names_the_desk_impact_and_the_runbook() {
+        let msg =
+            format_loyalty_stall_message(10, 30, "• `BK-1` — `create_booking` pending for 12m", 1);
+        assert!(
+            msg.contains("จอง"),
+            "must name what the room board is missing"
+        );
+        assert!(msg.contains("docs/runbooks/writeback-leg-degraded.md"));
+        assert!(msg.contains("10 minute(s)"));
+        assert!(msg.contains("30 min"));
+        assert!(
+            msg.contains(":white_check_mark:"),
+            "must promise the all-clear"
+        );
+        // Warning tier, not pager tier — no channel mention (issue #261).
+        assert!(!msg.contains(crate::notifications::slack::PAGER_MENTION.trim()));
+    }
+
+    /// The closure must be recognisably the counterpart of the alert and must
+    /// point at the post-outage cleanup, because a hold that expired mid-
+    /// outage can leave a stale `จอง` behind.
+    #[test]
+    fn loyalty_stall_all_clear_text_closes_the_loop() {
+        let msg = format_loyalty_stall_all_clear_message(10);
+        assert!(msg.starts_with(":white_check_mark:"));
+        assert!(
+            msg.contains(":satellite_antenna:"),
+            "must name the alert it closes"
+        );
+        assert!(msg.contains("docs/runbooks/writeback-leg-degraded.md"));
+        assert!(!msg.contains(crate::notifications::slack::PAGER_MENTION.trim()));
     }
 }

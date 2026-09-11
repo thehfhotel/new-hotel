@@ -131,6 +131,19 @@ Sensitive credentials (`DB_PASSWORD`, `POSTGRES_PASSWORD`, `VILLE_DB_PASSWORD`, 
 - `/home/deploy/secrets/postgres_password` — newdb superuser
 - `/home/deploy/secrets/ville_db_password` — alias of `postgres_password` until HF Ville gets a distinct DB credential (coexistence hardening — ADR 0002; formerly tied to the now-superseded "ADR 0001 Phase 8")
 - `/home/deploy/secrets/slack_webhook_url`
+- `/home/deploy/secrets/ota_bridge_token` — OTA booking-bridge shared bearer (`docs/ota-bridge.md`). **INVARIANT: must hold the IDENTICAL string as ota-desk's `PMS_BRIDGE_TOKEN`** — two names for one value, same idiom as `PORTAL_NOTIFY_TOKEN` ≡ portal `NOTIFY_INGRESS_TOKEN`. Verify without exposing it: both repos print `sha256(token)[0..6]` (here, in the `OTA bridge: …` startup line). An unset GH secret yields an EMPTY file, which the hydrator treats as absent — the gate then has nothing to accept and `/api/ota/*` fails closed.
+- `/home/deploy/secrets/ota_bridge_token_previous` — rotation slot for the above; accepted with a "finish the rotation" WARN. Normally empty.
+- `/home/deploy/secrets/hfid_resolve_secret` → `HFID_RESOLVE_SECRET` — shared secret for the `/hk` employee-location lookup (`hotel-backend/src/hfid_location.rs`), sent as the `X-Reader-Secret` header on `POST {HFID_LOCATION_URL}`.
+
+  **`HFID_RESOLVE_SECRET` carries the same value as fingerprint-time-logger's `READER_RESOLVE_SECRET`.** HF ID guards its ENTIRE app↔central surface — `/resolve`, `/resolve-badge`, `/claim`, `/wait` — with that one secret, so there is no separate upstream credential to find; do not go hunting for one. It is therefore also the same value as this repo's own `READER_RESOLVE_SECRET` (card-login pairing, `service::reader`). Three names, one secret:
+
+  | name | where | consumer |
+  |---|---|---|
+  | `READER_RESOLVE_SECRET` | fingerprint-time-logger (HF ID) | the authority — guards its whole app↔central surface |
+  | `READER_RESOLVE_SECRET` | new-hotel | card-login pairing (`/claim`, `/wait`) |
+  | `HFID_RESOLVE_SECRET` | new-hotel | `/hk` badge→location lookup (`/resolve-badge`) |
+
+  The distinct new-hotel name is deliberate: it lets the two consumers be rotated independently later without a code change, and it keeps a `/hk` outage from being indistinguishable from a card-login outage. An unset GH secret yields an EMPTY file, which the hydrator treats as absent — no lookup client is built, and with `HK_LOCATION_ENFORCEMENT_ENABLED` on every `/hk` request fails closed with `503` (never a fallback to the `HK_BRANCHES` allowlist).
 
 The deploy script (`/srv/run-deploy.sh` on evergreen, NOT in this repo) writes these from the JSON payload's `.secrets` block on every deploy, with mode `0400` and owner `deploy:docker`.
 
@@ -181,6 +194,48 @@ requires a PK; no other legacy DDL is permitted. Residual hazard to remember: iH
 allocates ids app-side (MAX+1, race-prone) — a duplicate-id race that used to succeed
 silently now hard-fails iHOTEL's INSERT on the PK. If a receptionist reports a save
 error in iHOTEL, check for a concurrent same-table save first.
+
+That hazard is **per-table, and only where the id is not an IDENTITY column** — check
+`sys.columns.is_identity` before assuming it applies. On the two busiest folio tables
+they differ: `HT_CheckIn_Ds.id` is `is_identity = 0`, so iHOTEL supplies the value and
+the race is real; `HT_CheckIn_Pay.id` is `is_identity = 1`, so SQL Server allocates it,
+iHOTEL's INSERT omits the column, and no duplicate-id race is possible there at all
+(verified against HF Ville, 2026-08-19).
+
+Relatedly, **"has this intent ever run?" is answered from canonical `writeback_jobs`,
+never from `dbo.ht_writeback_ledger`** — the ledger only records create-writebacks, so
+non-ledgered intents (ExtendStay, MarkRoomClean/Dirty) never appear there and an empty
+ledger lookup proves nothing.
+
+**Before hand-editing ANY legacy value (not just schema) — read this.** Two guards
+exist, one accepted gap sits between them, and one column is a live lock:
+
+1. **Schema is guarded automatically.** `hotel-backend/src/writeback/fingerprint.rs`
+   hashes the column shapes of every legacy table we touch on startup and **refuses to
+   boot** on a mismatch. A hand-applied `ALTER` will stop the workers, not corrupt data.
+   Re-capture via `scripts/writeback-fingerprint.sh` if a change is ever legitimate.
+2. **NEVER hand-write SQL `NULL` into `HT_Book_H.Book_Cust_ID` or
+   `HT_CheckIn_H.Cin_cust_no`.** Our sync cannot represent a legacy value being
+   *cleared* (it is indistinguishable from "not observed"), so canonical would keep the
+   stale customer id **forever** and the resulting reconcile row **can never
+   auto-close** — a permanent, unfixable page. iHOTEL itself never does this: its
+   customer-delete cascade writes the reserved sentinel `'C0000'` instead, which is
+   Some→Some and handled correctly. Audited 2026-07-31: zero NULLs on both columns at
+   both sites. A per-tick tripwire alerts if that ever changes. If you genuinely must
+   clear a customer link, **write `'C0000'`, never NULL.**
+   Full analysis and the designed (deliberately unbuilt) fix:
+   `docs/adr/0005-null-clear-sentinel-semantics.md`.
+3. **NEVER write `HT_CheckIn_H.Cin_Work_number` casually** — it is not vestigial and
+   not a TM.30 batch number. It is iHOTEL's per-folio **optimistic-lock token**,
+   taken on folio LOAD by five reception forms and re-checked on save; changing it
+   makes the next save show `มีการแก้ไข … จากเครื่องอื่น`, close the form, and
+   **discard the receptionist's in-progress edit**. Exactly one recipe writes it on
+   purpose (`extend_stay`); no other may without its own decision record. Detail,
+   call sites and caveats: `docs/legacy-app/COMPAT_CHEATSHEET.md` §7.4. That decision
+   record — why the one write stays, why the other six recipes deliberately do not bump
+   the token, and why the lock must never be treated as a mutex — is
+   `docs/adr/0007-folio-lock-participation.md` §"Decision". Read it before widening the
+   write; do not infer permission from this bullet.
 
 ### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 
@@ -326,3 +381,7 @@ This application uses a **split architecture**:
 - Frontend dev server: `pnpm dev` (runs on port 3003)
 - Frontend build: `pnpm build`
 - Backend: See `/hotel-backend/README.md` for Rust development
+
+## Estate task board
+
+Cross-repo tasks live in ~/HF/hf-tasks (thehfhotel/hf-tasks). Read `tasks/INDEX.md` before cross-repo work; update task status as you work.

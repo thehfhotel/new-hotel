@@ -17,7 +17,19 @@
 //! `HT_CheckIn_Product`, `HT_Deposit`, `HT_Changed_Room`,
 //! `HT_Bill_Debt_*`, `HT_Rooms_Cancel`) need incremental propagation
 //! and are handled by the CT watcher (Phase 5.5c) — not here.
+//!
+//! Two **canonical** (not `legacy_mirror.*`) master tables piggy-back
+//! the same cadence, because their legacy sources are likewise not
+//! CT-enabled and change on the order of weeks:
+//! * `HT_Products`    → `ht_products`    (`sync/mappers/products.rs`)
+//! * `HT_Rooms_Price` → `ht_rate_tiers`  (`sync/mappers/rate_tiers.rs`)
+//!
+//! Both are UPSERT-only rather than DELETE+INSERT: canonical rows carry
+//! foreign keys from live transactional data, so the prune-on-reload
+//! shortcut used above is not available to them. See
+//! `sync/mappers/products.rs`'s module docstring for the full argument.
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::DbPool;
 use sqlx::PgPool;
 use std::time::Instant;
@@ -32,6 +44,26 @@ pub async fn reload_mirror_dimensions(legacy_pool: &DbPool, pg_pool: &PgPool) {
     let start = Instant::now();
     tracing::info!("[Mirror] Reloading legacy_mirror dimension tables...");
 
+    // Track F3 (T1 CRIT-3): canonical `ht_products` UPSERT keyed on
+    // `prod_legacy_no = Pro_no`. Same rationale as ht_rate_tiers below —
+    // `HT_Products` is not CT-enabled, so it rides this reconcile cadence.
+    //
+    // Runs FIRST because it is the only dimension the CT watcher has a hard
+    // FK dependency on: `sync/mappers/mirror.rs::upsert_canonical_pos_sale`
+    // INNER JOINs `ht_products` to resolve an `HT_CheckIn_Product` folio line
+    // and returns Err when the product is missing, holding the watermark —
+    // and the GLOBAL watermark gates on `!errored`, so an unmirrored product
+    // freezes every CT table for that site, not just POS. Loading products
+    // before the slower `legacy_mirror.*` DELETE+INSERT reloads keeps that
+    // window as short as this cadence allows. NOTE this bounds the race, it
+    // does not eliminate it: the CT tick is a different task (and, at HF
+    // Hotel, a different process) running sub-second against this 15-minute
+    // reload. A product created AND sold inside one interval still errors —
+    // correctly, since holding the watermark preserves the event — and the
+    // retry after this reload succeeds, well inside the 2-day CT retention.
+    if let Err(e) = crate::sync::mappers::products::poll_products_once(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] reload ht_products failed");
+    }
     if let Err(e) = reload_continuetime(legacy_pool, pg_pool).await {
         tracing::error!(error = %e, "[Mirror] reload HT_ContinueTime failed");
     }
@@ -130,13 +162,12 @@ pub async fn snapshot_mirror_transactional_tables(legacy_pool: &DbPool, pg_pool:
 
 async fn reload_continuetime(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Con_Name, Con_Minute, Con_Price, Con_Type FROM HT_ContinueTime",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Con_Name, Con_Minute, Con_Price, Con_Type FROM HT_ContinueTime",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_continuetime")
@@ -184,14 +215,13 @@ async fn reload_continuetime(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(
 
 async fn reload_rooms_price(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Room_Type, Room_CustType, Room_Price, Room_Price_H, Room_Price_M \
-             FROM HT_Rooms_Price",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Room_Type, Room_CustType, Room_Price, Room_Price_H, Room_Price_M \
+         FROM HT_Rooms_Price",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_rooms_price")
@@ -262,11 +292,7 @@ async fn reload_order_table(
 ) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
     let select_sql = format!("SELECT id, Cust_Type, Cust_Month, Cast_Type FROM {legacy_table}");
-    let rows = conn
-        .simple_query(&select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
 
     let mut tx = pg_pool.begin().await?;
     let delete_sql = format!("DELETE FROM {pg_table}");
@@ -314,14 +340,13 @@ async fn reload_order_table(
 
 async fn snapshot_cupon(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT cupon_no, cupon_cin_no, cupon_cin_room, cupon_date, \
-                    cupon_gen_date, cupon_by, cupon_print FROM HT_Cupon",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT cupon_no, cupon_cin_no, cupon_cin_room, cupon_date, \
+                cupon_gen_date, cupon_by, cupon_print FROM HT_Cupon",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_cupon")
@@ -363,15 +388,14 @@ async fn snapshot_cupon(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), An
 
 async fn snapshot_checkin_product(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Cin_No, Cin_Room_no, Cin_Ds_date, Cin_Pro_id, Cin_Pro_name, \
-                    Cin_Pro_Unit, Cin_Pro_num, Cin_Pro_price, Cin_Pro_priceTotal, \
-                    Cin_Pro_pay, Cin_Pro_note FROM HT_CheckIn_Product",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Cin_No, Cin_Room_no, Cin_Ds_date, Cin_Pro_id, Cin_Pro_name, \
+                Cin_Pro_Unit, Cin_Pro_num, Cin_Pro_price, Cin_Pro_priceTotal, \
+                Cin_Pro_pay, Cin_Pro_note FROM HT_CheckIn_Product",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_checkin_product")
@@ -419,14 +443,13 @@ async fn snapshot_checkin_product(legacy_pool: &DbPool, pg_pool: &PgPool) -> Res
 
 async fn snapshot_deposit(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Dep_no, Dep_Date, Dep_Room, Dep_Name, \
-                    Dep_Price, Dep_Status, Dep_ref FROM HT_Deposit",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Dep_no, Dep_Date, Dep_Room, Dep_Name, \
+                Dep_Price, Dep_Status, Dep_ref FROM HT_Deposit",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_deposit")
@@ -469,14 +492,13 @@ async fn snapshot_deposit(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), 
 
 async fn snapshot_changed_room(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, cin_no, room_before, room_after, change_date, \
-                    room_before_price, Note, ToPrice FROM HT_Changed_Room",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, cin_no, room_before, room_after, change_date, \
+                room_before_price, Note, ToPrice FROM HT_Changed_Room",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_changed_room")
@@ -527,17 +549,16 @@ async fn snapshot_changed_room(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
 
 async fn snapshot_bill_debt_h(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT Bill_No, Bill_Cust_ID, Bill_Cust_Name, Bill_Cust_Address, \
-                    Bill_Cust_Tel, Bill_Cust_Fax, Bill_Date, Bill_Ref, \
-                    Bill_Price_Type, Bill_Type, Bill_Total, Bill_Pay, \
-                    Bill_Debt, Bill_Pay_CASH, Bill_Pay_CREDIT, Bill_Status, \
-                    Bill_by, Bill_Note FROM HT_Bill_Debt_H",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT Bill_No, Bill_Cust_ID, Bill_Cust_Name, Bill_Cust_Address, \
+                Bill_Cust_Tel, Bill_Cust_Fax, Bill_Date, Bill_Ref, \
+                Bill_Price_Type, Bill_Type, Bill_Total, Bill_Pay, \
+                Bill_Debt, Bill_Pay_CASH, Bill_Pay_CREDIT, Bill_Status, \
+                Bill_by, Bill_Note FROM HT_Bill_Debt_H",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_bill_debt_h")
@@ -594,14 +615,13 @@ async fn snapshot_bill_debt_h(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<
 
 async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Bill_No, DS_ID, DS_NO, DS_NAME, \
-                    DS_UNIT, DS_NUM, DS_PRICE, DS_PRICE_TOTAL FROM HT_Bill_Debt_Ds",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Bill_No, DS_ID, DS_NO, DS_NAME, \
+                DS_UNIT, DS_NUM, DS_PRICE, DS_PRICE_TOTAL FROM HT_Bill_Debt_Ds",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_bill_debt_ds")
@@ -666,14 +686,13 @@ async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
 // The 9-column projection matches `BOOK_PRO_SELECT_COLS` in sync/mappers/mirror.rs.
 async fn snapshot_book_pro(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, B_NO, B_ROOM, B_NAME, B_UNIT, B_NUM, \
-                    B_PRICE, B_PRICE_TOTAL, B_PRO_ID FROM HT_Book_Pro",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, B_NO, B_ROOM, B_NAME, B_UNIT, B_NUM, \
+                B_PRICE, B_PRICE_TOTAL, B_PRO_ID FROM HT_Book_Pro",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut tx = pg_pool.begin().await?;
     sqlx::query("DELETE FROM legacy_mirror.ht_book_pro")
@@ -719,6 +738,65 @@ async fn snapshot_book_pro(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    /// Track F3 regression pin — the same "helper exists, nothing calls it"
+    /// class as the HT_Book_Pro guard below, but with a worse blast radius.
+    /// `sync/mappers/products.rs` shipped with a module docstring describing
+    /// a periodic poll and no poll: `ht_products` was populated only by an
+    /// operator hand-typing `prod_legacy_no` into `POST /api/new/products`.
+    /// The first product created and sold in iHOTEL therefore made
+    /// `sync/mappers/mirror.rs::upsert_canonical_pos_sale` return Err, which
+    /// marks the tick errored, which (since 42dc2c0 made the global watermark
+    /// gate on `!errored`) pinned the watermark for ALL CT tables on that
+    /// site until a human intervened — against a 2-day CT retention window.
+    #[test]
+    fn products_poll_is_wired_into_the_dimension_reload() {
+        let full = include_str!("mirror.rs");
+        let src = &full[..full
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist")];
+
+        let start = src
+            .find("pub async fn reload_mirror_dimensions(")
+            .expect("dimension-reload dispatcher must exist");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len())];
+
+        assert!(
+            body.contains("products::poll_products_once(legacy_pool, pg_pool)"),
+            "`poll_products_once` is not called by reload_mirror_dimensions — \
+             ht_products would have no automatic writer, and one product sold \
+             in iHOTEL stalls the whole site's CT watermark"
+        );
+    }
+
+    /// Products must be loaded BEFORE the sibling reloads, so a slow or
+    /// failing `legacy_mirror.*` DELETE+INSERT can never delay the one
+    /// dimension the CT watcher hard-depends on.
+    #[test]
+    fn products_poll_runs_before_the_legacy_mirror_reloads() {
+        let full = include_str!("mirror.rs");
+        let src = &full[..full
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist")];
+        let start = src
+            .find("pub async fn reload_mirror_dimensions(")
+            .expect("dimension-reload dispatcher must exist");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len())];
+
+        let products_at = body
+            .find("poll_products_once(legacy_pool")
+            .expect("products poll must be called");
+        let first_sibling = body
+            .find("reload_continuetime(legacy_pool")
+            .expect("reload_continuetime must be called");
+        assert!(
+            products_at < first_sibling,
+            "the ht_products poll must be the FIRST reload in the cycle — it \
+             is the only dimension a CT mapper blocks on"
+        );
+    }
+
     /// Drift guard for the class that left HT_Book_Pro out of the bootstrap for
     /// a full release (a `snapshot_*` helper existed but was never wired into
     /// `snapshot_mirror_transactional_tables`, so its rows never reached PG).

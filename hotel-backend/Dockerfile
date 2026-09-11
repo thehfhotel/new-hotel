@@ -175,6 +175,9 @@ RUN --mount=type=cache,target=/sccache,id=sccache-backend \
         --bin backfill_legacy_checkins \
         --bin backfill_legacy_bookings \
         --bin backfill_payment_ledger \
+        --bin backfill_receipt_payments \
+        --bin backfill_room_calendar \
+        --bin backfill_guest_registry_companions \
         --bin migrate_legacy \
         --bin create_user; \
     sccache --show-stats; \
@@ -187,6 +190,9 @@ RUN --mount=type=cache,target=/sccache,id=sccache-backend \
     cp target/release/backfill_legacy_checkins /out/; \
     cp target/release/backfill_legacy_bookings /out/; \
     cp target/release/backfill_payment_ledger /out/; \
+    cp target/release/backfill_receipt_payments /out/; \
+    cp target/release/backfill_room_calendar /out/; \
+    cp target/release/backfill_guest_registry_companions /out/; \
     cp target/release/migrate_legacy /out/; \
     cp target/release/create_user /out/; \
     rm -rf target
@@ -235,6 +241,9 @@ COPY --from=builder /out/backfill_checkin_rooms /app/backfill_checkin_rooms
 COPY --from=builder /out/backfill_legacy_checkins /app/backfill_legacy_checkins
 COPY --from=builder /out/backfill_legacy_bookings /app/backfill_legacy_bookings
 COPY --from=builder /out/backfill_payment_ledger /app/backfill_payment_ledger
+COPY --from=builder /out/backfill_receipt_payments /app/backfill_receipt_payments
+COPY --from=builder /out/backfill_room_calendar /app/backfill_room_calendar
+COPY --from=builder /out/backfill_guest_registry_companions /app/backfill_guest_registry_companions
 COPY --from=builder /out/migrate_legacy /app/migrate_legacy
 COPY --from=builder /out/create_user /app/create_user
 
@@ -246,6 +255,31 @@ EXPOSE 3003
 ENV HOST=0.0.0.0
 ENV PORT=3003
 ENV RUST_LOG=hotel_backend=info,tower_http=info
+
+# Commit SHA baked in at build time and surfaced by `/health` as `revision`
+# (see hotel-backend/src/routes/health.rs). Baked rather than injected at run
+# time on purpose — and NOT because the deploy shim is unreachable from CI: it
+# is version-controlled at scripts/deploy/run-deploy.sh and the live
+# /srv/run-deploy.sh self-updates from the repo on every deploy (CLAUDE.md
+# §"Deployment Policy" item 5), which is exactly how HK_MARK_DIRTY_ENABLED,
+# HFID_LOCATION_URL, RUST_LOG and friends already reach the container. The real
+# reason is stronger: a runtime env var proves only what the deploy shim
+# DELIVERED, not which image the container actually LOADED, and a baked value
+# keeps telling the truth through a rollback to an older tag. Without it,
+# "verified live" can only be argued from the promote job's ghcr digest,
+# off-band from the running container.
+#
+# Passed by the `build-backend` job in .github/workflows/docker-build.yml as
+# `build-args: GIT_SHA=${{ github.sha }}` — the FULL 40-char github.sha, not
+# the 7-char `type=sha` image tag. The `unknown` default keeps a local
+# `docker build` honest instead of blank, and the handler maps an empty value
+# to the same `unknown` (defensive: nothing supplies GIT_SHA at run time
+# today).
+#
+# Declared LAST on purpose: an ARG invalidates every layer after it, and this
+# value changes on every commit. Everything expensive is already above it.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 
 # Container-level healthcheck. Same endpoint the docker-compose healthcheck
 # uses — present here so `docker run` users + non-compose orchestrators

@@ -6,8 +6,9 @@
 //!
 //! ## Background
 //!
-//! `docs/legacy-app/COMPAT_CHEATSHEET.md:560-564` documents the stock
-//! invariant — every `HT_CheckIn_Product` INSERT/UPDATE/DELETE on the
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md` §6.3 "HT_Products.Pro_Amt -= num"
+//! documents the stock invariant — every `HT_CheckIn_Product`
+//! INSERT/UPDATE/DELETE on the
 //! legacy side is paired with
 //! `UPDATE HT_Products SET Pro_Amt = Pro_Amt ± num WHERE Pro_no='<id>'`
 //! so the running stock counter stays consistent with consumption.

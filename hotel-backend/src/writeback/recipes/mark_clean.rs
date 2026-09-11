@@ -20,7 +20,11 @@
 //! Spike §3j critical findings:
 //! - `HT_Rooms` is updated by **`id` (numeric)**, not `room_no`. Per spike §4e,
 //!   different statements pick different lookup keys — be precise.
-//! - `Room_Clean='no'` means "no cleaning needed" (already cleaned).
+//! - `Room_Clean='no'` means "no cleaning needed" (already cleaned). The
+//!   opposite pole is `'yes'` = "needs cleaning" (DIRTY) — findings.md §3e
+//!   check-out Phase 2 and §3i cancel-check-in both set `'yes'` when the
+//!   room is released. `mark_dirty` writes that literal; the two recipes
+//!   are deliberately NOT interchangeable.
 //! - The recipe issues a **lookup query** before the INSERT to find the prior
 //!   occupant — see [`fetch_prior_occupant`].
 //! - If no prior occupant exists (brand-new room), `h_cin` and `h_cin_name`
@@ -56,6 +60,53 @@ pub fn build_statements(
     prior: Option<&PriorOccupant>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
+    vec![
+        // 1. Clear the cleaning flag — by HT_Rooms.id (numeric).
+        //    `Room_Clean='no'` = "no cleaning needed" (spike §3j capture);
+        //    the DIRTY literal is `'yes'` — see `mark_dirty`.
+        format!(
+            "update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id={room_id}"
+        ),
+        // 2. Audit row in HT_Housewife — shared with `mark_dirty` via
+        //    [`build_housewife_audit_insert`] so the literal stays in
+        //    lock-step across both housekeeping recipes (`helpers` charter).
+        build_housewife_audit_insert(room_no, by, prior, now),
+    ]
+}
+
+/// Build the `HT_Housewife` audit-row INSERT. PURE — no I/O.
+///
+/// Shared by [`build_statements`] and
+/// [`super::mark_dirty::build_statements`]: iHOTEL logs every housekeeping
+/// action (clean / dirty / repair) into the same table with the same
+/// column set (`COMPAT_CHEATSHEET.md` §`HT_Housewife`), so the literal
+/// lives in one place.
+///
+/// Track C T5 HIGH-3 dedup guard (`docs/coexistence/audit-2026-05-13.md`):
+///
+/// HT_Housewife has no UNIQUE constraint we control (the legacy schema is
+/// read-only — we cannot add one without breaking the legacy app's INSERT
+/// path). Without a guard, two concurrent mark-clean events (housekeeper
+/// marks clean in iHOTEL at T0, our mobile app fires the same intent at
+/// T0+50ms) both succeed and the audit log over-counts.
+///
+/// The `WHERE NOT EXISTS` guard skips the INSERT when a matching audit row
+/// was written for the same (room, prior cin) pair in the last 5 minutes.
+/// The window matches realistic concurrent housekeeping scenarios:
+/// - A receptionist marks the room clean in iHOTEL and a housekeeper marks
+///   it clean on the mobile app within minutes of each other — coexistence
+///   path.
+/// - The writeback worker retries after a transient network failure on
+///   COMMIT — idempotency path.
+///
+/// Anything beyond 5 minutes is treated as a legitimate re-clean (e.g. the
+/// room was re-occupied and freshly cleaned again the same shift).
+pub(super) fn build_housewife_audit_insert(
+    room_no: &str,
+    by: &str,
+    prior: Option<&PriorOccupant>,
+    now: DateTime<Utc>,
+) -> String {
     let now_str = format_legacy_datetime(now);
     let now_q = sql_quote(&now_str);
     let by_q = sql_quote(by);
@@ -65,47 +116,20 @@ pub fn build_statements(
         None => ("''".to_string(), "''".to_string()),
     };
 
-    vec![
-        // 1. Clear the cleaning flag — by HT_Rooms.id (numeric)
-        format!(
-            "update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id={room_id}"
-        ),
-        // 2. Audit row in HT_Housewife — Track C T5 HIGH-3 dedup guard
-        //    (`docs/coexistence/audit-2026-05-13.md`).
-        //
-        //    HT_Housewife has no UNIQUE constraint we control (the legacy
-        //    schema is read-only — we cannot add one without breaking the
-        //    legacy app's INSERT path). Without a guard, two concurrent
-        //    mark-clean events (housekeeper marks clean in iHOTEL at T0,
-        //    our mobile app fires the same intent at T0+50ms) both succeed
-        //    and the audit log over-counts.
-        //
-        //    The `WHERE NOT EXISTS` guard skips the INSERT when a matching
-        //    audit row was written for the same (room, prior cin) pair in
-        //    the last 5 minutes. The window matches realistic concurrent
-        //    housekeeping scenarios:
-        //    - A receptionist marks the room clean in iHOTEL and a
-        //      housekeeper marks it clean on the mobile app within minutes
-        //      of each other — coexistence path.
-        //    - The writeback worker retries after a transient network
-        //      failure on COMMIT — idempotency path.
-        //    Anything beyond 5 minutes is treated as a legitimate
-        //    re-clean (e.g. the room was re-occupied and freshly cleaned
-        //    again the same shift).
-        format!(
-            "INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) \
-             SELECT {by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q} \
-             WHERE NOT EXISTS (\
-                 SELECT 1 FROM HT_Housewife \
-                  WHERE h_room={room_no_q} AND h_cin={h_cin_q} \
-                    AND h_date > DATEADD(minute, -5, GETDATE())\
-             )"
-        ),
-    ]
+    format!(
+        "INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) \
+         SELECT {by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q} \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM HT_Housewife \
+              WHERE h_room={room_no_q} AND h_cin={h_cin_q} \
+                AND h_date > DATEADD(minute, -5, GETDATE())\
+         )"
+    )
 }
 
 /// SELECT the prior occupant of `room_no` whose per-room check-out
-/// completed (Wave 5b item 1). Filter mirrors `COMPAT_CHEATSHEET.md:864-866`
+/// completed (Wave 5b item 1). Filter mirrors `COMPAT_CHEATSHEET.md`
+/// §"Table: `HT_Housewife` (A)" "order by cin_room_out desc"
 /// (`View_CheckIn_Ds where Cin_room_status='Check-Out' and cin_room_no=…
 /// order by cin_room_out desc`) so a multi-room check-in where one room is
 /// already out and another still occupied returns the freshly-out row, not
@@ -164,7 +188,8 @@ fn build_prior_occupant_sql(room_no: &str) -> String {
     let checked_out_q = sql_quote(CIN_ROOM_STATUS_CHECKED_OUT);
     let cancelled_q = sql_quote(CIN_STATUS_CANCELLED);
     // Wave 5b item 1: per-room status filter (`d.Cin_Room_Status='Check-Out'`)
-    // matches `COMPAT_CHEATSHEET.md:864-866`. The earlier whole-check-in filter
+    // matches `COMPAT_CHEATSHEET.md` §"Table: `HT_Housewife` (A)"
+    // "order by cin_room_out desc". The earlier whole-check-in filter
     // (`h.cin_status NOT IN ('ยกเลิก')`) is kept as belt-and-suspenders so a
     // partially-cancelled multi-room check-in (where one room shows
     // `Check-Out` but the header status was force-set to `ยกเลิก`) doesn't
@@ -217,6 +242,62 @@ mod tests {
         assert!(statements[1].contains("'306'"));
     }
 
+    /// Maid attribution (housekeeping-ops, 2026-08-11): `by` must land in
+    /// **`[h_name]`** — the FIRST projected column — and must not be confused
+    /// with `[h_cin_name]` (the prior occupant, last column). The pre-existing
+    /// spike-capture test only asserts `contains("'Admin'")`, which would still
+    /// pass if the two were swapped; the `/hk` surface now feeds the maid's
+    /// name through `by`, so pin the column ORDER explicitly.
+    #[test]
+    fn by_is_projected_into_h_name_not_h_cin_name() {
+        let prior = PriorOccupant {
+            cin_no: "CH26-005159".into(),
+            customer_full_name: "Jane Doe".into(),
+        };
+        let statements = build_statements(6, "306", "นก", Some(&prior), pinned_now());
+        let insert = &statements[1];
+
+        // Column list order is the contract the SELECT projection must match.
+        assert!(
+            insert.contains("([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name])"),
+            "column list changed — the projection assertions below assume it: {insert}"
+        );
+        // `by` is the FIRST projected value (h_name); the guest name is LAST.
+        assert!(
+            insert.contains("SELECT 'นก', '306',"),
+            "the maid's name must be projected first, into [h_name]: {insert}"
+        );
+        assert!(
+            insert.contains(",'Jane Doe'"),
+            "the prior occupant must remain in [h_cin_name]: {insert}"
+        );
+        assert!(
+            !insert.contains("SELECT 'Jane Doe'"),
+            "the guest name must never land in [h_name]: {insert}"
+        );
+    }
+
+    /// Byte-parity (invariant #3): a Thai maid name must be emitted as a PLAIN
+    /// `'…'` literal — an `N'…'` prefix corrupts TIS-620 on the legacy side —
+    /// and an apostrophe must be doubled, not escaped.
+    #[test]
+    fn thai_maid_name_is_a_plain_literal_with_doubled_apostrophes() {
+        let statements = build_statements(6, "306", "นก", None, pinned_now());
+        let insert = &statements[1];
+        assert!(insert.contains("'นก'"), "Thai name must round-trip: {insert}");
+        assert!(
+            !insert.contains("N'"),
+            "must never emit an N-prefixed literal (TIS-620 corruption): {insert}"
+        );
+
+        let quoted = build_statements(6, "306", "O'Brien", None, pinned_now());
+        assert!(
+            quoted[1].contains("'O''Brien'"),
+            "apostrophes must be doubled: {}",
+            quoted[1]
+        );
+    }
+
     /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — repeated
     /// calls with the same inputs produce byte-identical output, including
     /// the `h_date` stamp.
@@ -253,7 +334,8 @@ mod tests {
     /// multi-room check-in where room A is checked out and room B is still
     /// occupied would return room B's still-occupying detail row as the
     /// "prior occupant" for mark-clean on room A. Per
-    /// `COMPAT_CHEATSHEET.md:864-866`.
+    /// `COMPAT_CHEATSHEET.md` §"Table: `HT_Housewife` (A)"
+    /// "order by cin_room_out desc".
     #[test]
     fn filters_by_per_room_status_not_whole_checkin() {
         let sql = build_prior_occupant_sql("306");
