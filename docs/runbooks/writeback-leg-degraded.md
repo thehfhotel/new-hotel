@@ -3,8 +3,8 @@
 > **Alert:** `:satellite_antenna: Loyalty-channel writeback stalled — iHOTEL cannot see N app booking(s)`
 > **Fires from:** the backend/scheduler container (`scheduler::sync::check_loyalty_writeback_stall_and_alert`), every 2 minutes.
 > **Severity:** warning tier — no `<!channel>`. Real and actionable; not a wake-the-engineer page.
-> **Clock:** you have the remainder of a **2-hour hold TTL** to act (`docs/loyalty-channel.md:195`).
-> **Owner at 02:00:** the night receptionist (§6). Engineering owns the leg; the desk owns the room.
+> **Clock:** you have the remainder of a **2-hour hold TTL** to act (`docs/loyalty-channel.md` §"Piece 1 — inbound channel API" "book_hold_expires_at = now + 2h").
+> **Owner at 02:00:** the night receptionist (section 6). Engineering owns the leg; the desk owns the room.
 
 ---
 
@@ -16,8 +16,8 @@ writeback job to the legacy iHOTEL database has **not applied** for more than th
 configured threshold (default 10 minutes).
 
 **Why that matters more than an ordinary stuck writeback.** A loyalty hold is the one
-canonical write whose *value* depends on the legacy leg being up. From
-`docs/loyalty-channel.md:225-227`:
+canonical write whose *value* depends on the legacy leg being up. From `docs/loyalty-channel.md`
+§"Dual-write policy for holds" "receptionist would double-book the room during the 2h payment window":
 
 > A hold is a **roomed `pending` booking** … We deliberately keep that: **iHOTEL sees the
 > hold as `จอง` immediately**, otherwise a receptionist would double-book the room during
@@ -132,7 +132,7 @@ is not. **None of them is fixed by this PR** — they belong to the loyalty app.
    client, which sets 30 s. A black-holed TCP connection therefore **hangs** rather than
    failing fast, and the `is_timeout()` branch above is effectively unreachable for that
    case. A guest who gives up and retries can create a second hold (no idempotency key
-   either, `:41-53`). Tracked as control **L5** in the b8 overbooking analysis.
+   either, `:41-53`). Tracked as control **L5** in the B8 overbooking analysis.
 
 ### 2c. When the legacy leg is down — the app does NOT fail closed, and cannot
 
@@ -193,10 +193,11 @@ A partial drain is not a recovery. A site that has never stalled never emits one
 > Tailscale. HF Ville's MSSQL is reached over the `hfville` WG interface
 > (`evergreen → MikroTik DNAT → 192.168.11.51:1436`, `docker-compose.yml:987,1019`), a path
 > chosen **over** Tailscale subnet routing on purpose
-> (`docs/adr/0001-phase5-ville-multi-site.md:21,43`). **HF Hotel's MSSQL is on the LAN and
+> (`docs/adr/0001-phase5-ville-multi-site.md` §"Q3 — Tailscale subnet routing"). **HF Hotel's MSSQL is on the LAN and
 > needs no tunnel at all.** Tailscale still matters as a *liveness signal* — when a box
 > drops off Tailscale *and* the WG ping dies *and* SQL probes fail, the box itself is
-> down, not the tunnel (`docs/coexistence/sync-incident-log.md:721-722`). Do not spend
+> down, not the tunnel (`docs/coexistence/sync-incident-log.md` §"2026-08-11 — HF Ville box hang"
+> "Whole box unreachable"). Do not spend
 > 02:00 re-dialling a tunnel to a box that is hung.
 
 Work the ladder in order. Stop at the first rung that explains the symptom.
@@ -213,7 +214,7 @@ Service definitions: `docker-compose.yml:765` (`writeback`, `profiles: [legacy]`
 `:1250` (`writeback-hfville`, `profiles: [hfville]`). Bring back with
 `docker compose --profile legacy up -d` / `--profile hfville up -d`.
 
-**Note the restart-cap trap** (`docs/runbook-sync.md` §3): with `restart: on-failure:5`, a
+**Note the restart-cap trap** (`docs/runbook-sync.md` §"3. Slack alert meanings"): with `restart: on-failure:5`, a
 worker that refuses to start pages a few times and then goes **permanently silent**. A
 quiet channel is not recovery — always confirm with `docker compose ps`.
 
@@ -222,13 +223,14 @@ quiet channel is not recovery — always confirm with `docker compose ps`.
 collation check, or the writeback-ledger check
 (`bin/writeback.rs` startup probes; budget `WRITEBACK_STARTUP_PROBE_ATTEMPTS`, default 4,
 ~36 s total). A fingerprint mismatch is re-captured with
-`./scripts/writeback-fingerprint.sh` — read `docs/runbook-sync.md` §3 first; a
+`./scripts/writeback-fingerprint.sh` — read `docs/runbook-sync.md` §"3. Slack alert meanings" first; a
 fingerprint change usually means somebody altered the legacy schema, which is its own
 incident.
 
 **Rung 3 — HF Ville only: is the WG tunnel up?** The established recipe
-(`docs/coexistence/RUNBOOK-mssql-022-apply.md:49-55`, identical at
-`docs/coexistence/RUNBOOK-b5-backfill.md:59-64`):
+(`docs/coexistence/RUNBOOK-mssql-022-apply.md` §"Pre-flight checks"
+"Tunnel for HF-Ville only", identical in
+`docs/coexistence/RUNBOOK-b5-backfill.md` §"Pre-flight checks"):
 
 ```
 sudo wg-quick up hfville
@@ -237,7 +239,8 @@ ping -c1 192.168.11.51     # must succeed before continuing
 
 **Precedent — transient, self-healing.** A `HF Ville DEGRADED→UP` pair fired 2026-08-07
 09:26→09:28 ICT: WireGuard down during a **PPPoE re-dial**, self-healed in 2 minutes, app
-path stayed up, **needed no action** (`docs/coexistence/sync-incident-log.md:642-643`).
+path stayed up, **needed no action** (`docs/coexistence/sync-incident-log.md` §"2026-08-10 — HF Ville calendar"
+"during a PPPoE re-dial, self-healed in 2 min").
 If the leg returns on its own inside a few minutes and the all-clear arrives, that is this
 shape. Do not escalate it.
 
@@ -245,12 +248,14 @@ shape. Do not escalate it.
 are *all* dead at once, the box is hung, not the network. Precedent: 2026-08-11, an SSD
 I/O failure on HF Ville's system drive froze iHOTEL and the whole box; the CT watermark
 pinned onset to 11:36 and only a manual reboot at ~13:21 restored it
-(`docs/coexistence/sync-incident-log.md:719-755`). A reboot is an owner action at the
+(`docs/coexistence/sync-incident-log.md` §"2026-08-11 — HF Ville box hang"
+"reboot ~13:21 restored everything"). A reboot is an owner action at the
 physical site — wake the owner, not an engineer.
 
 **Rung 5 — after any legacy-box reboot, check what did not come back.** iHOTEL's
 middleware **did not autostart** after that reboot — its HKCU `Run` entry is UNQUOTED
-unlike every sibling entry (`docs/coexistence/sync-incident-log.md:753-755`). A box that
+unlike every sibling entry (`docs/coexistence/sync-incident-log.md` §"2026-08-11 — HF Ville box hang"
+"its HKCU Run entry is UNQUOTED"). A box that
 is "up" is not necessarily a leg that is working. Re-check `docker compose ps`, the
 watermark, and wait for the `:white_check_mark:`.
 
@@ -279,7 +284,8 @@ Check these before closing the incident:
    Our app auto-cancelled it via the 5-minute expiry sweep, which enqueues a normal
    `CancelBooking` writeback — so once the leg is back, iHOTEL may briefly show a `จอง`
    appear and then disappear. That churn is **expected**
-   (`docs/loyalty-channel.md:237-239` flags it as a go-live communication item), but a
+   (`docs/loyalty-channel.md` §"Dual-write policy for holds"
+   "churn reception should be told about at go-live"), but a
    guest who paid inside that window has paid for a room they no longer hold. Escalate to
    the owner for a refund-or-rebook decision; do not silently re-create the booking.
 2. **Stale `จอง` from stalled `cancel_booking` intents.** Confirm the room reads free in
@@ -291,7 +297,8 @@ Check these before closing the incident:
 4. **Deposit reads 0 in iHOTEL — expected, not a symptom.** Payment-verified is a PG-only
    flip; the validated `booking_modify` recipe has no deposit leg and inventing one would
    break byte-parity, so iHOTEL shows deposit 0 until checkout
-   (`docs/loyalty-channel.md:230-234`). Do not "correct" it by hand.
+   (`docs/loyalty-channel.md` §"Dual-write policy for holds"
+   "the deposit is not mirrored"). Do not "correct" it by hand.
 
 ---
 
@@ -359,12 +366,12 @@ held room is the fastest way to get the whole channel muted.
 
 ## Related
 
-- `hf-tasks/tasks/direct-booking-designs/b8-overbooking-analysis.md` §3, §4 — the analysis
+- hf-tasks task **B8** (`direct-booking-designs/b8-overbooking-analysis`), sections 3 and 4 — the analysis
   that specified this detector (defect 3, control **L7**), and the other controls (**L2**
   last-room guard, **L3** serialized pick→create, **L4** late-slip status filter, **L5**
   client timeout + idempotency key) that this one does *not* replace.
 - `docs/loyalty-channel.md` — the channel contract: hold TTL, why holds write back
   immediately, the deposit-0 divergence, the churn note.
-- `docs/runbook-sync.md` §2a (alert-tuning knobs), §3 (Slack alert meanings).
-- `docs/coexistence/sync-incident-log.md` — the WG re-dial (`:642-643`) and box-hang
-  (`:719-755`) precedents cited in §4.
+- `docs/runbook-sync.md` §"2a. Alert-tuning knobs", and its §"3. Slack alert meanings" table.
+- `docs/coexistence/sync-incident-log.md` — the WG re-dial and box-hang precedents
+  cited in section 4 above.
