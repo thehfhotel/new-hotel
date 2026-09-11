@@ -71,6 +71,19 @@ pub enum ServiceError {
     #[error("outbox error: {0}")]
     Outbox(String),
 
+    /// Transient, self-clearing contention — the request was well-formed, the
+    /// state was fine, and NOTHING was written; a concurrent writer simply
+    /// held a lock longer than we wait. **Retryable**: the HTTP layer maps it
+    /// to `503` + `Retry-After`, never to `400`.
+    ///
+    /// It exists because [`Self::Conflict`] is flattened to
+    /// [`ApiError::BadRequest`] by the mapping below (see the NOTE there), and
+    /// a 400 is terminal for a machine caller: the OTA bridge would treat a
+    /// millisecond of desk contention as a malformed booking and drop it. The
+    /// message is user-facing and must name no internal machinery.
+    #[error("busy: {0}")]
+    Busy(String),
+
     /// Catch-all for unexpected failures (`serde_json` encode, etc.).
     #[error("internal error: {0}")]
     Internal(String),
@@ -125,9 +138,47 @@ impl ServiceError {
         ServiceError::Outbox(err.to_string())
     }
 
+    /// Construct a retryable-contention error from any `Display`-able message.
+    pub fn busy(msg: impl Into<String>) -> Self {
+        ServiceError::Busy(msg.into())
+    }
+
     /// Construct an internal error from any `Display`-able message.
     pub fn internal(msg: impl Into<String>) -> Self {
         ServiceError::Internal(msg.into())
+    }
+}
+
+/// A booking-inventory lock (B8e / L3) that could not be taken.
+///
+/// A `Busy`, never a `Conflict` and never a successful create. The distinction
+/// is load-bearing twice over:
+///
+/// * **Not a conflict.** `Conflict` flattens to `400` for the desk form and the
+///   OTA bridge, and a 400 is terminal — a machine caller drops the booking
+///   instead of retrying, so a millisecond of contention would cost a real
+///   reservation. `Busy` is `503` + `Retry-After`.
+/// * **Not swallowed.** A create that proceeds without the lock is precisely
+///   the double-sell this feature exists to stop, so the only alternative to
+///   retrying is refusing.
+///
+/// The DETAIL (property, waited, cause) is logged here and deliberately kept
+/// OUT of the message the caller sees: `Busy` reaches an unauthenticated-ish
+/// machine surface, and naming our lock subsystem and property ids there
+/// leaks internals for no operational benefit — the log line has them.
+impl From<crate::repository::inventory_lock::InventoryLockError> for ServiceError {
+    fn from(err: crate::repository::inventory_lock::InventoryLockError) -> Self {
+        use crate::repository::inventory_lock::InventoryLockError;
+        match err {
+            InventoryLockError::Db(err) => ServiceError::Repository(err),
+            busy @ InventoryLockError::Busy { .. } => {
+                tracing::warn!(detail = %busy, "booking-inventory lock unavailable; answering 503");
+                ServiceError::Busy(
+                    "another booking is being saved right now; please retry in a moment"
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -152,6 +203,10 @@ impl From<ServiceError> for ApiError {
             // status codes as a side effect. `service::hk_signals` documents
             // the choice at its own boundary.
             ServiceError::Conflict(msg) => ApiError::BadRequest(msg),
+            // 503 + Retry-After, NOT 400: see the variant's own doc. This is
+            // the arm that keeps a transient lock wait from looking like a
+            // malformed request to the desk form and the OTA bridge.
+            ServiceError::Busy(msg) => ApiError::Busy(msg),
             ServiceError::Repository(err) => ApiError::Database(err.to_string()),
             ServiceError::Outbox(msg) => ApiError::Internal(format!("outbox: {msg}")),
             ServiceError::Internal(msg) => ApiError::Internal(msg),

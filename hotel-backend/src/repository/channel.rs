@@ -248,7 +248,16 @@ const PARKED_CLAIM_PREDICATE: &str = concat!(
 /// ([`pick_free_room`]) and the snapshot ([`inventory_snapshot`]) so the
 /// three cannot drift:
 ///
-/// * `free_rooms` — one row per physically free room (id, number, type);
+/// * `free_rooms` — one row per physically free room (id, number, type).
+///   NOTE: it filters on the ROOM (`room_active`, maintenance, no overlapping
+///   claim) and deliberately not on the room's TYPE, so a room whose
+///   `room_type_id` is NULL or points at an INACTIVE type still counts toward
+///   the property-wide total. That is right for the property-wide terms —
+///   such a room is still a bed reception can sell, and excluding it would
+///   understate `inventory_surplus` and produce false sold-outs — and it is
+///   harmless for the per-type ones, which join on `ht_room_types` and so
+///   never attribute it to a sellable type. The B8e last-room floor inherits
+///   the same semantics on purpose;
 /// * `parked_claims` — how many live roomless bookings overlap the window,
 ///   typed and untyped together (the property-wide pressure term);
 /// * `parked_claims_typed` — the same population grouped by
@@ -377,9 +386,16 @@ pub async fn availability_by_type(
 /// (the availability endpoint filters capacity, but a direct create must not
 /// trust the caller to have gone through it).
 ///
-/// NOTE: pick → create is not serialized against a concurrent pick of the
-/// same room (same race window the walk-in / booking form has today; the
-/// existing create path accepts it and the shadow validator observes it).
+/// SERIALIZATION (B8e / L3): this is a plain SELECT and knows nothing about
+/// locking, but its two callers — `service::channel::create_hold` and, for the
+/// desk/OTA shape, `service::booking::create` — hold the property's
+/// booking-inventory advisory lock (`repository::inventory_lock`) across
+/// pick → insert, so a concurrent pick of the same room waits and then
+/// re-evaluates. Paths OUTSIDE those two (walk-in check-in, room change,
+/// stay extension, booking edit / parked promote, the CT sync mappers) still
+/// race exactly as they did before; the B8e last-room floor, not this lock,
+/// is what keeps the channel clear of them. The full list is in
+/// `repository::inventory_lock`'s module doc — keep the two in step.
 ///
 /// B8a/B8c: gated on the same `type_availability` row the counter reports, so
 /// the picker REFUSES while this TYPE is spoken for by parked (roomless)

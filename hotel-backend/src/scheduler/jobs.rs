@@ -563,7 +563,17 @@ fn channel_service_for_pool(pg: &PgPool) -> ChannelService {
         events,
         pg.clone(),
     ));
-    ChannelService::new(pg.clone(), bookings, customers, customers_repo)
+    ChannelService::new(
+        pg.clone(),
+        bookings,
+        customers,
+        customers_repo,
+        // B8e / L2. The sweep only RELEASES holds, so the floor is never
+        // consulted on this path — pass the configured value anyway rather
+        // than a literal, so a future sweep-side create cannot inherit a
+        // silently disabled guard.
+        crate::config::loyalty_last_room_floor(),
+    )
 }
 
 /// Apply the task #69 site-id prefix to a Block-Kit Slack message in

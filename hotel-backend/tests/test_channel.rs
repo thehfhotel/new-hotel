@@ -89,7 +89,12 @@ fn service_for(pool: &PgPool) -> ChannelService {
         events,
         pool.clone(),
     ));
-    ChannelService::new(pool.clone(), bookings, customers, customers_repo)
+    // B8e / L2: floor 0 — this file's scenarios predate the last-room guard
+    // and assert the pre-guard behaviour (idempotency, sweep, confirm). The
+    // guard has its own file (`test_channel_last_room.rs`); leaving it on here
+    // would make every assertion depend on how many rooms the host database
+    // happens to carry.
+    ChannelService::new(pool.clone(), bookings, customers, customers_repo, 0)
 }
 
 /// Seed one test room type (sleeps 2) with two active rooms. Returns type_id.
@@ -203,6 +208,7 @@ fn count_for(
 
 fn hold_cmd(book_no: &str, type_id: i32, check_in: &str, check_out: &str) -> CreateHoldCommand {
     CreateHoldCommand {
+        property: "hf".to_string(),
         book_no: book_no.to_string(),
         room_type_id: type_id,
         check_in: d(check_in),
@@ -355,8 +361,11 @@ async fn loyalty_channel_end_to_end() {
         ))
         .await
     {
-        Err(ServiceError::Conflict(_)) => {}
-        other => panic!("expected Conflict for sold-out window, got {other:?}"),
+        // B8e / M2: sold-out is an OUTCOME now, not an error — the route
+        // needs it separable from the last-room floor (same 409, different
+        // guest copy) and from a lock timeout (503).
+        Ok(HoldCreateOutcome::SoldOut { .. }) => {}
+        other => panic!("expected SoldOut for a sold-out window, got {other:?}"),
     }
 
     // Party larger than the type sleeps ⇒ refuse even with rooms free
@@ -364,8 +373,8 @@ async fn loyalty_channel_end_to_end() {
     let mut oversized = hold_cmd(&format!("{BOOK_NO_PREFIX}-X2"), type_id, w2.0, w2.1);
     oversized.guests = 3;
     match svc.create_hold(oversized).await {
-        Err(ServiceError::Conflict(_)) => {}
-        other => panic!("expected Conflict for oversized party, got {other:?}"),
+        Ok(HoldCreateOutcome::SoldOut { .. }) => {}
+        other => panic!("expected SoldOut for an oversized party, got {other:?}"),
     }
 
     // Free the seeded conflicts for the rest of the scenario.
@@ -789,6 +798,7 @@ async fn cleanup_idem(pool: &PgPool) {
 
 fn idem_hold_cmd(book_no: &str, type_id: i32) -> CreateHoldCommand {
     CreateHoldCommand {
+        property: "hf".to_string(),
         book_no: book_no.to_string(),
         room_type_id: type_id,
         check_in: d("2026-11-02"),
@@ -857,6 +867,23 @@ async fn create_hold_with_key(
                         HoldCreateOutcome::KeyReusedForDifferentRequest => {
                             reservation.abandon().await;
                             return Ok(KeyedCreate::Mismatch);
+                        }
+                        // Unreachable here: `service_for` pins the B8e floor
+                        // to 0 for this file. Panic rather than fold it into
+                        // Mismatch — a floor refusal arriving where a key
+                        // verdict is expected means the fixture changed, and
+                        // silently reporting the wrong verdict would hide it.
+                        HoldCreateOutcome::LastRoomHeldForDesk { .. } => {
+                            reservation.abandon().await;
+                            panic!("the last-room floor is disabled in this file's fixtures");
+                        }
+                        // Likewise unreachable: these fixtures seed their own
+                        // free rooms. A sold-out answer here means the fixture
+                        // changed, and folding it into a key verdict would
+                        // report the wrong reason for the failure.
+                        HoldCreateOutcome::SoldOut { room_type } => {
+                            reservation.abandon().await;
+                            panic!("fixture room type '{room_type}' unexpectedly sold out");
                         }
                     };
                     // Stand-in for the real 201 payload; the point is that the

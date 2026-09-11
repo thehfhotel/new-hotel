@@ -257,6 +257,9 @@ async fn desk_create_records_the_claimed_room_type() {
             book_channel: None,
             book_ext_ref: None,
             book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,
@@ -490,6 +493,9 @@ async fn ordinary_edit_of_a_parked_booking_preserves_its_room_type() {
             book_channel: None,
             book_ext_ref: None,
             book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,
@@ -596,6 +602,9 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             book_channel: None,
             book_ext_ref: None,
             book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,
@@ -731,6 +740,9 @@ async fn already_mirrored_booking_takes_modify_path() {
             book_channel: None,
             book_ext_ref: None,
             book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,

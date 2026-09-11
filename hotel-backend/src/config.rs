@@ -576,6 +576,67 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// `BOOKING_INVENTORY_LOCK_ENABLED` (B8e / L3) — kill switch for the
+/// per-property booking-inventory advisory lock that serialises
+/// pick → create (`repository::inventory_lock`).
+///
+/// **Default ON**, unlike every other flag in this file: the flags below ship
+/// dark because they OPEN a legacy write, whereas this one CLOSES a
+/// double-sell window and turning it off re-opens the B8 §2.1/§2.3 race
+/// (two holds, or a hold and a desk booking, both taking the last room).
+/// It exists so an operator can un-serialise booking creates without a
+/// rollback deploy if the lock itself ever becomes the problem — an incident
+/// tool, not a tuning knob.
+///
+/// Only an explicit `false` / `0` disables it; unset, blank and garbage all
+/// keep the guard on, which is the same "a deploy typo must not silently
+/// remove a guard" rule as [`loyalty_last_room_floor`].
+pub fn booking_inventory_lock_enabled() -> bool {
+    match std::env::var("BOOKING_INVENTORY_LOCK_ENABLED") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "false" || normalized == "0")
+        }
+        Err(_) => true,
+    }
+}
+
+/// `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` (B8e / L2) — how many sellable rooms the
+/// property keeps back for the FRONT DESK.
+///
+/// When the channel's own property-wide surplus for the requested nights
+/// (`repository::channel::inventory_snapshot().surplus`) is at or below this
+/// number, `service::channel::create_hold` refuses the hold with a distinct
+/// 409 reason and the loyalty app shows call-the-desk copy. Reception is not
+/// gated: the desk can still book the room the channel just declined.
+///
+/// The CODE default is **1** (guard on) so an unset or garbled value can
+/// never silently remove an inventory guard — a typo in the deploy env must
+/// not disable it (contrast [`flag_enabled`], where an unparseable value
+/// reads as off because there the closed state IS off).
+///
+/// The DEPLOYED default is **0** (guard off) — `docker-compose.yml` ships
+/// `${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-0}` deliberately, because the refusal
+/// is only useful once loyalty-app renders call-the-desk copy for
+/// `reason: "last_room_held_for_desk"`; until it does, a floored hold reaches
+/// the guest as an unexplained failure. Flip the compose default to 1 after
+/// that lands — see `docs/loyalty-channel.md`. `0` disables the guard.
+///
+/// Not an allotment — loyalty-app ADR-0003 rejects those and this is not one:
+/// it caps nothing while the property has slack, it only reserves the tail.
+pub fn loyalty_last_room_floor() -> i64 {
+    const DEFAULT_FLOOR: i64 = 1;
+    match std::env::var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .unwrap_or(DEFAULT_FLOOR),
+        Err(_) => DEFAULT_FLOOR,
+    }
+}
+
 /// Loyalty-app integration config (booking channel + checkout stay hook).
 ///
 /// Two independent halves, both fail-closed:
@@ -1415,6 +1476,72 @@ mod tests {
     ///   including empty values.
     ///
     /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// B8e / L3 — the inventory-lock kill switch is DEFAULT ON, and only an
+    /// explicit false/0 turns it off.
+    ///
+    /// The polarity is the opposite of every ship-dark flag in this file and
+    /// that is the point: those gate a legacy WRITE (closed = off), this one
+    /// gates a double-sell GUARD (closed = on). A future refactor that routes
+    /// it through `flag_enabled` for consistency would silently un-serialise
+    /// every booking create, so the asymmetry is pinned here.
+    #[test]
+    fn inventory_lock_is_on_unless_explicitly_disabled() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["BOOKING_INVENTORY_LOCK_ENABLED"]);
+
+        assert!(
+            booking_inventory_lock_enabled(),
+            "unset must keep the lock on"
+        );
+
+        for on in ["true", "1", "", "   ", "yes", "garbage"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", on);
+            assert!(
+                booking_inventory_lock_enabled(),
+                "'{on}' must not disable the serialisation guard"
+            );
+        }
+
+        for off in ["false", "0", " FALSE ", "False"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", off);
+            assert!(
+                !booking_inventory_lock_enabled(),
+                "'{off}' is the explicit kill switch"
+            );
+        }
+    }
+
+    /// B8e / L2 — the last-room floor defaults to ON, and only an explicit,
+    /// parseable, non-negative number moves it.
+    ///
+    /// The asymmetry with [`flag_enabled`] is the point and is asserted here:
+    /// a garbled value there reads as OFF (the closed state), a garbled value
+    /// here reads as the DEFAULT (1, the closed state). Both fail safe; they
+    /// just fail safe in opposite directions, and a future edit that "makes
+    /// them consistent" would silently remove a guard.
+    #[test]
+    fn last_room_floor_defaults_to_one_and_only_a_real_number_moves_it() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["LOYALTY_CHANNEL_LAST_ROOM_FLOOR"]);
+
+        assert_eq!(loyalty_last_room_floor(), 1, "unset must keep the guard on");
+
+        for garbage in ["", "   ", "one", "true", "1.5", "-1"] {
+            env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", garbage);
+            assert_eq!(
+                loyalty_last_room_floor(),
+                1,
+                "'{garbage}' must fall back to the default, never silently disable the guard"
+            );
+        }
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", "0");
+        assert_eq!(loyalty_last_room_floor(), 0, "0 is the explicit opt-out");
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", " 3 ");
+        assert_eq!(loyalty_last_room_floor(), 3, "surrounding space is trimmed");
+    }
+
     /// never an empty-string "token" that the constant-time compare would then
     /// accept), and `LoyaltyConfig` must report the channel dark and the stay
     /// hook off — including with the flag forced on, which is the state the
