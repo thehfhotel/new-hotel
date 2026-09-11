@@ -23,6 +23,12 @@
 //! injected without changing route code.
 
 pub mod booking;
+// Loyalty-channel cross-aggregate queries (availability / holds / stay
+// snapshot). Free functions, not a trait — see the module doc for why.
+pub mod channel;
+// Caller-side request idempotency for the loyalty channel (migration 093).
+// Free functions like `channel`, and for the same reason.
+pub mod channel_idempotency;
 pub mod checkin;
 pub mod customer;
 pub mod inventory;

@@ -12,8 +12,8 @@
 //! * `Room_Manternace` is the **verbatim legacy typo**
 //!   (`hotel-backend/schema-baseline.txt:510` — `varchar(50) DEFAULT 'no'`).
 //! * Value vocabulary is lowercase `'yes'` / `'no'` (cheatsheet
-//!   §`HT_Rooms` status-flag enumeration; the CT room mapper reads it back
-//!   through `legacy_yesno_to_bool`). iHOTEL's grid treats
+//!   §"1.5 Boolean conventions" "`Room_Manternace` (HT_Rooms)"; the CT room
+//!   mapper reads it back through `legacy_yesno_to_bool`). iHOTEL's grid treats
 //!   `Room_Manternace='yes'` as "under repair, not rentable" regardless of
 //!   the other flags, so this single column is sufficient to take the room
 //!   off iHOTEL's market.
@@ -24,8 +24,8 @@
 //!
 //! Deliberate deviations from the decompile, with reasons:
 //!
-//! * **`Room_Clean='no'` is NOT bundled** even though iHOTEL's §3.15/§3.16
-//!   handlers set it alongside the maintenance flag. `Room_Clean` is owned
+//! * **`Room_Clean='no'` is NOT bundled** even though the cheatsheet §3.15 /
+//!   §3.16 handlers set it alongside the maintenance flag. `Room_Clean` is owned
 //!   by the `mark_clean` / `mark_dirty` recipes mirroring canonical
 //!   `ht_rooms_new.room_clean`; the canonical maintenance toggle does NOT
 //!   flip `room_clean`, so bundling the legacy write would diverge
@@ -76,8 +76,9 @@ pub async fn execute(
 mod tests {
     use super::*;
 
-    /// Byte-pin the to-maintenance statement (cheatsheet §3.15 / §`HT_Rooms`
-    /// operations: `update HT_Rooms set Room_Manternace='yes' where id=<id>`).
+    /// Byte-pin the to-maintenance statement (cheatsheet §3.15 /
+    /// §"Table: `HT_Rooms` (A)" operations:
+    /// `update HT_Rooms set Room_Manternace='yes' where id=<id>`).
     /// The column name keeps the legacy typo verbatim.
     #[test]
     fn build_statements_to_maintenance_matches_cheatsheet() {

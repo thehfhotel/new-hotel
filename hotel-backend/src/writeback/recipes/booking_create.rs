@@ -4,8 +4,8 @@
 //! needed) under TABLOCKX. Critical: every booking must have the §3k fields
 //! set correctly or it will be invisible in the .NET app's booking list.
 //!
-//! Reference SQL (verbatim from `booking-checkin-20260424-101838/writes.txt`
-//! lines 1-4 + spike §3k):
+//! Reference SQL (verbatim from
+//! `raw/booking-checkin-20260424-101838/writes.txt:1-4` + spike §3k):
 //!
 //! ```text
 //! 1. INSERT INTO [HT_Customers] (id, Cust_no, Cust_perfix, Cust_name, ...)
@@ -236,7 +236,8 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     //   `where (room_status='จอง' or room_status='เข้าพัก')`), AND when a
     //   check-in is later created against this booking, `checkin_to_booking`'s
     //   night-0 UPDATE matches 0 rows silently.
-    //   Per `COMPAT_CHEATSHEET.md` line 347: status='จอง', room_Book_No=Book_ID.
+    //   Per `COMPAT_CHEATSHEET.md` §`HT_Room_Status` "status='จอง', room_Book_No=Book_ID"
+    //   (was: cheatsheet 347, the schema fence header of that same section).
     //   room_CheckIn_No is empty until the booking converts to a check-in
     //   (mirrors legacy app's FrmBookRooms emit shape).
     let room_status_q = sql_quote(ROOM_STATUS_RESERVED);
@@ -846,7 +847,7 @@ mod tests {
     /// night with `status='จอง'`, `room_Book_No=Book_ID`. Without these
     /// rows, the .NET app's calendar grid shows the night as empty AND
     /// `checkin_to_booking`'s night-0 UPDATE matches 0 rows silently.
-    /// Per `COMPAT_CHEATSHEET.md` line 347.
+    /// Per `COMPAT_CHEATSHEET.md` §`HT_Room_Status` "status='จอง', room_Book_No=Book_ID".
     #[test]
     fn inserts_ht_room_status_per_booked_night() {
         let mut inputs = sample_inputs();

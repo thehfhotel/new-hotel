@@ -32,7 +32,9 @@
 //! - Does not run the CT watcher (lives in future `bin/sync.rs`).
 //! - Does not auto-fix schema drift — fail loud, alert ops, wait for human.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,7 +48,8 @@ use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
 use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKind};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
-use hotel_backend::outbox::intent::WritebackIntent;
+use hotel_backend::outbox::intent::{WritebackIntent, ALL_INTENT_NAMES};
+use hotel_backend::outbox::legacy_stale::{self, StaleNote};
 use hotel_backend::writeback::{
     dispatch, verify_legacy_collation_safety, verify_schema_fingerprint,
     verify_writeback_ledger_exists, DispatchContext, ResolvedJob, WritebackError,
@@ -79,18 +82,89 @@ const STUCK_IN_PROGRESS_TIMEOUT_SECS: i64 = 300;
 /// migration drift, etc.) and needs investigation.
 const SELF_HEAL_ALERT_THRESHOLD: u32 = 5;
 
-/// Self-heal alert window (audit MED-4). Sized to be longer than the
-/// "expected" salvages (a handful per hour from CreateBooking↔CheckIn races)
-/// but short enough that an operator gets the page within one coffee break of
-/// a real regression. After firing, the counter resets — back-to-back bursts
-/// produce back-to-back alerts (every 5 min, not every event).
+/// Self-heal alert window (audit MED-4). Two jobs, both measured in TIME:
+///
+/// * the burst window — `SELF_HEAL_ALERT_THRESHOLD` events must land inside
+///   it before anything fires, so a handful of expected salvages per hour
+///   (CreateBooking↔CheckIn races) never pages;
+/// * the minimum gap between two self-heal pages, so a sustained salvage
+///   rate cannot page faster than once per window.
+///
+/// The second job used to be missing. `should_alert` zeroed the counter when
+/// it fired and nothing else gated the next send, so the real meaning was
+/// "one alert per {SELF_HEAL_ALERT_THRESHOLD} events" — at 5 salvages/second
+/// (a broken back-population during a queue drain) that is one Slack POST
+/// per second, with no floor on the interval at all. The floor is now
+/// explicit: see `SelfHealCounter::last_alert_at`.
 const SELF_HEAL_WINDOW_SECS: u64 = 300;
 
-/// Listener supervisor: max consecutive immediate failures before we slow
-/// down + page the operator (audit LOW-3). Matches the ~10 retries-in-50s
-/// budget below; past this point the listener is broken in a way that
-/// reconnecting won't fix (PG down, network partition, auth revoked).
-const LISTENER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+/// Collapse window for the `Writeback EXHAUSTED retries` page.
+///
+/// The alert is per-JOB, and two classes of failure exhaust a job on its
+/// FIRST attempt without ever touching the retry budget:
+///
+/// * non-retryable errors (`Recipe` / `SchemaDrift` / `IntentMismatch` /
+///   `Serde` / `Config` / `Disabled`) — routed straight to
+///   `force_exhaust_job` by `mark_failed_with_retryable`;
+/// * panics — force-exhausted by the main loop's `JoinError` arm.
+///
+/// So one bad recipe or one vendor schema change pages once per affected
+/// row, at full drain speed, and every `await`ed Slack POST slows the drain
+/// further. We collapse repeats of the same `(intent, error-class)` inside
+/// this window into a single follow-up message carrying the suppressed
+/// count. Sized to match `SELF_HEAL_WINDOW_SECS` — long enough to absorb a
+/// full-queue drain of one bad class, short enough that a genuinely new
+/// burst pages within a coffee break.
+///
+/// The FIRST occurrence of a class is never suppressed: it is the
+/// actionable one, and it carries the full error text.
+const EXHAUSTED_ALERT_WINDOW_SECS: u64 = 300;
+
+/// Listener supervisor: how long the NOTIFY listener has to be
+/// **continuously** down before the operator is paged (audit LOW-3, recalibrated).
+///
+/// This alert used to fire on a COUNT — 10 consecutive respawn failures —
+/// with the counter zeroed on every send and no cooldown timestamp. At a 5s
+/// backoff that is one page per ~105s (10×5s of retries + the 60s post-alert
+/// backoff) for the entire duration of an outage, for a condition that is
+/// self-recovering by design: the supervisor reconnects forever, and the
+/// worker keeps draining the queue on its 30s poll the whole time. Nothing
+/// is lost, nothing is stuck; only NOTIFY latency degrades (sub-second ⇒
+/// ≤30s). That is a log line, not a page.
+///
+/// **Why 10 minutes.** Two independent grounds:
+///
+/// * *Every self-recovering cause clears well inside it.* The routine PG
+///   interruptions here are a deploy (`run-deploy.sh` recreating containers
+///   and running migrations), a `newdb` restart, a brief WireGuard blip, or
+///   a `max_connections` spike — all seconds-to-low-minutes. Ten minutes is
+///   past all of them, so a page at this point means reconnection is NOT
+///   happening on its own.
+/// * *It outlives every other self-healing mechanism in this binary.* It is
+///   2× `STUCK_IN_PROGRESS_TIMEOUT_SECS` (the janitor's claim-steal window),
+///   so an operator paged here is looking at something that already survived
+///   the worker's own recovery paths. At `LISTENER_BACKOFF_SECS` that is
+///   ~120 failed reconnects in a row — unambiguous.
+///
+/// Cost of waiting: the queue is drained on the 30s poll throughout, so the
+/// whole delay buys at most ~20 extra polls of added latency and zero
+/// durability risk. Bulk symptoms have their own faster page — the
+/// queue-depth janitor fires on `pending > 500` regardless of this alert.
+const LISTENER_SUSTAINED_OUTAGE_SECS: u64 = 600;
+
+/// Listener supervisor: minimum gap between two pages inside ONE sustained
+/// outage. Matches `QUEUE_DEPTH_ALERT_COOLDOWN_SECS` — the operator is
+/// already engaged after the first page; re-stating it every 105s only
+/// trains them to mute the channel.
+const LISTENER_REPAGE_COOLDOWN_SECS: u64 = 1800;
+
+/// Listener supervisor: how long a subscription must survive before the
+/// session counts as HEALTHY and clears the outage clock. One poll interval
+/// (30s) — long enough that a connect-then-instantly-drop flap keeps
+/// accumulating toward the sustained threshold instead of resetting it on
+/// every attempt, short enough that a genuinely recovered listener closes
+/// the incident on its first good session.
+const LISTENER_HEALTHY_SESSION_SECS: u64 = 30;
 
 /// Listener supervisor: base sleep between respawn attempts. Short enough
 /// that a transient PG conn drop is invisible to the operator (5s gap in
@@ -105,12 +179,14 @@ const LISTENER_BACKOFF_SECS: u64 = 5;
 /// `process_job` for the full rationale.
 const RESET_TRANCOUNT_SQL: &str = "IF @@TRANCOUNT > 0 ROLLBACK";
 
-/// Listener supervisor: extended backoff after exceeding
-/// `LISTENER_MAX_CONSECUTIVE_FAILURES`. We don't give up — exiting would
+/// Listener supervisor: extended backoff once an outage has passed
+/// `LISTENER_SUSTAINED_OUTAGE_SECS`. We don't give up — exiting would
 /// leave the worker with no NOTIFY signal source, relying solely on the
 /// 30s poll. We keep retrying but at a sustainable cadence so the operator
-/// has time to investigate.
-const LISTENER_BACKOFF_AFTER_ALERT_SECS: u64 = 60;
+/// has time to investigate. Tied to the outage duration, NOT to whether a
+/// page was sent: the cadence should slow because the outage is long, not
+/// because Slack was told about it.
+const LISTENER_BACKOFF_SUSTAINED_SECS: u64 = 60;
 
 /// Track D / T7 HIGH-2 — queue-depth janitor poll interval (60s).
 /// Reads `writeback_jobs` grouped by status and pages when any
@@ -145,6 +221,29 @@ const QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i32 = 10;
 /// Track D / T7 HIGH-2 — minimum gap between queue-depth Slack pages
 /// per condition. 30 min — operator gets one ping per breach window.
 const QUEUE_DEPTH_ALERT_COOLDOWN_SECS: u64 = 1800;
+
+/// Env var gating the `legacy_stale` reception hint (ADR 0006). Ships DARK —
+/// see [`legacy_stale_notify_enabled`]. Per-site: the `writeback-hfville`
+/// compose service maps it from `HFVILLE_LEGACY_STALE_NOTIFY_ENABLED`, so the
+/// two-service topology gives the canary rollout for free.
+const LEGACY_STALE_NOTIFY_FLAG: &str = "LEGACY_STALE_NOTIFY_ENABLED";
+
+/// Parse [`LEGACY_STALE_NOTIFY_FLAG`]. Truthy = `true` / `1` (trimmed,
+/// case-insensitive); unset, empty, `false`, `0` or garbage ⇒ `false`.
+///
+/// Same liberal-on-input, default-OFF policy as `config::flag_enabled` (the
+/// reader for every other ship-dark coexistence flag). Duplicated rather than
+/// imported because that helper is private to `config.rs` and this binary
+/// already parses its own env directly (`WRITEBACK_*` above).
+fn legacy_stale_notify_enabled(raw: Option<String>) -> bool {
+    match raw {
+        Some(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        None => false,
+    }
+}
 
 /// Exponential backoff (in seconds) between retry attempts. Indexed by
 /// `attempts` (0-based: backoff_secs(1) is the wait before attempt #2).
@@ -182,6 +281,403 @@ fn current_site_id() -> &'static str {
     SITE_ID.get().map(String::as_str).unwrap_or("hfhotel")
 }
 
+/// The site id whose writeback worker honors [`HFVILLE_WRITEBACK_INTENTS`].
+const VILLE_SITE_ID: &str = "hfville";
+
+/// Running count of jobs this worker parked as `skipped`. Reported on every
+/// park so an unexpected burst is visible in deploy logs without aggregation.
+static VILLE_SKIPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-global HF Ville intent allowlist, resolved once on first use from
+/// `HFVILLE_WRITEBACK_INTENTS`. `None` = unset ⇒ allow every intent (current
+/// behavior). See `config::hfville_writeback_intents` for the rationale.
+static VILLE_INTENT_ALLOWLIST: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+
+/// Parse, VALIDATE and install the HF Ville intent allowlist. Call once at
+/// startup, after `init_site_id`.
+///
+/// Panics on an unknown entry, matching `SiteConfig::from_env`'s stance
+/// ("panic on a typo so a misconfigured deploy fails loud"). This is the whole
+/// point of validating: a typo such as `mark_clean` for `mark_room_clean`
+/// would otherwise fail closed AND SILENT — the maid taps done, canonical PG
+/// flips, and the job parks `'skipped'` forever while nothing reaches Ville's
+/// iHOTEL. A crash-looping container is loud; a silently diverging database is
+/// not. Failing to start is also the SAFE direction: nothing wrong is written
+/// to legacy.
+///
+/// Validation is enforced only where the variable actually governs dispatch
+/// (`SITE_ID=hfville`). On the HF Hotel worker the variable has no effect, so
+/// a stray value there is a WARN rather than a reason to refuse to boot the
+/// long-lived production path.
+fn init_ville_intent_allowlist() {
+    let allowlist = hotel_backend::config::hfville_writeback_intents();
+    let site = current_site_id();
+
+    match (&allowlist, site == VILLE_SITE_ID) {
+        (Some(names), true) => {
+            let mut unknown: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !ALL_INTENT_NAMES.contains(name))
+                .collect();
+            if !unknown.is_empty() {
+                unknown.sort_unstable();
+                let mut valid: Vec<&str> = ALL_INTENT_NAMES.to_vec();
+                valid.sort_unstable();
+                panic!(
+                    "Invalid HFVILLE_WRITEBACK_INTENTS entr{}: {unknown:?}. \
+                     No such writeback intent — the job would park as 'skipped' forever \
+                     and canonical PG would silently diverge from Ville's iHOTEL. \
+                     Valid intents: {valid:?}."
+                    , if unknown.len() == 1 { "y" } else { "ies" }
+                );
+            }
+            let mut active: Vec<&str> = names.iter().map(String::as_str).collect();
+            active.sort_unstable();
+            tracing::info!(
+                site = site,
+                allowlist = ?active,
+                "HF Ville writeback intent allowlist ACTIVE — every other intent will park as 'skipped'"
+            );
+        }
+        (None, true) => {
+            tracing::info!(
+                site = site,
+                "HFVILLE_WRITEBACK_INTENTS unset — every intent dispatches (default behavior)"
+            );
+        }
+        (Some(_), false) => {
+            tracing::warn!(
+                site = site,
+                "HFVILLE_WRITEBACK_INTENTS is set but this worker is not the HF Ville site — ignoring it"
+            );
+        }
+        (None, false) => {}
+    }
+
+    let _ = VILLE_INTENT_ALLOWLIST.set(allowlist);
+}
+
+/// Whether this worker may dispatch `intent_name` to its legacy MSSQL.
+///
+/// Reads the allowlist installed by [`init_ville_intent_allowlist`]. If that
+/// was never called (unit tests constructing no worker), the `OnceLock` is
+/// empty and this degrades to "no allowlist" — the unchanged default.
+fn ville_intent_allowed(intent_name: &str) -> bool {
+    let allowlist = VILLE_INTENT_ALLOWLIST.get().and_then(Option::as_ref);
+    intent_allowed_for_site(current_site_id(), allowlist, intent_name)
+}
+
+/// PURE allowlist decision — split out so the matrix is unit-testable without
+/// touching process-global state or the environment.
+///
+/// The allowlist is deliberately scoped to the HF Ville worker: the HF Hotel
+/// worker is the long-live production path and must stay unaffected no matter
+/// what the env says (the var name says `HFVILLE_`, so honoring it at HF Hotel
+/// would be a surprising blast radius). Unset ⇒ allow everything, so this is
+/// inert until an operator opts in.
+fn intent_allowed_for_site(
+    site_id: &str,
+    allowlist: Option<&HashSet<String>>,
+    intent_name: &str,
+) -> bool {
+    if site_id != VILLE_SITE_ID {
+        return true;
+    }
+    match allowlist {
+        None => true,
+        Some(allowed) => allowed.contains(intent_name),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Startup probes (collation / schema fingerprint / idempotency ledger)
+//
+// All three refuse to start the worker, and all three used to conflate two
+// completely different situations:
+//
+//   * the probe's read came back and the ANSWER is bad — a real, permanent
+//     configuration problem the operator has to fix;
+//   * the probe never got an answer — legacy MSSQL slow or unreachable
+//     (HF Ville over WireGuard at a quiet hour is the everyday case).
+//
+// The fingerprint probe was hardened for this in incident 2026-06-28: a
+// timed-out catalog read that mis-reported as "schema drift" could lead an
+// operator to re-baseline against a bad read. The collation and ledger
+// probes still mapped ANY failure — including a bb8 pool timeout — onto
+// "collation is case-sensitive" / "`dbo.ht_writeback_ledger` is missing",
+// and they run FIRST, so on a tunnel blip they shadowed the hardened path
+// entirely and sent the operator to re-collate a database or re-apply an
+// already-applied migration. That is how "REFUSED TO START" gets learned as
+// "probably the tunnel again" — including on the day it is real.
+// -----------------------------------------------------------------------
+
+/// Why a startup probe refused to let the worker boot. The distinction is
+/// the whole point: it decides which of two mutually-exclusive stories the
+/// Slack alert tells, and therefore whether the operator touches the legacy
+/// database at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailureKind {
+    /// The read COMPLETED and the value it returned is the bad one. Only
+    /// here may the alert name the permanent cause and hand out a
+    /// remediation that mutates legacy state.
+    Confirmed,
+    /// The read never completed, after every retry — timeout, pool
+    /// exhaustion, dead tunnel. Nothing is known about the thing being
+    /// probed, so the alert must say exactly that and tell the operator
+    /// NOT to act on the permanent cause.
+    Unreachable,
+}
+
+/// A startup probe's terminal failure, after retries.
+struct ProbeFailure {
+    kind: ProbeFailureKind,
+    err: WritebackError,
+    /// Attempts actually made — 1 for a confirmed failure (no point
+    /// retrying a definite answer), `attempts` for an unreachable one.
+    attempts: u32,
+}
+
+/// Default attempts per startup probe before refusing to start. Four
+/// attempts with the 6/12/18s backoff below spans ~36s — longer than any
+/// WireGuard re-handshake or `newdb`/legacy restart blip.
+const DEFAULT_STARTUP_PROBE_ATTEMPTS: u32 = 4;
+
+/// Attempt budget shared by all three startup probes.
+/// `WRITEBACK_FINGERPRINT_ATTEMPTS` is still honoured — it was the
+/// fingerprint probe's own knob before the other two got the same
+/// treatment, and it may be set in a live `.env`.
+fn startup_probe_attempts() -> u32 {
+    parse_probe_attempts(
+        env::var("WRITEBACK_STARTUP_PROBE_ATTEMPTS").ok().as_deref(),
+        env::var("WRITEBACK_FINGERPRINT_ATTEMPTS").ok().as_deref(),
+    )
+}
+
+/// Pure half of [`startup_probe_attempts`] — new name wins, old name is the
+/// fallback, anything unparseable or `< 1` falls back to the default (a
+/// zero would skip the probe entirely, which is not a thing we let an env
+/// typo do).
+fn parse_probe_attempts(primary: Option<&str>, legacy: Option<&str>) -> u32 {
+    primary
+        .or(legacy)
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_STARTUP_PROBE_ATTEMPTS)
+}
+
+/// Fingerprint probe: only a hash mismatch is a confirmed answer. Every
+/// other failure means the catalog read itself did not land, and re-running
+/// `writeback-fingerprint.sh` against a bad read is how you corrupt the
+/// baseline (incident 2026-06-28).
+fn fingerprint_failure_is_confirmed(err: &WritebackError) -> bool {
+    matches!(err, WritebackError::SchemaDrift { .. })
+}
+
+/// Catalog probes (collation + idempotency ledger): both issue one tiny
+/// `SELECT` and turn its ANSWER into `WritebackError::Config`. Every
+/// transport failure — `pool.get()`, the per-op timeout, a driver error —
+/// arrives as `Pool` / `Tiberius` / `Sqlx` instead, and means the answer
+/// was never seen.
+///
+/// Written as an exhaustive match, not a `matches!`, so a new
+/// `WritebackError` variant fails the build here and forces someone to
+/// decide which side of this line it falls on.
+fn catalog_probe_failure_is_confirmed(err: &WritebackError) -> bool {
+    match err {
+        // The SELECT came back; `Config` carries what it said (a `_CS_`
+        // collation name, a NULL `OBJECT_ID`, an unreadable result shape).
+        WritebackError::Config(_) => true,
+        // The read never completed. Retry, then report connectivity.
+        WritebackError::Tiberius(_) | WritebackError::Pool(_) | WritebackError::Sqlx(_) => false,
+        // Not producible by either probe today. Fail loud rather than
+        // retry-then-blame-the-network on something deterministic.
+        WritebackError::SchemaDrift { .. }
+        | WritebackError::Disabled
+        | WritebackError::IntentMismatch(_)
+        | WritebackError::Recipe(_)
+        | WritebackError::Serde(_) => true,
+    }
+}
+
+/// Run one startup probe, retrying transient failures with a 6/12/18s
+/// backoff, and classify the terminal failure.
+///
+/// `is_confirmed` decides what "transient" means for this probe — it is
+/// per-probe on purpose: a `Config` error is a definite answer from the
+/// collation/ledger probes but merely a malformed catalog read from the
+/// fingerprint probe, which retries it.
+///
+/// A confirmed failure short-circuits: re-asking a question that already
+/// has a definite answer only delays the page.
+async fn run_startup_probe<F, Fut>(
+    site_id: &str,
+    label: &str,
+    attempts: u32,
+    is_confirmed: fn(&WritebackError) -> bool,
+    mut probe: F,
+) -> Result<(), ProbeFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), WritebackError>>,
+{
+    let attempts = attempts.max(1);
+    // Overwritten on the first failing attempt; `attempts >= 1` makes the
+    // sentinel unreachable, but it keeps this function panic-free.
+    let mut last = WritebackError::Config(format!("{label}: probe never ran"));
+    for attempt in 1..=attempts {
+        match probe().await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_confirmed(&e) => {
+                return Err(ProbeFailure {
+                    kind: ProbeFailureKind::Confirmed,
+                    err: e,
+                    attempts: attempt,
+                });
+            }
+            Err(e) => {
+                if attempt < attempts {
+                    let backoff = Duration::from_secs((attempt as u64) * 6);
+                    tracing::warn!(
+                        site = %site_id,
+                        probe = label,
+                        attempt,
+                        attempts,
+                        backoff_secs = backoff.as_secs(),
+                        error = %e,
+                        "Startup probe read failed (transient) — retrying before refusing"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                last = e;
+            }
+        }
+    }
+    Err(ProbeFailure {
+        kind: ProbeFailureKind::Unreachable,
+        err: last,
+        attempts,
+    })
+}
+
+/// Slack body for the collation probe (W1).
+///
+/// The `Confirmed` branch deliberately does not assert *which* bad answer
+/// came back — `verify_legacy_collation_safety` also fails when the probe
+/// returns no rows or an unreadable column, and the error text says which.
+/// What it does assert, and what the old unconditional message could not,
+/// is that an answer WAS received: the operator is looking at a real
+/// configuration problem, not at the tunnel.
+fn collation_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy MSSQL collation check FAILED — the probe read succeeded, so this \
+             is a real configuration problem, not connectivity.\n\
+             *Error:* `{err}`\n\
+             _Recipes pin every string literal to the case iHOTEL emits, so a \
+             case-sensitive (`_CS_`) collation silently forks our SQL filters. \
+             Expected `Thai_CI_AS` (or any `_CI_` collation) — restore the legacy DB \
+             with a case-insensitive collation before retrying._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT read the legacy server collation after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT a collation problem — the \
+             collation was never read, so nothing is known about it. Do NOT re-collate \
+             or restore the legacy DB. The worker retries on restart; check the site \
+             server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Slack body for the schema-fingerprint probe (W3). Both texts are the
+/// ones this probe already sent — it was the one guard that got this right,
+/// and the other two are now modelled on it.
+fn fingerprint_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy MSSQL schema fingerprint MISMATCH (real drift).\n\
+             *Error:* `{err}`\n\
+             _The legacy DB columns drifted from the captured baseline. \
+             Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+             README to update the baseline before restarting the worker._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT read the legacy schema after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT confirmed schema \
+             drift — do NOT run `writeback-fingerprint.sh`. The worker retries \
+             on restart; check the site server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Slack body for the idempotency-ledger probe (W4).
+fn ledger_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy idempotency ledger `dbo.ht_writeback_ledger` is MISSING — the probe \
+             read succeeded and `OBJECT_ID` came back NULL.\n\
+             *Error:* `{err}`\n\
+             _Apply_ `migrations/legacy-mssql/024_writeback_ledger.sql` _(the deploy runs_ \
+             `scripts/migrate-legacy-mssql.sh` _automatically — check its output / \
+             `dbo.ht_legacy_migrations`). It is the crash-after-commit duplicate guard for \
+             create recipes; the worker will not run without it._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT probe for `dbo.ht_writeback_ledger` after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT a missing table — the probe \
+             never got an answer, so the ledger's presence is UNKNOWN. Do NOT re-apply_ \
+             `024_writeback_ledger.sql` _chasing this; it is almost certainly already \
+             applied (check `dbo.ht_legacy_migrations`). The worker retries on restart; \
+             check the site server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Shared fail-loud envelope for a startup probe that refused the boot:
+/// log, post `body` to Slack, then sleep before exiting so Docker's
+/// `restart: unless-stopped` backs off instead of re-paging 6×/min.
+/// Returns the string `main` bubbles up as its error.
+async fn refuse_to_start(
+    slack: &Option<SlackClient>,
+    site_id: &str,
+    what: &str,
+    failure: &ProbeFailure,
+    body: String,
+) -> String {
+    tracing::error!(
+        site = %site_id,
+        probe = what,
+        error = %failure.err,
+        confirmed = failure.kind == ProbeFailureKind::Confirmed,
+        attempts = failure.attempts,
+        "Startup probe failed — refusing to start"
+    );
+    if let Some(slack) = slack {
+        let _ = slack
+            .send_message(&SlackMessage::with_site_text(site_id, body))
+            .await;
+    }
+    tracing::warn!(
+        site = %site_id,
+        "Sleeping 60s before exit to throttle Docker restart cadence \
+         and avoid Slack alert flood"
+    );
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    format!("{what} failed: {}", failure.err)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     hotel_backend::secrets::hydrate_env_from_secret_files();
@@ -199,6 +695,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let site = SiteConfig::from_env();
     init_site_id(&site.id);
     tracing::info!(site = %site.id, "Writeback worker: site identity resolved");
+
+    // Same stance, one line later: parse + validate HFVILLE_WRITEBACK_INTENTS
+    // now and log what is actually active, rather than resolving it lazily on
+    // the first job. A typo must stop the worker at boot, not quietly park
+    // every job it was meant to admit.
+    init_ville_intent_allowlist();
 
     // 1. WRITEBACK_ENABLED — graceful no-op for State C
     let enabled = env::var("WRITEBACK_ENABLED")
@@ -219,9 +721,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_ATTEMPTS);
 
+    // ADR 0006 — ship DARK. When off, nothing is built and nothing is
+    // notified; the drain loop behaves exactly as before. Read once here so
+    // the hot path never touches the environment.
+    let stale_notify = legacy_stale_notify_enabled(env::var(LEGACY_STALE_NOTIFY_FLAG).ok());
+
     tracing::info!(
         poll_interval_secs = poll_interval,
         max_attempts,
+        legacy_stale_notify = stale_notify,
         "Starting writeback worker"
     );
 
@@ -257,38 +765,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // 4b0. All three startup probes share one retry + classification
+    //      envelope (see `run_startup_probe`). Each retries a read that did
+    //      not land, and only names its permanent cause when the read
+    //      actually came back with a bad answer.
+    let probe_attempts = startup_probe_attempts();
+    let mssql_probe = &mssql;
+
     // 4b1. Wave 6 LOW item 8 — Ville cutover safety: refuse to start on a
     //      case-sensitive collation. Recipes pin every string literal to
     //      the case the .NET app emits; a `_CS_` collation would silently
     //      fork our SQL filters on a fresh Ville cutover. Cheap one-row
     //      SELECT — runs before the fingerprint check so a misconfigured
     //      Ville fails fast at startup.
-    if let Err(e) = verify_legacy_collation_safety(&mssql).await {
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            "Legacy MSSQL collation check failed — refusing to start"
-        );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy MSSQL collation is case-sensitive.\n\
-                     *Error:* `{e}`\n\
-                     _Recipes assume `Thai_CI_AS` (or any `_CI_` collation). \
-                     Restore the legacy DB with a case-insensitive collation \
-                     before retrying._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Legacy collation check failed: {e}").into());
+    //
+    //      Because it runs FIRST, an unclassified failure here shadows the
+    //      fingerprint probe's careful transient/permanent split: a pool
+    //      timeout on the very first legacy round-trip of the process used
+    //      to be reported as "collation is case-sensitive".
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "legacy collation",
+        probe_attempts,
+        catalog_probe_failure_is_confirmed,
+        || verify_legacy_collation_safety(mssql_probe),
+    )
+    .await
+    {
+        let body = collation_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(refuse_to_start(&slack, &site.id, "Legacy collation check", &f, body)
+            .await
+            .into());
     }
 
     // 4b. Schema fingerprint guard — refuse to start on drift, but post
@@ -303,81 +810,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `SchemaDrift` (read succeeded, hash differs) should tell the operator to
     // run `writeback-fingerprint.sh`. Mis-firing that on a timeout could lead to
     // updating the baseline against a bad read and corrupting it (incident
-    // 2026-06-28). Attempts tunable via WRITEBACK_FINGERPRINT_ATTEMPTS.
-    let fp_attempts: u32 = std::env::var("WRITEBACK_FINGERPRINT_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(4);
-    let mut fp_outcome: Result<(), WritebackError> = Ok(());
-    for attempt in 1..=fp_attempts {
-        match verify_schema_fingerprint(&mssql).await {
-            Ok(()) => {
-                fp_outcome = Ok(());
-                break;
-            }
-            // Real drift — the read succeeded but the hash differs. Don't retry.
-            Err(e @ WritebackError::SchemaDrift { .. }) => {
-                fp_outcome = Err(e);
-                break;
-            }
-            // Transient (timeout / I/O / pool) — retry with backoff.
-            Err(e) => {
-                fp_outcome = Err(e);
-                if attempt < fp_attempts {
-                    let backoff = Duration::from_secs((attempt as u64) * 6);
-                    tracing::warn!(
-                        site = %site.id,
-                        attempt,
-                        attempts = fp_attempts,
-                        backoff_secs = backoff.as_secs(),
-                        "Schema fingerprint read failed (transient) — retrying before refusing"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-    if let Err(e) = fp_outcome {
-        let is_drift = matches!(e, WritebackError::SchemaDrift { .. });
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            is_drift,
-            "Schema fingerprint check failed — refusing to start"
+    // 2026-06-28).
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "schema fingerprint",
+        probe_attempts,
+        fingerprint_failure_is_confirmed,
+        || verify_schema_fingerprint(mssql_probe),
+    )
+    .await
+    {
+        let body = fingerprint_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(
+            refuse_to_start(&slack, &site.id, "Schema fingerprint check", &f, body)
+                .await
+                .into(),
         );
-        if let Some(slack) = &slack {
-            let body = if is_drift {
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy MSSQL schema fingerprint MISMATCH (real drift).\n\
-                     *Error:* `{e}`\n\
-                     _The legacy DB columns drifted from the captured baseline. \
-                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                     README to update the baseline before restarting the worker._"
-                )
-            } else {
-                format!(
-                    ":warning: *Writeback worker could not start* :warning:\n\
-                     Could NOT read the legacy schema after {fp_attempts} attempts \
-                     (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
-                     *Error:* `{e}`\n\
-                     _This is a connectivity/timeout problem, NOT confirmed schema \
-                     drift — do NOT run `writeback-fingerprint.sh`. The worker retries \
-                     on restart; check the site server / WireGuard if it persists._"
-                )
-            };
-            let _ = slack
-                .send_message(&SlackMessage::with_site_text(&site.id, body))
-                .await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence \
-             and avoid Slack alert flood"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
     // 4c. Idempotency-ledger guard — refuse to start if dbo.ht_writeback_ledger
@@ -385,34 +833,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     the create recipes is silently gone (a missing table reads as a
     //     retryable Tiberius error -> retry-storm with zero protection). Same
     //     fail-loud + Slack + throttle-sleep envelope as the fingerprint guard.
-    if let Err(e) = verify_writeback_ledger_exists(&mssql).await {
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            "Writeback idempotency ledger missing — refusing to start"
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "writeback ledger",
+        probe_attempts,
+        catalog_probe_failure_is_confirmed,
+        || verify_writeback_ledger_exists(mssql_probe),
+    )
+    .await
+    {
+        let body = ledger_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(
+            refuse_to_start(&slack, &site.id, "Writeback ledger check", &f, body)
+                .await
+                .into(),
         );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy idempotency ledger `dbo.ht_writeback_ledger` is missing.\n\
-                     *Error:* `{e}`\n\
-                     _Apply_ `migrations/legacy-mssql/024_writeback_ledger.sql` _(the deploy runs_ \
-                     `scripts/migrate-legacy-mssql.sh` _automatically — check its output / \
-                     `dbo.ht_legacy_migrations`). It is the crash-after-commit duplicate guard for \
-                     create recipes; the worker will not run without it._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence \
-             and avoid Slack alert flood"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Writeback idempotency ledger missing: {e}").into());
     }
 
     // 5. NOTIFY listener + poll fallback. The listener is wrapped in a
@@ -466,6 +901,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 6. Main loop — process jobs whenever NOTIFY wakes us OR every poll_interval
     loop {
+        // ADR 0006 — one `legacy_stale` hint per DRAIN TICK, not per job.
+        // No timer is needed because the inner loop already runs to queue
+        // exhaustion: a booking that emits 3 intents enqueues all 3 rows in
+        // one PG transaction, the notify trigger wakes us once, and all 3
+        // drain here ⇒ one signal with `count: 3`. A slow trickle produces
+        // one signal each, which is correct — those ARE separate events, and
+        // suppressing them into one toast is the middleware latch's job.
+        //
+        // Stays empty whenever `LEGACY_STALE_NOTIFY_ENABLED` is off:
+        // `process_job` doesn't even build a note then.
+        let mut stale_notes: Vec<StaleNote> = Vec::new();
+
         // Drain all pending jobs in this tick
         loop {
             match claim_next_job(&pg, max_attempts).await {
@@ -485,9 +932,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mssql_inner = mssql.clone();
                     let slack_inner = slack.clone();
                     let result = tokio::spawn(async move {
-                        process_job(&pg_inner, &mssql_inner, max_attempts, &slack_inner, job).await;
+                        process_job(
+                            &pg_inner,
+                            &mssql_inner,
+                            max_attempts,
+                            &slack_inner,
+                            job,
+                            stale_notify,
+                        )
+                        .await
                     })
                     .await;
+                    // The spawn wrapper's `Ok` value used to be discarded; it
+                    // now carries the reception hint for jobs that landed.
+                    // Borrowed so the panic-recovery arm below is untouched.
+                    if let Ok(Some(note)) = &result {
+                        stale_notes.push(note.clone());
+                    }
                     if let Err(join_err) = result {
                         let panic_msg = if join_err.is_panic() {
                             // Try to recover the panic payload as a string —
@@ -540,6 +1001,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        // The queue is drained (or the claim query broke — the jobs that DID
+        // land are still worth announcing). One coalesced hint, then back to
+        // waiting. A failure here must never fail or retry a job whose MSSQL
+        // transaction already committed: log a warn and carry on.
+        if !stale_notes.is_empty() {
+            let signal = legacy_stale::coalesce(current_site_id(), &stale_notes);
+            tracing::debug!(
+                count = signal.count(),
+                summary = signal.summary(),
+                "Publishing legacy_stale hint for this drain tick"
+            );
+            if let Err(err) = legacy_stale::publish(&pg, &signal).await {
+                tracing::warn!(
+                    error = %err,
+                    count = signal.count(),
+                    "legacy_stale notify failed; the legacy writes are committed \
+                     and unaffected — reception just won't be told this time"
+                );
+            }
+        }
+
         // Wait for either NOTIFY, poll tick, or shutdown
         tokio::select! {
             _ = wakeup.notified() => {
@@ -558,6 +1040,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     listener_handle.abort();
     tracing::info!("Writeback worker exited cleanly");
     Ok(())
+}
+
+/// What the queue row looked like in the instant BEFORE this claim flipped
+/// it to `in_progress`.
+///
+/// **Why this has to be captured at claim time.** `mark_done` used to read
+/// the "prior" status itself, via a `WITH prev AS (SELECT status …)` CTE on
+/// its own UPDATE. That never worked: `claim_next_job` commits the flip to
+/// `in_progress` in an EARLIER statement, so by the time `mark_done` runs
+/// the pre-image is long gone and its CTE could only ever observe
+/// `in_progress` (and its UPDATE gate requires exactly that anyway). The
+/// `exhausted → done` branch was unreachable, which silently killed the
+/// `:white_check_mark:` closure alert for the single most actionable page
+/// in this binary. The claim statement is the last place the pre-image
+/// exists, so it is captured there and carried in memory.
+///
+/// **Why this is a classification, not a raw status string.** An
+/// `exhausted` row is terminal — `claim_next_job` deliberately never
+/// selects one (operator triage is the only way out). The documented
+/// recovery, printed in `send_exhausted_alert`'s own remediation text, is
+/// `UPDATE writeback_jobs SET status='pending', attempts=0,
+/// next_retry_at=NULL`. So even at claim time the literal status of a
+/// recovered job reads `pending`, never `exhausted`, and a naive
+/// `prior_status == "exhausted"` comparison would stay dead. We recognise
+/// the *shape* the operator's reset leaves behind instead — see
+/// [`classify_prior_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorDisposition {
+    /// Enqueued and never attempted: `pending` with no error residue.
+    Fresh,
+    /// A normal retry — either `failed` with a scheduled `next_retry_at`,
+    /// or a stale `in_progress` claim stolen back from a crashed worker.
+    /// No operator was ever paged for this row.
+    Retrying,
+    /// The row had reached the terminal `exhausted` state — meaning
+    /// `send_exhausted_alert` paged an operator for it — and was put back
+    /// into the queue by hand. Success on this attempt is the closure of
+    /// that page.
+    RecoveredFromExhausted,
+}
+
+/// Classify the claim-time pre-image of a queue row. Pure — the whole
+/// point is that the `exhausted → done` transition can be unit-tested
+/// without a database.
+///
+/// Recognised shapes:
+///
+/// * `exhausted` — a literal terminal pre-image. Unreachable while
+///   `claim_next_job` excludes the state, but classified correctly so the
+///   detection does not silently die again if that predicate is ever
+///   widened.
+/// * `pending` + carries a `last_error` + has NO scheduled retry — the
+///   fingerprint of an operator reset from `exhausted`, and it is
+///   unambiguous in this schema:
+///     - enqueue INSERTs `pending` with `last_error` NULL (migration 011
+///       default), so a fresh row never carries an error;
+///     - `mark_failed`'s non-terminal branch always writes
+///       `next_retry_at = NOW() + backoff`, so a retrying row always has
+///       one scheduled AND sits in `failed`, not `pending`;
+///     - only `mark_failed`'s terminal branch and `force_exhaust_job`
+///       produce (`last_error` set, `next_retry_at` NULL) — and both write
+///       `exhausted`;
+///     - nothing in this codebase writes `pending` after the initial
+///       INSERT.
+///
+///   Residual over-fire: an operator who hand-resets a merely `failed` row
+///   with the same SQL gets a closure alert without a preceding
+///   `:rotating_light:`. The statement it makes ("a job that was in an
+///   error state has now succeeded") is still true, so this is left as-is.
+/// * anything else — an ordinary retry.
+fn classify_prior_disposition(
+    prior_status: &str,
+    prior_had_error: bool,
+    prior_retry_scheduled: bool,
+) -> PriorDisposition {
+    match prior_status {
+        "exhausted" => PriorDisposition::RecoveredFromExhausted,
+        "pending" if prior_had_error && !prior_retry_scheduled => {
+            PriorDisposition::RecoveredFromExhausted
+        }
+        "pending" => PriorDisposition::Fresh,
+        _ => PriorDisposition::Retrying,
+    }
 }
 
 /// Claimed job — what we got from `writeback_jobs` after the atomic claim.
@@ -585,6 +1150,12 @@ struct ClaimedJob {
     idempotency_key: Uuid,
     attempts: i32,
     claimed_at: DateTime<Utc>,
+    /// The row's state in the instant before THIS claim flipped it to
+    /// `in_progress`, captured from the claim statement's own pre-image.
+    /// Threaded to `mark_done` so it can detect the `exhausted → done`
+    /// recovery and post the closure alert. See [`PriorDisposition`] for
+    /// why it cannot be re-read later.
+    prior: PriorDisposition,
 }
 
 /// Atomically claim the next pending / retry-eligible / stuck job.
@@ -604,28 +1175,45 @@ struct ClaimedJob {
 /// `exhausted` rows are never re-claimed — they require operator triage and
 /// a manual status reset. The Slack alert sent at the moment of exhaustion
 /// is the operator's notification path.
+///
+/// **Pre-image capture.** The victim sub-select is a CTE rather than a bare
+/// scalar sub-query so it can also project the row's PRE-claim
+/// `status` / `last_error` / `next_retry_at`. Every CTE and the main query
+/// share one statement snapshot, so `victim` sees the row as it was BEFORE
+/// this UPDATE's own flip to `in_progress` — the last point at which that
+/// state is observable. `mark_done` cannot re-derive it (the flip has
+/// committed by then), so it is classified here and carried on
+/// `ClaimedJob`. See [`PriorDisposition`].
 async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<ClaimedJob>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-        UPDATE writeback_jobs
+        WITH victim AS (
+            SELECT id,
+                   status                      AS prior_status,
+                   (last_error IS NOT NULL)    AS prior_had_error,
+                   (next_retry_at IS NOT NULL) AS prior_retry_scheduled
+              FROM writeback_jobs
+             WHERE (status = 'pending')
+                OR (status = 'failed'
+                    AND attempts < $1
+                    AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                OR (status = 'in_progress'
+                    AND attempts < $1
+                    AND claimed_at IS NOT NULL
+                    AND claimed_at < NOW() - make_interval(secs => $2))
+             ORDER BY created_at
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE writeback_jobs wj
            SET status     = 'in_progress',
-               attempts   = attempts + 1,
+               attempts   = wj.attempts + 1,
                claimed_at = NOW()
-         WHERE id = (
-             SELECT id FROM writeback_jobs
-              WHERE (status = 'pending')
-                 OR (status = 'failed'
-                     AND attempts < $1
-                     AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
-                 OR (status = 'in_progress'
-                     AND attempts < $1
-                     AND claimed_at IS NOT NULL
-                     AND claimed_at < NOW() - make_interval(secs => $2))
-              ORDER BY created_at
-              FOR UPDATE SKIP LOCKED
-              LIMIT 1
-         )
-        RETURNING id, intent, payload, aggregate_id, idempotency_key, attempts, claimed_at
+          FROM victim v
+         WHERE wj.id = v.id
+        RETURNING wj.id, wj.intent, wj.payload, wj.aggregate_id, wj.idempotency_key,
+                  wj.attempts, wj.claimed_at,
+                  v.prior_status, v.prior_had_error, v.prior_retry_scheduled
         "#,
     )
     .bind(max_attempts)
@@ -646,6 +1234,23 @@ async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<Claimed
     // against a parallel janitor steal (audit MED-2).
     let claimed_at: DateTime<Utc> = row.try_get("claimed_at")?;
 
+    // Pre-claim state, projected by the `victim` CTE from the same snapshot
+    // (i.e. before this statement's own flip). Classified here because this
+    // is the last place the information exists — `mark_done` runs after the
+    // flip has committed and can only ever see `in_progress`.
+    let prior_status: String = row.try_get("prior_status")?;
+    let prior_had_error: bool = row.try_get("prior_had_error")?;
+    let prior_retry_scheduled: bool = row.try_get("prior_retry_scheduled")?;
+    let prior = classify_prior_disposition(&prior_status, prior_had_error, prior_retry_scheduled);
+    if prior == PriorDisposition::RecoveredFromExhausted {
+        tracing::info!(
+            job_id = id,
+            prior_status = %prior_status,
+            "Claimed a job that was previously exhausted (operator reset) — \
+             a closure alert will fire if this attempt succeeds"
+        );
+    }
+
     // Deserialize payload into the matching variant. The JSON shape is
     // produced by `serde(tag = "intent", content = "payload")` — the queue's
     // separate `intent` column is what the dispatcher uses, but the JSON
@@ -661,17 +1266,28 @@ async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<Claimed
         idempotency_key,
         attempts,
         claimed_at,
+        prior,
     }))
 }
 
 /// Process one claimed job: open MSSQL conn, dispatch, persist outcome.
+///
+/// Returns `Some(note)` exactly when a row landed in legacy MSSQL **and** this
+/// worker owned the completion (see [`mark_done`]'s return contract) — the
+/// drain loop accumulates those and publishes one coalesced `legacy_stale`
+/// signal per tick (ADR 0006). Every failure path returns `None`.
+///
+/// `stale_notify` is the `LEGACY_STALE_NOTIFY_ENABLED` flag, read once at
+/// startup and threaded in so that when the feature is dark we don't even
+/// build the label.
 async fn process_job(
     pg: &PgPool,
     mssql: &DbPool,
     max_attempts: i32,
     slack: &Option<SlackClient>,
     job: ClaimedJob,
-) {
+    stale_notify: bool,
+) -> Option<StaleNote> {
     let job_id = job.id;
     let intent_name = job.intent.intent_name();
     tracing::info!(
@@ -680,6 +1296,41 @@ async fn process_job(
         attempt = job.attempts,
         "Processing writeback job"
     );
+
+    // HF Ville per-intent allowlist (housekeeping-ops, 2026-08-11). Checked
+    // FIRST — before resolving legacy IDs and before acquiring an MSSQL
+    // connection — so a non-allowlisted intent costs nothing and, crucially,
+    // never opens a transaction against Ville's iHOTEL.
+    if !ville_intent_allowed(intent_name) {
+        // WARN, not INFO/DEBUG. Ville coequal writes are live, so setting the
+        // allowlist NARROWS a running system: every park here is a real legacy
+        // write that did NOT happen, leaving canonical PG ahead of Ville's
+        // iHOTEL. That is the accepted cost of a deliberate restriction, but it
+        // must never be quiet — an operator has to be able to see, in ordinary
+        // deploy logs, exactly what the restriction is holding back.
+        // `skipped_total` is this process's running count, so a burst is
+        // obvious without grepping every line.
+        tracing::warn!(
+            job_id,
+            intent = intent_name,
+            site = current_site_id(),
+            allowlist = ?VILLE_INTENT_ALLOWLIST.get().and_then(|a| a.as_ref()),
+            skipped_total = VILLE_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1,
+            "Parking job as skipped: intent is not in HFVILLE_WRITEBACK_INTENTS"
+        );
+        mark_skipped(
+            pg,
+            job_id,
+            job.claimed_at,
+            &format!(
+                "intent '{intent_name}' not in HFVILLE_WRITEBACK_INTENTS allowlist for site \
+                 '{}'",
+                current_site_id()
+            ),
+        )
+        .await;
+        return None;
+    }
 
     // Resolve legacy IDs from PG canonical tables. `slack` is plumbed in
     // for the MED-4 throttled self-heal alert, which fires from inside
@@ -698,7 +1349,7 @@ async fn process_job(
                 &format!("resolve_legacy_ids: {err}"),
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -728,7 +1379,7 @@ async fn process_job(
                 &format!("mssql_acquire: {err}"),
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -780,7 +1431,7 @@ async fn process_job(
             &format!("trancount_reset: {err}"),
         )
         .await;
-        return;
+        return None;
     }
 
     let ctx = DispatchContext {
@@ -795,16 +1446,35 @@ async fn process_job(
     match outcome {
         Ok(legacy_ids) => {
             tracing::info!(job_id, intent = intent_name, "Writeback succeeded");
-            mark_done(
+            // Built BEFORE `into_json()` consumes `legacy_ids`. The room number
+            // is whatever we already have in hand — the recipe-minted one wins
+            // (walk-in / checkin-to-booking allocate it), falling back to the
+            // one the resolver read from PG before dispatch. No extra query.
+            let note = stale_notify.then(|| {
+                let room_no = legacy_ids
+                    .room_no
+                    .as_deref()
+                    .or(resolved.legacy_room_no.as_deref());
+                StaleNote::for_intent(&job.intent, room_no)
+            });
+            let landed = mark_done(
                 pg,
                 job_id,
                 job.claimed_at,
                 job.aggregate_id,
                 &job.intent,
                 slack,
+                job.prior,
                 legacy_ids.into_json(),
             )
             .await;
+            // A stolen claim means the OTHER worker owns this job's completion
+            // and will emit its own hint — see `mark_done`'s return contract.
+            if landed {
+                note
+            } else {
+                None
+            }
         }
         Err(err) => {
             let retryable = err.is_retryable();
@@ -825,6 +1495,7 @@ async fn process_job(
                 retryable,
             )
             .await;
+            None
         }
     }
 }
@@ -1083,10 +1754,17 @@ async fn resolve_legacy_ids(
             }
         }
         // MarkRoomDirty (audit 2026-06-11 P2) and SetRoomMaintenance share
-        // MarkRoomClean's resolution: both recipes key `HT_Rooms` by the
-        // numeric internal `id` (spike §3j critical finding), and the
-        // housekeeping recipes additionally need the display `room_no`
-        // for the `HT_Housewife` audit row + prior-occupant lookup.
+        // MarkRoomClean's resolution query: all three key `HT_Rooms` by
+        // the numeric internal `id` (spike §3j critical finding), fetched
+        // here as `legacy_room_id_int`. Only `MarkRoomClean` still needs
+        // the display `room_no` too, for its `HT_Housewife` audit row +
+        // prior-occupant lookup (mark_clean.rs). Since issue #276,
+        // `MarkRoomDirty` no longer writes an `HT_Housewife` row or does
+        // a prior-occupant lookup — iHOTEL itself never inserts one on a
+        // standalone dirty flip (mark_dirty.rs module doc) — so its
+        // `room_no` is resolved here (cheap, shared query) but unused by
+        // the recipe; `SetRoomMaintenance` never needed `room_no` at all
+        // (set_maintenance.rs keys by `id` only).
         MarkRoomClean { room_id, .. }
         | MarkRoomDirty { room_id, .. }
         | SetRoomMaintenance { room_id, .. } => {
@@ -1404,6 +2082,10 @@ async fn resolve_legacy_ids(
                     .await?;
             resolved.companion_guest_exists = exists.is_some();
         }
+        // Issue #202 — CreateCashEntry is standalone: the payload carries
+        // everything the recipe needs directly, no legacy FK to resolve from
+        // PG (same shape as CreateBooking / MirrorCompanion).
+        CreateCashEntry { .. } => {}
     }
     Ok(resolved)
 }
@@ -1437,6 +2119,12 @@ struct SelfHealCounter {
     /// `SELF_HEAL_ALERT_THRESHOLD * 2` so Slack body stays small even if
     /// the threshold is bumped in env config later.
     aggregates: Vec<Uuid>,
+    /// When the last self-heal alert was SENT. This is what makes the
+    /// throttle a time window rather than a counter: without it, zeroing
+    /// `count` on fire is the only thing standing between a sustained
+    /// salvage rate and one Slack POST per `SELF_HEAL_ALERT_THRESHOLD`
+    /// events, however fast those arrive.
+    last_alert_at: Option<Instant>,
 }
 
 impl SelfHealCounter {
@@ -1445,6 +2133,7 @@ impl SelfHealCounter {
             window_start: None,
             count: 0,
             aggregates: Vec::new(),
+            last_alert_at: None,
         }
     }
 }
@@ -1476,14 +2165,26 @@ fn self_heal_counter() -> &'static Arc<Mutex<SelfHealCounter>> {
 /// Pure throttle decision — extracted from the IO path so the threshold and
 /// window logic can be unit-tested without spinning up Slack or PG.
 ///
-/// Rules:
-///   - First event in a new window opens the window at `now` and counts 1.
-///   - Subsequent events inside the same window bump the count.
-///   - When count reaches `threshold`, return `fire=true` AND reset the
-///     window so the next event opens a fresh one (no spam — exactly one
-///     alert per `window_secs` per burst).
-///   - When an event arrives after the window has expired, the window
-///     resets to `now` with count=1 (no spurious alert from a stale count).
+/// `window` does two things, and both are measured in TIME:
+///
+///   - **Burst window.** `threshold` events have to land inside it before
+///     anything fires. Events arriving after it lapses open a fresh window
+///     at count=1, so a stale partial burst from an hour ago never
+///     contributes to a page now.
+///   - **Alert floor.** Two alerts are never less than `window` apart, no
+///     matter the event rate — `last_alert_at` gates the send.
+///
+/// **The floor is the fix.** The original implementation only zeroed the
+/// counter on fire, which reads as a throttle but isn't one: the meaning was
+/// "one alert per `threshold` events", so at a sustained salvage rate (a
+/// broken back-population while the queue drains) the interval between
+/// pages collapsed to whatever `threshold` events cost — potentially
+/// sub-second, with nothing bounding it. The counter still resets on fire
+/// so the next page reports only what happened since the last one; the
+/// floor is what stops the storm.
+///
+/// Events that arrive while the floor is closed are still counted (and
+/// still logged at warn by the caller) — suppression here is never silent.
 fn should_alert(
     state: &mut SelfHealCounter,
     now: Instant,
@@ -1504,7 +2205,14 @@ fn should_alert(
 
     state.count = state.count.saturating_add(1);
 
-    let fire = state.count >= threshold;
+    // Time floor: an alert may only go out if we haven't sent one inside
+    // `window`. First ever alert (None) is always allowed through.
+    let floor_clear = state
+        .last_alert_at
+        .map(|sent| now.duration_since(sent) >= window)
+        .unwrap_or(true);
+
+    let fire = state.count >= threshold && floor_clear;
     let decision = AlertDecision {
         fire,
         count: state.count,
@@ -1512,9 +2220,10 @@ fn should_alert(
     };
 
     if fire {
-        // Reset for the next window so we don't re-fire on every event past
-        // the threshold (audit-mandated throttle).
-        state.window_start = None;
+        // Open the floor's cooldown and start counting again from zero, so
+        // the next page reports the volume accumulated since THIS one.
+        state.last_alert_at = Some(now);
+        state.window_start = Some(now);
         state.count = 0;
         state.aggregates.clear();
     }
@@ -1557,12 +2266,15 @@ async fn record_self_heal(slack: &Option<SlackClient>, aggregate_id: Uuid) {
     };
 
     // Per-event log (warn) so a log-grep alert can catch sustained drift
-    // even if Slack is offline.
+    // even if Slack is offline. `page_held` marks the events that WOULD
+    // have paged but for the time floor — suppression by the throttle is
+    // never invisible, it just isn't a Slack message.
     tracing::warn!(
         %aggregate_id,
         count = decision.count,
         window_secs = decision.window_secs,
         threshold = SELF_HEAL_ALERT_THRESHOLD,
+        page_held = !decision.fire && decision.count >= SELF_HEAL_ALERT_THRESHOLD,
         "Self-heal event recorded"
     );
 
@@ -1719,11 +2431,19 @@ async fn salvage_legacy_ids(
 /// Without step 1, step 2 fails with "ModifyBooking requires resolved
 /// legacy_book_id".
 ///
-/// Audit LOW-2: the UPDATE captures the *prior* status via a CTE so we can
-/// detect the `exhausted → done` transition (operator manually fixed +
-/// reset the row to `pending`, the next attempt succeeded). On that
-/// transition we post a `:white_check_mark:` Slack so the operator sees
+/// Audit LOW-2: on an `exhausted → done` transition (operator manually
+/// fixed the cause + put the row back in the queue, and this attempt
+/// succeeded) we post a `:white_check_mark:` Slack so the operator sees
 /// closure, not just the original `:rotating_light:` alarm.
+///
+/// **The transition is detected from `prior`, not from PG.** This UPDATE
+/// used to carry a `WITH prev AS (SELECT status …)` CTE for that purpose,
+/// which was dead code from the day it was written: `claim_next_job`
+/// commits the flip to `in_progress` in an earlier statement, so the CTE
+/// read a post-claim snapshot and `prior_status` was invariably
+/// `in_progress` — doubly so, since the UPDATE's own gate below requires
+/// exactly that value. The pre-image is now captured by the claim
+/// statement and threaded in as [`PriorDisposition`].
 ///
 /// **Claim-gating (audit MED-2):** the UPDATE matches only when
 /// `status='in_progress' AND claimed_at = $X`. If a slow recipe ran past
@@ -1736,6 +2456,52 @@ async fn salvage_legacy_ids(
 /// warning and skip back-population so we don't race the new claim's
 /// `mark_done` to write possibly-different `legacy_*` values into the
 /// canonical row.
+///
+/// **Returns `true` only when this worker's claim-gated UPDATE actually
+/// matched a row**, i.e. when THIS worker is the one that terminated the job.
+/// The stolen-claim (`Ok(None)`) and error paths return `false`. The caller
+/// uses that to decide whether to emit a `legacy_stale` hint: if another
+/// worker stole the claim, IT will re-run the recipe and notify, and a
+/// duplicate signal from here would inflate reception's toast count for a
+/// single real change.
+/// Park a job the HF Ville allowlist refused, as a TERMINAL `skipped` row.
+///
+/// Deliberately terminal rather than left `pending`: a parked-pending job is
+/// an invisible backlog that would suddenly flush into Ville's iHOTEL the day
+/// the allowlist widens — months of stale bookings/payments replayed at once.
+/// `skipped` is inert, never retried, and shows up in the
+/// `/api/sync/status` `(intent, status)` breakdown so operators can see what
+/// the allowlist is holding back. Re-queue by hand (`status='pending'`) if a
+/// skipped job is later wanted.
+///
+/// Claim-gated on `(status='in_progress', claimed_at)` exactly like
+/// [`mark_done`] so a janitor re-claim can't be clobbered.
+async fn mark_skipped(pg: &PgPool, job_id: i64, claimed_at: DateTime<Utc>, reason: &str) {
+    let result = sqlx::query(
+        "UPDATE writeback_jobs \
+            SET status = 'skipped', completed_at = NOW(), last_error = $2, next_retry_at = NULL \
+          WHERE id = $1 AND status = 'in_progress' AND claimed_at = $3",
+    )
+    .bind(job_id)
+    .bind(reason)
+    .bind(claimed_at)
+    .execute(pg)
+    .await;
+
+    match result {
+        Ok(res) if res.rows_affected() == 0 => {
+            tracing::warn!(
+                job_id,
+                "mark_skipped matched no row (claim stolen by the stuck-job janitor?)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(job_id, error = %err, "Failed to mark job skipped");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn mark_done(
     pg: &PgPool,
@@ -1744,28 +2510,22 @@ async fn mark_done(
     aggregate_id: Uuid,
     intent: &WritebackIntent,
     slack: &Option<SlackClient>,
+    prior: PriorDisposition,
     legacy_ids: serde_json::Value,
-) {
-    // CTE pattern keeps prior-status capture atomic with the status flip —
-    // no race between SELECT and UPDATE in case another worker / janitor
-    // touches the row mid-call. The MED-2 claim-gate (status + claimed_at)
-    // lives on the UPDATE, not on the prev SELECT — we still want to read
-    // the row's prior_status for the LOW-2 closure alert even if the gate
-    // would otherwise reject our update.
+) -> bool {
+    // No prior-status CTE here — see the doc comment. The pre-image is
+    // carried in `prior`; this statement only needs the MED-2 claim-gate
+    // (status + claimed_at) and the columns the closure alert reports.
     let row = sqlx::query(
         r#"
-        WITH prev AS (
-            SELECT id, status AS prior_status FROM writeback_jobs WHERE id = $1
-        )
         UPDATE writeback_jobs wj
            SET status       = 'done',
                completed_at = NOW(),
                legacy_ids   = $2
-          FROM prev
-         WHERE wj.id = prev.id
+         WHERE wj.id = $1
            AND wj.status = 'in_progress'
            AND wj.claimed_at = $3
-        RETURNING wj.attempts, wj.intent, wj.aggregate_id, prev.prior_status
+        RETURNING wj.attempts, wj.intent, wj.aggregate_id
         "#,
     )
     .bind(job_id)
@@ -1776,9 +2536,10 @@ async fn mark_done(
 
     match &row {
         Ok(Some(r)) => {
-            let prior_status: String = r.try_get("prior_status").unwrap_or_default();
-            // LOW-2: closure alert on operator-driven recovery.
-            if prior_status == "exhausted" {
+            // LOW-2: closure alert on operator-driven recovery. `prior` was
+            // classified from the claim statement's pre-image (the only
+            // place it is observable) and carried here on `ClaimedJob`.
+            if prior == PriorDisposition::RecoveredFromExhausted {
                 let attempts: i32 = r.try_get("attempts").unwrap_or(0);
                 let intent_name: String = r.try_get("intent").unwrap_or_default();
                 let agg: Option<Uuid> = r.try_get("aggregate_id").ok();
@@ -1806,7 +2567,7 @@ async fn mark_done(
                 job_id,
                 "Job {job_id} was re-claimed by another worker before mark_done; discarding result"
             );
-            return;
+            return false;
         }
         Err(err) => {
             // Wave 5a item 4: when the `mark_done` UPDATE itself errors we
@@ -1826,7 +2587,7 @@ async fn mark_done(
                  clobbering a stolen-claim winner. Resolver self-heal will \
                  recover legacy_ids from writeback_jobs at next intent."
             );
-            return;
+            return false;
         }
     }
 
@@ -1868,6 +2629,11 @@ async fn mark_done(
              from writeback_jobs.legacy_ids at next intent"
         );
     }
+
+    // The status flip landed and it was OURS — back-population is a
+    // best-effort follow-up (self-healing at the next intent), so its
+    // outcome does not change who owns the completion.
+    true
 }
 
 /// Write the recipe's allocated legacy identifiers (book_id, cin_no, etc.)
@@ -1888,6 +2654,11 @@ async fn back_populate_legacy_ids(
     let receipt_no = legacy_ids.get("receipt_no").and_then(|v| v.as_str());
     let checkin_ds_id = legacy_ids
         .get("checkin_ds_id")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
+    // Issue #202 — see the `CreateCashEntry` arm below.
+    let cash_legacy_id = legacy_ids
+        .get("cash_legacy_id")
         .and_then(|v| v.as_i64())
         .map(|n| n as i32);
 
@@ -2304,6 +3075,29 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
+        // Issue #202 — CreateCashEntry back-populates the freshly-allocated
+        // `TB_Pay_History.id` onto `ht_cash_ledger.cash_legacy_id`, keyed by
+        // the row's `aggregate_id` (migration 085). This is the SAME column
+        // `sync_cash_history`'s `ON CONFLICT (cash_legacy_id)` UPSERT dedups
+        // on (`bin/sync.rs::CASH_HISTORY_UPSERT_SQL`, consumed at
+        // `bin/sync.rs::sync_cash_history`) — closing the echo gap this
+        // issue named: without this stamp, an app-originated cash entry's
+        // `cash_legacy_id` stays NULL forever and every re-import tick
+        // inserts a genuine duplicate row (pinned by
+        // `bin/sync.rs::cash_sync_tests::reimport_without_backpopulation_still_duplicates`).
+        CreateCashEntry { .. } => {
+            if let Some(cash_legacy_id) = cash_legacy_id {
+                sqlx::query(
+                    "UPDATE ht_cash_ledger SET \
+                       cash_legacy_id = COALESCE($2, cash_legacy_id) \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cash_legacy_id)
+                .execute(pg)
+                .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -2510,9 +3304,158 @@ async fn mark_failed(
     }
 }
 
+/// Coarse failure class for an exhausted job, derived from the message text.
+///
+/// Deliberately string-based rather than typed: `send_exhausted_alert` is
+/// reached from four call sites (`mark_failed`'s terminal branch,
+/// `force_exhaust_job` via the non-retryable route, the panic arm of the
+/// main loop, and the resolver/pool/trancount pre-dispatch failures), and
+/// only one of them still holds a `WritebackError`. Classifying the
+/// rendered message keeps every path on the same key without threading a
+/// typed error through call sites that never had one.
+///
+/// The prefixes are the `#[error(...)]` Display forms in
+/// `writeback::error::WritebackError` plus the four messages this binary
+/// synthesises itself. Returns `&'static str` so the throttle map's key
+/// space stays bounded by construction (intents are a fixed enum, classes
+/// a fixed list) — no unbounded growth from attacker- or vendor-controlled
+/// error text.
+fn classify_error_kind(err_msg: &str) -> &'static str {
+    // Worker-synthesised prefixes first — these wrap an inner error whose
+    // own prefix would otherwise win the match.
+    const PREFIXES: &[(&str, &str)] = &[
+        ("PANIC:", "panic"),
+        ("resolve_legacy_ids:", "resolve_legacy_ids"),
+        ("mssql_acquire:", "mssql_acquire"),
+        ("trancount_reset:", "trancount_reset"),
+        ("legacy schema drift:", "schema_drift"),
+        ("writeback disabled by", "disabled"),
+        ("intent payload mismatch:", "intent_mismatch"),
+        ("recipe error:", "recipe"),
+        ("legacy connection pool:", "pool"),
+        ("payload deserialize:", "serde"),
+        ("tiberius:", "tiberius"),
+        ("sqlx:", "sqlx"),
+        ("config:", "config"),
+    ];
+    for (prefix, kind) in PREFIXES {
+        if err_msg.starts_with(prefix) {
+            return kind;
+        }
+    }
+    "other"
+}
+
+/// Throttle key: one collapse window per `(intent, error-class)` pair.
+/// Keeping the intent in the key means a recipe broken for `CreateBooking`
+/// does not mask an unrelated `CheckOut` failure that starts during the
+/// same window.
+type ExhaustedAlertKey = (String, &'static str);
+
+/// Open collapse window for one [`ExhaustedAlertKey`].
+#[derive(Debug)]
+struct ExhaustedAlertWindow {
+    /// When the alert that opened this window was SENT.
+    opened_at: Instant,
+    /// Alerts collapsed into this window since then (excludes the one that
+    /// opened it).
+    suppressed: u32,
+}
+
+/// Outcome of the throttle check — pure decision, split out from the Slack
+/// POST so the collapse rules are unit-testable without a webhook.
+#[derive(Debug, PartialEq, Eq)]
+enum ExhaustedAlertDecision {
+    /// Post to Slack. `collapsed` is how many alerts for this key were
+    /// suppressed since the previous send — 0 on a first occurrence, >0 on
+    /// the first send after a window that absorbed repeats.
+    Send { collapsed: u32 },
+    /// Do not post. `collapsed` is the running suppressed count inside the
+    /// currently-open window.
+    Suppress { collapsed: u32, window_secs: u64 },
+}
+
+/// Open collapse windows, keyed by `(intent, error-class)`.
+type ExhaustedAlertWindows = HashMap<ExhaustedAlertKey, ExhaustedAlertWindow>;
+
+/// Process-global collapse state. `OnceLock` + `Mutex` mirrors
+/// `SELF_HEAL_COUNTER` — keeps the call-site change to a single lookup
+/// instead of threading throttle state through `mark_failed` /
+/// `force_exhaust_job` / the panic arm.
+static EXHAUSTED_ALERT_WINDOWS: OnceLock<Arc<Mutex<ExhaustedAlertWindows>>> = OnceLock::new();
+
+/// Lazily get-or-init the process-global exhausted-alert collapse state.
+fn exhausted_alert_windows() -> &'static Arc<Mutex<ExhaustedAlertWindows>> {
+    EXHAUSTED_ALERT_WINDOWS.get_or_init(|| Arc::new(Mutex::new(ExhaustedAlertWindows::new())))
+}
+
+/// Pure collapse decision for the exhausted-job page.
+///
+/// Rules — chosen so the alert stays trustworthy under a bad-recipe drain
+/// while never hiding the actionable first signal:
+///
+///   - No open window for the key ⇒ **send immediately**, open a window.
+///     The first occurrence is the one an operator acts on and it carries
+///     the full error text.
+///   - Inside an open window ⇒ **suppress**, bump the count. This is the
+///     bad-recipe drain case: N identical pages become one line of context
+///     on the next send instead of N webhook round-trips in the hot path.
+///   - Window expired ⇒ **send**, reporting how many were collapsed while
+///     it was open, and reopen. A sustained outage therefore pages once per
+///     `window`, each time stating the true volume.
+///
+/// Expired windows that absorbed nothing are dropped, so the map stays at
+/// the size of the currently-failing key set rather than every pair ever
+/// seen. (Dropping them is behaviour-preserving: a fresh insert and an
+/// expired-with-zero window both yield `Send { collapsed: 0 }`.)
+fn decide_exhausted_alert(
+    windows: &mut ExhaustedAlertWindows,
+    key: ExhaustedAlertKey,
+    now: Instant,
+    window: Duration,
+) -> ExhaustedAlertDecision {
+    windows.retain(|k, w| {
+        k == &key || w.suppressed > 0 || now.duration_since(w.opened_at) < window
+    });
+
+    match windows.get_mut(&key) {
+        Some(open) if now.duration_since(open.opened_at) < window => {
+            open.suppressed = open.suppressed.saturating_add(1);
+            ExhaustedAlertDecision::Suppress {
+                collapsed: open.suppressed,
+                window_secs: window.as_secs(),
+            }
+        }
+        Some(expired) => {
+            let collapsed = expired.suppressed;
+            expired.opened_at = now;
+            expired.suppressed = 0;
+            ExhaustedAlertDecision::Send { collapsed }
+        }
+        None => {
+            windows.insert(
+                key,
+                ExhaustedAlertWindow {
+                    opened_at: now,
+                    suppressed: 0,
+                },
+            );
+            ExhaustedAlertDecision::Send { collapsed: 0 }
+        }
+    }
+}
+
 /// Post a Slack alert when a writeback job exhausts its retry budget.
 /// Best-effort — Slack failures are logged inside `send_message` but never
 /// propagated. Avoids blocking the writeback main loop on Slack timeouts.
+///
+/// Repeats of the same `(intent, error-class)` within
+/// `EXHAUSTED_ALERT_WINDOW_SECS` are collapsed (see
+/// [`decide_exhausted_alert`]). Suppression is never silent: every
+/// suppressed job logs at `warn` with its job_id, so a log grep still sees
+/// one line per affected row even though Slack sees one message per class
+/// per window. The unconditional per-job `tracing::error!` at both call
+/// sites is untouched.
 async fn send_exhausted_alert(
     slack: &SlackClient,
     job_id: i64,
@@ -2521,6 +3464,44 @@ async fn send_exhausted_alert(
     attempts: i32,
     err_msg: &str,
 ) {
+    let error_kind = classify_error_kind(err_msg);
+    let decision = {
+        // Short critical section, no awaits held across the lock. Poisoned
+        // lock ⇒ recover and continue: this is alert hygiene, not a
+        // correctness path.
+        let windows = exhausted_alert_windows();
+        let mut guard = match windows.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        decide_exhausted_alert(
+            &mut guard,
+            (intent.to_string(), error_kind),
+            Instant::now(),
+            Duration::from_secs(EXHAUSTED_ALERT_WINDOW_SECS),
+        )
+    };
+
+    let collapsed = match decision {
+        ExhaustedAlertDecision::Suppress {
+            collapsed,
+            window_secs,
+        } => {
+            tracing::warn!(
+                job_id,
+                intent,
+                error_kind,
+                collapsed,
+                window_secs,
+                "Writeback EXHAUSTED alert collapsed — same (intent, error class) \
+                 already paged inside the window; the job itself is still \
+                 exhausted and still needs triage"
+            );
+            return;
+        }
+        ExhaustedAlertDecision::Send { collapsed } => collapsed,
+    };
+
     let aggregate_id_str = aggregate_id
         .map(|u| u.to_string())
         .unwrap_or_else(|| "(unknown)".into());
@@ -2529,12 +3510,25 @@ async fn send_exhausted_alert(
     // pure head truncation would lose it. Slice on character boundaries
     // (Thai messages are multi-byte) by walking with `char_indices`.
     let truncated_err = truncate_head_tail(err_msg, 200, 300);
+    // Only present on a follow-up send, so the common single-failure page
+    // reads exactly as it always has.
+    let collapsed_line = if collapsed > 0 {
+        format!(
+            "*Also suppressed:* {collapsed} further `{intent}` / `{error_kind}` \
+             exhaustion(s) in the last {EXHAUSTED_ALERT_WINDOW_SECS}s — \
+             `SELECT * FROM writeback_jobs WHERE status='exhausted' AND intent='{intent}'`\n"
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
         ":rotating_light: *Writeback EXHAUSTED retries* :rotating_light:\n\
          *Job ID:* `{job_id}`\n\
          *Intent:* `{intent}`\n\
          *Aggregate:* `{aggregate_id_str}`\n\
          *Attempts:* {attempts}\n\
+         *Error class:* `{error_kind}`\n\
+         {collapsed_line}\
          *Last error:*\n```\n{truncated_err}\n```\n\
          _Manual intervention required. Inspect_ \
          `SELECT * FROM writeback_jobs WHERE id = {job_id}` _and either fix \
@@ -2595,9 +3589,21 @@ fn truncate_head_tail(s: &str, head_chars: usize, tail_chars: usize) -> String {
 }
 
 /// Long-lived PG LISTEN connection; signals the main loop on every NOTIFY.
-async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error> {
+///
+/// `subscribed` is set the moment the `LISTEN` lands, so the supervisor can
+/// tell "never got a connection" apart from "was live and then dropped".
+/// Without that distinction there is no way to know whether an outage is
+/// still going: a listener that reconnects cleanly and runs for hours, then
+/// hits one `recv()` error, is indistinguishable from one that has never
+/// come up.
+async fn run_listener(
+    pg: PgPool,
+    wakeup: Arc<Notify>,
+    subscribed: &AtomicBool,
+) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(&pg).await?;
     listener.listen(WRITEBACK_CHANNEL).await?;
+    subscribed.store(true, Ordering::Relaxed);
     tracing::info!(channel = WRITEBACK_CHANNEL, "PgListener subscribed");
     loop {
         match listener.recv().await {
@@ -2613,85 +3619,272 @@ async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error
     }
 }
 
-/// Supervisor for `run_listener` (audit LOW-3). Respawns the listener on
-/// every error with a 5s backoff; if `LISTENER_MAX_CONSECUTIVE_FAILURES`
-/// happen back-to-back, fires a Slack alert and slows the retry cadence
-/// to `LISTENER_BACKOFF_AFTER_ALERT_SECS` (one alert per burst — same
-/// throttle pattern as MED-4) but never gives up.
+/// Rolling health of the NOTIFY listener, as seen by its supervisor.
+///
+/// The old version of this was a bare `consecutive_failures` counter that
+/// paged at 10 and zeroed itself on every send. Two things were wrong with
+/// it, and both made the page less trustworthy the longer an outage ran:
+/// the counter had no notion of "the listener has been fine for six hours"
+/// (nothing reset it on a healthy session, so ten unrelated `recv()` errors
+/// spread over days added up to a page), and zeroing on fire with no
+/// timestamp made re-firing a function of the retry cadence — ~105s during
+/// a sustained outage.
+#[derive(Debug, Default)]
+struct ListenerHealth {
+    /// Start of the current uninterrupted outage. `None` = no outage in
+    /// progress (only true before the first failure).
+    outage_started: Option<Instant>,
+    /// Failed sessions since the last healthy one. Reported for context;
+    /// it is no longer what decides the page.
+    consecutive_failures: u32,
+    /// When the last page for this outage went out — the re-page floor.
+    last_paged_at: Option<Instant>,
+    /// Whether this outage has already paged, i.e. whether recovery owes
+    /// the operator an all-clear.
+    paged_this_outage: bool,
+}
+
+/// What the supervisor should do after one listener session ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ListenerAction {
+    /// Log it and reconnect. The overwhelming majority — a reconnect loop
+    /// doing its job is not news.
+    LogOnly,
+    /// The listener has been continuously down for
+    /// `LISTENER_SUSTAINED_OUTAGE_SECS`. Reconnection is not happening on
+    /// its own; page.
+    Page { outage_secs: u64, consecutive_failures: u32 },
+    /// A healthy session closed an outage we had paged for — post the
+    /// all-clear so the channel doesn't keep a stale alarm open.
+    Recovered { outage_secs: u64 },
+}
+
+/// Action + how long to wait before respawning.
+#[derive(Debug, PartialEq, Eq)]
+struct ListenerDecision {
+    action: ListenerAction,
+    backoff_secs: u64,
+}
+
+/// Pure supervisor policy — called once per ended listener session.
+///
+/// `healthy_session` means the subscription actually came up AND survived
+/// `LISTENER_HEALTHY_SESSION_SECS`; a connect-then-instantly-drop flap is
+/// NOT healthy and keeps accumulating toward the sustained threshold.
+///
+/// The page is gated on elapsed outage TIME, not on a failure count, and
+/// re-pages inside one outage are floored at `repage_cooldown`. Backoff
+/// tracks the outage duration rather than the alert: the retry cadence
+/// should slow because the outage is long, not because Slack was told.
+fn decide_listener_action(
+    state: &mut ListenerHealth,
+    now: Instant,
+    healthy_session: bool,
+    sustained: Duration,
+    repage_cooldown: Duration,
+) -> ListenerDecision {
+    if healthy_session {
+        // The listener was live for a meaningful stretch, so whatever
+        // outage preceded it is over — even though this session has just
+        // ended and a new one may be starting.
+        let recovered = state.paged_this_outage.then(|| {
+            state
+                .outage_started
+                .map(|start| now.duration_since(start).as_secs())
+                .unwrap_or(0)
+        });
+        // This session ended with an error too, so a fresh outage clock
+        // starts now; if the next session is healthy it clears silently.
+        *state = ListenerHealth {
+            outage_started: Some(now),
+            consecutive_failures: 1,
+            last_paged_at: None,
+            paged_this_outage: false,
+        };
+        return ListenerDecision {
+            action: recovered
+                .map(|outage_secs| ListenerAction::Recovered { outage_secs })
+                .unwrap_or(ListenerAction::LogOnly),
+            backoff_secs: LISTENER_BACKOFF_SECS,
+        };
+    }
+
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let started = *state.outage_started.get_or_insert(now);
+    let outage = now.duration_since(started);
+    let is_sustained = outage >= sustained;
+
+    let backoff_secs = if is_sustained {
+        LISTENER_BACKOFF_SUSTAINED_SECS
+    } else {
+        LISTENER_BACKOFF_SECS
+    };
+
+    let repage_clear = state
+        .last_paged_at
+        .map(|sent| now.duration_since(sent) >= repage_cooldown)
+        .unwrap_or(true);
+
+    if is_sustained && repage_clear {
+        state.last_paged_at = Some(now);
+        state.paged_this_outage = true;
+        return ListenerDecision {
+            action: ListenerAction::Page {
+                outage_secs: outage.as_secs(),
+                consecutive_failures: state.consecutive_failures,
+            },
+            backoff_secs,
+        };
+    }
+
+    ListenerDecision {
+        action: ListenerAction::LogOnly,
+        backoff_secs,
+    }
+}
+
+/// Supervisor for `run_listener` (audit LOW-3, recalibrated). Respawns the
+/// listener forever with a 5s backoff, and pages only once the listener has
+/// been continuously down for `LISTENER_SUSTAINED_OUTAGE_SECS` — see that
+/// constant for why a reconnect loop below that bar is a log line, not a
+/// page.
 ///
 /// Why we keep retrying instead of exiting: the worker has two signal
 /// sources — NOTIFY and the 30s poll. If we exit the listener task entirely
 /// the worker still functions (it just sees jobs ~30s late). But an
 /// operator under time pressure during the live test won't realize sync
-/// silently degraded. Persistent reconnect + Slack alert preserves both
-/// liveness AND visibility.
+/// silently degraded. Persistent reconnect + a *sustained* Slack alert
+/// preserves both liveness AND visibility, without spending the operator's
+/// attention on a condition that fixes itself.
 async fn run_listener_supervised(pg: PgPool, wakeup: Arc<Notify>, slack: Option<SlackClient>) {
-    let mut consecutive_failures: u32 = 0;
+    let mut health = ListenerHealth::default();
+    let subscribed = AtomicBool::new(false);
+    let sustained = Duration::from_secs(LISTENER_SUSTAINED_OUTAGE_SECS);
+    let repage_cooldown = Duration::from_secs(LISTENER_REPAGE_COOLDOWN_SECS);
+
     loop {
         let pg_inner = pg.clone();
         let wakeup_inner = wakeup.clone();
-        match run_listener(pg_inner, wakeup_inner).await {
+        subscribed.store(false, Ordering::Relaxed);
+        let session_started = Instant::now();
+        let outcome = run_listener(pg_inner, wakeup_inner, &subscribed).await;
+        // "Healthy" = the LISTEN actually landed and the subscription then
+        // held for at least one poll interval. A connect that fails, or one
+        // that drops immediately, does not clear the outage clock.
+        let healthy_session = subscribed.load(Ordering::Relaxed)
+            && session_started.elapsed() >= Duration::from_secs(LISTENER_HEALTHY_SESSION_SECS);
+
+        match &outcome {
             Ok(()) => {
                 // Listener returned Ok — the only path is `loop {}` exit,
-                // which currently can't happen. Treated as success: reset
-                // the failure counter and respawn after the standard backoff.
+                // which currently can't happen.
                 tracing::warn!("PgListener returned Ok unexpectedly — respawning");
-                consecutive_failures = 0;
             }
             Err(err) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                tracing::error!(
+                tracing::warn!(
                     error = %err,
-                    consecutive_failures,
+                    healthy_session,
+                    session_secs = session_started.elapsed().as_secs(),
                     "PgListener task ended; will respawn after backoff"
                 );
             }
         }
 
-        let sleep_secs = if consecutive_failures >= LISTENER_MAX_CONSECUTIVE_FAILURES {
-            // First time we cross the threshold (or every threshold-th
-            // failure after that): page the operator, then back off.
-            // Counter is reset post-alert so we get one alert per burst,
-            // not one per attempt past the threshold.
-            tracing::error!(
-                consecutive_failures,
-                threshold = LISTENER_MAX_CONSECUTIVE_FAILURES,
-                "PgListener supervisor: alert threshold breached — paging operator + slowing respawn"
-            );
-            if let Some(slack) = &slack {
-                send_listener_alert(slack, consecutive_failures).await;
-            }
-            consecutive_failures = 0;
-            LISTENER_BACKOFF_AFTER_ALERT_SECS
-        } else {
-            LISTENER_BACKOFF_SECS
-        };
+        let decision = decide_listener_action(
+            &mut health,
+            Instant::now(),
+            healthy_session,
+            sustained,
+            repage_cooldown,
+        );
 
-        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        match decision.action {
+            ListenerAction::LogOnly => {
+                // The demotion. A reconnect loop that is doing its job is a
+                // log line: the queue keeps draining on the 30s poll, so
+                // nothing is stuck and nothing is lost.
+                tracing::info!(
+                    consecutive_failures = health.consecutive_failures,
+                    outage_secs = health
+                        .outage_started
+                        .map(|s| s.elapsed().as_secs())
+                        .unwrap_or(0),
+                    sustained_threshold_secs = LISTENER_SUSTAINED_OUTAGE_SECS,
+                    backoff_secs = decision.backoff_secs,
+                    "PgListener down — reconnecting (worker still drains via the 30s poll; \
+                     no page until the outage is sustained)"
+                );
+            }
+            ListenerAction::Page {
+                outage_secs,
+                consecutive_failures,
+            } => {
+                tracing::error!(
+                    outage_secs,
+                    consecutive_failures,
+                    sustained_threshold_secs = LISTENER_SUSTAINED_OUTAGE_SECS,
+                    "PgListener supervisor: SUSTAINED outage — paging operator"
+                );
+                if let Some(slack) = &slack {
+                    send_listener_alert(slack, outage_secs, consecutive_failures).await;
+                }
+            }
+            ListenerAction::Recovered { outage_secs } => {
+                tracing::info!(
+                    outage_secs,
+                    "PgListener recovered after a paged outage — posting all-clear"
+                );
+                if let Some(slack) = &slack {
+                    send_listener_recovered_alert(slack, outage_secs).await;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(decision.backoff_secs)).await;
     }
 }
 
-/// Post a Slack alert when the PG NOTIFY listener has failed to stay up
-/// across `LISTENER_MAX_CONSECUTIVE_FAILURES` consecutive respawn attempts
-/// (audit LOW-3). The worker is still functional via the 30s poll fallback,
-/// but sync latency has degraded from sub-second to ~30s — the operator
-/// needs to know.
-async fn send_listener_alert(slack: &SlackClient, consecutive_failures: u32) {
+/// Post a Slack alert when the PG NOTIFY listener has been continuously
+/// down for `LISTENER_SUSTAINED_OUTAGE_SECS` (audit LOW-3, recalibrated).
+/// The worker is still functional via the 30s poll fallback — this is a
+/// latency-degradation page, which is exactly why it waits for the outage
+/// to prove it is not self-recovering before spending the operator's
+/// attention.
+async fn send_listener_alert(slack: &SlackClient, outage_secs: u64, consecutive_failures: u32) {
+    let outage_mins = outage_secs / 60;
     let text = format!(
         ":warning: *Writeback PG NOTIFY listener UNHEALTHY* :warning:\n\
-         *Consecutive failures:* {consecutive_failures} \
-         (threshold: {LISTENER_MAX_CONSECUTIVE_FAILURES})\n\
-         _The worker is still draining the queue via 30s poll fallback, but \
-         sync latency has degraded from sub-second to ~30s. Likely causes: \
-         PG down, network partition, role missing LISTEN privilege, or \
-         max_connections exhausted. Inspect:_\n\
+         *Down for:* {outage_mins}m ({outage_secs}s continuous, \
+         {consecutive_failures} failed reconnects)\n\
+         _Past the {LISTENER_SUSTAINED_OUTAGE_SECS}s sustained threshold, so this is NOT \
+         a self-recovering blip. The worker is still draining the queue via the 30s poll \
+         fallback — nothing is lost — but sync latency has degraded from sub-second to \
+         ~30s. Likely causes: PG down, network partition, role missing LISTEN privilege, \
+         or max_connections exhausted. Inspect:_\n\
          ```\n\
          SELECT * FROM pg_stat_activity WHERE query LIKE '%LISTEN%';\n\
          SELECT count(*) FROM pg_stat_activity;\n\
          ```\n\
-         _The supervisor will keep retrying every \
-         {LISTENER_BACKOFF_AFTER_ALERT_SECS}s — fix the underlying issue and \
-         the next reconnect will succeed automatically._"
+         _The supervisor keeps retrying every {LISTENER_BACKOFF_SUSTAINED_SECS}s and will \
+         post an all-clear when it reconnects; you will not be re-paged for this outage \
+         more than once per {LISTENER_REPAGE_COOLDOWN_SECS}s._"
+    );
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
+    let _ = slack.send_message(&msg).await;
+}
+
+/// All-clear for a listener outage that was paged. Same pairing rule as the
+/// exhausted-job `:white_check_mark:`: a failure alert that never closes
+/// trains the operator to ignore the channel.
+async fn send_listener_recovered_alert(slack: &SlackClient, outage_secs: u64) {
+    let outage_mins = outage_secs / 60;
+    let text = format!(
+        ":white_check_mark: *Writeback PG NOTIFY listener RECOVERED* \
+         :white_check_mark:\n\
+         *Outage duration:* {outage_mins}m ({outage_secs}s)\n\
+         _The listener reconnected and held the subscription for at least \
+         {LISTENER_HEALTHY_SESSION_SECS}s. NOTIFY-driven wakeups are back to sub-second; \
+         closure of the_ `:warning:` _sent earlier for this outage._"
     );
     let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
@@ -2923,6 +4116,154 @@ fn _suppress_unused_writeback_error_import(_: WritebackError) {}
 mod tests {
     use super::*;
 
+    // ---- HF Ville per-intent writeback allowlist (housekeeping-ops) -----
+
+    fn allowlist(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Unset allowlist ⇒ every intent dispatches, at BOTH sites. This is the
+    /// "current behavior unchanged" contract — the feature must be inert
+    /// until an operator sets the env var.
+    #[test]
+    fn absent_allowlist_permits_every_intent_at_every_site() {
+        for site in ["hfhotel", "hfville"] {
+            for intent in ["mark_room_clean", "create_booking", "check_out"] {
+                assert!(
+                    intent_allowed_for_site(site, None, intent),
+                    "{site}/{intent} must be allowed when no allowlist is set"
+                );
+            }
+        }
+    }
+
+    /// The allowlist is scoped to HF Ville — the HF Hotel worker is the
+    /// long-lived production path and must be unaffected even if the var
+    /// leaks into its environment.
+    #[test]
+    fn allowlist_never_constrains_the_hf_hotel_worker() {
+        let only_clean = allowlist(&["mark_room_clean"]);
+        for intent in ["create_booking", "check_out", "record_payment"] {
+            assert!(
+                intent_allowed_for_site("hfhotel", Some(&only_clean), intent),
+                "HF Hotel must dispatch {intent} regardless of HFVILLE_WRITEBACK_INTENTS"
+            );
+        }
+    }
+
+    /// A maximally narrow restriction: ONLY `mark_room_clean` reaches Ville's
+    /// iHOTEL and every other intent is held back. This is the shape an
+    /// operator would use to isolate housekeeping during an incident.
+    #[test]
+    fn ville_allowlist_admits_only_the_listed_intents() {
+        let only_clean = allowlist(&["mark_room_clean"]);
+        assert!(intent_allowed_for_site(
+            "hfville",
+            Some(&only_clean),
+            "mark_room_clean"
+        ));
+        for blocked in [
+            "create_booking",
+            "check_out",
+            "record_payment",
+            "mark_room_dirty",
+            "create_check_in",
+        ] {
+            assert!(
+                !intent_allowed_for_site("hfville", Some(&only_clean), blocked),
+                "{blocked} must NOT reach Ville's iHOTEL under a mark_room_clean-only allowlist"
+            );
+        }
+    }
+
+    /// Multi-entry allowlists work, and matching is exact — no prefix or
+    /// substring matching that could admit a neighbouring intent.
+    #[test]
+    fn ville_allowlist_matches_intent_names_exactly() {
+        let two = allowlist(&["mark_room_clean", "mark_room_dirty"]);
+        assert!(intent_allowed_for_site("hfville", Some(&two), "mark_room_clean"));
+        assert!(intent_allowed_for_site("hfville", Some(&two), "mark_room_dirty"));
+        // `mark_room` is a prefix of both but is not itself listed.
+        assert!(!intent_allowed_for_site("hfville", Some(&two), "mark_room"));
+        // Case matters — discriminants are snake_case by construction.
+        assert!(!intent_allowed_for_site("hfville", Some(&two), "MARK_ROOM_CLEAN"));
+    }
+
+    /// The allowlist string an operator would actually set must round-trip
+    /// through the config parser into a working decision — the end-to-end
+    /// contract for `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`.
+    #[test]
+    fn allowlist_string_parses_and_gates_correctly() {
+        let parsed =
+            hotel_backend::config::parse_csv_allowlist(Some(" mark_room_clean , ".to_string()))
+                .expect("a non-empty list must parse to Some");
+        assert!(intent_allowed_for_site(
+            "hfville",
+            Some(&parsed),
+            "mark_room_clean"
+        ));
+        assert!(!intent_allowed_for_site(
+            "hfville",
+            Some(&parsed),
+            "create_booking"
+        ));
+    }
+
+    // ---- allowlist entry validation (fail loud, not closed-and-silent) --
+
+    /// The exact typo class this validation exists for. `mark_clean` looks
+    /// plausible but matches no intent, so without startup validation the
+    /// maid taps done, PG flips, and the job parks `'skipped'` forever while
+    /// nothing reaches Ville's iHOTEL — silent divergence.
+    #[test]
+    fn a_typo_is_not_a_valid_intent_name() {
+        for typo in [
+            "mark_clean",
+            "mark_room_cleaned",
+            "markroomclean",
+            "MarkRoomClean",
+            "mark_room_clean ", // untrimmed (the parser trims, so this is post-trim only)
+        ] {
+            assert!(
+                !ALL_INTENT_NAMES.contains(&typo),
+                "{typo:?} must not be accepted as a valid intent"
+            );
+        }
+        assert!(ALL_INTENT_NAMES.contains(&"mark_room_clean"));
+    }
+
+    /// Every entry an operator could legitimately set must validate — the
+    /// parser trims, so the realistic `" mark_room_clean , "` form is clean.
+    #[test]
+    fn realistic_allowlist_entries_are_all_known_intents() {
+        let parsed = hotel_backend::config::parse_csv_allowlist(Some(
+            " mark_room_clean , mark_room_dirty ".to_string(),
+        ))
+        .expect("parses");
+        let unknown: Vec<&String> = parsed
+            .iter()
+            .filter(|n| !ALL_INTENT_NAMES.contains(&n.as_str()))
+            .collect();
+        assert!(unknown.is_empty(), "unexpected unknown entries: {unknown:?}");
+    }
+
+    /// The validation predicate used by `init_ville_intent_allowlist`, applied
+    /// to a mixed list: exactly the bogus entries are reported.
+    #[test]
+    fn unknown_entries_are_identified_precisely() {
+        let parsed = hotel_backend::config::parse_csv_allowlist(Some(
+            "mark_room_clean,mark_clean,check_out,bogus_intent".to_string(),
+        ))
+        .expect("parses");
+        let mut unknown: Vec<&str> = parsed
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !ALL_INTENT_NAMES.contains(name))
+            .collect();
+        unknown.sort_unstable();
+        assert_eq!(unknown, vec!["bogus_intent", "mark_clean"]);
+    }
+
     /// Backoff schedule: 30s, 2min, 10min — matches the constants and
     /// guards against an accidental edit that could collapse the schedule
     /// (e.g. all 0s would re-enable the previous thrashing behavior).
@@ -3056,6 +4397,8 @@ mod tests {
 
     /// MED-4 throttle: the Nth event inside the window fires exactly once,
     /// then resets the counter so the next event opens a fresh window.
+    /// (The time floor added later is what keeps the *next* burst from
+    /// paging immediately — see `should_alert_enforces_time_floor_*`.)
     #[test]
     fn should_alert_at_threshold_fires_once_then_resets() {
         let mut state = SelfHealCounter::new();
@@ -3104,18 +4447,97 @@ mod tests {
         assert_eq!(decision.count, 1, "counter must reset after window expiry");
     }
 
-    /// MED-4 throttle: threshold of 1 fires immediately on every event —
-    /// edge case but the math should still be safe (no off-by-one panic).
+    /// MED-4 throttle, recalibrated: even at `threshold = 1` — the
+    /// degenerate config where every single event is alert-worthy — the
+    /// time floor still holds. This test previously asserted the opposite
+    /// ("threshold=1 must fire every event"), which is exactly the
+    /// counter-reset semantics the floor replaces: with no `last_alert_at`,
+    /// "one alert per 1 event" meant one Slack POST per salvage.
     #[test]
-    fn should_alert_threshold_of_one_fires_every_event() {
+    fn should_alert_threshold_of_one_still_honours_the_time_floor() {
         let mut state = SelfHealCounter::new();
-        let now = Instant::now();
+        let t0 = Instant::now();
         let window = Duration::from_secs(60);
 
-        for _ in 0..3 {
-            let d = should_alert(&mut state, now, 1, window);
-            assert!(d.fire, "threshold=1 must fire every event");
-            assert_eq!(d.count, 1, "counter resets after each fire");
+        let first = should_alert(&mut state, t0, 1, window);
+        assert!(first.fire, "the first event must always page");
+
+        // Same instant, and every second after it inside the window: the
+        // floor holds them all.
+        for offset in [0, 1, 5, 30, 59] {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(offset), 1, window);
+            assert!(
+                !d.fire,
+                "event at +{offset}s must be held by the {}s floor",
+                window.as_secs()
+            );
+        }
+
+        // Once the floor lapses, the next event pages again.
+        let after = should_alert(&mut state, t0 + Duration::from_secs(60), 1, window);
+        assert!(after.fire, "the floor must open again after the window");
+    }
+
+    /// THE W5 regression test. Under a sustained salvage rate the old
+    /// implementation paged once per `SELF_HEAL_ALERT_THRESHOLD` events —
+    /// counter semantics wearing a window's name — so an hour of one
+    /// salvage per second produced ~720 Slack messages. The floor makes the
+    /// interval a genuine function of time.
+    #[test]
+    fn should_alert_enforces_time_floor_under_sustained_rate() {
+        let mut state = SelfHealCounter::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(300);
+
+        // One self-heal every second for an hour.
+        let mut fire_times: Vec<u64> = Vec::new();
+        for sec in 0..3600u64 {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(sec), 5, window);
+            if d.fire {
+                fire_times.push(sec);
+            }
+        }
+
+        // Old behaviour: 3600 events / 5 per alert = 720 pages.
+        assert!(
+            fire_times.len() <= 13,
+            "3600 events in 1h must not produce {} pages — the window is a \
+             time window, not an event counter",
+            fire_times.len()
+        );
+        assert!(
+            !fire_times.is_empty(),
+            "a sustained salvage rate must still page at least once"
+        );
+        for pair in fire_times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= window.as_secs(),
+                "pages at {}s and {}s are closer than the {}s floor",
+                pair[0],
+                pair[1],
+                window.as_secs()
+            );
+        }
+    }
+
+    /// Suppression by the floor must not be a black hole: events keep being
+    /// counted while it is closed, so the caller's per-event warn log (and
+    /// the next page) still reflect the real volume.
+    #[test]
+    fn should_alert_keeps_counting_while_the_floor_is_closed() {
+        let mut state = SelfHealCounter::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(300);
+
+        for _ in 0..5 {
+            let _ = should_alert(&mut state, t0, 5, window);
+        }
+        // The 5th fired and zeroed the count; the next three are held by
+        // the floor but still counted.
+        for expected in 1..=3 {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(1), 5, window);
+            assert!(!d.fire, "floor must hold this page");
+            assert_eq!(d.count, expected, "held events must still be counted");
         }
     }
 
@@ -3140,23 +4562,47 @@ mod tests {
     }
 
     /// LOW-3 listener constants must form a usable supervisor: backoff
-    /// short enough to be invisible normally, long enough not to spin;
-    /// alert threshold high enough to absorb transient flaps but low
-    /// enough to page within a minute on a real outage.
+    /// short enough to be invisible normally, long enough not to spin; and
+    /// a sustained-outage threshold that is unambiguously past the
+    /// self-recovering blips this alert used to fire on.
     #[test]
     fn listener_supervisor_constants_are_in_safe_range() {
-        assert!(LISTENER_BACKOFF_SECS >= 1, "<1s would spin CPU");
+        // Bound through locals — same idiom as
+        // `queue_stuck_in_progress_age_mins_is_i32_for_make_interval`, so
+        // the assertions aren't compile-time constants and a type change
+        // at the const site fails here rather than silently.
+        let backoff: u64 = LISTENER_BACKOFF_SECS;
+        let backoff_sustained: u64 = LISTENER_BACKOFF_SUSTAINED_SECS;
+        let sustained: u64 = LISTENER_SUSTAINED_OUTAGE_SECS;
+        let repage: u64 = LISTENER_REPAGE_COOLDOWN_SECS;
+        let healthy: u64 = LISTENER_HEALTHY_SESSION_SECS;
+        let stuck_claim: u64 = STUCK_IN_PROGRESS_TIMEOUT_SECS as u64;
+
+        assert!(backoff >= 1, "<1s would spin CPU");
+        assert!(backoff <= 30, ">30s defeats the point of NOTIFY");
         assert!(
-            LISTENER_BACKOFF_SECS <= 30,
-            ">30s defeats the point of NOTIFY"
+            backoff_sustained > backoff,
+            "sustained-outage backoff must be longer than normal backoff"
+        );
+        // The demotion's load-bearing number. Below ~5 min we are back to
+        // paging on deploys and tunnel re-handshakes; the justification in
+        // the constant's doc leans on it being 2x the janitor's
+        // claim-steal window.
+        assert!(
+            sustained >= 2 * stuck_claim,
+            "a page must outlive every other self-healing mechanism here"
         );
         assert!(
-            LISTENER_MAX_CONSECUTIVE_FAILURES >= 3,
-            "<3 would page on every flap"
+            sustained <= 3600,
+            ">1h of degraded NOTIFY latency should not pass unreported"
         );
         assert!(
-            LISTENER_BACKOFF_AFTER_ALERT_SECS > LISTENER_BACKOFF_SECS,
-            "post-alert backoff must be longer than normal backoff"
+            repage >= sustained,
+            "re-paging faster than the outage threshold rebuilds the storm"
+        );
+        assert!(
+            healthy < sustained,
+            "a session can never prove itself healthy otherwise"
         );
     }
 
@@ -3213,11 +4659,407 @@ mod tests {
             idempotency_key: Uuid::nil(),
             attempts: 1,
             claimed_at,
+            prior: PriorDisposition::RecoveredFromExhausted,
         };
         let cloned = job.clone();
         assert_eq!(cloned.claimed_at, claimed_at);
         assert_eq!(cloned.id, 42);
         assert_eq!(cloned.attempts, 1);
+        // The LOW-2 closure alert depends on this field surviving the copy
+        // from `claim_next_job` to `mark_done` — it is the ONLY carrier of
+        // the pre-claim status (see `PriorDisposition`).
+        assert_eq!(cloned.prior, PriorDisposition::RecoveredFromExhausted);
+    }
+
+    // -------------------------------------------------------------------
+    // Audit LOW-2 — `exhausted → done` detection
+    //
+    // Regression cover for the dead `:white_check_mark:` closure alert:
+    // `mark_done` read the "prior" status AFTER `claim_next_job` had
+    // already committed the flip to `in_progress`, so the transition test
+    // could never be true. The pre-image is now captured by the claim and
+    // classified by this pure helper.
+    // -------------------------------------------------------------------
+
+    /// THE regression test. The documented operator recovery — printed in
+    /// `send_exhausted_alert`'s own remediation text — is
+    /// `SET status='pending', attempts=0, next_retry_at=NULL`. That leaves
+    /// a `pending` row still carrying the `last_error` stamped when it
+    /// exhausted, and with no scheduled retry. That shape MUST classify as
+    /// a recovery, otherwise the closure alert stays dead exactly the way
+    /// it was before this fix (a literal `prior_status == "exhausted"`
+    /// comparison never matches, because a reset row no longer says
+    /// `exhausted` and `claim_next_job` refuses to claim one that does).
+    #[test]
+    fn prior_disposition_detects_operator_reset_from_exhausted() {
+        assert_eq!(
+            classify_prior_disposition("pending", true, false),
+            PriorDisposition::RecoveredFromExhausted,
+            "operator-reset-from-exhausted must be detected — this is the \
+             transition the RESOLVED alert exists for"
+        );
+    }
+
+    /// A literal `exhausted` pre-image also classifies as a recovery.
+    /// Unreachable today (the claim predicate excludes the state) but
+    /// pinned so widening that predicate can't silently kill detection a
+    /// second time.
+    #[test]
+    fn prior_disposition_detects_literal_exhausted_pre_image() {
+        assert_eq!(
+            classify_prior_disposition("exhausted", true, false),
+            PriorDisposition::RecoveredFromExhausted
+        );
+        // Residue flags must not override an explicit terminal status.
+        assert_eq!(
+            classify_prior_disposition("exhausted", false, true),
+            PriorDisposition::RecoveredFromExhausted
+        );
+    }
+
+    /// A never-attempted job is `pending` with no error residue — it must
+    /// NOT produce a closure alert, or every ordinary writeback would post
+    /// a `:white_check_mark:` and the signal would be worthless.
+    #[test]
+    fn prior_disposition_fresh_enqueue_is_not_a_recovery() {
+        assert_eq!(
+            classify_prior_disposition("pending", false, false),
+            PriorDisposition::Fresh
+        );
+    }
+
+    /// Ordinary retries must not produce a closure alert either. Covers
+    /// both retry shapes: `failed` with a scheduled backoff, and a stale
+    /// `in_progress` claim stolen back from a crashed worker.
+    #[test]
+    fn prior_disposition_ordinary_retries_are_not_recoveries() {
+        assert_eq!(
+            classify_prior_disposition("failed", true, true),
+            PriorDisposition::Retrying,
+            "a backoff retry never paged an operator — no closure to send"
+        );
+        assert_eq!(
+            classify_prior_disposition("in_progress", true, false),
+            PriorDisposition::Retrying,
+            "a janitor steal of a stuck claim is not an operator recovery"
+        );
+        assert_eq!(
+            classify_prior_disposition("done", false, false),
+            PriorDisposition::Retrying
+        );
+    }
+
+    /// Structural pin: `mark_done` must NOT reintroduce a post-claim read
+    /// of the row's status. The original bug was precisely a
+    /// `WITH prev AS (SELECT … status AS prior_status …)` CTE inside
+    /// `mark_done`, which ran after `claim_next_job` had committed the flip
+    /// and therefore could only ever observe `in_progress`. The pre-image
+    /// must come from the claim statement.
+    #[test]
+    fn mark_done_does_not_reread_prior_status_from_pg() {
+        let source = include_str!("writeback.rs");
+        let fn_start = source
+            .find("async fn mark_done(")
+            .expect("mark_done must exist");
+        let fn_body = &source[fn_start..];
+        let body_end = fn_body
+            .find("\n/// Write the recipe's allocated legacy identifiers")
+            .expect("mark_done must be followed by back_populate_legacy_ids' doc comment");
+        let body = &fn_body[..body_end];
+        assert!(
+            !body.contains("prior_status"),
+            "mark_done must not read prior_status from PG — by the time it \
+             runs, claim_next_job has already committed status='in_progress', \
+             so any such read is dead code. Use ClaimedJob.prior instead."
+        );
+        assert!(
+            body.contains("PriorDisposition::RecoveredFromExhausted"),
+            "mark_done must gate the closure alert on the carried \
+             PriorDisposition"
+        );
+    }
+
+    /// The claim statement is the only place the pre-image is observable,
+    /// so it must project all three inputs the classifier needs.
+    #[test]
+    fn claim_next_job_projects_the_pre_image() {
+        let source = include_str!("writeback.rs");
+        let fn_start = source
+            .find("async fn claim_next_job(")
+            .expect("claim_next_job must exist");
+        let body = &source[fn_start..fn_start + 3000];
+        for col in [
+            "prior_status",
+            "prior_had_error",
+            "prior_retry_scheduled",
+        ] {
+            assert!(
+                body.contains(col),
+                "claim_next_job must capture `{col}` — the pre-image cannot \
+                 be recovered after the claim commits"
+            );
+        }
+        assert!(
+            body.contains("FOR UPDATE SKIP LOCKED"),
+            "the pre-image CTE must keep the concurrent-claim guard"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // EXHAUSTED-alert collapse guard
+    //
+    // Non-retryable errors and panics bypass the retry budget and exhaust
+    // on the FIRST attempt, so one bad recipe paged once per affected row
+    // at full drain speed — each send `await`ed in the hot path.
+    // -------------------------------------------------------------------
+
+    /// First occurrence of a class is always immediate and un-collapsed —
+    /// it is the genuinely actionable page and carries the full error text.
+    #[test]
+    fn exhausted_alert_first_occurrence_sends_immediately() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let decision = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "recipe"),
+            now,
+            Duration::from_secs(300),
+        );
+        assert_eq!(decision, ExhaustedAlertDecision::Send { collapsed: 0 });
+    }
+
+    /// An immediate repeat of the same `(intent, class)` is collapsed
+    /// rather than posted — this is the bad-recipe drain case.
+    #[test]
+    fn exhausted_alert_repeat_within_window_is_collapsed() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(300);
+
+        let first = decide_exhausted_alert(&mut windows, key.clone(), now, window);
+        assert_eq!(first, ExhaustedAlertDecision::Send { collapsed: 0 });
+
+        // 50 more rows fail the same way while the window is open.
+        for expected in 1..=50u32 {
+            let d = decide_exhausted_alert(&mut windows, key.clone(), now, window);
+            assert_eq!(
+                d,
+                ExhaustedAlertDecision::Suppress {
+                    collapsed: expected,
+                    window_secs: 300,
+                },
+                "repeat #{expected} must be collapsed, not posted"
+            );
+        }
+    }
+
+    /// A DIFFERENT error class must not be collapsed behind an open window
+    /// — a schema drift starting during a recipe-failure drain is new
+    /// information and has to page.
+    #[test]
+    fn exhausted_alert_different_error_class_is_not_collapsed() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let window = Duration::from_secs(300);
+
+        let _ = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "recipe"),
+            now,
+            window,
+        );
+        // Same intent, different class → sends.
+        let drift = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "schema_drift"),
+            now,
+            window,
+        );
+        assert_eq!(
+            drift,
+            ExhaustedAlertDecision::Send { collapsed: 0 },
+            "a new error class must page even mid-drain of another class"
+        );
+        // Same class, different intent → also sends.
+        let other_intent = decide_exhausted_alert(
+            &mut windows,
+            ("check_out".to_string(), "recipe"),
+            now,
+            window,
+        );
+        assert_eq!(
+            other_intent,
+            ExhaustedAlertDecision::Send { collapsed: 0 },
+            "a broken recipe for one intent must not mask another intent"
+        );
+    }
+
+    /// After the window expires the next occurrence sends AND reports how
+    /// many it absorbed, so nothing is silently dropped from Slack either.
+    #[test]
+    fn exhausted_alert_window_expiry_sends_with_collapsed_count() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(60);
+
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        for _ in 0..7 {
+            let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        }
+
+        let t1 = t0 + Duration::from_secs(61);
+        let d = decide_exhausted_alert(&mut windows, key.clone(), t1, window);
+        assert_eq!(
+            d,
+            ExhaustedAlertDecision::Send { collapsed: 7 },
+            "the follow-up page must state the true suppressed volume"
+        );
+
+        // And the counter resets for the new window.
+        let d2 = decide_exhausted_alert(&mut windows, key, t1, window);
+        assert_eq!(
+            d2,
+            ExhaustedAlertDecision::Suppress {
+                collapsed: 1,
+                window_secs: 60,
+            }
+        );
+    }
+
+    /// The key space must stay bounded — idle keys that absorbed nothing
+    /// are dropped so a long-lived worker doesn't accumulate one entry per
+    /// `(intent, class)` pair ever seen.
+    #[test]
+    fn exhausted_alert_windows_do_not_grow_unbounded() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+
+        for i in 0..25 {
+            let _ = decide_exhausted_alert(
+                &mut windows,
+                (format!("intent_{i}"), "recipe"),
+                t0,
+                window,
+            );
+        }
+        assert_eq!(windows.len(), 25);
+
+        // Long after everything expired, one new key prunes the idle ones.
+        let t1 = t0 + Duration::from_secs(600);
+        let _ = decide_exhausted_alert(&mut windows, ("fresh".to_string(), "panic"), t1, window);
+        assert_eq!(
+            windows.len(),
+            1,
+            "expired windows with nothing suppressed must be pruned"
+        );
+    }
+
+    /// A window that absorbed repeats must survive expiry until its count
+    /// has actually been reported — pruning it would silently discard the
+    /// suppressed volume.
+    #[test]
+    fn exhausted_alert_pending_counts_survive_pruning() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(60);
+
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+
+        // An unrelated key at a much later time triggers the prune.
+        let t1 = t0 + Duration::from_secs(600);
+        let _ = decide_exhausted_alert(&mut windows, ("other".to_string(), "panic"), t1, window);
+
+        let d = decide_exhausted_alert(&mut windows, key, t1, window);
+        assert_eq!(
+            d,
+            ExhaustedAlertDecision::Send { collapsed: 1 },
+            "the suppressed count must not be lost to pruning"
+        );
+    }
+
+    /// The collapse key depends on classifying the rendered error message,
+    /// so the prefixes must track `WritebackError`'s Display forms and the
+    /// messages this binary synthesises. A misclassification would collapse
+    /// two unrelated failure modes into one page.
+    #[test]
+    fn classify_error_kind_separates_the_non_retryable_classes() {
+        // These six bypass the retry budget entirely (is_retryable == false)
+        // and so exhaust on the FIRST attempt — the flood this guard exists
+        // for. Each must get its own key.
+        assert_eq!(
+            classify_error_kind("recipe error: no prior occupant for room 301"),
+            "recipe"
+        );
+        assert_eq!(
+            classify_error_kind("legacy schema drift: expected fingerprint a, got b"),
+            "schema_drift"
+        );
+        assert_eq!(
+            classify_error_kind("intent payload mismatch: CheckOut"),
+            "intent_mismatch"
+        );
+        assert_eq!(
+            classify_error_kind("payload deserialize: missing field `nights`"),
+            "serde"
+        );
+        assert_eq!(classify_error_kind("config: NEW_DB_NAME unset"), "config");
+        assert_eq!(
+            classify_error_kind("writeback disabled by WRITEBACK_ENABLED env var"),
+            "disabled"
+        );
+        // Panics skip the budget too (force_exhaust_job from the main loop).
+        assert_eq!(classify_error_kind("PANIC: index out of bounds"), "panic");
+    }
+
+    /// Retryable/wrapper classes must stay distinct from each other, and a
+    /// worker-synthesised wrapper must win over the inner error's prefix.
+    #[test]
+    fn classify_error_kind_wrapper_prefixes_win_over_inner() {
+        assert_eq!(classify_error_kind("tiberius: connection reset"), "tiberius");
+        assert_eq!(classify_error_kind("sqlx: pool timed out"), "sqlx");
+        assert_eq!(
+            classify_error_kind("legacy connection pool: timed out"),
+            "pool"
+        );
+        // The binary wraps these before they reach the alert — the wrapper
+        // is the useful class, not the inner driver error.
+        assert_eq!(
+            classify_error_kind("resolve_legacy_ids: sqlx: row not found"),
+            "resolve_legacy_ids"
+        );
+        assert_eq!(
+            classify_error_kind("mssql_acquire: legacy connection pool: timed out"),
+            "mssql_acquire"
+        );
+        assert_eq!(
+            classify_error_kind("trancount_reset: tiberius: broken pipe"),
+            "trancount_reset"
+        );
+        assert_eq!(classify_error_kind("something unexpected"), "other");
+        assert_eq!(classify_error_kind(""), "other");
+    }
+
+    /// The collapse window must be a real throttle but not a black hole.
+    /// Bound through a local (same idiom as
+    /// `queue_stuck_in_progress_age_mins_is_i32_for_make_interval`) so the
+    /// assertion isn't a compile-time constant, and so a type change at the
+    /// const site fails here rather than silently.
+    #[test]
+    fn exhausted_alert_window_is_in_safe_range() {
+        let window_secs: u64 = EXHAUSTED_ALERT_WINDOW_SECS;
+        assert!(
+            window_secs >= 60,
+            "<60s barely dents a full-speed queue drain"
+        );
+        assert!(
+            window_secs <= 3600,
+            ">1h would hide a genuinely new failure class for too long"
+        );
     }
 
     /// Wave 5a item 4 — the `Err(_)` arm of `mark_done`'s row-match
@@ -3228,6 +5070,12 @@ mod tests {
     /// `return` BEFORE the back_populate_legacy_ids retry loop.
     /// A regression that drops the `return` would silently let a
     /// stale `legacy_ids` clobber a stolen-claim winner's row.
+    ///
+    /// ADR 0006 tightened the literal from `return;` to `return false;`
+    /// when `mark_done` gained its bool return — which also pins the
+    /// second half of the contract: an errored status-flip must not
+    /// claim the completion, or the drain loop would announce a
+    /// `legacy_stale` hint for a job it may not own.
     #[test]
     fn mark_done_err_arm_returns_before_back_population() {
         let source = include_str!("writeback.rs");
@@ -3252,8 +5100,8 @@ mod tests {
         // we can assert the early-return sits inside the arm.
         let from_err = &source[fn_start + err_arm_pos..];
         let return_pos = from_err
-            .find("return;")
-            .expect("Err arm must contain `return;` per Wave 5a item 4");
+            .find("return false;")
+            .expect("Err arm must contain `return false;` per Wave 5a item 4 + ADR 0006");
         // The back-pop loop is far below the Err arm (after the closing
         // `}` of the match). We need the `return;` to come BEFORE the
         // back-pop call to guarantee the Err path skips it.
@@ -3339,5 +5187,808 @@ mod tests {
             3,
             "all three conditions must produce one reason each"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // W1 / W4 — startup probes must not name a permanent cause on a
+    // transient read
+    //
+    // The collation probe runs FIRST, before the hardened fingerprint
+    // guard, and mapped ANY failure (including a bb8 pool timeout on the
+    // very first legacy round-trip of the process) onto "Legacy MSSQL
+    // collation is case-sensitive". The ledger probe did the same with
+    // "`dbo.ht_writeback_ledger` is missing", sending the operator to
+    // re-apply a migration that was already applied.
+    // -------------------------------------------------------------------
+
+    /// A pool-get timeout / driver error means the read never landed. It
+    /// must be retried, and it must never be reported as a bad value.
+    #[test]
+    fn catalog_probe_transport_failures_are_not_confirmed() {
+        assert!(
+            !catalog_probe_failure_is_confirmed(&WritebackError::Pool(bb8::RunError::TimedOut)),
+            "a bb8 acquire timeout is the tunnel, not the collation"
+        );
+        assert!(
+            !catalog_probe_failure_is_confirmed(&WritebackError::Sqlx(sqlx::Error::PoolTimedOut)),
+            "wire-level failures are transient"
+        );
+    }
+
+    /// `Config` is the only thing the two catalog probes synthesise from an
+    /// answer they actually received — a `_CS_` collation name, a NULL
+    /// `OBJECT_ID`, an unreadable result shape. That, and only that, may
+    /// refuse the boot on the first try.
+    #[test]
+    fn catalog_probe_bad_answer_is_confirmed() {
+        assert!(catalog_probe_failure_is_confirmed(&WritebackError::Config(
+            "Legacy server collation is case-sensitive (Thai_CS_AS)".into()
+        )));
+        assert!(catalog_probe_failure_is_confirmed(&WritebackError::Config(
+            "dbo.ht_writeback_ledger missing".into()
+        )));
+    }
+
+    /// The fingerprint probe keeps its own, narrower rule (W3, incident
+    /// 2026-06-28): only a hash mismatch is confirmed. A malformed catalog
+    /// read is retried, because re-baselining against a bad read corrupts
+    /// the baseline.
+    #[test]
+    fn fingerprint_probe_confirms_only_a_hash_mismatch() {
+        assert!(fingerprint_failure_is_confirmed(
+            &WritebackError::SchemaDrift {
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+        ));
+        assert!(!fingerprint_failure_is_confirmed(&WritebackError::Pool(
+            bb8::RunError::TimedOut
+        )));
+        assert!(
+            !fingerprint_failure_is_confirmed(&WritebackError::Config(
+                "TABLE_NAME column missing".into()
+            )),
+            "a malformed catalog read is not drift — this is the 2026-06-28 rule"
+        );
+    }
+
+    /// A transient collation probe must produce the connectivity message
+    /// and must NOT tell the operator to touch the database's collation.
+    #[test]
+    fn collation_alert_on_transient_does_not_blame_the_collation() {
+        let body = collation_probe_alert_body(
+            ProbeFailureKind::Unreachable,
+            4,
+            "legacy connection pool: Timed out in bb8",
+        );
+        assert!(
+            body.contains("could not start"),
+            "must not shout REFUSED TO START for a read that never landed"
+        );
+        assert!(!body.contains("REFUSED TO START"));
+        assert!(body.contains("connectivity/timeout problem"));
+        assert!(body.contains("NOT a collation problem"));
+        assert!(
+            body.contains("Do NOT re-collate"),
+            "the remediation must be explicitly negated"
+        );
+        assert!(
+            !body.contains("Thai_CI_AS"),
+            "naming the expected collation invites a restore that fixes nothing"
+        );
+        assert!(body.contains("4 attempts"), "must state the retry budget");
+    }
+
+    /// A confirmed collation failure still says everything it used to.
+    #[test]
+    fn collation_alert_on_confirmed_names_the_configuration_problem() {
+        let body = collation_probe_alert_body(
+            ProbeFailureKind::Confirmed,
+            1,
+            "config: Legacy server collation is case-sensitive (Thai_CS_AS)",
+        );
+        assert!(body.contains("REFUSED TO START"));
+        assert!(body.contains("the probe read succeeded"));
+        assert!(body.contains("Thai_CI_AS"));
+        assert!(body.contains("case-insensitive"));
+        assert!(body.contains("Thai_CS_AS"), "error text must be carried");
+    }
+
+    /// A transient ledger probe must not claim the table is missing — the
+    /// probe never got an answer, so its presence is unknown.
+    #[test]
+    fn ledger_alert_on_transient_does_not_claim_the_table_is_missing() {
+        let body = ledger_probe_alert_body(
+            ProbeFailureKind::Unreachable,
+            4,
+            "tiberius: connection reset by peer",
+        );
+        assert!(body.contains("could not start"));
+        assert!(!body.contains("REFUSED TO START"));
+        assert!(
+            !body.contains("is MISSING"),
+            "the claim the operator acts on must not be made on a timeout"
+        );
+        assert!(body.contains("UNKNOWN"));
+        assert!(
+            body.contains("Do NOT re-apply"),
+            "re-applying an already-applied migration is the wrong action"
+        );
+        assert!(body.contains("connectivity/timeout problem"));
+    }
+
+    /// A confirmed missing ledger still routes to the migration.
+    #[test]
+    fn ledger_alert_on_confirmed_routes_to_the_migration() {
+        let body = ledger_probe_alert_body(
+            ProbeFailureKind::Confirmed,
+            1,
+            "config: dbo.ht_writeback_ledger missing",
+        );
+        assert!(body.contains("REFUSED TO START"));
+        assert!(body.contains("is MISSING"));
+        assert!(body.contains("024_writeback_ledger.sql"));
+        assert!(body.contains("OBJECT_ID"));
+        assert!(!body.contains("Do NOT re-apply"));
+    }
+
+    /// W3's two messages are the model the other two now follow — pin them
+    /// so a future edit can't quietly re-merge the two stories.
+    #[test]
+    fn fingerprint_alert_keeps_its_transient_and_drift_split() {
+        let drift = fingerprint_probe_alert_body(ProbeFailureKind::Confirmed, 1, "hash a != b");
+        assert!(drift.contains("REFUSED TO START"));
+        assert!(drift.contains("real drift"));
+        assert!(drift.contains("writeback-fingerprint.sh"));
+
+        let transient =
+            fingerprint_probe_alert_body(ProbeFailureKind::Unreachable, 4, "tiberius: timeout");
+        assert!(transient.contains("could not start"));
+        assert!(transient.contains("NOT confirmed schema"));
+        assert!(transient.contains("do NOT run `writeback-fingerprint.sh`"));
+    }
+
+    /// End-to-end on the retry envelope: a read that fails transiently and
+    /// then lands must NOT refuse the boot. `start_paused` auto-advances
+    /// the 6s/12s backoff sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_retries_a_transient_read_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            4,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                if calls_ref.get() < 3 {
+                    Err(WritebackError::Pool(bb8::RunError::TimedOut))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(out.is_ok(), "a recovered transient must not refuse the boot");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// A read that never lands exhausts the budget and reports
+    /// `Unreachable` — the branch that must not name a permanent cause.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_exhausts_transients_as_unreachable() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            3,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                Err(WritebackError::Pool(bb8::RunError::TimedOut))
+            },
+        )
+        .await;
+        let failure = out.expect_err("must fail");
+        assert_eq!(failure.kind, ProbeFailureKind::Unreachable);
+        assert_eq!(failure.attempts, 3);
+        assert_eq!(calls.get(), 3, "every attempt must be made");
+        // And the message the operator gets is the connectivity one.
+        let body = collation_probe_alert_body(failure.kind, failure.attempts, "…");
+        assert!(body.contains("NOT a collation problem"));
+    }
+
+    /// A definite bad answer short-circuits: re-asking a question that is
+    /// already answered only delays the page.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_short_circuits_a_confirmed_failure() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            4,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                Err(WritebackError::Config("dbo.ht_writeback_ledger missing".into()))
+            },
+        )
+        .await;
+        let failure = out.expect_err("must fail");
+        assert_eq!(failure.kind, ProbeFailureKind::Confirmed);
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(calls.get(), 1, "a definite answer must not be retried");
+    }
+
+    /// The attempt budget: new env var wins, the fingerprint probe's
+    /// original name still works, garbage and zero fall back to the
+    /// default (a `0` would skip the probe entirely).
+    #[test]
+    fn probe_attempts_parse_precedence_and_floor() {
+        assert_eq!(parse_probe_attempts(Some("7"), Some("2")), 7);
+        assert_eq!(parse_probe_attempts(None, Some("2")), 2);
+        assert_eq!(parse_probe_attempts(Some(" 3 "), None), 3);
+        assert_eq!(
+            parse_probe_attempts(None, None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS
+        );
+        assert_eq!(
+            parse_probe_attempts(Some("0"), None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS,
+            "0 attempts would disable the probe"
+        );
+        assert_eq!(
+            parse_probe_attempts(Some("nope"), None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // W8 — listener UNHEALTHY is a log line until the outage is sustained
+    //
+    // The supervisor reconnects forever and the worker keeps draining on
+    // the 30s poll, so a reconnect loop is self-recovering by design. The
+    // old alert fired on 10 consecutive failures, zeroed its counter on
+    // fire, and had no cooldown timestamp — one page per ~105s for the
+    // whole duration of an outage.
+    // -------------------------------------------------------------------
+
+    /// Helper: one failed listener session at `t`.
+    fn listener_fail(state: &mut ListenerHealth, t: Instant) -> ListenerDecision {
+        decide_listener_action(
+            state,
+            t,
+            false,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        )
+    }
+
+    /// Nine minutes of failed reconnects at the 5s cadence — 108 sessions,
+    /// which under the old rule would have been ~10 pages — must produce
+    /// no Slack traffic at all.
+    #[test]
+    fn listener_does_not_page_below_the_sustained_threshold() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        for sec in (0..540).step_by(5) {
+            let d = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+            assert_eq!(
+                d.action,
+                ListenerAction::LogOnly,
+                "a reconnect loop at +{sec}s is a log line, not a page"
+            );
+            assert_eq!(
+                d.backoff_secs, LISTENER_BACKOFF_SECS,
+                "cadence stays fast while the outage may still self-recover"
+            );
+        }
+        assert!(state.consecutive_failures > 100, "sanity: many failures");
+    }
+
+    /// Past the threshold it pages exactly once, then holds the re-page
+    /// floor for the whole cooldown.
+    #[test]
+    fn listener_pages_once_when_sustained_then_holds_the_floor() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let _ = listener_fail(&mut state, t0);
+
+        // Just before the threshold: still silent.
+        let before = listener_fail(&mut state, t0 + Duration::from_secs(599));
+        assert_eq!(before.action, ListenerAction::LogOnly);
+
+        // At the threshold: one page.
+        let at = listener_fail(&mut state, t0 + Duration::from_secs(600));
+        match at.action {
+            ListenerAction::Page { outage_secs, .. } => assert_eq!(outage_secs, 600),
+            other => panic!("expected a page at the sustained threshold, got {other:?}"),
+        }
+        assert_eq!(
+            at.backoff_secs, LISTENER_BACKOFF_SUSTAINED_SECS,
+            "cadence slows once the outage is sustained"
+        );
+
+        // Every 60s for the next half hour: silent.
+        for sec in (660..2400).step_by(60) {
+            let d = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+            assert_eq!(
+                d.action,
+                ListenerAction::LogOnly,
+                "re-page floor must hold at +{sec}s"
+            );
+        }
+
+        // Past the cooldown, one more page restates the outage.
+        let repage = listener_fail(&mut state, t0 + Duration::from_secs(2400));
+        assert!(
+            matches!(repage.action, ListenerAction::Page { .. }),
+            "a still-broken listener restates itself once per cooldown"
+        );
+    }
+
+    /// A healthy session clears the outage clock with no Slack traffic when
+    /// nothing was ever paged — the ordinary "PG restarted during a deploy"
+    /// case.
+    #[test]
+    fn listener_healthy_session_clears_the_outage_silently() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        for sec in (0..120).step_by(5) {
+            let _ = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+        }
+        let recovered = decide_listener_action(
+            &mut state,
+            t0 + Duration::from_secs(300),
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(
+            recovered.action,
+            ListenerAction::LogOnly,
+            "an outage nobody was paged for needs no all-clear"
+        );
+        assert!(!state.paged_this_outage);
+
+        // And the clock restarted: the next page is 600s away from the
+        // recovery, not from the original failure.
+        let d = listener_fail(&mut state, t0 + Duration::from_secs(899));
+        assert_eq!(d.action, ListenerAction::LogOnly);
+    }
+
+    /// If the outage DID page, recovery closes it — same pairing rule as
+    /// the exhausted-job `:white_check_mark:`.
+    #[test]
+    fn listener_recovery_posts_an_all_clear_only_after_a_page() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let _ = listener_fail(&mut state, t0);
+        let paged = listener_fail(&mut state, t0 + Duration::from_secs(700));
+        assert!(matches!(paged.action, ListenerAction::Page { .. }));
+
+        let recovered = decide_listener_action(
+            &mut state,
+            t0 + Duration::from_secs(900),
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(
+            recovered.action,
+            ListenerAction::Recovered { outage_secs: 900 }
+        );
+        // The incident is closed; a later short outage starts from scratch.
+        assert!(!state.paged_this_outage);
+        assert!(state.last_paged_at.is_none());
+    }
+
+    /// A connect-then-instantly-drop flap is NOT a healthy session (the
+    /// supervisor gates that on `LISTENER_HEALTHY_SESSION_SECS`), so it
+    /// keeps accumulating toward the threshold instead of resetting the
+    /// clock on every attempt — otherwise a flapping listener could never
+    /// page at all.
+    #[test]
+    fn listener_flapping_still_reaches_the_sustained_threshold() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let mut paged = false;
+        for sec in (0..700).step_by(7) {
+            // healthy_session=false — the session came up but died in <30s.
+            let action = listener_fail(&mut state, t0 + Duration::from_secs(sec)).action;
+            if matches!(action, ListenerAction::Page { .. }) {
+                paged = true;
+            }
+        }
+        assert!(
+            paged,
+            "a listener that flaps for 11 minutes is still an outage"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // ADR 0006 — legacy_stale emission
+    // -------------------------------------------------------------------
+
+    /// Ships DARK: unset, empty, `false`, `0` and garbage are all off. Only
+    /// an explicit truthy value arms the reception hint.
+    #[test]
+    fn legacy_stale_flag_defaults_off_and_only_accepts_truthy() {
+        assert!(!legacy_stale_notify_enabled(None));
+        for off in ["", "  ", "false", "FALSE", "0", "no", "yes please"] {
+            assert!(
+                !legacy_stale_notify_enabled(Some(off.to_string())),
+                "{off:?} must not arm the flag",
+            );
+        }
+        for on in ["true", "TRUE", " True ", "1"] {
+            assert!(
+                legacy_stale_notify_enabled(Some(on.to_string())),
+                "{on:?} must arm the flag",
+            );
+        }
+    }
+
+    /// The flag name is the one `docker-compose.yml` sets (and the only place
+    /// flags live — ADR 0004). A rename here silently disables the feature.
+    #[test]
+    fn legacy_stale_flag_name_matches_compose() {
+        assert_eq!(LEGACY_STALE_NOTIFY_FLAG, "LEGACY_STALE_NOTIFY_ENABLED");
+    }
+
+    /// `mark_done` must report FALSE when its claim-gated UPDATE matches no
+    /// row — the stolen-claim case. That return value is what stops two
+    /// workers emitting two `legacy_stale` hints for one real change (the
+    /// stealer re-runs the recipe and notifies from its own `mark_done`).
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset (same convention as
+    /// `tests/test_permissions_g7.rs`).
+    #[tokio::test]
+    async fn mark_done_reports_false_when_the_claim_was_stolen() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let intent = WritebackIntent::MarkRoomDirty {
+            room_id: aggregate_id,
+            by: "TEST_mark_done_stolen_claim".into(),
+        };
+        let our_claim = Utc::now();
+        let their_claim = our_claim + chrono::Duration::seconds(30);
+
+        // The row as the JANITOR left it: still in_progress, but re-claimed
+        // (claimed_at bumped) by another worker while our recipe ran.
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO writeback_jobs \
+                 (intent, payload, aggregate_id, idempotency_key, status, claimed_at) \
+             VALUES ($1, $2, $3, $4, 'in_progress', $5) \
+             RETURNING id",
+        )
+        .bind(intent.intent_name())
+        .bind(serde_json::to_value(&intent).unwrap())
+        .bind(aggregate_id)
+        .bind(Uuid::new_v4())
+        .bind(their_claim)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture job");
+
+        let landed = mark_done(
+            &pg,
+            job_id,
+            our_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert!(
+            !landed,
+            "a stolen claim must not report the completion as ours"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pg)
+            .await
+            .expect("re-read fixture job");
+        assert_eq!(
+            status, "in_progress",
+            "the stealer's claim must be left alone for it to finish"
+        );
+
+        // Same call, matching claim → this worker owns the completion.
+        let landed = mark_done(
+            &pg,
+            job_id,
+            their_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(landed, "the claim holder's mark_done must report true");
+
+        sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #202 — CreateCashEntry back-population
+    // -------------------------------------------------------------------
+
+    fn cash_entry_intent(cash_aggregate_id: Uuid, amount: f64) -> WritebackIntent {
+        WritebackIntent::CreateCashEntry {
+            cash_aggregate_id,
+            payload: hotel_backend::outbox::intent::CreateCashEntryPayload {
+                site_id: "hfhotel".into(),
+                entry_date: Utc::now(),
+                program_date: None,
+                amount,
+                legacy_pay_type: "รายจ่าย".into(),
+                bill_no: None,
+                payee: None,
+                note: None,
+                group: None,
+                account: None,
+            },
+        }
+    }
+
+    /// "mark_done stamps the right row": `back_populate_legacy_ids` must
+    /// stamp `cash_legacy_id` on the `ht_cash_ledger` row whose `aggregate_id`
+    /// matches the intent — and leave an unrelated row (decoy) untouched.
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset (same convention as
+    /// `mark_done_reports_false_when_the_claim_was_stolen`).
+    #[tokio::test]
+    async fn back_populate_stamps_cash_legacy_id_on_the_matching_row_only() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let target_agg = Uuid::new_v4();
+        let decoy_agg = Uuid::new_v4();
+
+        let target_row: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 100.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(target_agg)
+        .fetch_one(&pg)
+        .await
+        .expect("insert target fixture row");
+
+        let decoy_row: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 200.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(decoy_agg)
+        .fetch_one(&pg)
+        .await
+        .expect("insert decoy fixture row");
+
+        let intent = cash_entry_intent(target_agg, 100.0);
+        back_populate_legacy_ids(
+            &pg,
+            target_agg,
+            &intent,
+            &serde_json::json!({"cash_legacy_id": 900_100_001}),
+        )
+        .await
+        .expect("back-populate must succeed");
+
+        let target_legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(target_row)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read target row");
+        assert_eq!(
+            target_legacy,
+            Some(900_100_001),
+            "the aggregate_id-matched row must be stamped"
+        );
+
+        let decoy_legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(decoy_row)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read decoy row");
+        assert_eq!(
+            decoy_legacy, None,
+            "an unrelated row (different aggregate_id) must NOT be stamped"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(target_row)
+            .execute(&pg)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(decoy_row)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    /// "stolen-claim path does not stamp": mirrors
+    /// `mark_done_reports_false_when_the_claim_was_stolen`'s stolen-claim
+    /// setup, but asserts the CONCRETE side effect on `ht_cash_ledger`
+    /// rather than only the boolean — a stolen claim must leave
+    /// `cash_legacy_id` NULL; the re-claimant's own `mark_done` owns the
+    /// stamp.
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn mark_done_stolen_claim_does_not_stamp_cash_legacy_id() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('income', 300.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture row");
+
+        let intent = cash_entry_intent(aggregate_id, 300.0);
+        let our_claim = Utc::now();
+        let their_claim = our_claim + chrono::Duration::seconds(30);
+
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO writeback_jobs \
+                 (intent, payload, aggregate_id, idempotency_key, status, claimed_at) \
+             VALUES ($1, $2, $3, $4, 'in_progress', $5) \
+             RETURNING id",
+        )
+        .bind(intent.intent_name())
+        .bind(serde_json::to_value(&intent).unwrap())
+        .bind(aggregate_id)
+        .bind(Uuid::new_v4())
+        .bind(their_claim)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture job");
+
+        let landed = mark_done(
+            &pg,
+            job_id,
+            our_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({"cash_legacy_id": 900_100_002}),
+        )
+        .await;
+
+        assert!(
+            !landed,
+            "a stolen claim must not report the completion as ours"
+        );
+
+        let legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(row_id)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read fixture row");
+        assert_eq!(
+            legacy, None,
+            "a stolen claim's mark_done must not stamp cash_legacy_id — the \
+             re-claimant's own mark_done owns that"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(row_id)
+            .execute(&pg)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    /// "echo-recognition": once back-population has stamped `cash_legacy_id`,
+    /// a legacy-side re-import of THAT SAME id must UPDATE the existing row,
+    /// not insert a duplicate. This reproduces the exact `ON CONFLICT
+    /// (cash_legacy_id)` target `sync_cash_history`'s
+    /// `CASH_HISTORY_UPSERT_SQL` upserts on (`hotel-backend/src/bin/sync.rs`,
+    /// the `const CASH_HISTORY_UPSERT_SQL` and its `ON CONFLICT
+    /// (cash_legacy_id) DO UPDATE` clause, consumed by `fn sync_cash_history`)
+    /// against the real `ht_cash_ledger`
+    /// UNIQUE constraint — it does NOT call or modify `bin/sync.rs` (out of
+    /// this task's ownership; the dedup itself is proven correct there by
+    /// `cash_sync_tests::reimport_without_backpopulation_still_duplicates`,
+    /// which pins the CONVERSE case — no back-population ⇒ a real duplicate).
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn backpopulated_row_absorbs_a_legacy_reimport_instead_of_duplicating() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let legacy_id = 900_100_003;
+
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 250.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pg)
+        .await
+        .expect("insert app-originated fixture row");
+
+        let intent = cash_entry_intent(aggregate_id, 250.0);
+        back_populate_legacy_ids(
+            &pg,
+            aggregate_id,
+            &intent,
+            &serde_json::json!({"cash_legacy_id": legacy_id}),
+        )
+        .await
+        .expect("back-populate must succeed");
+
+        // Simulate the mirror poll re-importing the SAME legacy row under the
+        // SAME `ON CONFLICT (cash_legacy_id)` target `CASH_HISTORY_UPSERT_SQL`
+        // uses — not the importer function itself.
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES ($1, 'expense', 250.00, 'legacy') \
+             ON CONFLICT (cash_legacy_id) DO UPDATE SET cash_synced_at = NOW()",
+        )
+        .bind(legacy_id)
+        .execute(&pg)
+        .await
+        .expect("simulated re-import upsert");
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ht_cash_ledger WHERE cash_legacy_id = $1")
+                .bind(legacy_id)
+                .fetch_one(&pg)
+                .await
+                .expect("count rows for this legacy id");
+        assert_eq!(
+            total, 1,
+            "back-population must make ON CONFLICT (cash_legacy_id) target the \
+             SAME row — otherwise the re-import lands as a duplicate (the gap \
+             bin/sync.rs::cash_sync_tests::reimport_without_backpopulation_still_duplicates pins)"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(row_id)
+            .execute(&pg)
+            .await
+            .ok();
     }
 }

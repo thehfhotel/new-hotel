@@ -45,7 +45,7 @@ pub struct RecordPaymentCommand {
     /// Routes look these up from `ht_customers` before issuing the command.
     pub receipt: RecordPaymentReceipt,
     /// Specific `HT_CheckIn_Ds.id` the payment is being apportioned against —
-    /// per spike §3h capture line 3, the .NET app fires
+    /// per `raw/invoice-20260424-100827/writes.txt:3` (spike §3h), the .NET app fires
     /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
     /// just before inserting `HT_CheckIn_Pay`. Routes resolve this via the
     /// canonical PG state when the payment maps to a single room. `None` for

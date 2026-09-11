@@ -1,6 +1,7 @@
-//! `RoomChange` recipe — Track G4 / T4 HIGH-3
-//! (`docs/coexistence/audit-2026-05-13.md`), completed to the full §3.17
-//! flow per the 2026-06-11 coexistence audit (P0-4).
+//! `RoomChange` recipe — Track G4 / T4 HIGH-3 (`docs/coexistence/audit-2026-05-13.md`
+//! §"Track G — Standalone-readiness features"), completed to the full
+//! `docs/legacy-app/COMPAT_CHEATSHEET.md` §3.17 flow per the 2026-06-11
+//! coexistence audit (P0-4).
 //!
 //! Mirrors legacy `Module1.Change_Room` AND its caller's duties
 //! (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.17 Change Room Mid-Stay,
@@ -59,7 +60,8 @@
 //! ## Race-safety
 //!
 //! `HT_Changed_Room.id` is `int IDENTITY NOT NULL` (per
-//! `docs/legacy-app/SCHEMA.sql:12`) — the recipe lets MSSQL allocate the
+//! `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Changed_Room"
+//! "[id] int IDENTITY NOT NULL") — the recipe lets MSSQL allocate the
 //! id and captures it via `OUTPUT INSERTED.id` so we never read
 //! `SCOPE_IDENTITY()` across a wire boundary (audit H12). The wrapping
 //! `BEGIN TRAN … COMMIT TRAN` in `run_in_transaction` provides
