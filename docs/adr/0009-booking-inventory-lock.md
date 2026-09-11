@@ -69,4 +69,5 @@ separate decision — they take real row locks inside their own transactions.
 `BOOKING_INVENTORY_LOCK_ENABLED` (compose-owned, **default on**) turns the lock into a no-op
 guard. Opposite polarity to every ship-dark flag in `config.rs`, because this one closes a
 window rather than opening a legacy write. It is an incident tool: setting it false re-opens
-the B8 §2.1 / §2.3 double-sell.
+the hold-vs-hold and hold-vs-desk double-sell (races 2.1 and 2.3 of the B8 overbooking
+analysis, in hf-tasks).
