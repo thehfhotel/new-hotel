@@ -40,12 +40,12 @@
 //! of a recipe forgetting it.
 
 use bb8::PooledConnection;
-use bb8_tiberius::ConnectionManager;
 
 use crate::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKind};
+use crate::db::PoisonAwareManager;
 
 /// Convenience alias matching `writeback::allocate::LegacyConn`.
-type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
+type LegacyConn<'a> = PooledConnection<'a, PoisonAwareManager>;
 
 /// Issue `SET CONTEXT_INFO 0x4E48` on the supplied connection.
 ///

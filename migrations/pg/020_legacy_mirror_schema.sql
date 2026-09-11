@@ -3,7 +3,7 @@
 -- Date: 2026-04-28
 -- Phase 5.5a — opaque pass-through mirror for legacy-only features.
 --
--- Per docs/architecture.md §11, the legacy .NET app implements a
+-- Per `docs/architecture.md` §"11. Legacy-only features", the legacy .NET app implements a
 -- number of features our app does not (and likely never will, until
 -- decommission): coupons, standalone deposits, in-stay POS / minibar,
 -- mid-stay room moves, credit-sales ledger, hourly-extension pricing,

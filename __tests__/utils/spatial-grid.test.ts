@@ -16,6 +16,7 @@
  */
 
 import {
+  buildLayoutMoves,
   computeSpatialLayout,
   deriveBoardPixels,
   isUnplaced,
@@ -245,5 +246,76 @@ describe('moveEligibility (#225 decision comment)', () => {
     expect(
       moveEligibility(room({ id: 3, status: 'available' }), room({ id: 2, status: 'available' })),
     ).toBe('blocked')
+  })
+})
+
+describe('buildLayoutMoves (#236 จัดผัง — PUT /api/rooms/layout payload)', () => {
+  /** Same synthetic board as the derivation suite: 3×3 with holes. */
+  const BOARD: SpatialRoom[] = [
+    room({ id: 1, roomX: 10, roomY: 12 }),
+    room({ id: 2, roomX: 118, roomY: 10 }),
+    room({ id: 3, roomX: 231, roomY: 8 }),
+    room({ id: 4, roomX: 14, roomY: 130 }),
+    room({ id: 5, roomX: 122, roomY: 128 }),
+    room({ id: 6, roomX: 8, roomY: 262 }),
+  ]
+  const byId = (id: number) => BOARD.find((r) => r.id === id) as SpatialRoom
+
+  it('swap exchanges the two rooms exact pixel pairs verbatim — no derivation', () => {
+    const moves = buildLayoutMoves(BOARD, byId(1), { type: 'swap', room: byId(5) })
+    expect(moves).toEqual([
+      { id: 1, roomX: 122, roomY: 128 },
+      { id: 5, roomX: 10, roomY: 12 },
+    ])
+  })
+
+  it('a swap is ONE request of two moves so the shared board is never half-swapped', () => {
+    const moves = buildLayoutMoves(BOARD, byId(2), { type: 'swap', room: byId(4) })
+    expect(moves).toHaveLength(2)
+    // Sending them separately is what the single-request contract prevents.
+    expect(moves?.map((m) => m.id).sort()).toEqual([2, 4])
+  })
+
+  it('cell drop emits ONE move whose pixels round-trip into that exact cell', () => {
+    const target = { col: 3, row: 2 } // a hole on the board
+    const moves = buildLayoutMoves(BOARD, byId(1), { type: 'cell', ...target })
+    expect(moves).toHaveLength(1)
+    expect(moves?.[0].id).toBe(1)
+
+    // The whole point of neighbour-derived pixels (decision 2).
+    const after = BOARD.map((r) =>
+      r.id === 1 ? { ...r, roomX: moves![0].roomX, roomY: moves![0].roomY } : r,
+    )
+    const placed = computeSpatialLayout(after).placed.find((p) => p.room.id === 1)
+    expect([placed?.col, placed?.row]).toEqual([target.col, target.row])
+  })
+
+  it('placing an unplaced-row room derives real coords, never the (0,0) sentinel', () => {
+    const newcomer = room({ id: 99 })
+    const moves = buildLayoutMoves([...BOARD, newcomer], newcomer, {
+      type: 'cell',
+      col: 2,
+      row: 3,
+    })
+    expect(moves).toHaveLength(1)
+    expect(isUnplaced({ roomX: moves![0].roomX, roomY: moves![0].roomY })).toBe(false)
+  })
+
+  it('returns null when the swap partner has no coords (unplaced tile has no pair to give)', () => {
+    expect(buildLayoutMoves(BOARD, byId(1), { type: 'swap', room: room({ id: 99 }) })).toBeNull()
+    expect(buildLayoutMoves(BOARD, room({ id: 99 }), { type: 'swap', room: byId(1) })).toBeNull()
+  })
+
+  it('returns null for a self-swap rather than emitting two conflicting updates', () => {
+    expect(buildLayoutMoves(BOARD, byId(1), { type: 'swap', room: byId(1) })).toBeNull()
+  })
+
+  it('never emits the (0,0) unplaced sentinel the backend rejects', () => {
+    for (let col = 1; col <= 4; col++) {
+      for (let row = 1; row <= 4; row++) {
+        const moves = buildLayoutMoves(BOARD, byId(1), { type: 'cell', col, row })
+        expect(isUnplaced({ roomX: moves![0].roomX, roomY: moves![0].roomY })).toBe(false)
+      }
+    }
   })
 })

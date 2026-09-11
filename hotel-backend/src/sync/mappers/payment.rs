@@ -34,6 +34,7 @@ use crate::db::DbPool;
 use crate::outbox::event::{DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::checkin::apply_checkin_aggregate;
 use crate::sync::parent_loader::load_checkin_aggregate;
@@ -60,10 +61,12 @@ pub struct PaymentMapper;
 // marker (`'ยกเลิก'`) down to the check-in aggregate sweep. The legacy
 // app cascades a folio cancel into `HT_CheckIn_Pay` via
 // `update HT_CheckIn_Pay set cin_status='ยกเลิก' where cin_no=…`
-// (COMPAT_CHEATSHEET line 531). Without the projection the sync layer
+// (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "update HT_CheckIn_Pay set cin_status='ยกเลิก'"
+// — was: cheatsheet 545). Without the projection the sync layer
 // silently treats the cancelled rows as active and over-counts
-// `cin_paid_amount`. Verified column shape per COMPAT_CHEATSHEET
-// line 492 (`Cin_Status varchar(50) NOT NULL DEFAULT '1'`).
+// `cin_paid_amount`. Verified column shape per `COMPAT_CHEATSHEET.md`
+// §"Table: `HT_CheckIn_Pay`" "Cin_Status varchar(50) NOT NULL DEFAULT '1'"
+// (was: cheatsheet 492, which is in the `HT_CheckIn_Ds` section).
 //
 // The two additional tender columns (`Cin_Pay_Free`, `Cin_Pay_web`)
 // round out the canonical sum so a future aggregate-by-tender
@@ -71,7 +74,8 @@ pub struct PaymentMapper;
 // pipeline change. Order matches the canonical writeback-recipe order
 // (Cash + Credit + Free + Tran + web) so downstream code reads
 // left-to-right in the same sequence as the legacy invariant
-// (COMPAT_CHEATSHEET line 534).
+// (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cin_Pay_Free + Cin_Pay_Tran + Cin_Pay_Web"
+// — was: cheatsheet 548).
 const PAYMENT_SELECT_COLS: &str = "t.id, t.Cin_No, t.Cin_Pay_Cash, t.Cin_Pay_Credit, \
     t.Cin_Pay_Free, t.Cin_Pay_Tran, t.Cin_Pay_web, t.Pay_No, t.Cin_Status";
 
@@ -331,8 +335,8 @@ pub async fn mirror_payment_ledger(
 // =============================================================================
 
 /// CT mapper for `HT_Receipt_H`. Receipts are append-only in the legacy
-/// app (cheatsheet §3.9 "Receipts are never deleted on check-out") so
-/// the I path dominates; U is the cancel path (status_name='ยกเลิก').
+/// app (spike §"5. Writeback design implications" "Receipts are append-only")
+/// so the I path dominates; U is the cancel path (status_name='ยกเลิก').
 pub struct ReceiptMapper;
 
 const RECEIPT_SELECT_COLS: &str =
@@ -450,7 +454,177 @@ fn project_receipt(row: &dyn MappableRow) -> Result<ReceiptProjection, SyncError
     })
 }
 
-async fn apply_receipt_upsert(
+// =============================================================================
+// Reconcile-hash contract — see `crate::sync::gate_guard` (Phase 6-A)
+// =============================================================================
+
+/// The legacy cancel literal on `HT_Receipt_H.status_name`. `'ปกติ'` is
+/// the normal counterpart.
+const RECEIPT_CANCELLED_STATUS: &str = "ยกเลิก";
+
+/// `true` when a legacy receipt carries the cancel marker.
+///
+/// Single-sources the Thai literal for BOTH the mapper's void decision
+/// ([`apply_receipt_upsert`]) and the legacy side of the `payments`
+/// reconcile hash (`scheduler::sync::sync_payments`), so detection and
+/// application can never disagree on what "cancelled" means — the
+/// `legacy_yesno_to_bool` / `legacy_yesno_canonical` split on rooms is
+/// the cautionary sibling (a duplicated literal that had to be pinned by
+/// a round-trip test).
+pub(crate) fn receipt_status_is_cancelled(status_name: Option<&str>) -> bool {
+    status_name == Some(RECEIPT_CANCELLED_STATUS)
+}
+
+/// The inputs `scheduler::sync::payment_canonical_hash` consumes, as a
+/// descriptor table over the mapper's own legacy projection.
+///
+/// **`HT_Receipt_H` has NO idempotency gate**: [`apply_receipt_upsert`]
+/// resolves the canonical row by `(pay_cin_id, receipt_no)` and then runs
+/// [`RECEIPT_UPSERT_UPDATE_SQL`] unconditionally — there is no
+/// `existing_matches` chain that could skip a hashed change. The contract
+/// therefore declares `always_writes: true` and every `gated_by` here is
+/// empty, exactly like `rooms`. (The ONE early return —
+/// `Receipt_ref` absent — is excluded from the reconcile scan by
+/// construction: `PAYMENTS_RECONCILE_PROJECTION`'s filter is
+/// `Receipt_ref IS NOT NULL AND <> ''`, because a no-check-in receipt is
+/// a deliberate mapper skip, not sync lag.)
+///
+/// Segments render the LEGACY side of the hash. The canonical side
+/// re-derives them from `ht_payments` (`pay_amount`, `pay_voided`) joined
+/// to `ht_checkins.legacy_cin_no`.
+///
+/// **Excluded on purpose** (both would be permanent false sync lag):
+/// * `pay_date` — [`RECEIPT_UPSERT_UPDATE_SQL`] COALESCEs it, so an
+///   app-originated row keeps its own creation instant forever and can
+///   never converge on `Receipt_Date`;
+/// * `pay_method` — the receipt header does not carry the tender, so the
+///   INSERT defaults to `'cash'`; it is never mirrored either way.
+const HASH_INPUTS: [HashInput<ReceiptProjection>; 4] = [
+    HashInput {
+        name: "receipt_no",
+        // Row identity: the canonical probe SELECTs
+        // `WHERE legacy_receipt_no = $1 OR pay_reference = $1`, so a
+        // changed `Receipt_no` resolves a different row (or none →
+        // missing_pg) instead of reaching any comparison.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.receipt_no.clone(),
+        mutate: |p| p.receipt_no = "B9999-9999".into(),
+    },
+    HashInput {
+        name: "pay_amount",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| crate::scheduler::sync::money_hash_segment(p.receipt_total),
+        mutate: |p| p.receipt_total += 100.0,
+    },
+    HashInput {
+        name: "pay_voided",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| {
+            crate::scheduler::sync::voided_hash_segment(receipt_status_is_cancelled(
+                p.status_name.as_deref(),
+            ))
+        },
+        mutate: |p| p.status_name = Some(RECEIPT_CANCELLED_STATUS.into()),
+    },
+    HashInput {
+        name: "legacy_cin_no",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.legacy_cin_no.clone().unwrap_or_default(),
+        mutate: |p| p.legacy_cin_no = Some("CH26-009999".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// No gate exists — see [`HASH_INPUTS`]. Returns empty, and the contract
+/// declares `always_writes: true` so that emptiness is a stated fact
+/// rather than a silently vacuous check.
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Render the `payments` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — see the room mapper's equivalent.
+#[cfg(test)]
+fn hash_body(p: &ReceiptProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
+}
+
+/// The UPDATE arm of [`apply_receipt_upsert`]. Hoisted to a const so the
+/// regression tests execute the EXACT statement the mapper runs (against a
+/// shadowing TEMP TABLE) rather than a re-typed copy that could drift.
+///
+/// `pay_date` is COALESCE'd so re-importing a receipt never rewrites the
+/// timestamp of an app-originated row (which holds the app's creation
+/// instant) — only fills it when absent. Receipts are append-only in
+/// legacy, so the date is immutable post-insert for legacy-originated rows
+/// too.
+///
+/// ## `pay_voided` is MONOTONIC — false→true only. Do NOT "simplify".
+///
+/// Canonical payment void is PG-ONLY: `repository/payment.rs::void` flips
+/// the flag and there is NO writeback recipe carrying it to legacy
+/// (`writeback/recipes/pos_void.rs` is the POS void — a different flow).
+/// `HT_Receipt_H.status_name` therefore stays `'ปกติ'` forever after we
+/// void here, so every later CT event for that receipt arrives with
+/// `is_cancelled = false`. Because the probe above deliberately matches
+/// app-originated rows too (via `legacy_receipt_no`), a plain
+/// `pay_voided = $3` RESURRECTED a canonically voided payment and wiped
+/// `pay_voided_at`. iHOTEL's customer-delete cascade
+/// (`UPDATE HT_Receipt_H SET Receipt_c_no='C0000'` — COMPAT_CHEATSHEET
+/// §6.6) fires exactly such an event, on a column this mapper discards.
+/// `service/shifts.rs` sums `WHERE pay_voided = false`, so a resurrected
+/// payment silently INFLATES reported shift income.
+///
+/// The asymmetry is the whole point — only ONE direction is blocked:
+///   * legacy void → canonical  — PRESERVED. That is the `OR $3` half:
+///     `status_name='ยกเลิก'` in iHOTEL still voids our row, first time
+///     and every time.
+///   * canonical void → un-void — BLOCKED. Legacy cannot know we voided,
+///     so its "not cancelled" is absence of information, never a contrary
+///     fact, and must not overwrite a canonical decision.
+///
+/// `pay_voided_at` is COALESCE'd for the same reason: an already-voided
+/// row keeps its ORIGINAL void instant instead of being restamped to
+/// `NOW()` by every unrelated legacy touch of the receipt.
+///
+/// `COALESCE(…, false)` guards the nullable column (`pay_voided BOOLEAN
+/// DEFAULT false`): without it a NULL row would evaluate `NULL OR false`
+/// to NULL, and every `WHERE pay_voided = false` / `NOT pay_voided` reader
+/// (`service/shifts.rs`, `routes/new_checkins.rs`) would then drop the
+/// payment — the same over/under-count class, opposite sign.
+const RECEIPT_UPSERT_UPDATE_SQL: &str = "UPDATE ht_payments \
+        SET pay_amount    = $1::float8, \
+            pay_date      = COALESCE(pay_date, $2), \
+            pay_voided    = COALESCE(ht_payments.pay_voided, false) OR $3, \
+            pay_voided_at = CASE WHEN COALESCE(ht_payments.pay_voided, false) OR $3 \
+                                 THEN COALESCE(ht_payments.pay_voided_at, NOW()) \
+                                 ELSE NULL END \
+      WHERE pay_id = $4";
+
+/// `pub` (not `pub(crate)`) so the one-shot `backfill_receipt_payments` bin
+/// (issue #278) can re-drive the EXACT same projection + UPSERT the live CT
+/// mapper uses — `pub(crate)` is invisible from `bin/*.rs`, which compiles
+/// as a separate crate depending on this one externally; same reason
+/// `mirror_payment_ledger` above, and `apply_checkin_aggregate` /
+/// `apply_booking_aggregate` in the sibling mappers, are `pub` rather than
+/// `pub(crate)`. Do not hand-write a bespoke INSERT against `ht_payments`
+/// in a bin — that divergence-from-the-mapper is the exact bug class this
+/// repo keeps hitting (see the receipt-status / void-monotonicity history
+/// above).
+pub async fn apply_receipt_upsert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &dyn MappableRow,
 ) -> Result<Option<DomainEvent>, SyncError> {
@@ -495,7 +669,7 @@ async fn apply_receipt_upsert(
         };
 
     // Cancel path — UPSERT with pay_voided=true and emit no event.
-    let is_cancelled = p.status_name.as_deref() == Some("ยกเลิก");
+    let is_cancelled = receipt_status_is_cancelled(p.status_name.as_deref());
 
     // UPSERT on (pay_cin_id, pay_reference) — pay_reference carries the
     // legacy Receipt_no and is unique per legacy receipt sequence.
@@ -536,25 +710,16 @@ async fn apply_receipt_upsert(
 
     let pay_id = match existing_pay_id {
         Some(id) => {
-            sqlx::query(
-                // `pay_date` is COALESCE'd so re-importing a receipt never
-                // rewrites the timestamp of an app-originated row (which holds
-                // the app's creation instant) — only fills it when absent.
-                // Receipts are append-only in legacy, so the date is immutable
-                // post-insert for legacy-originated rows too.
-                "UPDATE ht_payments \
-                    SET pay_amount    = $1::float8, \
-                        pay_date      = COALESCE(pay_date, $2), \
-                        pay_voided    = $3, \
-                        pay_voided_at = CASE WHEN $3 THEN NOW() ELSE NULL END \
-                  WHERE pay_id = $4",
-            )
-            .bind(p.receipt_total)
-            .bind(pay_date)
-            .bind(is_cancelled)
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
+            // See [`RECEIPT_UPSERT_UPDATE_SQL`] — `pay_voided` folds in the
+            // existing value (monotonic) so this re-import cannot un-void a
+            // canonically voided payment.
+            sqlx::query(RECEIPT_UPSERT_UPDATE_SQL)
+                .bind(p.receipt_total)
+                .bind(pay_date)
+                .bind(is_cancelled)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
             id
         }
         None => {
@@ -675,7 +840,8 @@ mod tests {
     /// so the CT pipeline carries the cancellation marker
     /// (`'ยกเลิก'`) into the check-in aggregate sweep. Without it the
     /// cascade `update HT_CheckIn_Pay set cin_status='ยกเลิก' where
-    /// cin_no=…` (COMPAT_CHEATSHEET line 531) is silently dropped at
+    /// cin_no=…` (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cancel cascade"
+    /// — was: cheatsheet 545) is silently dropped at
     /// the sync layer and `ht_checkins.cin_paid_amount` over-counts.
     #[test]
     fn projects_cin_pay_status() {
@@ -691,7 +857,8 @@ mod tests {
     /// column so an aggregate-by-tender computation can be derived
     /// from CT-delivered rows without another pipeline change. The
     /// canonical writeback recipe sums Cash + Credit + Free + Tran +
-    /// web (COMPAT_CHEATSHEET line 534).
+    /// web (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay`" "Cin_Pay_Free + Cin_Pay_Tran + Cin_Pay_Web"
+    /// — was: cheatsheet 548).
     #[test]
     fn projects_every_tender_column() {
         let m = PaymentMapper;
@@ -793,7 +960,9 @@ mod tests {
 
     #[test]
     fn project_payment_line_carries_negative_refund_tenders() {
-        // Refunds use tender negation (COMPAT_CHEATSHEET line 513).
+        // Refunds use tender negation (`COMPAT_CHEATSHEET.md`
+        // §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)"
+        // — was: cheatsheet 527, inside the schema fence).
         let row = pay_line_row(9)
             .with("Cin_Pay_Cash", MockValue::Decimal(-450.0))
             .with("Cin_Pay_Ds_Price", MockValue::Decimal(-450.0));
@@ -905,6 +1074,302 @@ mod tests {
         );
         let p = project_receipt(&row).unwrap();
         assert_eq!(p.status_name.as_deref(), Some("ยกเลิก"));
+    }
+
+    // -------------------------------------------------------------------
+    // `pay_voided` monotonicity — a legacy CT re-import must never
+    // resurrect a canonically voided payment (which would inflate the
+    // `service/shifts.rs` income sum, `WHERE pay_voided = false`).
+    // -------------------------------------------------------------------
+
+    /// Shape guard — runs with NO database, so the invariant is still
+    /// pinned on a machine where the behavioural tests below skip. Locks
+    /// both halves: the old value must be folded in, and the void instant
+    /// must be COALESCE'd rather than restamped.
+    #[test]
+    fn receipt_update_sql_is_monotonic_in_pay_voided() {
+        let sql = RECEIPT_UPSERT_UPDATE_SQL;
+        assert!(
+            sql.contains("pay_voided    = COALESCE(ht_payments.pay_voided, false) OR $3"),
+            "pay_voided must fold in the existing value — a bare assignment lets a \
+             legacy re-import un-void a canonical void; got: {sql}"
+        );
+        assert!(
+            !sql.contains("pay_voided    = $3"),
+            "pay_voided must never be assigned straight from the legacy flag; got: {sql}"
+        );
+        assert!(
+            sql.contains("THEN COALESCE(ht_payments.pay_voided_at, NOW())"),
+            "pay_voided_at must keep the ORIGINAL void instant across re-imports; got: {sql}"
+        );
+        assert!(
+            !sql.contains("THEN NOW()"),
+            "pay_voided_at must not be restamped to NOW() on every re-import; got: {sql}"
+        );
+    }
+
+    /// Column subset the behavioural tests need. Deliberately NOT the full
+    /// `ht_payments` shape — a TEMP TABLE only has to satisfy the statement
+    /// under test. `ON COMMIT DROP` plus the enclosing rollback means no
+    /// real row is ever touched, even when `DATABASE_URL` points at a
+    /// populated database (CI does exactly that).
+    const VOID_PROBE_DDL: &str = "CREATE TEMP TABLE ht_payments ( \
+             pay_id        INTEGER PRIMARY KEY, \
+             pay_cin_id    INTEGER NOT NULL, \
+             pay_amount    DECIMAL(12,2) NOT NULL, \
+             pay_method    VARCHAR(50) NOT NULL, \
+             pay_reference VARCHAR(100), \
+             pay_date      TIMESTAMP DEFAULT NOW(), \
+             pay_voided    BOOLEAN DEFAULT false, \
+             pay_voided_at TIMESTAMP \
+         ) ON COMMIT DROP";
+
+    /// Seed one `ht_payments` row in a whatever-state we want to re-import over.
+    const VOID_PROBE_SEED: &str = "INSERT INTO ht_payments \
+             (pay_id, pay_cin_id, pay_amount, pay_method, pay_reference, \
+              pay_date, pay_voided, pay_voided_at) \
+         VALUES (1, 10, 890.00, 'cash', 'B2604-0265', $1, $2, $3)";
+
+    /// Open a live PG connection for the behavioural tests, or `None` when
+    /// none is configured — `cargo test --lib` must stay green on a machine
+    /// with no database. CI DOES set `DATABASE_URL`
+    /// (`.github/workflows/docker-build.yml`), so these run for real there.
+    /// A connect failure skips rather than panics: an unreachable URL is an
+    /// environment problem, and the shape guard above still holds the line.
+    async fn void_probe_conn() -> Option<sqlx::PgConnection> {
+        use sqlx::Connection;
+        let url = std::env::var("SYNC_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        match sqlx::PgConnection::connect(&url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("pay_voided probe SKIPPED — cannot connect to PG: {e}");
+                None
+            }
+        }
+    }
+
+    /// Set up the shadowing TEMP TABLE and seed a row in `(voided,
+    /// voided_at)`. Returns the open transaction; the caller rolls back.
+    async fn void_probe_tx(
+        conn: &mut sqlx::PgConnection,
+        voided: Option<bool>,
+        voided_at: Option<NaiveDateTime>,
+    ) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        use sqlx::Connection;
+        let mut tx = conn.begin().await.expect("begin");
+        sqlx::query(VOID_PROBE_DDL)
+            .execute(&mut *tx)
+            .await
+            .expect("create temp ht_payments");
+        // `pg_temp` is searched first for relations anyway; pin it
+        // explicitly so the shadow is not implementation-dependent.
+        sqlx::query("SET LOCAL search_path = pg_temp, public")
+            .execute(&mut *tx)
+            .await
+            .expect("set search_path");
+        sqlx::query(VOID_PROBE_SEED)
+            .bind(probe_ts(2026, 4, 26, 15, 0, 0))
+            .bind(voided)
+            .bind(voided_at)
+            .execute(&mut *tx)
+            .await
+            .expect("seed ht_payments row");
+        tx
+    }
+
+    fn probe_ts(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, ss)
+            .unwrap()
+    }
+
+    /// Run the EXACT mapper UPDATE, then read back the void state.
+    async fn run_receipt_update(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        is_cancelled: bool,
+    ) -> (Option<bool>, Option<NaiveDateTime>) {
+        sqlx::query(RECEIPT_UPSERT_UPDATE_SQL)
+            .bind(890.0_f64)
+            .bind(probe_ts(2026, 4, 26, 15, 0, 0))
+            .bind(is_cancelled)
+            .bind(1_i32)
+            .execute(&mut **tx)
+            .await
+            .expect("receipt UPDATE must execute");
+        sqlx::query_as("SELECT pay_voided, pay_voided_at FROM ht_payments WHERE pay_id = 1")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read back")
+    }
+
+    /// THE BUG: iHOTEL's customer-delete cascade (`UPDATE HT_Receipt_H SET
+    /// Receipt_c_no='C0000'`, COMPAT_CHEATSHEET §6.6) re-fires CT for a
+    /// receipt whose `status_name` is still `'ปกติ'`. Canonical void is
+    /// PG-only, so the re-import reports not-cancelled — and used to
+    /// resurrect the payment into the shift income sum.
+    #[tokio::test]
+    async fn canonical_void_survives_legacy_reimport_reporting_not_voided() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let voided_at = probe_ts(2026, 7, 25, 9, 15, 0);
+        let mut tx = void_probe_tx(&mut conn, Some(true), Some(voided_at)).await;
+        let (voided, at) = run_receipt_update(&mut tx, false).await;
+        assert_eq!(
+            voided,
+            Some(true),
+            "a canonically voided payment must stay voided when legacy re-imports \
+             the receipt as not-cancelled"
+        );
+        assert_eq!(at, Some(voided_at), "pay_voided_at must not be wiped");
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction we DO preserve: legacy voiding a payment
+    /// (`status_name='ยกเลิก'` → `is_cancelled = true`) must still void
+    /// the canonical row. Monotonicity blocks un-voiding only.
+    #[tokio::test]
+    async fn legacy_void_still_propagates_to_unvoided_payment() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let mut tx = void_probe_tx(&mut conn, Some(false), None).await;
+        let (voided, at) = run_receipt_update(&mut tx, true).await;
+        assert_eq!(
+            voided,
+            Some(true),
+            "a legacy cancel must still void the canonical payment — the OR half \
+             of the monotonic fold"
+        );
+        assert!(
+            at.is_some(),
+            "a freshly voided row must get a pay_voided_at stamp"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// An already-voided row re-imported as cancelled keeps its ORIGINAL
+    /// void instant — the flag is monotonic AND the timestamp is stable,
+    /// so audit trails don't slide forward on unrelated legacy touches.
+    #[tokio::test]
+    async fn pay_voided_at_is_preserved_not_restamped_across_reimport() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let voided_at = probe_ts(2026, 7, 25, 9, 15, 0);
+        let mut tx = void_probe_tx(&mut conn, Some(true), Some(voided_at)).await;
+        let (voided, at) = run_receipt_update(&mut tx, true).await;
+        assert_eq!(voided, Some(true));
+        assert_eq!(
+            at,
+            Some(voided_at),
+            "pay_voided_at must keep the original void instant, not be restamped to NOW()"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// A NULL `pay_voided` (the column is nullable, `DEFAULT false`) must
+    /// normalise to `false`, not to NULL — `NULL OR false` would otherwise
+    /// make every `WHERE pay_voided = false` reader drop the payment.
+    #[tokio::test]
+    async fn null_pay_voided_normalises_to_false_not_null() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let mut tx = void_probe_tx(&mut conn, None, None).await;
+        let (voided, at) = run_receipt_update(&mut tx, false).await;
+        assert_eq!(voided, Some(false), "NULL pay_voided must not stay NULL");
+        assert_eq!(at, None);
+        tx.rollback().await.expect("rollback");
+    }
+
+    // ----- reconcile-hash contract (see `crate::sync::gate_guard`) -------
+
+    /// Byte-parity pin for the NEW `payments` descriptor (Phase 6-A).
+    /// `ht_reconcile_log.mssql_hash` and `ht_receipts_legacy.sync_hash`
+    /// are stored SHA256s of this exact body — one byte of drift
+    /// invalidates every ack and triggers a full re-diff storm.
+    ///
+    /// No behavioural mutation test here, same reason as rooms:
+    /// `apply_receipt_upsert` has no idempotency gate to defeat
+    /// (`always_writes: true`). The golden vector plus
+    /// `payments_hash_mutators_all_move_their_segment` below are what keep
+    /// the descriptor honest.
+    #[test]
+    fn payments_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{payment_canonical_hash, sha256};
+
+        let p = project_receipt(&receipt_row(20663, "B2604-0265", "CH26-005228", 890.0))
+            .expect("fixture must project");
+
+        // Body shape: receipt_no | {:.2} amount | voided=<bool> | cin_no
+        let expected = sha256("B2604-0265|890.00|voided=false|CH26-005228");
+
+        assert_eq!(
+            payment_canonical_hash("B2604-0265", 890.0, false, Some("CH26-005228")),
+            expected,
+            "production payment hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    /// The cancelled receipt projects the `voided=true` segment — the
+    /// legacy `status_name='ยกเลิก'` literal is the ONLY source of that
+    /// bit on the MSSQL side.
+    #[test]
+    fn payments_hash_body_carries_the_cancelled_bit() {
+        use crate::scheduler::sync::{payment_canonical_hash, sha256};
+
+        let mut row = receipt_row(20663, "B2604-0265", "CH26-005228", 890.0);
+        row.cells.insert(
+            "status_name".into(),
+            MockValue::Str(RECEIPT_CANCELLED_STATUS.into()),
+        );
+        let p = project_receipt(&row).expect("fixture must project");
+
+        let expected = sha256("B2604-0265|890.00|voided=true|CH26-005228");
+        assert_eq!(sha256(&hash_body(&p)), expected);
+        assert_eq!(
+            payment_canonical_hash("B2604-0265", 890.0, true, Some("CH26-005228")),
+            expected,
+            "canonical pay_voided=true must hash like legacy status_name='ยกเลิก'"
+        );
+    }
+
+    /// Self-validating mutators: each descriptor entry must actually move
+    /// its own segment, else a future behavioural test built on this table
+    /// would pass vacuously.
+    #[test]
+    fn payments_hash_mutators_all_move_their_segment() {
+        let base = project_receipt(&receipt_row(20663, "B2604-0265", "CH26-005228", 890.0))
+            .expect("fixture must project");
+        for input in HASH_INPUTS.iter() {
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment",
+                input.name,
+            );
+        }
+    }
+
+    /// The cancel literal is single-sourced: the mapper's void decision
+    /// and the reconcile hash's `voided` segment read the SAME helper.
+    #[test]
+    fn receipt_status_is_cancelled_matches_the_legacy_literal() {
+        assert!(receipt_status_is_cancelled(Some("ยกเลิก")));
+        assert!(!receipt_status_is_cancelled(Some("ปกติ")));
+        assert!(!receipt_status_is_cancelled(None));
     }
 
     // -------------------------------------------------------------------

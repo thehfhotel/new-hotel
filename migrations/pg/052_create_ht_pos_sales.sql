@@ -8,7 +8,9 @@
 -- iHOTEL has a POS module that lets a cashier ring up F&B / laundry /
 -- minibar / amenity products and charge them to a guest's current
 -- folio. The legacy app inserts one row per line item into
--- `HT_CheckIn_Product` (see `docs/legacy-app/SCHEMA.sql` line 17 and
+-- `HT_CheckIn_Product` (see `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_CheckIn_Product" "[id] int IDENTITY NOT NULL"
+-- — was a bare SCHEMA.sql line-17 citation, which landed on the closing
+-- paren of `HT_Bank_Accounts` after the 2026-06-11 regeneration — and
 -- `docs/legacy-spike/schema/01-baseline-schema.txt` lines 275-286 for
 -- the verified column list — 12 cols, `id` IDENTITY).
 --

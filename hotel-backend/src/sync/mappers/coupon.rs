@@ -211,8 +211,8 @@ mod tests {
     }
 
     /// Build a representative `HT_Cupon` CT row mirroring the spike
-    /// capture (`docs/legacy-spike/findings.md` line 104 — issued at
-    /// check-in time).
+    /// capture (`docs/legacy-spike/findings.md` §"3a. Walk-in check-in" "UPDATE HT_Cupon SET cupon_print=1"
+    /// — issued at check-in time).
     fn sample_cupon_row(cupon_print: i32) -> HashMapRow {
         HashMapRow::new(TABLE)
             .with("cupon_no", MockValue::I32(17_895))

@@ -4,7 +4,8 @@
 -- Description: Durable domain-event bus. Every state-mutating action emits one
 --              row; subscribers (SSE broadcaster, writeback worker, audit
 --              logger) maintain their own cursor and replay missed events from
---              this table. Per docs/architecture.md §3.6, §4d-bis.
+--              this table. Per `docs/architecture.md` §"3.6. Event-driven sync design"
+--              and `docs/architecture.md` §"4d-bis. Event log (durable bus)".
 
 -- =============================================================================
 -- UP MIGRATION

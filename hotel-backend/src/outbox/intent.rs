@@ -206,7 +206,7 @@ pub enum WritebackIntent {
         /// of issuing a no-detail receipt rather than failing the payment).
         receipt: RecordPaymentReceipt,
         /// Specific `HT_CheckIn_Ds.id` the payment is being apportioned to —
-        /// per spike §3h capture line 3, the legacy app fires
+        /// per `raw/invoice-20260424-100827/writes.txt:3` (spike §3h), the legacy app fires
         /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
         /// just before inserting the `HT_CheckIn_Pay` row. `None` when the
         /// route hasn't resolved a specific room (multi-room check-ins where
@@ -247,14 +247,16 @@ pub enum WritebackIntent {
     MarkRoomClean { room_id: Uuid, by: String },
 
     /// Coexistence audit 2026-06-11 P2 — standalone mark-dirty writeback
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13, ClickClean.cs:493-540).
+    /// (`docs/legacy-spike/findings.md` §3e check-out Phase 2 / §3i cancel:
+    /// DIRTY is `Room_Clean='yes'`).
     ///
-    /// Mirrors [`Self::MarkRoomClean`]: `UPDATE HT_Rooms` (by numeric `id`,
-    /// not `room_no` — same critical finding as spike §3j) + an
-    /// `INSERT HT_Housewife` "start cleaning" audit row referencing the
-    /// prior checked-out occupant. Before this intent existed,
-    /// `service::housekeeping::mark_dirty` was PG-only and iHOTEL's room
-    /// grid kept showing the room clean.
+    /// Mirrors [`Self::MarkRoomClean`]'s shape: `UPDATE HT_Rooms` (by
+    /// numeric `id`, not `room_no` — same critical finding as spike §3j) +
+    /// an `INSERT HT_Housewife` audit row referencing the prior
+    /// checked-out occupant — but the flag literal is the OPPOSITE pole
+    /// and the two recipes are not interchangeable. Before this intent
+    /// existed, `service::housekeeping::mark_dirty` was PG-only and
+    /// iHOTEL's room grid kept showing the room clean.
     MarkRoomDirty { room_id: Uuid, by: String },
 
     /// Coexistence audit 2026-06-11 P2 — room maintenance flag writeback
@@ -290,7 +292,7 @@ pub enum WritebackIntent {
     ///
     /// The payload is the full [`CustomerResave`] field set — the same
     /// 31-column `UPDATE HT_Customers ... where Cust_no=...` an iHOTEL
-    /// re-save fires (spike §3c capture line 28) — hydrated by
+    /// re-save fires (`raw/booking-checkin-20260424-101838/writes.txt:28`, spike §3d) — hydrated by
     /// `service::customer::update` from the canonical `ht_customers` row
     /// AFTER the PG UPDATE commits its values. Columns the new-app edit
     /// doesn't touch are hydrated from the CT-mirrored columns
@@ -367,9 +369,9 @@ pub enum WritebackIntent {
 
     /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
     /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
-    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:513`
-    /// — "Cin_Pay_Cash/Credit ... can be negative (refunds use
-    /// negation)") and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
+    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md`
+    /// §"Table: `HT_CheckIn_Pay`" "can be negative (refunds use negation)")
+    /// and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
     /// / `Total_Price_Balance` / `Total_Price_vat` from `HT_CheckIn_Pay`
     /// rows under UPDLOCK+HOLDLOCK (Track C pattern — never additive).
     ///
@@ -445,7 +447,8 @@ pub enum WritebackIntent {
     },
 
     /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`).
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Product`" "Stock change cascade"
+    /// — was: cheatsheet 574-578, a section boundary, not the invariant).
     ///
     /// `UPDATE HT_Products SET Pro_Amt = Pro_Amt + <delta> WHERE Pro_no=<no>`
     /// — closes the stock invariant from our app's writes. The legacy
@@ -541,8 +544,9 @@ pub enum WritebackIntent {
     ///
     /// Stock-adjust is bundled into the SAME recipe rather than
     /// emitting a separate `AdjustProductStock` intent: the legacy
-    /// app's POS form fires both writes inside one transaction
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`); splitting the
+    /// app's POS form fires both writes as an unconditional pair
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Product`" "The new app MUST replicate this pairing"
+    /// — was: cheatsheet 574-578); splitting the
     /// pair into two jobs would let one succeed while the other
     /// failed, breaking the stock invariant the legacy app expects.
     RecordPosSale {
@@ -611,7 +615,8 @@ pub enum WritebackIntent {
 
     /// Track J6 (round-bill coexistence step 2) — our app **opens** a
     /// cashier round, mirroring iHOTEL's `FrmDueBill.cs:1653`
-    /// (`COMPAT_CHEATSHEET.md` §946 / §3.20):
+    /// (`COMPAT_CHEATSHEET.md` §`HT_Round_Bill` "INSERT (id, round_start, round_price, round_by)",
+    /// §3.20 — was: cheatsheet 960, which sits in the `HT_Log` section):
     /// `INSERT HT_Round_Bill (id, round_start, round_price, round_by)`
     /// with `round_end` NULL. The legacy `id` is **explicit** in the
     /// payload (allocated by `ShiftService::open_shift` as
@@ -643,7 +648,7 @@ pub enum WritebackIntent {
 
     /// Task #49 — deposit refund (คืนเงินมัดจำ). Mirrors iHOTEL
     /// `FormShowDEPBack.cs:536` (`docs/legacy-app/COMPAT_CHEATSHEET.md`
-    /// §`HT_CheckIn_Ds` "Refund deposit", lines 466-467):
+    /// §`HT_CheckIn_Ds` "Refund deposit"):
     ///
     /// ```text
     /// update HT_CheckIn_Ds
@@ -836,6 +841,71 @@ pub enum WritebackIntent {
         cin_legacy_no: String,
         legacy_id: i64,
     },
+
+    /// Issue #202 — mirror one app-originated `ht_cash_ledger` row (petty-cash
+    /// income/expense, migration 059) into legacy `TB_Pay_History`. Positional
+    /// INSERT, `TB_Pay_History.id` allocated app-side (MAX+1 TABLOCKX — see
+    /// `writeback::allocate::allocate_pay_history_id`); the worker
+    /// back-populates the allocated id onto `ht_cash_ledger.cash_legacy_id`
+    /// (`cash_aggregate_id` addresses the row — same role as
+    /// `note_aggregate_id` / `rate_aggregate_id`; migration 085 adds the
+    /// column). That column is the SAME one the inbound `sync_cash_history`
+    /// importer's `ON CONFLICT (cash_legacy_id)` dedups on
+    /// (`bin/sync.rs::CASH_HISTORY_UPSERT_SQL`), so once back-population
+    /// lands a re-import of our own write UPDATEs the existing row instead
+    /// of inserting a duplicate — closing the echo gap this issue names.
+    ///
+    /// **UNWIRED**: no service/route call site emits this intent yet (`POST
+    /// /api/cash/{income,expense}` still writes canonical-only — see
+    /// `writeback::recipes::cash_entry`'s module doc). This variant + its
+    /// dispatcher arm + back-population exist so cash-outbound emission has
+    /// something correct to call; the emission itself, its env flag, and
+    /// reception-coordinated live verification are separate, later work —
+    /// the writeback stays dark until then.
+    CreateCashEntry {
+        cash_aggregate_id: Uuid,
+        payload: CreateCashEntryPayload,
+    },
+}
+
+/// Payload for [`WritebackIntent::CreateCashEntry`] (issue #202).
+///
+/// Field-for-field mirror of `writeback::recipes::cash_entry::CashEntryPayload`
+/// — kept as a separate type so `outbox/` (the emit-side wire contract) never
+/// depends on `writeback/` (the dispatch-side adapter); the dispatcher builds
+/// one from the other before calling the recipe. See that module's doc
+/// comment for the legacy `TB_Pay_History` column mapping and what remains
+/// byte-shape-unverified (`Pay_Type` / `Pay_Group` / `Pay_Account` /
+/// `Pay_Program`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCashEntryPayload {
+    /// Which site this entry belongs to ("hfhotel" | "hfville").
+    pub site_id: String,
+    /// `Pay_Date` — the entry date (rendered as a Bangkok-calendar OADate).
+    pub entry_date: DateTime<Utc>,
+    /// `Pay_Program` — a second legacy OADate of uncertain semantics; `None`
+    /// defaults it to the entry date (see the recipe module's TODO).
+    #[serde(default)]
+    pub program_date: Option<DateTime<Utc>>,
+    /// `Pay_Total` — amount in baht (must be finite; sign per iHOTEL convention).
+    pub amount: f64,
+    /// `Pay_Type` — raw legacy income/expense marker (verbatim).
+    pub legacy_pay_type: String,
+    /// `Pay_Bill`.
+    #[serde(default)]
+    pub bill_no: Option<String>,
+    /// `Pay_Cust`.
+    #[serde(default)]
+    pub payee: Option<String>,
+    /// `Pay_Note`.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// `Pay_Group` — account-tree id_full.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// `Pay_Account` — account-tree id_full.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// One companion in a MirrorCompanionList replace-all payload.
@@ -1145,6 +1215,52 @@ pub struct RoomLine {
     pub legacy_ds_id: Option<i32>,
 }
 
+/// Every discriminant [`WritebackIntent::intent_name`] can return.
+///
+/// Exists so operator-supplied intent lists (today: `HFVILLE_WRITEBACK_INTENTS`)
+/// can be VALIDATED at startup instead of silently never matching. A typo like
+/// `mark_clean` for `mark_room_clean` would otherwise fail closed and silent —
+/// canonical PG flips, the job parks `'skipped'` forever, and PG diverges from
+/// legacy with no signal. Kept in lock-step with `intent_name` by
+/// `all_intent_names_matches_intent_name_arms`, which reads this file's own
+/// source, so a new variant cannot drift out of this list unnoticed.
+pub const ALL_INTENT_NAMES: &[&str] = &[
+    "adjust_product_stock",
+    "cancel_booking",
+    "cancel_check_in",
+    "check_out",
+    "close_round",
+    "companion_add",
+    "companion_delete",
+    "create_booking",
+    "create_cash_entry",
+    "create_check_in",
+    "create_note",
+    "extend_stay",
+    "issue_coupon",
+    "mark_note_read",
+    "mark_room_clean",
+    "mark_room_dirty",
+    "mirror_companion",
+    "mirror_companion_list",
+    "mirror_guest_image",
+    "modify_booking",
+    "move_room_tiles",
+    "open_round",
+    "record_payment",
+    "record_pos_sale",
+    "record_receipt",
+    "redeem_coupon",
+    "refund_deposit",
+    "refund_payment",
+    "room_change",
+    "set_room_maintenance",
+    "update_customer",
+    "update_room",
+    "upsert_rate_price",
+    "void_pos_sale",
+];
+
 impl WritebackIntent {
     /// Stable string identifier for this variant — matches the `intent` discriminant
     /// produced by `serde(tag = "intent", rename_all = "snake_case")`.
@@ -1186,6 +1302,7 @@ impl WritebackIntent {
             WritebackIntent::MirrorCompanionList { .. } => "mirror_companion_list",
             WritebackIntent::CompanionAdd { .. } => "companion_add",
             WritebackIntent::CompanionDelete { .. } => "companion_delete",
+            WritebackIntent::CreateCashEntry { .. } => "create_cash_entry",
         }
     }
 
@@ -1269,6 +1386,9 @@ impl WritebackIntent {
             WritebackIntent::CompanionDelete { cin_legacy_no, .. } => {
                 companion_aggregate(cin_legacy_no)
             }
+            WritebackIntent::CreateCashEntry {
+                cash_aggregate_id, ..
+            } => *cash_aggregate_id,
         }
     }
 }
@@ -1318,6 +1438,59 @@ fn default_extend_stay_start() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drift guard for [`ALL_INTENT_NAMES`].
+    ///
+    /// Rust cannot enumerate enum variants at runtime, so instead of
+    /// hand-constructing all 34 variants (which would itself rot) this reads
+    /// THIS FILE's source and extracts every string literal the `intent_name`
+    /// match returns. Adding a variant without adding it to
+    /// `ALL_INTENT_NAMES` fails here — which matters because that constant is
+    /// what makes a misconfigured `HFVILLE_WRITEBACK_INTENTS` fail loud at
+    /// boot instead of silently parking jobs forever.
+    #[test]
+    fn all_intent_names_matches_intent_name_arms() {
+        let src = include_str!("intent.rs");
+        let start = src
+            .find("pub fn intent_name(&self) -> &'static str {")
+            .expect("intent_name fn must exist");
+        let body = &src[start..];
+        // The match arms end at the fn's closing brace (4-space indent).
+        let end = body.find("\n    }\n").expect("intent_name fn must close");
+        let body = &body[..end];
+
+        let mut from_source: Vec<String> = body
+            .lines()
+            .filter_map(|line| line.split_once("=> \""))
+            .filter_map(|(_, rest)| rest.split('"').next())
+            .map(str::to_string)
+            .collect();
+        from_source.sort();
+        from_source.dedup();
+
+        let mut declared: Vec<String> =
+            ALL_INTENT_NAMES.iter().map(|s| (*s).to_string()).collect();
+        declared.sort();
+
+        assert_eq!(
+            from_source, declared,
+            "ALL_INTENT_NAMES is out of sync with intent_name's match arms.\n\
+             In source but not declared: {:?}\n\
+             Declared but not in source: {:?}",
+            from_source
+                .iter()
+                .filter(|n| !declared.contains(n))
+                .collect::<Vec<_>>(),
+            declared
+                .iter()
+                .filter(|n| !from_source.contains(n))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            declared.contains(&"mark_room_clean".to_string()),
+            "the housekeeping intent must be a valid allowlist entry"
+        );
+    }
 
     /// Audit H1 back-compat: in-flight CheckOut events queued before the
     /// Wave 2 deploy carry only `check_in_id` — the new totals fields must
@@ -1731,7 +1904,8 @@ pub struct RecordPaymentReceipt {
 /// retained as `None` are left untouched. The writeback recipe applies these
 /// as targeted UPDATEs (not the legacy app's DELETE-then-REINSERT).
 ///
-/// `customer_resave` mirrors spike §3c lines 5/16/28: the .NET app re-saves
+/// `customer_resave` mirrors `raw/booking-checkin-20260424-101838/writes.txt:5,16,28`
+/// (spike §3c for 5/16, §3d for 28): the .NET app re-saves
 /// the customer record on every booking modify. Phone/address edits never
 /// propagate to the customer master without it. When `Some(_)` the recipe
 /// emits an `UPDATE HT_Customers SET …` with the full field set.
@@ -1761,7 +1935,8 @@ pub struct BookingChanges {
 
 /// Full customer-record re-save payload for [`BookingChanges::customer_resave`].
 ///
-/// Fields mirror the .NET app's UPDATE in spike §3c capture line 28 — the
+/// Fields mirror the .NET app's UPDATE in
+/// `raw/booking-checkin-20260424-101838/writes.txt:28` (spike §3d) — the
 /// recipe writes them all so the legacy customer record reflects the latest
 /// values from PG. Empty strings are preferred over NULL (NULL crashes the
 /// .NET WinForms downstream — see `booking_create` recipe).

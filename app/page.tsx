@@ -269,6 +269,11 @@ export default function NewDashboard() {
     for (const eventName of DASHBOARD_REFRESH_EVENTS) {
       eventSource.addEventListener(eventName, scheduleRefetch)
     }
+    // Canonical resync signal (`hotel-backend/src/routes/events.rs::RESYNC_EVENT`)
+    // — emitted after a listener reconnect or a lagged subscriber ("you may
+    // have missed something"). Always listen for it, independent of the
+    // dashboard-specific subset above, so a resync always triggers a refetch.
+    eventSource.addEventListener('refresh', scheduleRefetch)
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {

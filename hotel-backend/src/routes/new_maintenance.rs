@@ -1,17 +1,32 @@
-//! Maintenance Request System API routes for HotelNew database
+//! Maintenance Request System API routes for HotelNew database.
+//!
+//! ## RETIRED as an intake (wave-5, 2026-08-16) — reads only
+//!
+//! The PMS's own แจ้งซ่อม flow duplicated the Housekeeping ops app, which the
+//! owner made the system of record for maintenance WORK ORDERS. The three
+//! write routes now answer `410 Gone` with a Thai body naming the housekeeping
+//! app, and the PMS Kanban UI that drove them is deleted. Same disposition as
+//! `ht_hk_broken_reports` (retired 2026-08-11): the table and the GETs stay so
+//! existing history remains readable, and nothing silently disappears.
+//!
+//! `ht_maintenance_requests` held **0 rows at both properties** when this
+//! landed (verified read-only against production, both `hotelnew` and
+//! `hotelville`), so there was nothing to migrate and history-only is a
+//! complete answer rather than a compromise.
 //!
 //! Categories:
-//! - GET /api/new/maintenance/categories - List all categories
+//! - GET /api/maintenance/categories - List all categories
 //!
 //! Requests:
-//! - GET /api/new/maintenance/requests - List requests with filters (status, room, priority)
-//! - POST /api/new/maintenance/requests - Create request (generates MReq_No as MR-YYMM-NNNN)
-//! - GET /api/new/maintenance/requests/:id - Get single request
-//! - PUT /api/new/maintenance/requests/:id - Update request
-//! - PUT /api/new/maintenance/requests/:id/status - Quick status update
+//! - GET /api/maintenance/requests - List requests with filters (status, room, priority)
+//! - GET /api/maintenance/requests/:id - Get single request
+//! - ~~POST /api/maintenance/requests~~ - **410 Gone**
+//! - ~~PUT /api/maintenance/requests/:id~~ - **410 Gone**
+//! - ~~PUT /api/maintenance/requests/:id/status~~ - **410 Gone**
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     Json,
 };
 use chrono::NaiveDateTime;
@@ -89,8 +104,12 @@ pub struct RequestsQuery {
     pub branch: Option<Branch>,
 }
 
-fn default_page() -> i32 { 1 }
-fn default_limit() -> i32 { 50 }
+fn default_page() -> i32 {
+    1
+}
+fn default_limit() -> i32 {
+    50
+}
 
 /// Branch selector for maintenance handlers without a list query. `branchFetch`
 /// appends `?branch=`; absent ⇒ HF Hotel.
@@ -123,48 +142,37 @@ pub struct RequestResponse {
     pub request: MaintenanceRequest,
 }
 
-/// Request for creating a maintenance request
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateRequestInput {
-    pub room_id: i32,
-    pub category_id: i32,
-    pub title: String,
-    pub description: Option<String>,
-    pub priority: Option<i32>,
-    pub assigned_to: Option<String>,
-}
-
-/// Request for updating a maintenance request
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateRequestInput {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub priority: Option<i32>,
-    pub status: Option<String>,
-    pub assigned_to: Option<String>,
-    pub resolution: Option<String>,
-    pub cost: Option<f64>,
-}
-
-/// Request for quick status update
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusUpdateInput {
-    pub status: String,
-}
-
-/// Generic mutation response
+/// Body of a `410 Gone` answer from a retired write route. Same
+/// `{success:false, error}` shape `ApiError`'s `IntoResponse` emits, so a
+/// client's existing error handling needs no special case. Mirrors
+/// `routes::hk::GoneResponse` — the established precedent for a retired
+/// endpoint in this codebase (`ApiError` has no `Gone` variant, and adding one
+/// for two call sites would be the bigger change).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MutationResponse {
+pub struct GoneResponse {
     pub success: bool,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_no: Option<String>,
+    pub error: String,
+}
+
+/// The one Thai sentence every retired maintenance write answers with. Names
+/// the app that took over, so a receptionist reading a stale tab knows where to
+/// go rather than just that something broke.
+const RETIRED_MESSAGE: &str =
+    "ระบบแจ้งซ่อมย้ายไปที่แอปแม่บ้านแล้ว: แจ้งซ่อมและติดตามงานที่ housekeeping.thehfhotel.org \
+     (ข้อมูลเดิมยังดูย้อนหลังได้ในระบบนี้)";
+
+/// The shared `410` answer. `410` not `404` is deliberate: the resource existed
+/// and is permanently gone, which tells a stale cached client to STOP retrying
+/// rather than treat it as a transient routing error.
+fn retired() -> (StatusCode, Json<GoneResponse>) {
+    (
+        StatusCode::GONE,
+        Json(GoneResponse {
+            success: false,
+            error: RETIRED_MESSAGE.to_string(),
+        }),
+    )
 }
 
 // ============================================================================
@@ -179,7 +187,7 @@ pub async fn list_categories(
     let pool = resolve_pool(&state, query.branch)?;
 
     let rows = sqlx::query(
-            r#"
+        r#"
             SELECT
                 mcat_id,
                 mcat_name,
@@ -190,9 +198,9 @@ pub async fn list_categories(
             WHERE mcat_active = true
             ORDER BY mcat_priority DESC, mcat_name ASC
             "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     let categories: Vec<MaintenanceCategory> = rows
         .iter()
@@ -266,7 +274,10 @@ pub async fn list_requests(
     );
 
     let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
-    let count_q = match &params.status { Some(s) => count_q.bind(s), None => count_q };
+    let count_q = match &params.status {
+        Some(s) => count_q.bind(s),
+        None => count_q,
+    };
     let count_rows = count_q.fetch_all(pool).await?;
 
     let total: i32 = count_rows
@@ -314,7 +325,10 @@ pub async fn list_requests(
     );
 
     let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
-    let data_q = match &params.status { Some(s) => data_q.bind(s), None => data_q };
+    let data_q = match &params.status {
+        Some(s) => data_q.bind(s),
+        None => data_q,
+    };
     let rows = data_q.fetch_all(pool).await?;
 
     let requests: Vec<MaintenanceRequest> = rows
@@ -329,7 +343,9 @@ pub async fn list_requests(
             title: row.try_get::<String, _>("mreq_title").unwrap_or_default(),
             description: row.try_get::<String, _>("mreq_description").ok(),
             priority: row.try_get::<i32, _>("mreq_priority").unwrap_or(2),
-            status: row.try_get::<String, _>("mreq_status").unwrap_or_else(|_| "open".to_string()),
+            status: row
+                .try_get::<String, _>("mreq_status")
+                .unwrap_or_else(|_| "open".to_string()),
             assigned_to: row.try_get::<String, _>("mreq_assigned_to").ok(),
             started_at: row.try_get::<NaiveDateTime, _>("mreq_started_at").ok(),
             completed_at: row.try_get::<NaiveDateTime, _>("mreq_completed_at").ok(),
@@ -347,70 +363,15 @@ pub async fn list_requests(
     }))
 }
 
-/// POST /api/new/maintenance/requests - Create a new maintenance request
-pub async fn create_request(
-    State(state): State<AppState>,
-    Query(query): Query<BranchQuery>,
-    Json(body): Json<CreateRequestInput>,
-) -> ApiResult<Json<MutationResponse>> {
-    let title = body.title.trim();
-    if title.is_empty() {
-        return Err(ApiError::BadRequest("Title is required".to_string()));
-    }
-
-    let pool = resolve_pool(&state, query.branch)?;
-
-    // Generate request number: MR-YYMM-NNNN
-    let seq_rows = sqlx::query("SELECT nextval('sq_maintenance_no')::int AS seq_num")
-        .fetch_all(pool)
-        .await?;
-
-    let seq_num: i32 = seq_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("seq_num").ok())
-        .unwrap_or(1);
-
-    let now = chrono::Local::now();
-    let request_no = format!(
-        "MR-{:02}{:02}-{:04}",
-        now.format("%y"),
-        now.format("%m"),
-        seq_num
-    );
-
-    let priority = body.priority.unwrap_or(2);
-
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_maintenance_requests (
-                mreq_no, mreq_room_id, mreq_category_id, mreq_title,
-                mreq_description, mreq_priority, mreq_assigned_to
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING mreq_id
-            "#,
-        )
-        .bind(&request_no.as_str())
-        .bind(&body.room_id)
-        .bind(&body.category_id)
-        .bind(&title)
-        .bind(&body.description.as_deref())
-        .bind(&priority)
-        .bind(&body.assigned_to.as_deref())
-        .fetch_all(pool)
-        .await?;
-
-    let id = rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("mreq_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create maintenance request".to_string()))?;
-
-    Ok(Json(MutationResponse {
-        success: true,
-        message: "Maintenance request created successfully".to_string(),
-        id: Some(id),
-        request_no: Some(request_no),
-    }))
+/// POST /api/maintenance/requests — **RETIRED (410 Gone)**.
+///
+/// Maintenance intake is the Housekeeping ops app's job now (owner decision,
+/// wave-5): it owns the work-order lifecycle, and running a second intake here
+/// meant two queues nobody reconciled. Takes NO extractors on purpose — a
+/// stale client's body is never parsed or validated, so it cannot 400 on its
+/// way to being told the endpoint is gone.
+pub async fn retired_create_request() -> (StatusCode, Json<GoneResponse>) {
+    retired()
 }
 
 /// GET /api/new/maintenance/requests/:id - Get a single maintenance request
@@ -422,7 +383,7 @@ pub async fn get_request(
     let pool = resolve_pool(&state, query.branch)?;
 
     let rows = sqlx::query(
-            r#"
+        r#"
             SELECT
                 r.mreq_id,
                 r.mreq_no,
@@ -446,10 +407,10 @@ pub async fn get_request(
             LEFT JOIN ht_maintenance_categories c ON r.mreq_category_id = c.mcat_id
             WHERE r.mreq_id = $1
             "#,
-        )
-        .bind(&request_id)
-        .fetch_all(pool)
-        .await?;
+    )
+    .bind(&request_id)
+    .fetch_all(pool)
+    .await?;
 
     let row = rows
         .first()
@@ -465,7 +426,9 @@ pub async fn get_request(
         title: row.try_get::<String, _>("mreq_title").unwrap_or_default(),
         description: row.try_get::<String, _>("mreq_description").ok(),
         priority: row.try_get::<i32, _>("mreq_priority").unwrap_or(2),
-        status: row.try_get::<String, _>("mreq_status").unwrap_or_else(|_| "open".to_string()),
+        status: row
+            .try_get::<String, _>("mreq_status")
+            .unwrap_or_else(|_| "open".to_string()),
         assigned_to: row.try_get::<String, _>("mreq_assigned_to").ok(),
         started_at: row.try_get::<NaiveDateTime, _>("mreq_started_at").ok(),
         completed_at: row.try_get::<NaiveDateTime, _>("mreq_completed_at").ok(),
@@ -481,150 +444,64 @@ pub async fn get_request(
     }))
 }
 
-/// PUT /api/new/maintenance/requests/:id - Update a maintenance request
-pub async fn update_request(
-    State(state): State<AppState>,
-    Path(request_id): Path<i32>,
-    Query(query): Query<BranchQuery>,
-    Json(body): Json<UpdateRequestInput>,
-) -> ApiResult<Json<MutationResponse>> {
-    let pool = resolve_pool(&state, query.branch)?;
+/// PUT /api/maintenance/requests/:id — **RETIRED (410 Gone)**.
+///
+/// See [`retired_create_request`]. Editing a request is part of the work-order
+/// lifecycle that moved wholesale; `GET /api/maintenance/requests/:id` still
+/// serves the row for history.
+pub async fn retired_update_request() -> (StatusCode, Json<GoneResponse>) {
+    retired()
+}
 
-    // Build dynamic UPDATE query with parameterized placeholders. Each text/
-    // numeric column that takes a user-supplied value reserves the next `$N`
-    // slot; the values are bound below in the same order via sqlx, so they
-    // cannot be interpreted as SQL. Integer columns are still safe to inline
-    // because `i32`/`f64` cannot encode SQL syntax.
-    let mut set_parts: Vec<String> = Vec::new();
-    let mut next_param_index: i32 = 1;
+/// PUT /api/maintenance/requests/:id/status — **RETIRED (410 Gone)**.
+///
+/// See [`retired_create_request`]. This was the Kanban board's drag-to-column
+/// action; the board is deleted and the column it wrote lives in the
+/// housekeeping app.
+pub async fn retired_update_request_status() -> (StatusCode, Json<GoneResponse>) {
+    retired()
+}
 
-    if body.title.is_some() {
-        set_parts.push(format!("mreq_title = ${}", next_param_index));
-        next_param_index += 1;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if body.description.is_some() {
-        set_parts.push(format!("mreq_description = ${}", next_param_index));
-        next_param_index += 1;
-    }
-
-    if let Some(priority) = body.priority {
-        set_parts.push(format!("mreq_priority = {}", priority));
-    }
-
-    if let Some(ref status) = body.status {
-        set_parts.push(format!("mreq_status = ${}", next_param_index));
-        next_param_index += 1;
-
-        // Automatically set timestamps based on status
-        if status == "in_progress" {
-            set_parts.push("mreq_started_at = NOW()".to_string());
-        } else if status == "completed" {
-            set_parts.push("mreq_completed_at = NOW()".to_string());
+    /// All three retired writes answer 410 (permanently gone), not 404
+    /// (transient/unknown) — so a stale cached tab stops retrying instead of
+    /// looking like a routing blip.
+    #[tokio::test]
+    async fn every_retired_write_answers_410() {
+        for (name, (status, Json(body))) in [
+            ("create", retired_create_request().await),
+            ("update", retired_update_request().await),
+            ("status", retired_update_request_status().await),
+        ] {
+            assert_eq!(status, StatusCode::GONE, "{name} must be 410");
+            assert!(!body.success, "{name}");
         }
     }
 
-    if body.assigned_to.is_some() {
-        set_parts.push(format!("mreq_assigned_to = ${}", next_param_index));
-        next_param_index += 1;
+    /// The body must NAME the app that took over, in Thai. A bare "gone" tells
+    /// a receptionist that something broke; this tells her where to go.
+    #[test]
+    fn the_thai_body_names_the_housekeeping_app() {
+        assert!(
+            RETIRED_MESSAGE.contains("housekeeping.thehfhotel.org"),
+            "{RETIRED_MESSAGE}"
+        );
+        assert!(RETIRED_MESSAGE.contains("แอปแม่บ้าน"), "{RETIRED_MESSAGE}");
+        // History stays readable via the surviving GETs — say so, or the
+        // message reads as "your data is gone".
+        assert!(RETIRED_MESSAGE.contains("ย้อนหลัง"), "{RETIRED_MESSAGE}");
     }
 
-    if body.resolution.is_some() {
-        set_parts.push(format!("mreq_resolution = ${}", next_param_index));
-        next_param_index += 1;
+    /// The wire shape matches `ApiError`'s `IntoResponse` (`success` + `error`),
+    /// so existing client error handling needs no special case.
+    #[test]
+    fn the_gone_body_matches_the_house_error_shape() {
+        let (_, Json(body)) = retired();
+        let json = serde_json::to_string(&body).expect("serializes");
+        assert!(json.contains("\"success\":false"), "{json}");
+        assert!(json.contains("\"error\""), "{json}");
     }
-
-    if let Some(cost) = body.cost {
-        set_parts.push(format!("mreq_cost = {}", cost));
-    }
-
-    if set_parts.is_empty() {
-        return Err(ApiError::BadRequest("No fields to update".to_string()));
-    }
-
-    set_parts.push("mreq_updated_at = NOW()".to_string());
-
-    // mreq_id is the LAST bind so it occupies the final `$N` slot regardless
-    // of which optional columns appeared above.
-    let id_param_index = next_param_index;
-
-    let update_query = format!(
-        "UPDATE ht_maintenance_requests SET {} WHERE mreq_id = ${}",
-        set_parts.join(", "),
-        id_param_index
-    );
-
-    // Bind values in the same order the placeholders were assigned above, then
-    // bind `request_id` last to match the WHERE-clause `$id_param_index`.
-    let q = sqlx::query(sqlx::AssertSqlSafe(&*update_query));
-    let q = match &body.title { Some(v) => q.bind(v), None => q };
-    let q = match &body.description { Some(v) => q.bind(v), None => q };
-    let q = match &body.status { Some(v) => q.bind(v), None => q };
-    let q = match &body.assigned_to { Some(v) => q.bind(v), None => q };
-    let q = match &body.resolution { Some(v) => q.bind(v), None => q };
-    let q = q.bind(request_id);
-
-    let result = q.execute(pool).await?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("Maintenance request not found".to_string()));
-    }
-
-    Ok(Json(MutationResponse {
-        success: true,
-        message: "Maintenance request updated successfully".to_string(),
-        id: Some(request_id),
-        request_no: None,
-    }))
-}
-
-/// PUT /api/new/maintenance/requests/:id/status - Quick status update
-pub async fn update_request_status(
-    State(state): State<AppState>,
-    Path(request_id): Path<i32>,
-    Query(query): Query<BranchQuery>,
-    Json(body): Json<StatusUpdateInput>,
-) -> ApiResult<Json<MutationResponse>> {
-    let status = body.status.trim().to_lowercase();
-
-    // Validate status
-    let valid_statuses = ["open", "in_progress", "completed", "cancelled"];
-    if !valid_statuses.contains(&status.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid status '{}'. Must be one of: {}",
-            status,
-            valid_statuses.join(", ")
-        )));
-    }
-
-    let pool = resolve_pool(&state, query.branch)?;
-
-    // Build update query with automatic timestamp handling
-    let update_query = match status.as_str() {
-        "in_progress" => format!(
-            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_started_at = NOW(), mreq_updated_at = NOW() WHERE mreq_id = {}",
-            status, request_id
-        ),
-        "completed" => format!(
-            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_completed_at = NOW(), mreq_updated_at = NOW() WHERE mreq_id = {}",
-            status, request_id
-        ),
-        _ => format!(
-            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_updated_at = NOW() WHERE mreq_id = {}",
-            status, request_id
-        ),
-    };
-
-    let result = sqlx::query(sqlx::AssertSqlSafe(&*update_query)).execute(pool).await?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("Maintenance request not found".to_string()));
-    }
-
-    Ok(Json(MutationResponse {
-        success: true,
-        message: format!("Status updated to '{}'", status),
-        id: Some(request_id),
-        request_no: None,
-    }))
 }
