@@ -83,6 +83,11 @@ use crate::outbox::event::DomainEvent;
 // `sync_status.entity_type` and its `RECONCILE_RESOLVABLE_TABLES` entry, so
 // the three can never drift apart.
 use crate::scheduler::payment_ledger_probe::{LedgerEraFloor, PAYMENT_LEDGER_PROBE_KEY};
+// Track F5: the loyalty-channel writeback tripwire filters on the SAME
+// `book_channel` marker the channel service stamps on every hold. Imported
+// rather than re-typed as a literal so the detector cannot silently stop
+// matching if the marker is ever changed.
+use crate::service::channel::LOYALTY_CHANNEL;
 use crate::sync::change_op::ChangeOp;
 // Single-sourced `|` separator, shared with the mapper-side descriptor
 // tables that pin the gate ⊇ reconcile-hash invariant.
@@ -92,9 +97,7 @@ use crate::sync::mapper::MssqlChangeMapper;
 // the reconcile arm and the mapper cannot disagree about what a folio is,
 // and the canonical name re-concatenation is the SAME bytes the mapper's
 // echo-adoption match uses.
-use crate::sync::mappers::guest_registry::{
-    RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL,
-};
+use crate::sync::mappers::guest_registry::{RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL};
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
 
@@ -409,11 +412,8 @@ pub async fn run_sync(
     // `consecutive_failures` and stamps `last_sync_at` (`last_error`/
     // `last_error_at` keep the most recent failure).
     if reconcile_payment_ledger_probe_enabled() {
-        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(
-            legacy_pool,
-            pg_pool,
-        )
-        .await
+        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(legacy_pool, pg_pool)
+            .await
         {
             Ok(outcome) => {
                 // added=0 (the probe writes no canonical rows),
@@ -1142,7 +1142,15 @@ async fn clear_level_alert_cooldown_pg(pg_pool: &PgPool, site_id: &str, table_na
 /// [`check_stale_active_checkins_and_alert`], which is the only caller
 /// that can evaluate the condition. The reconcile sweep must keep its
 /// hands off it.
-const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
+/// Track F5 adds the second member: the loyalty writeback stall tripwire
+/// parks [`LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY`] in the same table on a 30
+/// MINUTE window. Letting the reconcile all-clear delete that row would be
+/// worse here than for the stale-checkin key — the window is short enough
+/// that the alert would effectively refire every tick during an outage.
+const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[
+    STALE_CHECKIN_COOLDOWN_KEY,
+    LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY,
+];
 
 /// Is this cooldown key a canonical `ht_reconcile_log` table name — i.e.
 /// something the sync-lag all-clear is entitled to declare recovered?
@@ -1186,7 +1194,11 @@ fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> 
 /// Slack body for the level-drift all-clear. Pure — unit-testable
 /// without a PG pool. All-clear tier (issue #261) — stays on
 /// `with_site_text`, never the pager mention.
-fn format_level_drift_all_clear_message(stale_hours: i64, body: &str, cooldown_hours: i64) -> String {
+fn format_level_drift_all_clear_message(
+    stale_hours: i64,
+    body: &str,
+    cooldown_hours: i64,
+) -> String {
     format!(
         ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
          Every `ht_reconcile_log` row older than \
@@ -1414,14 +1426,8 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     // early return below, because "no table has stale rows any more" is
     // exactly the everything-recovered case an operator needs to hear about.
     let still_stale_tables: Vec<String> = counts.iter().map(|r| r.table.clone()).collect();
-    check_level_drift_recovery_and_notify(
-        pg_pool,
-        slack,
-        site_id,
-        &still_stale_tables,
-        thresholds,
-    )
-    .await;
+    check_level_drift_recovery_and_notify(pg_pool, slack, site_id, &still_stale_tables, thresholds)
+        .await;
 
     if counts.is_empty() {
         tracing::debug!(
@@ -1915,6 +1921,479 @@ async fn notify_stale_checkin_all_clear(
              the next tick retries the closure"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Track F5 — loyalty-channel writeback-leg stall detector
+// ---------------------------------------------------------------------------
+//
+// The gap this closes (b8 overbooking analysis §3, defect 3). A loyalty hold
+// is the one canonical write whose VALUE depends on the legacy leg being up:
+// `docs/loyalty-channel.md` makes iHOTEL show the hold as `จอง` immediately
+// *"otherwise a receptionist would double-book the room during the 2h payment
+// window"*. The hold's TTL is 2 hours. Every pre-existing detector is slower
+// than that TTL or blind to a single row:
+//
+//   * level-drift digest — needs a row unconverged for 4h
+//     ([`DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS`]); 4h > 2h TTL, so the
+//     hold expires and vanishes before the digest can mention it;
+//   * burst page — needs 50 rows/hour ([`DEFAULT_DRIFT_ALERT_THRESHOLD`]);
+//     one stuck hold is 1;
+//   * queue-depth janitor — needs 500 pending jobs
+//     (`QUEUE_PENDING_ALERT_THRESHOLD`, `bin/writeback.rs`); one stuck hold
+//     is 1.
+//
+// So at 02:00, with the writeback leg down, a guest pays a 50% deposit for a
+// room iHOTEL does not know is taken, and nothing pages until long after the
+// hold has died.
+//
+// **Why this lives in the scheduler and not in `bin/writeback.rs`.** The
+// failure being detected is *the writeback worker is not draining the queue*,
+// and its most likely cause is that the worker process/container is down or
+// its MSSQL leg is unreachable. A detector hosted inside that worker shares
+// its fate: worker down ⇒ detector down ⇒ silence, which is precisely the
+// 02:00 case. The scheduler runs in the API process, which is a different
+// container with a different failure domain, and it already owns the other
+// pure-PG tripwire with exactly this shape
+// ([`check_stale_active_checkins_and_alert`]). The queue-depth janitor in
+// `bin/writeback.rs` stays where it is — it measures *bulk* backlog, which is
+// only meaningful from inside a running worker.
+//
+// **Confirmed failure, never a blip.** The alert needs a job row that EXISTS
+// (so PG committed — this is never "the hold was never created"), is older
+// than the threshold, and is in any state other than `done`. A healthy leg
+// applies a `create_booking` in seconds (NOTIFY-driven, 30s poll fallback),
+// so the 10-minute default is ~20× the healthy latency and well past the
+// worker's own retry backoff and its 5-minute stuck-claim steal window.
+
+/// Track F5 — default age (minutes) past which a not-yet-applied writeback
+/// job for a loyalty-channel booking is treated as a confirmed stall.
+///
+/// 10 minutes, per the b8 analysis's L7 recommendation. The floor is set by
+/// what the writeback worker does on its own before a human should be woken:
+/// NOTIFY delivery is sub-second, the poll fallback is 30s, retry backoff and
+/// the janitor's stuck-`in_progress` steal both settle inside 5 minutes. A job
+/// still unapplied at 10 minutes is not retrying — it is stuck. The ceiling is
+/// the 2h hold TTL: the alert must land with enough of the window left for
+/// reception to act, which 10 minutes does with ~1h50m to spare.
+///
+/// `i32` because it is bound straight into `make_interval(mins => $1)`, which
+/// PostgreSQL overloads only on `int` — a `bigint` bind raises
+/// `function make_interval(mins => bigint) does not exist` and silently
+/// disables the detector (the same trap documented at
+/// `QUEUE_STUCK_IN_PROGRESS_AGE_MINS` in `bin/writeback.rs`).
+///
+/// Override with `LOYALTY_WRITEBACK_STALL_ALERT_MINUTES`.
+pub const DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES: i32 = 10;
+
+/// Track F5 — default cooldown (minutes) between repeats of the stall alert
+/// for one site.
+///
+/// 30 minutes, deliberately much shorter than the 24h level-drift cooldown:
+/// the condition it reports is bounded by a 2h TTL, so a 24h window would
+/// collapse the whole incident into one message and a 4h window would allow
+/// at most one repeat. 30 minutes gives an unattended overnight outage ~4
+/// reminders inside a hold's life — enough to catch a night receptionist
+/// coming back to the desk, few enough not to train anyone to mute the
+/// channel. The paired all-clear (below) closes it out.
+///
+/// Override with `LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`.
+pub const DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES: i64 = 30;
+
+/// Cooldown sentinel for the stall alert, parked in the shared
+/// `ht_level_drift_alert_cooldowns` table alongside
+/// [`STALE_CHECKIN_COOLDOWN_KEY`].
+///
+/// A bare (non-namespaced) key, so it MUST be listed in
+/// [`NON_RECONCILE_COOLDOWN_KEYS`] — otherwise the reconcile sweep's
+/// all-clear would read it as a converged `ht_reconcile_log` table name and
+/// DELETE the row, un-throttling this alert to once per tick.
+const LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY: &str = "loyalty_writeback_stall";
+
+/// The single `writeback_jobs.status` that means "the legacy MSSQL write
+/// landed". Every other status — `pending`, `in_progress`, `failed`,
+/// `exhausted` — means iHOTEL has not seen this booking yet.
+///
+/// Written as "not `done`" rather than an allow-list of bad statuses on
+/// purpose: a future status added to the lifecycle should default to
+/// *alerting*, not to silence. The two easy-to-miss members of that set are
+/// the ones an allow-list of `('pending','failed')` would drop:
+///
+///   * `in_progress` — a worker that dies mid-claim leaves the row claimed
+///     forever until some worker returns to steal it. Worker down is exactly
+///     the scenario this detector exists for, so excluding `in_progress`
+///     would blind it to its own primary case.
+///   * `exhausted` — the terminal give-up state. `bin/writeback.rs` pages on
+///     it separately, but that alert says "a job died"; this one says "a
+///     guest who has paid a deposit holds a room iHOTEL believes is free".
+///     Different fact, different remedy, and when the worker is down no job
+///     ever *reaches* `exhausted` anyway.
+const WRITEBACK_APPLIED_STATUS: &str = "done";
+
+/// Resolve the stall threshold (minutes) from
+/// `LOYALTY_WRITEBACK_STALL_ALERT_MINUTES`, clamped to a floor of 1 minute.
+/// Falls back to [`DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES`] on a missing or
+/// unparseable value. Same shape as [`stale_checkin_alert_days`]; global-only
+/// (no per-site suffix) because the channel contract is property-independent.
+fn loyalty_writeback_stall_minutes() -> i32 {
+    env::var("LOYALTY_WRITEBACK_STALL_ALERT_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES)
+}
+
+/// Resolve the alert cooldown (minutes) from
+/// `LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`, clamped to a floor of 1
+/// minute. Falls back to
+/// [`DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES`].
+fn loyalty_writeback_stall_cooldown_minutes() -> i64 {
+    env::var("LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES)
+}
+
+/// One not-yet-applied writeback job belonging to a loyalty-channel booking,
+/// as returned by [`fetch_stalled_loyalty_writebacks`]. Field order matches
+/// the SELECT list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledLoyaltyWriteback {
+    /// `ht_bookings.book_no` — the reference reception can type into iHOTEL.
+    pub book_no: String,
+    /// `writeback_jobs.intent`, e.g. `create_booking` / `cancel_booking`.
+    pub intent: String,
+    /// `writeback_jobs.status` — anything but [`WRITEBACK_APPLIED_STATUS`].
+    pub status: String,
+    /// Whole minutes since the job row was enqueued.
+    pub age_minutes: i64,
+    /// `ht_bookings.book_hold_expires_at`, when the booking is still a hold.
+    /// `None` once the hold has been confirmed (payment verified) — the
+    /// booking is then a normal reservation whose iHOTEL twin still matters.
+    pub hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Pure decision function — is this one job a confirmed loyalty-leg stall?
+///
+/// Every arm of the predicate is a deliberate noise control:
+///
+///   * `book_channel` must be exactly the loyalty marker. A stuck desk or
+///     OTA writeback is a real problem but NOT this alert's problem: it has
+///     no 2h fuse and it is covered by the existing digest/queue alerts.
+///   * `status` must not be [`WRITEBACK_APPLIED_STATUS`] — i.e. the legacy
+///     write provably has not landed.
+///   * the job must be at least `threshold_minutes` old, so an in-flight
+///     write on a healthy leg (sub-second to 30s) can never trip it.
+///
+/// Kept free of PG and of the clock so the thresholds can be driven directly
+/// in unit tests, matching [`ct_lag_breached`] and [`tables_recovered`].
+pub fn loyalty_writeback_is_stalled(
+    book_channel: Option<&str>,
+    job_status: &str,
+    job_age_minutes: i64,
+    threshold_minutes: i64,
+) -> bool {
+    let is_loyalty = book_channel.is_some_and(|c| c.trim() == LOYALTY_CHANNEL);
+    is_loyalty && job_status != WRITEBACK_APPLIED_STATUS && job_age_minutes >= threshold_minutes
+}
+
+/// Pure decision function — should this tick emit the paired all-clear?
+///
+/// Only when the backlog has actually drained AND we previously said
+/// something (a cooldown row proves it). Without the second arm a site that
+/// has never stalled would announce a recovery from nothing; without the
+/// first, a partial drain would claim the incident closed.
+pub fn loyalty_stall_all_clear_due(stalled_count: usize, alerted_earlier: bool) -> bool {
+    stalled_count == 0 && alerted_earlier
+}
+
+/// Slack body for the stall alert. Pure — pulled out so the operator-facing
+/// wording is unit-testable without a PG pool, as with
+/// [`format_burst_alert_message`].
+///
+/// Warning tier, not pager tier (issue #261): it goes out on
+/// `with_site_text`, no `<!channel>`. The condition is real and actionable
+/// but it is bounded by a 2h TTL and its remedy is a desk action, not a
+/// wake-the-engineer action — and a channel-mention at 02:00 for a single
+/// held room would be the fastest way to get this alert muted.
+fn format_loyalty_stall_message(
+    threshold_minutes: i32,
+    cooldown_minutes: i64,
+    body: &str,
+    count: usize,
+) -> String {
+    format!(
+        ":satellite_antenna: *Loyalty-channel writeback stalled — iHOTEL cannot see {count} \
+         app booking(s)* :satellite_antenna:\n\
+         {count} booking(s) made in the guest app committed to PostgreSQL but their legacy \
+         writeback job has not applied for more than {threshold_minutes} minute(s). iHOTEL does \
+         NOT show these rooms as `จอง`, so the desk can double-book them — and a hold that \
+         expires before the leg recovers disappears without ever reaching the room board:\n\
+         {body}\n\
+         _Runbook:_ `docs/runbooks/writeback-leg-degraded.md` _— check the writeback worker and \
+         the legacy leg first. Per-site cooldown {cooldown_minutes} min; a_ \
+         `:white_check_mark:` _all-clear fires once the backlog drains._"
+    )
+}
+
+/// Slack body for the paired all-clear. Pure, same reasons as above.
+fn format_loyalty_stall_all_clear_message(threshold_minutes: i32) -> String {
+    format!(
+        ":white_check_mark: *Loyalty-channel writeback RECOVERED* :white_check_mark:\n\
+         Every loyalty-channel booking's writeback job has applied — no job is older than \
+         {threshold_minutes} minute(s) without reaching iHOTEL. The app's holds are back on the \
+         iHOTEL room board.\n\
+         _Closure of the_ `:satellite_antenna:` _stall alert sent earlier. Check \
+         `docs/runbooks/writeback-leg-degraded.md` §5 for the bookings that were invisible \
+         during the outage — a hold that expired mid-outage may have left a stale_ `จอง` _row._"
+    )
+}
+
+/// Track F5 — loyalty-channel writeback-leg stall tripwire.
+///
+/// Pure-PG and read-only: it compares `writeback_jobs` against `ht_bookings`
+/// on this site's canonical database and touches neither MSSQL nor the queue.
+/// That is what lets it keep working while the legacy leg — the thing it is
+/// reporting on — is unreachable.
+///
+/// Fires ONE cooldown-gated Slack message listing the affected bookings, and
+/// owns its own `:white_check_mark:` closure when the backlog drains
+/// (the "pair failure with recovery" convention, 2026-07-28 alert inventory
+/// defect C8). Best-effort throughout: a PG or Slack failure logs a warning
+/// and leaves the cooldown untouched so the next tick retries.
+pub async fn check_loyalty_writeback_stall_and_alert(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    let threshold_minutes = loyalty_writeback_stall_minutes();
+    let cooldown_minutes = loyalty_writeback_stall_cooldown_minutes();
+    let cooldown = std::time::Duration::from_secs((cooldown_minutes * 60) as u64);
+
+    let stalled = match fetch_stalled_loyalty_writebacks(pg_pool, threshold_minutes).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] Failed to query loyalty-channel writeback stalls — observability degraded"
+            );
+            return;
+        }
+    };
+
+    if stalled.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            threshold_minutes,
+            "[Sync] Loyalty writeback tripwire: every channel booking's writeback has applied"
+        );
+        notify_loyalty_stall_all_clear(pg_pool, slack, site_id, threshold_minutes).await;
+        return;
+    }
+
+    tracing::warn!(
+        site = %site_id,
+        count = stalled.len(),
+        threshold_minutes,
+        "[Sync] Loyalty writeback tripwire: channel booking(s) not mirrored to iHOTEL \
+         (writeback leg degraded)"
+    );
+
+    if !level_alert_eligible_pg(
+        pg_pool,
+        site_id,
+        LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY,
+        cooldown,
+    )
+    .await
+    {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Loyalty writeback stall alert suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let now = chrono::Utc::now();
+        let shown = stalled.len().min(15);
+        let body = stalled
+            .iter()
+            .take(shown)
+            .map(|row| {
+                let hold = match row.hold_expires_at {
+                    // Minutes of hold left, floored at 0 — a negative number
+                    // would read as "expires in -12 minutes" at 02:00.
+                    Some(exp) => {
+                        let left = (exp - now).num_minutes();
+                        if left > 0 {
+                            format!(", hold expires in {left}m")
+                        } else {
+                            ", HOLD ALREADY EXPIRED".to_string()
+                        }
+                    }
+                    None => String::new(),
+                };
+                format!(
+                    "• `{book_no}` — `{intent}` {status} for {age}m{hold}",
+                    book_no = row.book_no,
+                    intent = row.intent,
+                    status = row.status,
+                    age = row.age_minutes,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if stalled.len() > shown {
+            format!("\n…and {} more", stalled.len() - shown)
+        } else {
+            String::new()
+        };
+
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_loyalty_stall_message(
+                threshold_minutes,
+                cooldown_minutes,
+                &format!("{body}{more}"),
+                stalled.len(),
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; loyalty writeback stall logged only ({} row(s))",
+            stalled.len()
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    // Defect A3 — burn the cooldown only on a confirmed delivery, so a
+    // webhook outage can't silence a degraded leg for a full window.
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Loyalty writeback stall alert POST failed — leaving cooldown unset so \
+             the next tick retries"
+        );
+    }
+}
+
+/// Paired all-clear for [`check_loyalty_writeback_stall_and_alert`]. Emits
+/// nothing unless a cooldown row proves we alerted earlier, and clears that
+/// row only after the closure has actually been delivered — so a recurrence
+/// alerts on the very next tick instead of waiting out a stale window.
+async fn notify_loyalty_stall_all_clear(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    threshold_minutes: i32,
+) {
+    let alerted_earlier =
+        cooldown_row_exists_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    if !loyalty_stall_all_clear_due(0, alerted_earlier) {
+        return;
+    }
+
+    tracing::info!(
+        site = %site_id,
+        threshold_minutes,
+        "[Sync] Loyalty writeback all-clear: backlog drained — clearing tripwire cooldown"
+    );
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_loyalty_stall_all_clear_message(threshold_minutes),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; loyalty writeback all-clear logged only"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        clear_level_alert_cooldown_pg(pg_pool, site_id, LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Loyalty writeback all-clear POST failed — keeping the cooldown row so \
+             the next tick retries the closure"
+        );
+    }
+}
+
+/// One indexed round-trip for the stall set.
+///
+/// Joins on `aggregate_id`, which is the only key the two tables share:
+/// `writeback_jobs.aggregate_id` carries the booking's UUID for all three
+/// booking intents (`create_booking` / `modify_booking` / `cancel_booking`,
+/// see `WritebackIntent::aggregate_id`), and `ht_bookings.aggregate_id` is
+/// uniquely indexed (`ux_ht_bookings_aggregate_id`). The join therefore
+/// selects booking intents on its own — no `intent IN (…)` filter, so a
+/// booking intent added later is covered without touching this query.
+///
+/// Cancel intents are deliberately in scope alongside creates: a cancel that
+/// never reaches iHOTEL leaves a phantom `จอง` on the room board and reception
+/// holds a room that is actually free — the same class of harm, inverted.
+///
+/// Runs on the existing `ix_writeback_jobs_claim` partial index
+/// (`status IN ('pending','failed','in_progress')`) plus a lookup per row on
+/// `ux_ht_bookings_aggregate_id`; in steady state the driving side is empty,
+/// so no new index and no migration is needed.
+async fn fetch_stalled_loyalty_writebacks(
+    pg_pool: &PgPool,
+    threshold_minutes: i32,
+) -> Result<Vec<StalledLoyaltyWriteback>, sqlx::Error> {
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            i64,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT b.book_no, \
+                j.intent, \
+                j.status, \
+                (EXTRACT(EPOCH FROM (now() - j.created_at)) / 60)::bigint AS age_minutes, \
+                b.book_hold_expires_at \
+           FROM writeback_jobs j \
+           JOIN ht_bookings b ON b.aggregate_id = j.aggregate_id \
+          WHERE j.status <> $1 \
+            AND j.created_at <= now() - make_interval(mins => $2) \
+            AND b.book_channel = $3 \
+          ORDER BY j.created_at \
+          LIMIT 100",
+    )
+    .bind(WRITEBACK_APPLIED_STATUS)
+    .bind(threshold_minutes)
+    .bind(LOYALTY_CHANNEL)
+    .fetch_all(pg_pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(book_no, intent, status, age_minutes, hold_expires_at)| {
+                StalledLoyaltyWriteback {
+                    book_no,
+                    intent,
+                    status,
+                    age_minutes,
+                    hold_expires_at,
+                }
+            })
+            .collect()
+    })
 }
 
 /// Resolved CT-lag thresholds (versions + seconds) for a reconcile tick.
@@ -3575,8 +4054,8 @@ async fn compute_current_pg_hash(
         // an ABSENT key hashes to `mirror_absent_hash` so a row deleted on
         // both sides converges instead of sitting open forever.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
-            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
-                .expect("guard just matched");
+            let probe =
+                crate::scheduler::mirror_probe::probe_for_table(t).expect("guard just matched");
             crate::scheduler::mirror_probe::resolve_pg_hash(pg_pool, probe, legacy_pk).await
         }
         // Phase 6-D. `legacy_pk` is either a `Cin_No` or the `<aggregate>`
@@ -3663,8 +4142,8 @@ async fn compute_current_legacy_hash(
         // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
         // arm; same absent-is-a-real-hash contract.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
-            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
-                .expect("guard just matched");
+            let probe =
+                crate::scheduler::mirror_probe::probe_for_table(t).expect("guard just matched");
             crate::scheduler::mirror_probe::resolve_legacy_hash(
                 legacy_pool,
                 pg_pool,
@@ -4107,7 +4586,8 @@ const ROOM_CALENDAR_ERA_FLOOR_SQL: &str =
 ///
 /// The floor is a BOUND parameter and `NULL` means "no mirrored coverage at
 /// all" — then every tile is in scope, matching the unfloored legacy scan.
-const ROOM_CALENDAR_PAIRS_PG_SQL: &str = "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
+const ROOM_CALENDAR_PAIRS_PG_SQL: &str =
+    "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
        FROM ht_room_calendar c \
        JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
       WHERE $1::date IS NULL OR c.rcal_date >= $1::date";
@@ -4424,10 +4904,11 @@ async fn fetch_room_calendar_pairs_pg(
     pg_pool: &PgPool,
     floor: Option<NaiveDate>,
 ) -> Result<BTreeMap<RoomCalendarPair, CanonicalCalendarTile>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
-        .bind(floor)
-        .fetch_all(pg_pool)
-        .await?;
+    let rows =
+        sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
+            .bind(floor)
+            .fetch_all(pg_pool)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|(room_no, night, rcal_id, legacy_id)| {
@@ -5682,21 +6163,27 @@ async fn auto_resolve_reconcile_log(
 
     let mut resolved = 0usize;
     for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
-        let current_legacy_hash =
-            match compute_current_legacy_hash(legacy_pool, pg_pool, &table_name, &legacy_pk).await {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::warn!(
-                        site = %site_id,
-                        id,
-                        table_name = %table_name,
-                        legacy_pk = %legacy_pk,
-                        error = %e,
-                        "[Sync] Auto-resolve sweep: failed to re-fetch legacy hash, skipping row"
-                    );
-                    continue;
-                }
-            };
+        let current_legacy_hash = match compute_current_legacy_hash(
+            legacy_pool,
+            pg_pool,
+            &table_name,
+            &legacy_pk,
+        )
+        .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(
+                    site = %site_id,
+                    id,
+                    table_name = %table_name,
+                    legacy_pk = %legacy_pk,
+                    error = %e,
+                    "[Sync] Auto-resolve sweep: failed to re-fetch legacy hash, skipping row"
+                );
+                continue;
+            }
+        };
 
         let current_pg_hash = match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await
         {
@@ -7930,12 +8417,8 @@ async fn upsert_checkin_mirror(
 /// excluded from the hash. (`Receipt_Date` IS used in the scan's WHERE
 /// clause as the canonical-era floor — see [`PAYMENTS_ERA_FLOOR_SQL`] —
 /// which is a scope filter, not a hash input.)
-const PAYMENTS_RECONCILE_PROJECTION: &[&str] = &[
-    "Receipt_no",
-    "Receipt_Total",
-    "Receipt_ref",
-    "status_name",
-];
+const PAYMENTS_RECONCILE_PROJECTION: &[&str] =
+    &["Receipt_no", "Receipt_Total", "Receipt_ref", "status_name"];
 
 /// The scan filter for the bulk payments sweep.
 ///
@@ -8164,15 +8647,15 @@ async fn fetch_canonical_payment(
 ) -> Result<Option<CanonicalPaymentRow>, sqlx::Error> {
     sqlx::query_as::<_, (f64, Option<bool>, Option<String>)>(CANONICAL_PAYMENT_PROBE_SQL)
         .bind(receipt_no)
-    .fetch_optional(pg_pool)
-    .await
-    .map(|opt| {
-        opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
-            pay_amount: amount,
-            pay_voided: voided,
-            legacy_cin_no: cin_no,
+        .fetch_optional(pg_pool)
+        .await
+        .map(|opt| {
+            opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
+                pay_amount: amount,
+                pay_voided: voided,
+                legacy_cin_no: cin_no,
+            })
         })
-    })
 }
 
 /// Best-effort ack: record the `mssql_hash` we last reconciled for this
@@ -8626,9 +9109,7 @@ pub(crate) fn clamped_era_floor<T: Ord>(persisted: Option<T>, derived: Option<T>
     }
 }
 
-async fn guest_registry_era_floor(
-    pg_pool: &PgPool,
-) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+async fn guest_registry_era_floor(pg_pool: &PgPool) -> Result<Option<NaiveDateTime>, sqlx::Error> {
     // `AssertSqlSafe`: the statement is assembled from compile-time consts
     // only (no runtime value reaches it) — same audit note as the sibling
     // canonical-folio statements below.
@@ -8646,21 +9127,17 @@ async fn guest_registry_era_floor(
     // fails the whole guest-registry tick. A NULL reads as "nothing
     // persisted", which is exactly what `clamped_era_floor` already handles.
     let persisted = match derived {
-        Some(d) => {
-            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
-                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
-                .bind(d)
-                .fetch_optional(pg_pool)
-                .await?
-                .flatten()
-        }
-        None => {
-            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
-                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
-                .fetch_optional(pg_pool)
-                .await?
-                .flatten()
-        }
+        Some(d) => sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
+            .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+            .bind(d)
+            .fetch_optional(pg_pool)
+            .await?
+            .flatten(),
+        None => sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
+            .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+            .fetch_optional(pg_pool)
+            .await?
+            .flatten(),
     };
 
     let effective = clamped_era_floor(persisted, derived);
@@ -9998,7 +10475,8 @@ mod tests {
     #[test]
     fn room_clean_projections_agree_across_detection_and_auto_resolve() {
         // A dirty room: legacy says "needs cleaning", canonical says not clean.
-        let legacy_dirty = room_canonical_hash("512", legacy_yesno_canonical(Some("yes")), "no", None);
+        let legacy_dirty =
+            room_canonical_hash("512", legacy_yesno_canonical(Some("yes")), "no", None);
         let canonical_dirty =
             room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(false)), "no", None);
         assert_eq!(
@@ -10007,7 +10485,8 @@ mod tests {
         );
 
         // A clean room: legacy "no cleaning needed", canonical clean.
-        let legacy_clean = room_canonical_hash("512", legacy_yesno_canonical(Some("no")), "no", None);
+        let legacy_clean =
+            room_canonical_hash("512", legacy_yesno_canonical(Some("no")), "no", None);
         let canonical_clean =
             room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(true)), "no", None);
         assert_eq!(
@@ -11383,10 +11862,9 @@ mod tests {
         ));
         for sloppy in ["TRUE", "1", "yes", " true", "True"] {
             assert!(
-                !with_env_vars(
-                    &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))],
-                    || { reconcile_payments_arm_enabled() }
-                ),
+                !with_env_vars(&[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))], || {
+                    reconcile_payments_arm_enabled()
+                }),
                 "`{sloppy}` must NOT enable the arm"
             );
         }
@@ -11710,9 +12188,7 @@ mod tests {
     /// check-ins BEFORE it (the CT mapper ERRORS on an unresolvable parent).
     #[test]
     fn guest_registry_ranks_after_its_parent_checkin() {
-        assert!(
-            reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry")
-        );
+        assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry"));
         assert!(
             reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank("something_new"),
             "the wildcard must stay strictly after every ranked entity"
@@ -11800,20 +12276,27 @@ mod tests {
             "a registered PRIMARY guest is not a companion: {folios}"
         );
         assert_eq!(
-            CANONICAL_COMPANION_PRIMARY_FILTER,
-            "COALESCE(guest_is_primary, false) = false",
+            CANONICAL_COMPANION_PRIMARY_FILTER, "COALESCE(guest_is_primary, false) = false",
             "the column is nullable; a bare `= false` drops NULL rows out of \
              the canonical folio and reports them as legacy-only forever"
         );
         assert!(
-            folios.contains("JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"),
+            folios.contains(
+                "JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"
+            ),
             "join companion → check-in, never the reverse: a duplicate \
              legacy_cin_no would otherwise duplicate companion lines: {folios}"
         );
-        assert!(folios.contains("ht_checkins.cin_checkin_time >= $1"), "{folios}");
+        assert!(
+            folios.contains("ht_checkins.cin_checkin_time >= $1"),
+            "{folios}"
+        );
 
         let floor = guest_registry_era_floor_sql();
-        assert!(floor.contains("MIN(ht_checkins.cin_checkin_time)"), "{floor}");
+        assert!(
+            floor.contains("MIN(ht_checkins.cin_checkin_time)"),
+            "{floor}"
+        );
         assert!(floor.contains("FROM ht_guest_registry"), "{floor}");
         assert!(
             floor.contains("date_trunc('day'"),
@@ -11897,9 +12380,8 @@ mod tests {
     #[test]
     fn era_floor_watermark_sql_is_monotonic_and_single_round_trip() {
         assert!(
-            RECONCILE_ERA_FLOOR_UPSERT_SQL.contains(
-                "GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"
-            ),
+            RECONCILE_ERA_FLOOR_UPSERT_SQL
+                .contains("GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"),
             "without GREATEST the upsert would happily write a LOWER floor: \
              {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
         );
@@ -12107,8 +12589,10 @@ mod tests {
         assert!(body.contains("40470"), "effective floor missing: {body:?}");
         assert!(body.contains("hfhotel"), "site missing: {body:?}");
         assert!(
-            body.contains("DELETE FROM ht_reconcile_era_floor WHERE table_name = \
-                           'payment_ledger_probe';"),
+            body.contains(
+                "DELETE FROM ht_reconcile_era_floor WHERE table_name = \
+                           'payment_ledger_probe';"
+            ),
             "the delete-row escape hatch must be spelled out: {body:?}"
         );
         assert!(
@@ -12199,8 +12683,14 @@ mod tests {
         let probe = &NULL_SENTINEL_PROBES[0];
         assert_eq!(probe.table_name, "bookings");
         let body = format_null_sentinel_message(probe, 3, 24);
-        assert!(body.contains("HT_Book_H"), "must name the legacy table: {body:?}");
-        assert!(body.contains("Book_Cust_ID"), "must name the legacy column: {body:?}");
+        assert!(
+            body.contains("HT_Book_H"),
+            "must name the legacy table: {body:?}"
+        );
+        assert!(
+            body.contains("Book_Cust_ID"),
+            "must name the legacy column: {body:?}"
+        );
         assert!(body.contains("*3*"), "must state the count: {body:?}");
         assert!(
             body.to_lowercase().contains("cannot"),
@@ -12747,10 +13237,7 @@ mod tests {
 
         // PRE-FIX: the canonical side counted `rcal_legacy_id IS NOT NULL`
         // only — 3 legacy nights vs 0 mirrored — and fabricated a deficit.
-        let bound_only = canonical
-            .values()
-            .filter(|t| t.legacy_id.is_some())
-            .count();
+        let bound_only = canonical.values().filter(|t| t.legacy_id.is_some()).count();
         assert_eq!(bound_only, 0);
         assert!(
             legacy.len() > bound_only,
@@ -12849,7 +13336,10 @@ mod tests {
             (
                 "deficit alongside both surplus classes",
                 classify_room_calendar_pairs(
-                    &legacy_pairs(&[("107", "2026-08-05", 4799, 1), ("405", "2026-05-11", 50980, 1)]),
+                    &legacy_pairs(&[
+                        ("107", "2026-08-05", 4799, 1),
+                        ("405", "2026-05-11", 50980, 1),
+                    ]),
                     &canonical_pairs(&[
                         ("405", "2026-05-11", 48, None),
                         ("303", "2026-05-14", 87, None),
@@ -12922,7 +13412,10 @@ mod tests {
     #[test]
     fn room_calendar_divergence_is_missing_pg_or_nothing() {
         for c in [
-            classify_room_calendar_pairs(&legacy_pairs(&ville_dropped_nights()), &canonical_pairs(&[])),
+            classify_room_calendar_pairs(
+                &legacy_pairs(&ville_dropped_nights()),
+                &canonical_pairs(&[]),
+            ),
             classify_room_calendar_pairs(
                 &legacy_pairs(&[]),
                 &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
@@ -13052,7 +13545,9 @@ mod tests {
              stamped in the meantime: {sql}"
         );
         assert!(
-            sql.contains("NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"),
+            sql.contains(
+                "NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"
+            ),
             "the id must not already be bound to another row — the partial \
              unique index would raise: {sql}"
         );
@@ -13097,7 +13592,9 @@ mod tests {
             "async fn compute_room_calendar_deficit_hash(",
             "pub(crate) async fn probe_room_calendar_business_key(",
         ] {
-            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} must exist"));
             let rest = &src[start..];
             let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
             assert!(
@@ -13137,7 +13634,9 @@ mod tests {
             "async fn compute_current_pg_hash(",
             "async fn compute_current_legacy_hash(",
         ] {
-            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} must exist"));
             let rest = &src[start..];
             let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
 
@@ -13305,7 +13804,8 @@ mod tests {
              {all} — the region may have been refactored away"
         );
         assert_eq!(
-            all, via_const,
+            all,
+            via_const,
             "{} emission site(s) name their event with a raw string literal \
              instead of a registered EV_ constant. A typo or rename there is \
              invisible to the registry and silently breaks the \
@@ -13546,7 +14046,10 @@ mod tests {
     /// namesake in the issue — must lead with the exact mention.
     #[test]
     fn escalated_level_digest_composition_leads_with_channel_mention() {
-        let body = format_escalated_level_digest_message(72, "• `bookings`: 3 unresolved row(s), oldest *388h*");
+        let body = format_escalated_level_digest_message(
+            72,
+            "• `bookings`: 3 unresolved row(s), oldest *388h*",
+        );
         let msg = SlackMessage::with_site_text_paged("hfhotel", body);
         assert!(
             msg.text.starts_with("<!channel> "),
@@ -13562,7 +14065,12 @@ mod tests {
     /// breaks.
     #[test]
     fn stale_level_digest_composition_has_no_channel_mention() {
-        let body = format_stale_level_digest_message(4, "• `customers`: 1 unresolved row(s), oldest 6h", 24, 72);
+        let body = format_stale_level_digest_message(
+            4,
+            "• `customers`: 1 unresolved row(s), oldest 6h",
+            24,
+            72,
+        );
         let msg = SlackMessage::with_site_text("hfhotel", body);
         assert!(
             !msg.text.contains("<!channel>"),
@@ -13586,7 +14094,8 @@ mod tests {
     /// the re-scope.
     #[test]
     fn burst_alert_composition_leads_with_channel_mention() {
-        let body = format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
+        let body =
+            format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
         let msg = SlackMessage::with_site_text_paged("hfville", body);
         assert!(
             msg.text.starts_with("<!channel> "),
@@ -13618,7 +14127,13 @@ mod tests {
         // `guest_registry` (Phase 6-B) is the first entity name carrying an
         // underscore — it must still read as a bare reconcile table key
         // (no `:`), and must not collide with any namespaced family.
-        for table in ["bookings", "customers", "checkins", "rooms", "guest_registry"] {
+        for table in [
+            "bookings",
+            "customers",
+            "checkins",
+            "rooms",
+            "guest_registry",
+        ] {
             let key = escalated_cooldown_key(table);
             assert_ne!(key, table, "escalation key must not equal the entity name");
             assert!(
@@ -13743,7 +14258,10 @@ mod tests {
             ],
             || level_drift_thresholds_from_env("hfhotel"),
         );
-        assert_eq!((t.stale_hours, t.cooldown_hours, t.escalate_hours), (8, 12, 96));
+        assert_eq!(
+            (t.stale_hours, t.cooldown_hours, t.escalate_hours),
+            (8, 12, 96)
+        );
     }
 
     /// Per-site override wins over the global, and does not leak to the
@@ -13999,5 +14517,306 @@ mod tests {
         ];
         let (first, _, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
         assert_eq!(first.table_name, "HT_Customers");
+    }
+
+    // -------------------------------------------------------------------
+    // Track F5 — loyalty-channel writeback-leg stall tripwire
+    // -------------------------------------------------------------------
+
+    /// Statuses `writeback_jobs` can hold that all mean "iHOTEL has not seen
+    /// this booking". Enumerated in the test rather than in `src` so a new
+    /// lifecycle status added without thought fails here, not in production.
+    const NOT_APPLIED_STATUSES: &[&str] = &["pending", "in_progress", "failed", "exhausted"];
+
+    /// The core "not before N minutes" contract. A hold whose writeback is
+    /// merely in flight must never page: the healthy leg applies in seconds,
+    /// and the whole point of the threshold is that everything below it is
+    /// indistinguishable from normal latency.
+    #[test]
+    fn loyalty_stall_does_not_fire_before_the_threshold() {
+        for age in [0, 1, 5, 9] {
+            assert!(
+                !loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", age, 10),
+                "a {age}-minute-old pending job is still inside the 10-minute window"
+            );
+        }
+    }
+
+    /// …and fires from the threshold onward. `>=`, not `>`, so "alert after
+    /// 10 minutes" means the tick that observes minute 10.
+    #[test]
+    fn loyalty_stall_fires_at_and_after_the_threshold() {
+        for age in [10, 11, 60, 240] {
+            assert!(
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", age, 10),
+                "a {age}-minute-old pending job is a confirmed stall at threshold 10"
+            );
+        }
+    }
+
+    /// Every non-`done` status counts. `in_progress` and `exhausted` are the
+    /// two an allow-list of `('pending','failed')` would silently drop — and
+    /// `in_progress` is the state a worker that dies mid-claim leaves behind,
+    /// i.e. the detector's own primary scenario.
+    #[test]
+    fn loyalty_stall_covers_every_not_applied_status() {
+        for status in NOT_APPLIED_STATUSES {
+            assert!(
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), status, 30, 10),
+                "status `{status}` means the legacy write has not landed"
+            );
+        }
+    }
+
+    /// The one status that must stay silent: the write landed.
+    #[test]
+    fn loyalty_stall_ignores_applied_jobs() {
+        assert!(!loyalty_writeback_is_stalled(
+            Some(LOYALTY_CHANNEL),
+            WRITEBACK_APPLIED_STATUS,
+            10_000,
+            10
+        ));
+    }
+
+    /// Non-loyalty jobs are ignored however old and however broken. A stuck
+    /// desk / OTA / walk-in writeback is a real problem, but it carries no 2h
+    /// fuse and it belongs to the existing digest + queue-depth alerts.
+    /// Widening this predicate would turn a bounded tripwire into a second
+    /// copy of the queue-depth alert.
+    #[test]
+    fn loyalty_stall_ignores_non_loyalty_jobs() {
+        for channel in [Some("ota"), Some("walkin"), Some("desk"), Some(""), None] {
+            for status in NOT_APPLIED_STATUSES {
+                assert!(
+                    !loyalty_writeback_is_stalled(channel, status, 1_440, 10),
+                    "channel {channel:?} / status {status} is out of scope for the F5 tripwire"
+                );
+            }
+        }
+    }
+
+    /// A `book_channel` that only *contains* the marker is not the marker —
+    /// guards against a future `'loyalty-import'` style value quietly joining
+    /// the alert's scope.
+    #[test]
+    fn loyalty_stall_matches_the_channel_marker_exactly() {
+        assert!(!loyalty_writeback_is_stalled(
+            Some("loyalty-import"),
+            "pending",
+            60,
+            10
+        ));
+        // Whitespace padding from a hand-edited row still matches.
+        assert!(loyalty_writeback_is_stalled(
+            Some(" loyalty "),
+            "pending",
+            60,
+            10
+        ));
+    }
+
+    /// End-to-end timeline over the two pure decisions the live tick
+    /// composes: "is it stalled?" and "has the cooldown elapsed?".
+    ///
+    /// Drives 2-minute ticks (the registered cadence) across a 90-minute
+    /// outage with the shipped defaults (threshold 10 min, cooldown 30 min)
+    /// and asserts the exact set of minutes that page. This is the test that
+    /// pins "fires ONCE after N minutes, not before, and not again inside the
+    /// cooldown" as one property rather than three separate ones.
+    #[test]
+    fn loyalty_stall_fires_once_then_respects_the_cooldown() {
+        let threshold = DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES as i64;
+        let cooldown_mins = DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES;
+        let cooldown = std::time::Duration::from_secs((cooldown_mins * 60) as u64);
+
+        let enqueued = chrono::Utc::now();
+        let mut last_alerted: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut fired_at_minute: Vec<i64> = Vec::new();
+
+        for tick in 0..=45 {
+            let minute = tick * 2;
+            let now = enqueued + chrono::Duration::minutes(minute);
+            let stalled =
+                loyalty_writeback_is_stalled(Some(LOYALTY_CHANNEL), "pending", minute, threshold);
+            if stalled && cooldown_elapsed(last_alerted, now, cooldown) {
+                fired_at_minute.push(minute);
+                last_alerted = Some(now);
+            }
+        }
+
+        // Minute 10 is the first tick at-or-past the threshold; then one
+        // reminder every 30 minutes for as long as the leg stays down.
+        assert_eq!(fired_at_minute, vec![10, 40, 70]);
+    }
+
+    /// The all-clear is a closure, not an announcement: it needs BOTH a
+    /// drained backlog and proof that we said something earlier.
+    #[test]
+    fn loyalty_stall_all_clear_fires_once_after_a_real_alert() {
+        // Drained + we alerted ⇒ closure is due.
+        assert!(loyalty_stall_all_clear_due(0, true));
+        // …and it fires exactly once, because the caller clears the cooldown
+        // row on delivery, which flips `alerted_earlier` to false.
+        assert!(!loyalty_stall_all_clear_due(0, false));
+    }
+
+    /// A site that has never stalled must never emit a recovery. This is the
+    /// arm that stops the tripwire posting a `:white_check_mark:` every two
+    /// minutes, forever, on a healthy deployment.
+    #[test]
+    fn loyalty_stall_all_clear_stays_silent_without_a_prior_alert() {
+        assert!(!loyalty_stall_all_clear_due(0, false));
+    }
+
+    /// A partial drain is not a recovery.
+    #[test]
+    fn loyalty_stall_all_clear_stays_silent_while_rows_remain() {
+        assert!(!loyalty_stall_all_clear_due(1, true));
+        assert!(!loyalty_stall_all_clear_due(7, true));
+    }
+
+    /// Env-isolation helper for the F5 threshold tests. Same shape as
+    /// `with_ct_lag_envs` above.
+    fn with_loyalty_stall_envs<T, F: FnOnce() -> T>(
+        minutes: Option<&str>,
+        cooldown: Option<&str>,
+        f: F,
+    ) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+
+        const MINUTES_VAR: &str = "LOYALTY_WRITEBACK_STALL_ALERT_MINUTES";
+        const COOLDOWN_VAR: &str = "LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES";
+
+        let prior_minutes = env::var(MINUTES_VAR).ok();
+        let prior_cooldown = env::var(COOLDOWN_VAR).ok();
+
+        match minutes {
+            Some(v) => env::set_var(MINUTES_VAR, v),
+            None => env::remove_var(MINUTES_VAR),
+        }
+        match cooldown {
+            Some(v) => env::set_var(COOLDOWN_VAR, v),
+            None => env::remove_var(COOLDOWN_VAR),
+        }
+
+        let out = f();
+
+        match prior_minutes {
+            Some(v) => env::set_var(MINUTES_VAR, v),
+            None => env::remove_var(MINUTES_VAR),
+        }
+        match prior_cooldown {
+            Some(v) => env::set_var(COOLDOWN_VAR, v),
+            None => env::remove_var(COOLDOWN_VAR),
+        }
+
+        out
+    }
+
+    #[test]
+    fn loyalty_stall_thresholds_default_when_envs_unset() {
+        let (m, c) = with_loyalty_stall_envs(None, None, || {
+            (
+                loyalty_writeback_stall_minutes(),
+                loyalty_writeback_stall_cooldown_minutes(),
+            )
+        });
+        assert_eq!(m, DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES);
+        assert_eq!(m, 10, "the documented F5 default is 10 minutes");
+        assert_eq!(c, DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES);
+        assert_eq!(c, 30, "the documented F5 default cooldown is 30 minutes");
+    }
+
+    #[test]
+    fn loyalty_stall_thresholds_honour_env_overrides() {
+        let (m, c) = with_loyalty_stall_envs(Some("3"), Some("15"), || {
+            (
+                loyalty_writeback_stall_minutes(),
+                loyalty_writeback_stall_cooldown_minutes(),
+            )
+        });
+        assert_eq!(m, 3);
+        assert_eq!(c, 15);
+    }
+
+    /// Garbage, zero and negatives fall back to the defaults rather than
+    /// disabling the tripwire or turning it into a per-tick firehose — a
+    /// `0`-minute threshold would alert on every job the instant it is
+    /// enqueued.
+    #[test]
+    fn loyalty_stall_thresholds_reject_garbage_and_non_positive_values() {
+        for bad in ["0", "-5", "", "  ", "ten", "10m"] {
+            let (m, c) = with_loyalty_stall_envs(Some(bad), Some(bad), || {
+                (
+                    loyalty_writeback_stall_minutes(),
+                    loyalty_writeback_stall_cooldown_minutes(),
+                )
+            });
+            assert_eq!(
+                m, DEFAULT_LOYALTY_WRITEBACK_STALL_MINUTES,
+                "`{bad}` must not become the threshold"
+            );
+            assert_eq!(
+                c, DEFAULT_LOYALTY_WRITEBACK_STALL_COOLDOWN_MINUTES,
+                "`{bad}` must not become the cooldown"
+            );
+        }
+    }
+
+    /// The cooldown key is a BARE sentinel in the shared cooldown table, so
+    /// the reconcile all-clear must be structurally forbidden from treating
+    /// it as a converged `ht_reconcile_log` table and deleting its row.
+    /// Without this the alert would refire every two minutes during an
+    /// outage.
+    #[test]
+    fn loyalty_stall_cooldown_key_is_excluded_from_the_reconcile_all_clear() {
+        assert!(!is_reconcile_table_key(
+            LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY
+        ));
+        assert!(NON_RECONCILE_COOLDOWN_KEYS.contains(&LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY));
+        // And the sweep must not list it as a "recovered table".
+        let recovered = tables_recovered(&[LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY.to_string()], &[]);
+        assert!(recovered.is_empty());
+    }
+
+    /// The operator-facing text must carry the three things that make it
+    /// actionable at 02:00 without reading code: what the desk sees (iHOTEL
+    /// does NOT show `จอง`), where to go (the runbook), and that a closure is
+    /// coming so nobody sits watching the channel.
+    #[test]
+    fn loyalty_stall_alert_text_names_the_desk_impact_and_the_runbook() {
+        let msg =
+            format_loyalty_stall_message(10, 30, "• `BK-1` — `create_booking` pending for 12m", 1);
+        assert!(
+            msg.contains("จอง"),
+            "must name what the room board is missing"
+        );
+        assert!(msg.contains("docs/runbooks/writeback-leg-degraded.md"));
+        assert!(msg.contains("10 minute(s)"));
+        assert!(msg.contains("30 min"));
+        assert!(
+            msg.contains(":white_check_mark:"),
+            "must promise the all-clear"
+        );
+        // Warning tier, not pager tier — no channel mention (issue #261).
+        assert!(!msg.contains(crate::notifications::slack::PAGER_MENTION.trim()));
+    }
+
+    /// The closure must be recognisably the counterpart of the alert and must
+    /// point at the post-outage cleanup, because a hold that expired mid-
+    /// outage can leave a stale `จอง` behind.
+    #[test]
+    fn loyalty_stall_all_clear_text_closes_the_loop() {
+        let msg = format_loyalty_stall_all_clear_message(10);
+        assert!(msg.starts_with(":white_check_mark:"));
+        assert!(
+            msg.contains(":satellite_antenna:"),
+            "must name the alert it closes"
+        );
+        assert!(msg.contains("docs/runbooks/writeback-leg-degraded.md"));
+        assert!(!msg.contains(crate::notifications::slack::PAGER_MENTION.trim()));
     }
 }
