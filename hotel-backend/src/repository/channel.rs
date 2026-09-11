@@ -429,10 +429,14 @@ pub async fn inventory_snapshot(
         WITH {ctes}
         SELECT (SELECT COUNT(*)::int8 FROM free_rooms) AS free_rooms,
                (SELECT n FROM parked_claims)           AS parked_claims,
-               COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0::int8)
+               -- `SUM(bigint)` is NUMERIC in PostgreSQL, so both of these are
+               -- cast back to int8: without it the row reads as a numeric and
+               -- `try_get::<i64>` fails into the `unwrap_or(0)` below —
+               -- silently reporting "no typed claims" rather than erroring.
+               COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0)::int8
                                                        AS parked_claims_typed,
-               (SELECT n FROM parked_claims)
-                 - COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0::int8)
+               ((SELECT n FROM parked_claims)
+                 - COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0))::int8
                                                        AS parked_claims_untyped,
                (SELECT n FROM inventory_surplus)       AS surplus
         "#,
