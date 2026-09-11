@@ -114,7 +114,7 @@ use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use tokio::sync::broadcast;
 
-use crate::outbox::event::DomainEvent;
+use crate::outbox::event::{DomainEvent, ROOM_SIGNAL_EVENT_NAMES};
 use crate::outbox::legacy_stale::{LegacyStaleSignal, LEGACY_STALE_CHANNEL, LEGACY_STALE_EVENT};
 use crate::routes::mode::{AppState, Branch};
 
@@ -181,6 +181,20 @@ impl EventSite {
         match self {
             EventSite::Hfhotel => "hfhotel",
             EventSite::Hfville => "hfville",
+        }
+    }
+
+    /// The ONE site a `?branch=` selects, or `None` for `all`.
+    ///
+    /// Deliberately total and deliberately `Option`: the maid stream
+    /// ([`hk_signal_receiver`]) must never multiplex two properties, and making
+    /// "all" unrepresentable as a site is how that is enforced by types rather
+    /// than by remembering to check.
+    pub fn for_branch(branch: Branch) -> Option<Self> {
+        match branch {
+            Branch::Hfhotel => Some(Self::Hfhotel),
+            Branch::Hfville => Some(Self::Hfville),
+            Branch::All => None,
         }
     }
 }
@@ -428,6 +442,145 @@ fn frame_stream(
             }
         }
     }
+}
+
+// ============================================================================
+// The maid signal stream (`GET /api/hk/events`) — ADR 0008
+// ============================================================================
+
+/// The ONE SSE event name every room-signal frame is published under on the
+/// maid stream.
+///
+/// The reception board consumes the four `DomainEvent` variant names directly
+/// off `/api/events` (this module's existing contract, unchanged). The `/hk`
+/// page gets a single name instead, carrying the DTO as its data, because it
+/// has exactly one thing to do with any of them: re-render the room's signal
+/// list and play the cue. Four listeners for one behaviour would be four places
+/// to forget a variant.
+pub const HK_SIGNAL_EVENT: &str = "hk_signal";
+
+/// Subscribe to ONE site's fan-out for the maid signal stream, or `None` when
+/// that site has no channel.
+///
+/// **No fallback, by design.** [`EventFanout::receivers_for`] degrades
+/// `hfville` to the HF Hotel channel when Ville is unavailable, which is right
+/// for reception's board (an operator watching the wrong-but-present property
+/// beats a dead stream) and WRONG here: it would stream HF Hotel's room signals
+/// — room numbers, maids' names, guest-accountability notices — to a HF Ville
+/// maid's phone. `None` becomes a `503` at the handler, which is the honest
+/// answer.
+pub fn hk_signal_receiver(
+    fanout: &EventFanout,
+    site: EventSite,
+) -> Option<broadcast::Receiver<BroadcastEvent>> {
+    match site {
+        EventSite::Hfhotel => Some(fanout.hfhotel_sender().subscribe()),
+        EventSite::Hfville => fanout.hfville_sender().map(|tx| tx.subscribe()),
+    }
+}
+
+/// Project one site's fan-out into the maid stream's frames.
+///
+/// Filters on [`ROOM_SIGNAL_EVENT_NAMES`] BEFORE parsing, so a busy site's
+/// booking/check-in traffic costs one `contains` per event and never a JSON
+/// parse. A lagged subscriber gets the same [`RESYNC_EVENT`] burst the main
+/// stream uses rather than a severed connection — the signals it missed are
+/// gone from the ring, but `GET /api/hk/signals` still holds the truth.
+///
+/// Typed over [`Frame`] (not `sse::Event`) for the same reason
+/// [`frame_stream`] is: the ordering and filtering are then assertable without
+/// a browser, a database or an HTTP server.
+pub fn hk_signal_frames(rx: broadcast::Receiver<BroadcastEvent>) -> impl Stream<Item = Frame> {
+    async_stream::stream! {
+        // FIRST, before any await — bytes on the wire in milliseconds so
+        // Cloudflare can never 524 the handshake (same rule as `frame_stream`).
+        yield Frame::Comment(HELLO_COMMENT);
+
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(frame) = hk_signal_frame(&event) {
+                        yield frame;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "hk signal subscriber lagged behind the fan-out; emitting resync",
+                    );
+                    for frame in resync_frames(None, "subscriber-lagged") {
+                        yield frame;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    tracing::warn!(
+                        "domain-event fan-out closed; ending hk signal stream so the client reconnects",
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One broadcast item → one `hk_signal` frame, or `None` if it is not a room
+/// signal. PURE apart from a `tracing` line, so the whole projection is
+/// unit-testable.
+///
+/// The DTO is re-serialized from the parsed event rather than the payload being
+/// forwarded verbatim (the `legacy_stale` treatment): the maid stream's wire
+/// contract is `data = RoomSignal`, not `data = DomainEvent`, so there is a
+/// real projection to perform. Its shape is pinned in `domain::hk_signal`.
+fn hk_signal_frame(event: &BroadcastEvent) -> Option<Frame> {
+    if !ROOM_SIGNAL_EVENT_NAMES.contains(&event.name) {
+        return None;
+    }
+    let parsed = match serde_json::from_str::<DomainEvent>(&event.payload) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                site = event.site.as_str(),
+                name = event.name,
+                error = %err,
+                "Skipping unparseable room-signal payload on the hk stream",
+            );
+            return None;
+        }
+    };
+    let signal = parsed.room_signal()?;
+    let data = match serde_json::to_string(signal) {
+        Ok(data) => data,
+        Err(err) => {
+            tracing::warn!(error = %err, "Failed to serialize a room signal for the hk stream");
+            return None;
+        }
+    };
+    Some(Frame::Message {
+        name: HK_SIGNAL_EVENT,
+        data: Arc::from(data.as_str()),
+    })
+}
+
+/// Wrap a [`Frame`] stream in the repo's standard SSE response — the same
+/// keep-alive interval and comment text `stream` uses, so a maid's phone and
+/// reception's browser are held open by identical mechanics.
+///
+/// Exists so `routes::hk` can build its own stream without `Frame::into_event`
+/// (private, and rightly so) or a second copy of the keep-alive settings.
+pub fn sse_from_frames(
+    frames: impl Stream<Item = Frame> + Send + 'static,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let event_stream = async_stream::stream! {
+        for await frame in frames {
+            yield Ok::<Event, Infallible>(frame.into_event());
+        }
+    };
+    Sse::new(event_stream).keep_alive(
+        KeepAlive::default()
+            .interval(KEEPALIVE_INTERVAL)
+            .text("ping"),
+    )
 }
 
 /// JSON body carried by every frame of a resync burst.
@@ -1070,5 +1223,153 @@ mod tests {
                 Frame::Comment(_) => {}
             }
         }
+    }
+
+    // ---- the maid signal stream (ADR 0008) ------------------------------
+
+    use crate::domain::hk_signal::{
+        RoomSignal, SignalActor, SignalDirection, SignalStatus, ROOM_CHECK,
+    };
+    use crate::outbox::event::EventSource;
+    use uuid::Uuid;
+
+    fn signal_dto() -> RoomSignal {
+        RoomSignal {
+            signal_id: 8871,
+            room_id: 42,
+            room_no: "104".to_string(),
+            direction: SignalDirection::DeskToMaid,
+            signal_type: ROOM_CHECK.to_string(),
+            status: SignalStatus::Open,
+            outcome: None,
+            parent_id: None,
+            created_by: SignalActor {
+                badge: "Q1001".to_string(),
+                name: None,
+            },
+            created_at: "2026-09-01T03:00:00Z".to_string(),
+            acked_by: None,
+            acked_at: None,
+            done_by: None,
+            done_at: None,
+            done_source: None,
+        }
+    }
+
+    fn signal_broadcast(site: EventSite) -> BroadcastEvent {
+        let event = DomainEvent::RoomSignalRaised {
+            room_id: Uuid::nil(),
+            signal: signal_dto(),
+            source: EventSource::our_app(Uuid::nil(), Uuid::nil()),
+        };
+        BroadcastEvent {
+            site,
+            name: event.type_name(),
+            payload: Arc::from(serde_json::to_string(&event).expect("serializes").as_str()),
+        }
+    }
+
+    /// The maid stream serves ONE event name carrying the DTO — not the four
+    /// `DomainEvent` variant names, and not the DomainEvent envelope. This is
+    /// the contract `app/hk` reads.
+    #[test]
+    fn a_signal_event_is_projected_to_one_named_frame_carrying_the_dto() {
+        let frame = hk_signal_frame(&signal_broadcast(EventSite::Hfhotel))
+            .expect("a room-signal event must project to a frame");
+        match frame {
+            Frame::Message { name, data } => {
+                assert_eq!(name, HK_SIGNAL_EVENT);
+                let parsed: RoomSignal = serde_json::from_str(&data).expect("data is the DTO");
+                assert_eq!(parsed, signal_dto());
+                let raw: serde_json::Value = serde_json::from_str(&data).unwrap();
+                assert!(
+                    raw.get("type").is_some_and(|t| t == "room_check"),
+                    "data must be the DTO, not the DomainEvent envelope"
+                );
+            }
+            other => panic!("expected an hk_signal frame, got {other:?}"),
+        }
+    }
+
+    /// Everything that is not a room signal is dropped BEFORE it is parsed —
+    /// a maid's phone must not receive the desk's booking traffic.
+    #[test]
+    fn non_signal_events_never_reach_the_maid_stream() {
+        for name in [
+            "BookingCreated",
+            "CheckInCreated",
+            "RoomMarkedClean",
+            "RoomCleaningStarted",
+            LEGACY_STALE_EVENT,
+            RESYNC_EVENT,
+        ] {
+            assert!(
+                hk_signal_frame(&sample(EventSite::Hfhotel, name)).is_none(),
+                "{name} must not reach the maid stream"
+            );
+        }
+    }
+
+    /// A malformed payload is dropped, never panicked on and never forwarded —
+    /// one bad row must not sever every maid's stream.
+    #[test]
+    fn a_malformed_signal_payload_is_dropped() {
+        let bad = BroadcastEvent {
+            site: EventSite::Hfhotel,
+            name: "RoomSignalRaised",
+            payload: Arc::from(r#"{"type":"RoomSignalRaised","data":{"nope":1}}"#),
+        };
+        assert!(hk_signal_frame(&bad).is_none());
+    }
+
+    /// **The isolation property.** `hk_signal_receiver` must NEVER degrade a
+    /// `hfville` request to the HF Hotel channel the way
+    /// `EventFanout::receivers_for` deliberately does for reception's board.
+    /// Streaming HF Hotel's room signals to a Ville maid is the exact leak this
+    /// endpoint's `?branch=` gate exists to prevent.
+    #[test]
+    fn the_maid_stream_never_falls_back_to_the_other_branch() {
+        let fanout = EventFanout::new(); // hfhotel only — Ville not wired
+        assert!(hk_signal_receiver(&fanout, EventSite::Hfhotel).is_some());
+        assert!(
+            hk_signal_receiver(&fanout, EventSite::Hfville).is_none(),
+            "an unavailable Ville channel must answer None (⇒ 503), never HF Hotel's stream"
+        );
+
+        // Contrast: the reception board's selector DOES fall back, on purpose.
+        let (_primary, secondary) = fanout.receivers_for(Branch::Hfville);
+        assert!(secondary.is_none(), "reception's selector degrades to one channel");
+
+        let mut with_ville = EventFanout::new();
+        with_ville.enable_hfville();
+        assert!(hk_signal_receiver(&with_ville, EventSite::Hfville).is_some());
+    }
+
+    /// `branch=all` has no single site, so it cannot address the maid stream —
+    /// enforced by the type, not by a forgotten check.
+    #[test]
+    fn branch_all_maps_to_no_site() {
+        assert_eq!(EventSite::for_branch(Branch::Hfhotel), Some(EventSite::Hfhotel));
+        assert_eq!(EventSite::for_branch(Branch::Hfville), Some(EventSite::Hfville));
+        assert_eq!(EventSite::for_branch(Branch::All), None);
+    }
+
+    /// Hello frame first (Cloudflare 524 prevention), then only signal frames.
+    #[tokio::test]
+    async fn the_maid_stream_greets_first_then_forwards_only_signals() {
+        let (tx, rx) = broadcast::channel(8);
+        tx.send(sample(EventSite::Hfhotel, "BookingCreated")).unwrap();
+        tx.send(signal_broadcast(EventSite::Hfhotel)).unwrap();
+
+        let mut stream = pin!(hk_signal_frames(rx));
+        assert_eq!(next_frame(&mut stream).await, Frame::Comment(HELLO_COMMENT));
+        match next_frame(&mut stream).await {
+            Frame::Message { name, .. } => assert_eq!(name, HK_SIGNAL_EVENT),
+            other => panic!("expected the hk_signal frame, got {other:?}"),
+        }
+        assert!(
+            matches!(poll_now(&mut stream), Poll::Pending),
+            "the booking event must have been dropped, not queued"
+        );
     }
 }

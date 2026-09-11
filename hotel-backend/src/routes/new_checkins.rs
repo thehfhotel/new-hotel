@@ -491,9 +491,11 @@ struct RoomBasis {
 ///
 /// `cin_total_amount` mirrors legacy `HT_CheckIn_H.Total_Price_Net`
 /// (`sync/mappers/checkin.rs::project_aggregate`), and iHOTEL defines
-/// `Total_Price_Net = Total_Price_Room + Total_Price_Product`, rewriting the
-/// whole family on EVERY payment/sale change
-/// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §359-362). Using it as the room
+/// `Total_Price_Net = Total_Price_Room + Total_Price_Product`
+/// (`docs/coexistence/checkout-folio-comparison.md` §"1. Field mapping" "`Room + Product`"),
+/// rewriting the whole family on EVERY payment/sale change
+/// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "aggregated totals; old app updates these on every payment/sale change"
+/// — was: cheatsheet 359-362, which is the `HT_Room_Status` section). Using it as the room
 /// basis and then adding `product_total` on top DOUBLE-COUNTS every POS line
 /// iHOTEL has already folded in — and, via `CheckOutCommand.room_price_total`
 /// → `writeback/recipes/checkout.rs`, stamps the inflated figure into the
@@ -927,6 +929,27 @@ pub async fn checkout(
         })
         .await
         .map_err(map_checkout_error)?;
+
+    // Loyalty stay hook (docs/loyalty-channel.md Piece 3). OFF unless both
+    // LOYALTY_APP_URL + LOYALTY_SERVICE_TOKEN are set (`from_env` → None).
+    // Fire-and-forget AFTER the checkout committed: the detached task
+    // re-reads the post-commit stay (so a per-room partial checkout that did
+    // NOT complete the stay is skipped), gates on the guest's membership
+    // link, and POSTs with bounded retries + a Slack page on persistent
+    // failure. Nothing here can block or fail the checkout response.
+    if let Some(client) = crate::service::LoyaltyClient::from_env() {
+        // Contract property literal for this branch: hf | hfville.
+        let property = match query.branch.unwrap_or_default() {
+            Branch::Hfville => "hfville",
+            Branch::Hfhotel | Branch::All => "hf",
+        };
+        tokio::spawn(crate::service::loyalty::run_checkout_stay_hook(
+            client,
+            pool.clone(),
+            property.to_string(),
+            cin_id,
+        ));
+    }
 
     Ok(Json(MutationResponse {
         success: true,
@@ -1568,6 +1591,15 @@ pub struct RegistrationSlip {
     pub booking_advance: Option<f64>,
     /// Originating booking number (จากการจองเลขที่ …), if this stay came from one.
     pub booking_no: Option<String>,
+    /// Provenance of the originating booking — `ht_bookings.book_channel`
+    /// (`'loyalty'` for a guest-app booking, an OTA slug, `None` for walk-in /
+    /// phone / manual desk). Paired with `booking_advance` it is what lets the
+    /// desk see that an app booking's deposit is already paid even though
+    /// iHOTEL shows 0 for it until checkout.
+    /// See docs/loyalty-channel.md §"Dual-write policy for holds" "deposit is not mirrored".
+    /// READ-ONLY: set only by the booking create path, never read back on a
+    /// write.
+    pub book_channel: Option<String>,
     pub deposit: Option<f64>,
     pub adults: Option<i32>,
     pub children: Option<i32>,
@@ -1607,6 +1639,7 @@ pub async fn registration_slip(
             GREATEST(1, (ci.cin_expected_checkout - ci.cin_checkin_time::date))::int AS nights, \
             b.book_deposit_amount::float8 AS booking_advance, \
             NULLIF(b.book_no, '') AS booking_no, \
+            b.book_channel AS book_channel, \
             (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
                FROM ht_checkin_rooms cr WHERE cr.cr_cin_id = ci.cin_id) AS deposit, \
             COALESCE( \
@@ -1659,6 +1692,7 @@ pub async fn registration_slip(
         total_amount: folio.as_ref().map(|f| f.net_total),
         booking_advance: row.try_get("booking_advance").ok(),
         booking_no: row.try_get("booking_no").ok(),
+        book_channel: row.try_get("book_channel").ok(),
         deposit: row.try_get("deposit").ok(),
         adults: row.try_get("adults").ok(),
         children: row.try_get("children").ok(),
@@ -1719,6 +1753,24 @@ pub struct DepositRow {
 pub struct DepositsResponse {
     pub success: bool,
     pub deposits: Vec<DepositRow>,
+    /// Provenance of the stay's originating booking —
+    /// `ht_bookings.book_channel`; `None` for a walk-in (no booking) or a
+    /// pre-076 row.
+    ///
+    /// Task B7. The rows above are the desk's own per-room deposits
+    /// (`ht_checkin_rooms`); a deposit the guest paid in the loyalty app lives
+    /// on the BOOKING instead and never appears here. Carrying the channel plus
+    /// [`Self::booking_deposit_amount`] on this response is what lets the folio
+    /// tell reception that money has already been collected even though iHOTEL
+    /// shows this booking's deposit as 0 until checkout.
+    /// See docs/loyalty-channel.md §"Dual-write policy for holds" "deposit is not mirrored".
+    /// READ-ONLY; neither field is ever written back.
+    pub book_channel: Option<String>,
+    /// Booking-level deposit in BAHT (`ht_bookings.book_deposit_amount`).
+    /// NOT the same money as `deposits[].amount`, which is the per-room
+    /// `cr_dep_amount` taken at the desk — the two are separate concepts and
+    /// must never be summed.
+    pub booking_deposit_amount: Option<f64>,
 }
 
 /// Response for `POST /api/checkins/{id}/deposit-refund`.
@@ -1810,9 +1862,33 @@ pub async fn list_deposits(
         })
         .collect();
 
+    // Task B7 — the originating booking's channel + its own deposit. Separate
+    // lightweight lookup rather than a join above, because the query above is
+    // driven by `ht_checkin_rooms` and filters `cr_dep_amount > 0`: an app
+    // booking whose rooms took NO desk deposit would otherwise return zero rows
+    // and the signpost would vanish exactly where it is needed. A walk-in has
+    // no `cin_book_id`, so both fields come back `None`.
+    let booking = sqlx::query(
+        "SELECT b.book_channel AS book_channel, \
+                b.book_deposit_amount::float8 AS booking_deposit_amount \
+           FROM ht_checkins ci \
+           JOIN ht_bookings b ON b.book_id = ci.cin_book_id \
+          WHERE ci.cin_id = $1",
+    )
+    .bind(cin_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Database(e.to_string()))?;
+
     Ok(Json(DepositsResponse {
         success: true,
         deposits,
+        book_channel: booking
+            .as_ref()
+            .and_then(|r| r.try_get("book_channel").ok()),
+        booking_deposit_amount: booking
+            .as_ref()
+            .and_then(|r| r.try_get("booking_deposit_amount").ok()),
     }))
 }
 
@@ -2897,5 +2973,114 @@ mod tests {
         let command = build_extend_stay_command(&detail, &body);
         assert_eq!(command.new_room_price_total.as_satang(), 0);
         assert_eq!(command.guest_label, "", "no customer name → empty label");
+    }
+
+    // =========================================================================
+    // Task B7 — app-deposit signpost wire contract
+    //
+    // iHOTEL shows a loyalty booking's deposit as 0 until checkout by design —
+    // docs/loyalty-channel.md §"Dual-write policy for holds" "deposit is not mirrored"
+    // — so the desk UI has to say so itself. These tests pin the
+    // two read-side fields that decision rests on: they must reach the wire
+    // camelCased, and they must be PRESENT-as-null for a walk-in so the
+    // frontend can branch without an `undefined` check.
+    // =========================================================================
+
+    fn registration_slip_fixture(book_channel: Option<&str>) -> RegistrationSlip {
+        RegistrationSlip {
+            success: true,
+            registration_no: "CIN-20260911-0001".to_string(),
+            check_in_id: 1,
+            acc_no: None,
+            guest_name: "สมชาย ใจดี".to_string(),
+            guest_id_card: None,
+            guest_contact: None,
+            guest_address: None,
+            vehicle_plate: None,
+            room_number: "401".to_string(),
+            room_type: None,
+            check_in_date: None,
+            check_out_date: None,
+            nights: 1,
+            rate_per_night: None,
+            other_total: None,
+            total_amount: None,
+            booking_advance: Some(600.0),
+            booking_no: Some("B000123".to_string()),
+            book_channel: book_channel.map(str::to_string),
+            deposit: None,
+            adults: None,
+            children: None,
+            guest_photo_doc_id: None,
+        }
+    }
+
+    /// The registration card is the screen reception has open with the arriving
+    /// guest in front of them, so it must carry the channel alongside the
+    /// already-present `bookingAdvance`.
+    #[test]
+    fn registration_slip_serialises_book_channel_as_camel_case() {
+        let json = serde_json::to_value(registration_slip_fixture(Some("loyalty")))
+            .expect("RegistrationSlip serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+        assert_eq!(json["bookingAdvance"], serde_json::json!(600.0));
+        assert!(
+            json.get("book_channel").is_none(),
+            "snake_case key must not leak onto the wire: {json}"
+        );
+    }
+
+    /// Walk-in: no booking, so no channel. The key still has to exist.
+    #[test]
+    fn registration_slip_absent_channel_is_explicit_null() {
+        let json = serde_json::to_value(registration_slip_fixture(None)).expect("slip serialises");
+
+        assert!(
+            json.as_object()
+                .expect("slip is an object")
+                .contains_key("bookChannel"),
+            "bookChannel must be present even when NULL: {json}"
+        );
+        assert_eq!(json["bookChannel"], serde_json::Value::Null);
+    }
+
+    /// The folio reads its signpost off the deposits response. The
+    /// booking-level deposit is a DIFFERENT sum from the per-room
+    /// `deposits[].amount`, so it gets its own distinctly-named key rather than
+    /// overloading `deposit`.
+    #[test]
+    fn deposits_response_carries_booking_channel_and_deposit() {
+        let json = serde_json::to_value(DepositsResponse {
+            success: true,
+            deposits: vec![],
+            book_channel: Some("loyalty".to_string()),
+            booking_deposit_amount: Some(600.0),
+        })
+        .expect("DepositsResponse serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+        assert_eq!(json["bookingDepositAmount"], serde_json::json!(600.0));
+        // An app booking normally has NO per-room desk deposit, so the signpost
+        // must not depend on this list being non-empty.
+        assert_eq!(json["deposits"], serde_json::json!([]));
+    }
+
+    /// A walk-in folio: both fields present, both null.
+    #[test]
+    fn deposits_response_walkin_reports_null_booking_fields() {
+        let json = serde_json::to_value(DepositsResponse {
+            success: true,
+            deposits: vec![],
+            book_channel: None,
+            booking_deposit_amount: None,
+        })
+        .expect("DepositsResponse serialises");
+
+        let obj = json.as_object().expect("response is an object");
+        assert!(obj.contains_key("bookChannel"), "{json}");
+        assert!(obj.contains_key("bookingDepositAmount"), "{json}");
+        assert_eq!(json["bookChannel"], serde_json::Value::Null);
+        assert_eq!(json["bookingDepositAmount"], serde_json::Value::Null);
     }
 }

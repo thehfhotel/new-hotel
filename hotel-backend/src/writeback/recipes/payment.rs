@@ -67,7 +67,7 @@ pub struct PaymentInputs<'a> {
     pub receipt_no: &'a str,
     pub receipt_h_id: i32,
     /// `HT_CheckIn_Ds.id` for the room being paid for. When `Some(_)` the
-    /// recipe emits the spike §3h capture line 3 statement
+    /// recipe emits the `raw/invoice-20260424-100827/writes.txt:3` (spike §3h) statement
     /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
     /// to apportion the payment to a single check-in detail row. `None`
     /// skips that UPDATE — header totals still settle.
@@ -234,7 +234,9 @@ pub fn build_statements(
     //
     //    Audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal` are the
     //    actual tender amount (not the nightly total). The legacy invariant
-    //    (COMPAT_CHEATSHEET.md:534) requires
+    //    (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay` (A)"
+    //    "Cin_Pay_Cash+Cin_Pay_Credit+Cin_Pay_Free+Cin_Pay_Tran+Cin_Pay_web")
+    //    requires
     //    `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`. The unit
     //    price (`Cin_Pay_Ds_PriceOne`) and quantity (`Cin_Pay_Ds_Num`)
     //    remain verbatim so the printed receipt line still shows the
@@ -290,8 +292,8 @@ pub fn build_statements(
     //    re-aggregation, so we no longer race the iHOTEL absolute SET. The
     //    `cin_status <> 'ยกเลิก'` filter excludes cancelled tender rows
     //    per T2 CRIT-2 (`Cin_Status` column on HT_CheckIn_Pay carries
-    //    `'1'` for active or `'ยกเลิก'` for cancelled — COMPAT_CHEATSHEET
-    //    line 106 / 498-500).
+    //    `'1'` for active or `'ยกเลิก'` for cancelled — `COMPAT_CHEATSHEET.md`
+    //    §"1.5 Boolean conventions" "`Cin_Pay_Status` (HT_CheckIn_Pay)").
     //
     //    Pattern matches the booking-edit race-safety recipe validated in
     //    spike §6.
@@ -805,7 +807,9 @@ mod tests {
     /// Fix for audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal`
     /// must equal the actual tender amount, satisfying the legacy invariant
     /// `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`
-    /// (COMPAT_CHEATSHEET.md:534). With the prior (nightly_total) wiring a
+    /// (`COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay` (A)"
+    /// "Cin_Pay_Cash+Cin_Pay_Credit+Cin_Pay_Free+Cin_Pay_Tran+Cin_Pay_web").
+    /// With the prior (nightly_total) wiring a
     /// partial payment broke the invariant: a 400-baht prepayment against a
     /// 711-baht nightly stay would write Ds_Price=711 but Cash+...=400.
     #[test]

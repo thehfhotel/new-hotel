@@ -1264,7 +1264,7 @@ pub(crate) async fn upsert_customer_from_row(
 }
 
 /// iHOTEL's reserved "deleted customer" sentinel (cheatsheet §3.24 /
-/// §HT_Customers invariants). The delete cascade rewrites every FK-style
+/// §`HT_Customers` invariants). The delete cascade rewrites every FK-style
 /// reference (`Cin_cust_no`, `Book_Cust_ID`, …) to `'C0000'`, and NO
 /// real `HT_Customers` row with that `Cust_no` exists — so the
 /// eager-mirror fetch can never satisfy it.

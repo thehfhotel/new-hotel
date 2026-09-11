@@ -1,5 +1,6 @@
 //! Scheduler module for background jobs
 
+pub mod hk_escalation;
 mod jobs;
 pub mod mirror;
 pub mod mirror_probe;

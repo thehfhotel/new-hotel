@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT book_id\n          FROM ht_bookings\n         WHERE book_channel = 'loyalty'\n           AND book_status = 'pending'\n           AND book_hold_expires_at IS NOT NULL\n           AND book_hold_expires_at < NOW()\n         ORDER BY book_id\n         LIMIT 100\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "book_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fb1ecf46abd71e5aa0d25592f01853537a65e72f8db31628536833f649ec7d26"
+}

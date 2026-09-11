@@ -217,6 +217,79 @@ services:
       # AUD tag of its path-scoped CF Access app; every /api/hk 401s
       # while unset (ships dark).
       - CF_ACCESS_HK_AUD=${CF_ACCESS_HK_AUD:-}
+      # /hk maid surface policy (wave-4 housekeeping). Same defaults as
+      # HkPolicy::from_env() in hotel-backend/src/main.rs. HK_BRANCHES
+      # defaults hfhotel-only — HF Ville needs repair_room_legacy_keys
+      # first (PENDING-VERIFICATIONS.md V13). HK_MARK_DIRTY_ENABLED ships
+      # OFF (invariant #6 — a maid's phone as the write TRIGGER needs its
+      # own reception-coordinated window, see PENDING-VERIFICATIONS.md V12).
+      - HK_MARK_DIRTY_ENABLED=${HK_MARK_DIRTY_ENABLED:-false}
+      - HK_BRANCHES=${HK_BRANCHES:-hfhotel}
+      # CR-1 (iHOTEL-WINS room status on /hk): HF Ville's LEGACY MSSQL target
+      # for the READ-ONLY `SELECT Room_no, Room_Clean FROM HT_Rooms` the maid
+      # list is reconciled against (hotel-backend/src/legacy_room_status.rs).
+      #
+      # HF Hotel needs NOTHING here: this container already carries DB_SERVER /
+      # DB_NAME / DB_USER / MSSQL_PORT + the db_password secret (above) for the
+      # scheduler's reconcile backstop, and the reader reuses that same pool.
+      #
+      # Values mirror the `sync-hfville` / `writeback-hfville` sidecars
+      # verbatim (Ville legacy MSSQL via the WG path, DNAT through MikroTik).
+      # Literals-as-defaults, exactly like those sidecars — no deploy-payload
+      # entry and no new GH variable is needed. The password reuses
+      # /run/secrets/db_password (both sites' legacy MSSQL share one `sa`
+      # credential today); set VILLE_MSSQL_PASSWORD to split them when one
+      # site rotates first.
+      #
+      # Named VILLE_MSSQL_* and NOT VILLE_DB_* on purpose — the latter is the
+      # Ville POSTGRES mirror further down. Two databases sharing an env
+      # prefix is how a read ends up pointed at the wrong server.
+      #
+      # The backend connects here ONLY when HK_BRANCHES admits hfville (V13),
+      # so while HK_BRANCHES=hfhotel this opens zero connections. Unset or
+      # unreachable is a supported state: /hk falls back to the canonical PG
+      # value with a visible Thai note.
+      - VILLE_MSSQL_SERVER=${VILLE_MSSQL_SERVER:-192.168.11.51}
+      - VILLE_MSSQL_PORT=${VILLE_MSSQL_PORT:-1436}
+      - VILLE_MSSQL_NAME=${VILLE_MSSQL_NAME:-HOTEL}
+      - VILLE_MSSQL_USER=${VILLE_MSSQL_USER:-sa}
+      # Per-employee location enforcement (wave-4 housekeeping C). HK_BRANCHES
+      # above answers "which properties does this DEPLOYMENT serve"; it never
+      # answered "which property does THIS MAID work at", so a HF Ville maid
+      # was offered HF Hotel in the picker and could file against the wrong
+      # property. With this ON, /api/hk/me serves HK_BRANCHES ∩ {the
+      # employee's HF ID location} and every room endpoint refuses a branch
+      # that is not hers.
+      #
+      # Ships OFF (invariant #6): flipping it can lock staff OUT of the
+      # surface — anyone whose HF ID Employee.location is NULL is refused, by
+      # design and with no fallback. Preconditions, in order (see
+      # PENDING-VERIFICATIONS.md V14): the owner sets every maid's location in
+      # HF ID (badge 421 is the only NULL today) → HFID_LOCATION_URL and
+      # HFID_RESOLVE_SECRET are both live → only THEN flip this.
+      #
+      # With the flag ON and the lookup unconfigured, EVERY /hk request 503s
+      # (fail closed — "unconfigured" must never equal "allowed"). The startup
+      # line logs `location_enforcement_enabled=… (lookup configured: …)`.
+      - HK_LOCATION_ENFORCEMENT_ENABLED=${HK_LOCATION_ENFORCEMENT_ENABLED:-false}
+      # FULL URL of HF ID's badge → location endpoint, path included —
+      # http://192.168.100.228:5000/api/private/reader/resolve-badge
+      # (fingerprint-time-logger app/api/reader.py). A full URL rather than a
+      # base + hardcoded path so a peer-side path change is a variable edit,
+      # not a code change.
+      #
+      # LAN ONLY — never route this through Cloudflare. It is a
+      # server-to-server call inside the property network sitting in the
+      # request path of every /hk read; an edge hop would add an auth surface,
+      # a failure mode and latency to it.
+      #
+      # Deliberately no default: unset must read as "unconfigured" (⇒ 503,
+      # fail closed), never as a confident lookup against a guessed path.
+      - HFID_LOCATION_URL=${HFID_LOCATION_URL:-}
+      # HF ID's on-duty escalation endpoint (ADR 0008 room signals). Same
+      # posture: no default — unset means the escalation scheduler never
+      # registers (one startup log line), which is "off", not an error.
+      - HFID_ESCALATE_URL=${HFID_ESCALATE_URL:-}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap
@@ -540,11 +613,108 @@ services:
       # Dir holding the card-reader middleware installers, served by
       # /api/downloads/middleware/{platform}. Bind-mounted read-only below.
       - MIDDLEWARE_ASSETS_DIR=${MIDDLEWARE_ASSETS_DIR:-/run/assets/middleware}
+      # OTA booking bridge (docs/ota-bridge.md) — the machine surface ota-desk
+      # calls on /api/ota/*. Both flags default OFF: the surface answers 503
+      # until ENABLED, then accepts un-credentialed calls (with a per-request
+      # WARN) until ENFORCE. The shared bearer itself is a SECRET, delivered as
+      # /run/secrets/ota_bridge_token — never an environment: entry.
+      #
+      # ADR 0004 applies to these two exactly as to the reconcile flags above:
+      # the DEFAULTS BELOW ARE THE LIVE PRODUCTION VALUES, they are deliberately
+      # NOT in .github/workflows/docker-build.yml, and they are NOT GitHub repo
+      # variables. Flip one by editing its default here — docker-compose.yml is
+      # in the workflow's `deploy` paths filter, so the edit triggers its own
+      # deploy and the flip is a one-line reviewable diff. Adding either key
+      # back to the workflow would make these defaults unreachable and silently
+      # revert the authentication posture on the next deploy.
+      #
+      # Flipping ENFORCE is NOT "just config": it is what turns an accepted
+      # unauthenticated ota-desk call into a 401. Precondition is 24h of zero
+      # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
+      - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-true}
+      - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-true}
+      # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+      #
+      # ADR 0004 applies to LOYALTY_CHANNEL_ENABLED exactly as to OTA_BRIDGE_*
+      # above: THE DEFAULT BELOW IS THE LIVE PRODUCTION VALUE, the key is
+      # deliberately NOT in .github/workflows/docker-build.yml, and it is NOT a
+      # GitHub repo variable. Flip it by editing the default here —
+      # docker-compose.yml is in the workflow's `deploy` paths filter, so the
+      # edit triggers its own deploy and the flip is a one-line reviewable diff
+      # that `git log -S LOYALTY_CHANNEL_ENABLED` can date. Adding the key back
+      # to the workflow would make this default unreachable and leave this file
+      # asserting the channel is dark while it is writing to the legacy DB;
+      # `lint-deploy-flag-ownership` fails CI if anyone does.
+      #
+      # Off ⇒ EVERY /api/channel/* request answers 503 before any credential is
+      # looked at (middleware::channel_token). Flipping it on is NOT "just
+      # config": a channel hold writes into the shared legacy DB as a normal จอง
+      # the moment it is created (coexistence invariant #6), so it needs a
+      # reception-coordinated live verification.
+      #
+      # There is ONE flag for BOTH properties — routes::channel::
+      # channel_service_for gates only HF Ville mutations (on
+      # HFVILLE_WRITES_ENABLED) and HF Hotel has no second gate — so this flip
+      # opens the mutating channel at HF Hotel and HF Ville in the same deploy.
+      # A single-property canary can only be enforced by the caller (the loyalty
+      # app choosing which `property=` it sends). See docs/loyalty-channel.md →
+      # "Go-live checklist".
+      - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
+      # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
+      # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
+      # secret file; with either missing, LoyaltyClient::from_config yields None
+      # and no stay ever accrues points (the checkout itself is unaffected).
+      #
+      # Unlike the flag above this one DOES ride the workflow as
+      # `vars.LOYALTY_APP_URL || ''` — a per-environment URL is the category ADR
+      # 0004 leaves on the variable path (ROUND_WRITEBACK_ENABLED /
+      # HFID_LOCATION_URL family). The two literals must stay identical;
+      # `lint-deploy-flag-ownership` asserts it.
+      - LOYALTY_APP_URL=${LOYALTY_APP_URL:-}
+      # NOTE: LOYALTY_CHANNEL_TOKEN and LOYALTY_SERVICE_TOKEN are SECRETS and so
+      # deliberately have NO `environment:` entry. They ride the deploy payload's
+      # `.secrets` block → /home/deploy/secrets/<name> → /run/secrets/<name>
+      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP maps both files).
+      # Their compose `secrets:` declaration landed ONE DEPLOY AFTER the payload
+      # keys (#296), exactly as ota_bridge_token and hfid_resolve_secret did —
+      # see the `secrets:` list below and docs/loyalty-channel.md →
+      # "Provisioning (deploy plumbing)" step 2. Mounting the files does not
+      # open anything: the channel still needs LOYALTY_CHANNEL_ENABLED (false,
+      # just above) and the stay hook still needs LOYALTY_APP_URL (blank).
     secrets:
       - db_password
       - postgres_password
       - ville_db_password
       - slack_webhook_url
+      # OTA booking bridge (docs/ota-bridge.md). SAFE to declare only because
+      # the deploy payload has carried `.secrets.ota_bridge_token{,_previous}`
+      # since the previous deploy, so both host files exist. run-deploy.sh
+      # writes a file for EVERY key in .secrets — including empty values — so
+      # an unset GH secret yields an empty file: the hydrator skips it (empty ==
+      # missing), the env var stays unset and the gate fails closed. A MISSING
+      # file, by contrast, aborts the entire stack start.
+      - ota_bridge_token
+      - ota_bridge_token_previous
+      # /hk employee-location lookup (hotel-backend/src/hfid_location.rs).
+      # SAFE to declare only because the deploy payload has carried
+      # `.secrets.hfid_resolve_secret` since the previous deploy, so the host
+      # file exists. Same one-deploy stagger, and the same reason, as the OTA
+      # pair above: run-deploy.sh writes a file for EVERY key in `.secrets`
+      # including empty values, so an unset GH secret yields an empty file
+      # (the hydrator skips it, no lookup client is built, the gate fails
+      # closed with 503) — whereas a compose `secrets:` entry pointing at a
+      # MISSING file aborts the ENTIRE stack start, not just backend.
+      #
+      # Backend only; no worker resolves badges.
+      - hfid_resolve_secret
+      # Loyalty-app bearers (docs/loyalty-channel.md). Backend only — no worker
+      # serves /api/channel/* or fires the checkout stay hook. SAFE to declare
+      # for the same reason as the entries above: the deploy payload has carried
+      # both `.secrets` keys since #296, so run-deploy.sh has already written
+      # both host files (empty while the GH secrets are unset, which the
+      # hydrator treats as absent — every gate stays closed).
+      - loyalty_channel_token
+      - loyalty_service_token
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -1332,15 +1502,36 @@ networks:
 # reads `std::env::var("DB_PASSWORD")` keeps working unchanged.
 #
 # DEPLOY-TIME PREREQUISITES on evergreen (must exist BEFORE merge / pipeline
-# runs `docker compose up`). The deploy script (`/srv/run-deploy.sh` on
-# evergreen, NOT in this repo) is responsible for writing these from GH
-# secrets, chmod 0400, chown deploy:docker:
+# runs `docker compose up`). The deploy script (`scripts/deploy/run-deploy.sh`
+# in this repo, self-updating `/srv/run-deploy.sh` on evergreen) is responsible
+# for writing these from the payload's `.secrets` block — `install -m 0444 -o
+# deploy -g docker`, one uniform loop over EVERY key, so a newly added secret
+# lands with exactly the same mode as the ones below.
+#
+# 0444, not 0400: the backend container's non-root `appuser` has to read the
+# bind-mounted file (v2.66.2 operator note). Tightening it is a tracked
+# follow-up with its own reasoning block in run-deploy.sh — do not "fix" the
+# mode in passing.
+#
+# One file per key under the top-level `secrets:` block at the end of this
+# file — that block is the authority; keep this list in step with it:
 #
 #     /home/deploy/secrets/db_password
 #     /home/deploy/secrets/postgres_password
-#     /home/deploy/secrets/ville_db_password   # symlink to postgres_password
-#                                              # until ADR 0001 Phase 8 split
+#     /home/deploy/secrets/ville_db_password   # a REAL file per key (one value
+#                                              # per secret, no symlink); still
+#                                              # the postgres value until HF
+#                                              # Ville gets its own credential
+#                                              # (ADR 0002)
 #     /home/deploy/secrets/slack_webhook_url
+#     /home/deploy/secrets/ota_bridge_token
+#     /home/deploy/secrets/ota_bridge_token_previous   # normally EMPTY
+#     /home/deploy/secrets/hfid_resolve_secret
+#     /home/deploy/secrets/loyalty_channel_token       # EMPTY until minted
+#     /home/deploy/secrets/loyalty_service_token       # EMPTY until minted
+#
+# An EMPTY file is fine (the hydrator treats it as absent, the gate stays
+# closed); a MISSING file is not — see below.
 #
 # An entry under `secrets:` that points to a missing file fails fast with
 #     "no such file or directory" before any container starts — operators
@@ -1365,3 +1556,45 @@ secrets:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/ville_db_password
   slack_webhook_url:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/slack_webhook_url
+  # OTA booking bridge shared bearer + its rotation slot (docs/ota-bridge.md).
+  # Declared ONE DEPLOY AFTER the docker-build.yml payload key that creates the
+  # files — see the note above about a missing file aborting the whole stack.
+  # `ota_bridge_token` MUST hold the identical string as ota-desk's
+  # `PMS_BRIDGE_TOKEN`; compare `sha256(token)[0..6]` on both sides rather than
+  # the values.
+  ota_bridge_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token
+  ota_bridge_token_previous:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token_previous
+  # Shared secret for the `/hk` employee-location lookup
+  # (hotel-backend/src/hfid_location.rs → `X-Reader-Secret`). Declared ONE
+  # DEPLOY AFTER the docker-build.yml payload key that creates the file — see
+  # the note above about a missing file aborting the whole stack.
+  #
+  # It MUST hold the identical string as fingerprint-time-logger's
+  # `READER_RESOLVE_SECRET` (HF ID guards its entire app↔central surface with
+  # that one secret — there is no separate credential to find). Same value as
+  # this stack's own `READER_RESOLVE_SECRET`; the distinct name keeps the two
+  # consumers independently rotatable. See CLAUDE.md → "Credentials & Docker
+  # secrets" for the three-names-one-secret table.
+  hfid_resolve_secret:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/hfid_resolve_secret
+  # Loyalty-app integration bearers (docs/loyalty-channel.md → "Provisioning
+  # (deploy plumbing)", step 2). Declared ONE DEPLOY AFTER the docker-build.yml
+  # payload keys `.secrets.loyalty_channel_token` / `.secrets.loyalty_service_token`
+  # (landed in #296), so both host files exist — the same stagger, and the same
+  # reason, as the OTA pair and hfid_resolve_secret above.
+  #
+  # `loyalty_channel_token` is the INBOUND bearer the loyalty app presents on
+  # /api/channel/*; `loyalty_service_token` is the OUTBOUND bearer this PMS
+  # presents on the checkout stay hook (it must hold the identical string as the
+  # loyalty app's own service token).
+  #
+  # Mounting them changes NOTHING about the dark state: the channel surface is
+  # additionally gated on LOYALTY_CHANNEL_ENABLED (false, compose-owned per ADR
+  # 0004) and the stay hook needs LOYALTY_APP_URL as well. An unset GH secret
+  # yields an EMPTY file, which the hydrator treats as absent.
+  loyalty_channel_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token
+  loyalty_service_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_service_token

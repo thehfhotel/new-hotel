@@ -258,6 +258,63 @@ impl ServerConfig {
     }
 }
 
+/// HF Ville's LEGACY MSSQL target, for read-only reads issued from the API
+/// backend (CR-1 — the `/hk` iHOTEL room-status read, `crate::legacy_room_status`).
+///
+/// The API container already carries HF Hotel's legacy target
+/// ([`DbConfig::from_env`] — `DB_SERVER` / `DB_NAME` / `DB_USER` / `MSSQL_PORT`
+/// + the `db_password` secret), because `main.rs` builds a legacy pool for the
+/// scheduler's reconcile backstop. It carries NO Ville target: Ville's legacy
+/// server is reached only by the `sync-hfville` / `writeback-hfville`
+/// sidecars, which hardcode it in `docker-compose.yml`. This mirrors those
+/// sidecars so a branch-aware read can resolve BOTH sites, and it keeps their
+/// values as DEFAULTS so the deploy payload needs no new entry.
+///
+/// **Every field is optional and the whole thing may resolve to `None`.** A
+/// missing password (the only value that cannot be defaulted) yields `None`,
+/// which the `/hk` merge treats exactly like an unreachable legacy: show the
+/// canonical PG value with the visible Thai note. Unconfigured is a degraded
+/// display, never a failure to boot — that is what lets this ship compatible.
+///
+/// Named `VILLE_MSSQL_*`, deliberately NOT `VILLE_DB_*`: the latter is already
+/// taken by [`VilleDbConfig`], the Ville POSTGRES mirror. Two different
+/// databases sharing an env prefix is how a read ends up pointed at the wrong
+/// server.
+#[derive(Debug, Clone)]
+pub struct VilleLegacyDbConfig;
+
+impl VilleLegacyDbConfig {
+    /// Resolve HF Ville's legacy-MSSQL target, or `None` when there is no
+    /// usable password.
+    ///
+    /// The password falls back to `DB_PASSWORD` because both sites' legacy
+    /// MSSQL share one `sa` credential today — the same reuse (and the same
+    /// caveat) `docker-compose.yml`'s `sync-hfville` documents. Set
+    /// `VILLE_MSSQL_PASSWORD` to split them when one site rotates first.
+    pub fn from_env() -> Option<DbConfig> {
+        let password = env::var("VILLE_MSSQL_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| env::var("DB_PASSWORD").ok().filter(|v| !v.is_empty()))?;
+        Some(DbConfig {
+            server: env::var("VILLE_MSSQL_SERVER")
+                .unwrap_or_else(|_| "192.168.11.51".to_string()),
+            port: parse_mssql_port("VILLE_MSSQL_PORT", 1436),
+            database: env::var("VILLE_MSSQL_NAME").unwrap_or_else(|_| "HOTEL".to_string()),
+            user: env::var("VILLE_MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
+            password,
+            // Small on purpose: this pool serves ONE read (`SELECT Room_no,
+            // Room_Clean FROM HT_Rooms`) on a surface with a handful of
+            // concurrent maids. It must never be able to crowd the shared
+            // legacy server the way a writeback pool could.
+            pool_max: env::var("VILLE_MSSQL_POOL_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        })
+    }
+}
+
 /// Database configuration for HF Ville mirror (PostgreSQL via cloudflared tunnel)
 #[derive(Debug, Clone)]
 pub struct VilleDbConfig {
@@ -519,6 +576,103 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// Loyalty-app integration config (booking channel + checkout stay hook).
+///
+/// Two independent halves, both fail-closed:
+///
+/// * **Inbound channel** (`/api/channel/*` — availability / hold-create /
+///   payment-verified / release): ships DARK behind `LOYALTY_CHANNEL_ENABLED`
+///   (default off, [`flag_enabled`] semantics) AND requires the shared bearer
+///   `LOYALTY_CHANNEL_TOKEN`. Channel holds ride the normal booking-create
+///   path — a roomed `pending` booking DOES write back to iHOTEL as `จอง` —
+///   so the flag flip is a coordinated go-live step (coexistence invariant
+///   #6), not "just config".
+/// * **Outbound stay hook** (`POST {LOYALTY_APP_URL}/api/loyalty/stays` on
+///   checkout of a membership-linked guest): active only when BOTH
+///   `LOYALTY_APP_URL` and `LOYALTY_SERVICE_TOKEN` are set (unset/empty ⇒
+///   hook silently off). Best-effort + retried; NEVER blocks a checkout.
+///
+/// Both tokens also flow through the `/run/secrets` hydrator (`secrets.rs` —
+/// files `loyalty_channel_token` / `loyalty_service_token`); env vars win.
+#[derive(Debug, Clone, Default)]
+pub struct LoyaltyConfig {
+    /// `LOYALTY_CHANNEL_ENABLED` — master switch for the inbound channel API.
+    pub channel_enabled: bool,
+    /// `LOYALTY_CHANNEL_TOKEN` — shared bearer the loyalty app presents on
+    /// every `/api/channel/*` request. `None` (unset/empty) ⇒ fail closed
+    /// (every channel request rejected) even if the flag is on.
+    pub channel_token: Option<String>,
+    /// `LOYALTY_APP_URL` — loyalty app base URL for the checkout stay hook.
+    pub app_url: Option<String>,
+    /// `LOYALTY_SERVICE_TOKEN` — bearer for the outbound stay hook.
+    pub service_token: Option<String>,
+}
+
+impl LoyaltyConfig {
+    pub fn from_env() -> Self {
+        Self {
+            channel_enabled: flag_enabled("LOYALTY_CHANNEL_ENABLED"),
+            channel_token: optional_env("LOYALTY_CHANNEL_TOKEN"),
+            app_url: optional_env("LOYALTY_APP_URL"),
+            service_token: optional_env("LOYALTY_SERVICE_TOKEN"),
+        }
+    }
+
+    /// The outbound checkout→loyalty stay hook is active (both halves set).
+    pub fn stay_hook_configured(&self) -> bool {
+        self.app_url.is_some() && self.service_token.is_some()
+    }
+}
+
+/// OTA booking-bridge config (`/api/ota/*` — see `docs/ota-bridge.md`).
+///
+/// The bridge is the machine surface that `ota-desk` calls to create bookings
+/// and to read them back for reconciliation. Unlike the loyalty channel it
+/// re-mounts EXISTING handlers, which the desk UI also reaches on `/api/*`
+/// through the Next.js rewrite — so this parallel prefix exists precisely so a
+/// bearer can be required WITHOUT breaking the browser UI.
+///
+/// Two flags, both [`flag_enabled`] semantics, both default **off**, and both
+/// deliberately absent from `.github/workflows/docker-build.yml` per ADR 0004
+/// (their state lives in `docker-compose.yml` defaults; re-adding them to the
+/// workflow would make those defaults unreachable dead code):
+///
+/// * `OTA_BRIDGE_ENABLED` — master switch. Off ⇒ every `/api/ota/*` request
+///   answers 503, whatever credential it carries. Ships DARK.
+/// * `OTA_BRIDGE_ENFORCE` — off ⇒ **permissive**: a request with NO
+///   `Authorization` header is served (with a WARN) so ota-desk can be cut over
+///   without a flag-flip race. A presented-but-WRONG bearer is still 401 in
+///   this mode — see [`crate::middleware::ota_token`] for why that is the
+///   invariant that makes the enforce flip safe.
+///
+/// The tokens ride the `/run/secrets` hydrator (`secrets.rs` — files
+/// `ota_bridge_token` / `ota_bridge_token_previous`); env vars win.
+/// `OTA_BRIDGE_TOKEN` MUST hold the identical string as ota-desk's
+/// `PMS_BRIDGE_TOKEN` — two names for one shared value. `..._PREVIOUS` is the
+/// rotation slot: it is accepted, but with a "finish the rotation" WARN.
+#[derive(Debug, Clone, Default)]
+pub struct OtaBridgeConfig {
+    /// `OTA_BRIDGE_ENABLED` — master switch for the `/api/ota/*` surface.
+    pub enabled: bool,
+    /// `OTA_BRIDGE_ENFORCE` — require a bearer (vs. permissive migration mode).
+    pub enforce: bool,
+    /// `OTA_BRIDGE_TOKEN` — the primary shared bearer.
+    pub token: Option<String>,
+    /// `OTA_BRIDGE_TOKEN_PREVIOUS` — rotation slot; accepted with a WARN.
+    pub previous_token: Option<String>,
+}
+
+impl OtaBridgeConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enabled: flag_enabled("OTA_BRIDGE_ENABLED"),
+            enforce: flag_enabled("OTA_BRIDGE_ENFORCE"),
+            token: optional_env("OTA_BRIDGE_TOKEN"),
+            previous_token: optional_env("OTA_BRIDGE_TOKEN_PREVIOUS"),
+        }
+    }
+}
+
 /// Default central HF-ID base URL. Overridden with `HFID_BASE_URL` in any real
 /// deploy. This is the central HF-ID (fingerprint-time-logger) service's
 /// published port on the evergreen server LAN — verified reachable from inside
@@ -570,10 +724,194 @@ impl ReaderConfig {
     }
 }
 
+/// Configuration for the HF ID badge → employee-location lookup that backs
+/// `/hk` location enforcement ([`crate::hfid_location`]).
+///
+///   * `url` (`HFID_LOCATION_URL`) — the FULL endpoint URL, path included, e.g.
+///     `http://192.168.100.228:5000/api/private/reader/resolve-badge`.
+///
+///     A full URL rather than [`DEFAULT_HFID_BASE_URL`] + a hardcoded path, on
+///     purpose: the peer service owns that path, and consuming it as config
+///     means a path change is a repo-variable edit rather than a code change.
+///     There is deliberately NO default — an unset value must read as
+///     "unconfigured" (⇒ `lookup_unavailable`, fail closed), and a default
+///     would instead produce a confident lookup against a guessed path.
+///
+///     It MUST be a plain LAN address. Never route this through Cloudflare:
+///     the call is server-to-server inside the property network, and an edge
+///     hop would add an auth surface, a failure mode and latency to a request
+///     that sits in the path of every `/hk` read.
+///
+///   * `resolve_secret` (`HFID_RESOLVE_SECRET`) — the shared secret sent as
+///     `X-Reader-Secret`. **It carries the same VALUE as HF ID's own
+///     `READER_RESOLVE_SECRET`** (and therefore as this repo's
+///     [`ReaderConfig::resolve_secret`]); the distinct name keeps the two
+///     consumers independently rotatable. See `CLAUDE.md` → "Credentials &
+///     Docker secrets".
+///
+/// Both halves are required. Either one missing ⇒
+/// [`crate::hfid_location::HfidLocationClient::from_config`] yields `None`,
+/// which with enforcement ON is `lookup_unavailable` — never a fallback to the
+/// `HK_BRANCHES` allowlist.
+///
+/// The secret ALSO flows through the `/run/secrets` hydrator (see `secrets.rs`
+/// — file `hfid_resolve_secret`); env vars still win.
+#[derive(Debug, Clone, Default)]
+pub struct HfidLocationConfig {
+    pub url: Option<String>,
+    pub resolve_secret: Option<String>,
+}
+
+impl HfidLocationConfig {
+    pub fn from_env() -> Self {
+        Self {
+            url: optional_env("HFID_LOCATION_URL"),
+            resolve_secret: optional_env("HFID_RESOLVE_SECRET"),
+        }
+    }
+
+    /// Whether both halves are present — for the startup log line, which must
+    /// report configured-ness WITHOUT printing either value.
+    pub fn is_configured(&self) -> bool {
+        self.url.is_some() && self.resolve_secret.is_some()
+    }
+}
+
+/// The ADR 0008 escalation valve — the ONE place LINE messages are ever spent.
+///
+/// A `room_check` (ขอเช็คห้อง) still unacked after two minutes is POSTed to HF
+/// ID, which resolves the ON-DUTY maids of that branch and LINE-multicasts them
+/// once. Everything else in the housekeeping feature — the boards, the SSE
+/// streams, the whole checkout ritual — costs zero LINE messages, forever
+/// (ADR 0008 §Decision 2).
+///
+///   * `url` (`HFID_ESCALATE_URL`) — full URL of HF ID's `/hk-escalate`
+///     endpoint on its reader surface. **Unset ⇒ escalation is DISABLED**, and
+///     the scheduler logs that once at startup rather than per tick. That is
+///     the feature's ship-dark switch: no default, because a guessed path would
+///     turn a misconfiguration into confident spend against a metered channel.
+///     A plain LAN address, like [`HfidLocationConfig::url`] — never routed
+///     through Cloudflare.
+///   * `resolve_secret` (`HFID_RESOLVE_SECRET`) — REUSED, not a new credential.
+///     HF ID guards its entire app↔central surface with that one secret (see
+///     `CLAUDE.md` → "Credentials & Docker secrets"), so `/hk-escalate` is
+///     behind the same `X-Reader-Secret` the `/hk` badge lookup already sends.
+///     Nothing to provision, nothing new to rotate.
+///   * `monthly_cap` (`HK_ESCALATION_MONTHLY_CAP`, default
+///     [`crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP`]) — the hard
+///     stop ADR 0008 requires so silent quota burn is impossible. Counted over
+///     `ht_hk_room_signals.sig_escalated_at` in the current **Bangkok** month.
+///     A malformed value falls back to the default WITH a warning: refusing to
+///     start over a typo in a rate limiter would be worse than the limit it
+///     protects, and falling through to "no cap" would be worse still.
+#[derive(Debug, Clone)]
+pub struct HkEscalationConfig {
+    pub url: Option<String>,
+    pub resolve_secret: Option<String>,
+    pub monthly_cap: i64,
+}
+
+impl Default for HkEscalationConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            resolve_secret: None,
+            monthly_cap: crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP,
+        }
+    }
+}
+
+impl HkEscalationConfig {
+    pub fn from_env() -> Self {
+        Self {
+            url: optional_env("HFID_ESCALATE_URL"),
+            resolve_secret: optional_env("HFID_RESOLVE_SECRET"),
+            monthly_cap: parse_escalation_cap(optional_env("HK_ESCALATION_MONTHLY_CAP").as_deref()),
+        }
+    }
+
+    /// Both halves present — the job is only registered when this is true.
+    /// Reports configured-ness WITHOUT printing either value.
+    pub fn is_configured(&self) -> bool {
+        self.url.is_some() && self.resolve_secret.is_some()
+    }
+}
+
+/// Parse `HK_ESCALATION_MONTHLY_CAP`. PURE — unit-tested below.
+///
+/// Absent or unparseable ⇒ the ADR's default, never "unlimited". A negative
+/// value is clamped to `0`, which disables escalation entirely (the predicate
+/// is `count < cap`) — a coherent reading of "cap of minus one" that fails
+/// SAFE for a metered channel, rather than an error that stops the process.
+fn parse_escalation_cap(raw: Option<&str>) -> i64 {
+    let Some(raw) = raw else {
+        return crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP;
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(cap) => cap.max(0),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default = crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP,
+                "HK_ESCALATION_MONTHLY_CAP is not an integer; using the default cap"
+            );
+            crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+
+    /// Shared with `secrets::tests` — one process-wide lock for every
+    /// env-mutating unit test in the crate (see its doc comment for why two
+    /// private mutexes did not serialise).
+    use crate::secrets::TEST_ENV_MUTEX as ENV_MUTEX;
+
+    /// The escalation cap is a rate limiter on METERED spend, so every odd
+    /// input must fail toward "fewer messages", never toward "no limit" and
+    /// never toward a process that refuses to start.
+    #[test]
+    fn escalation_cap_defaults_and_clamps_instead_of_failing() {
+        use crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP;
+        assert_eq!(parse_escalation_cap(None), DEFAULT_ESCALATION_MONTHLY_CAP);
+        assert_eq!(parse_escalation_cap(Some("  200 ")), 200);
+        assert_eq!(parse_escalation_cap(Some("0")), 0, "an explicit 0 disables pushes");
+        assert_eq!(parse_escalation_cap(Some("-5")), 0, "negative clamps to disabled");
+        for bad in ["", "abc", "12.5", "1e3", "''"] {
+            assert_eq!(
+                parse_escalation_cap(Some(bad)),
+                DEFAULT_ESCALATION_MONTHLY_CAP,
+                "{bad:?} must fall back to the default cap"
+            );
+        }
+    }
+
+    /// The escalation config is unconfigured by DEFAULT — ADR 0008's valve
+    /// ships dark, and an unset `HFID_ESCALATE_URL` must never be read as
+    /// "escalate somewhere sensible".
+    #[test]
+    fn escalation_is_unconfigured_by_default() {
+        let cfg = HkEscalationConfig::default();
+        assert!(!cfg.is_configured());
+        assert_eq!(
+            cfg.monthly_cap,
+            crate::domain::hk_signal::DEFAULT_ESCALATION_MONTHLY_CAP
+        );
+        assert!(!HkEscalationConfig {
+            url: Some("http://x/hk-escalate".into()),
+            resolve_secret: None,
+            ..Default::default()
+        }
+        .is_configured());
+        assert!(!HkEscalationConfig {
+            url: None,
+            resolve_secret: Some("s".into()),
+            ..Default::default()
+        }
+        .is_configured());
+    }
 
     /// `HFVILLE_WRITEBACK_INTENTS` parsing. The `None` cases matter most:
     /// they are the "current behavior unchanged" contract — an unset, blank,
@@ -630,12 +968,6 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed.contains("mark_room_clean"));
     }
-
-    /// Serialise env-mutating tests. `std::env::set_var` mutates
-    /// process-wide state — running these in parallel under
-    /// `cargo test` (which uses one process) would cause flakes when
-    /// one test clears `DB_PASSWORD` while another asserts it parses.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Snapshot the env vars we touch, restore them on drop. Lets each
     /// test mutate freely without leaking state to siblings.
@@ -881,5 +1213,285 @@ mod tests {
         // Used by `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` lookup.
         let site = SiteConfig::parse("hfville");
         assert_eq!(site.id_upper(), "HFVILLE");
+    }
+
+    // -------------------------------------------------------------------
+    // VilleLegacyDbConfig — HF Ville's LEGACY MSSQL target for the CR-1
+    // `/hk` room-status read. Unlike every other config here, being
+    // UNCONFIGURED must resolve to None rather than panic: it degrades the
+    // maid's screen to the PG mirror, it does not stop the boot. (A
+    // MALFORMED port still panics, via the shared `parse_mssql_port` — a
+    // typo must never silently dial the default instance.)
+    // -------------------------------------------------------------------
+
+    const VILLE_MSSQL_VARS: &[&str] = &[
+        "VILLE_MSSQL_PASSWORD",
+        "VILLE_MSSQL_SERVER",
+        "VILLE_MSSQL_PORT",
+        "VILLE_MSSQL_NAME",
+        "VILLE_MSSQL_USER",
+        "VILLE_MSSQL_POOL_MAX",
+        "DB_PASSWORD",
+    ];
+
+    /// Defaults reproduce `docker-compose.yml`'s `sync-hfville` block exactly
+    /// (192.168.11.51:1436/HOTEL as `sa`) — if these drift, a Ville maid is
+    /// shown another server's rooms.
+    #[test]
+    fn ville_legacy_defaults_match_the_sync_hfville_sidecar() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "shared-sa");
+        let cfg = VilleLegacyDbConfig::from_env().expect("DB_PASSWORD is enough to resolve");
+        assert_eq!(cfg.server, "192.168.11.51");
+        assert_eq!(cfg.port, 1436);
+        assert_eq!(cfg.database, "HOTEL");
+        assert_eq!(cfg.user, "sa");
+        assert_eq!(cfg.pool_max, 2, "the read pool must stay tiny");
+    }
+
+    /// No password anywhere ⇒ `None`, and NO panic. This is the "ships
+    /// compatible" property: a deployment without the secret still boots and
+    /// simply shows the canonical PG value with the stale note.
+    #[test]
+    fn ville_legacy_is_none_without_a_password_and_never_panics() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        assert!(VilleLegacyDbConfig::from_env().is_none());
+        // Empty is treated as missing — a CI substitution can render `VAR=''`.
+        env::set_var("DB_PASSWORD", "");
+        env::set_var("VILLE_MSSQL_PASSWORD", "");
+        assert!(VilleLegacyDbConfig::from_env().is_none());
+    }
+
+    /// A site-specific password wins over the shared `DB_PASSWORD`, so the
+    /// two sites can be split the day one rotates ahead of the other.
+    #[test]
+    fn ville_legacy_password_prefers_the_site_specific_secret() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "hfhotel-sa");
+        env::set_var("VILLE_MSSQL_PASSWORD", "ville-sa");
+        let cfg = VilleLegacyDbConfig::from_env().expect("resolves");
+        assert_eq!(cfg.password, "ville-sa");
+    }
+
+    /// Every env var the loyalty integration reads. Declared in
+    /// `docker-compose.yml` / `docker-build.yml` blank-or-false, so these tests
+    /// pin what "declared but dark" must mean at runtime.
+    const LOYALTY_VARS: &[&str] = &[
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The whole point of the B3 dark declaration: putting the keys into the
+    /// deploy manifests must NOT enable anything. Unset, blank, whitespace and
+    /// every non-`true`/`1` literal a hand-edited `.env` might carry all leave
+    /// the inbound channel off.
+    #[test]
+    fn loyalty_channel_stays_dark_when_the_flag_is_unset_or_blank() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        // A provisioned token must never be enough on its own.
+        env::set_var("LOYALTY_CHANNEL_TOKEN", "a-real-looking-channel-token");
+
+        // 1. Key absent entirely (pre-B3 production, and any local `.env`).
+        assert!(
+            !LoyaltyConfig::from_env().channel_enabled,
+            "unset LOYALTY_CHANNEL_ENABLED must leave the channel dark"
+        );
+
+        // 2. Key present but empty — what `${LOYALTY_CHANNEL_ENABLED:-}` or an
+        //    unset GH variable rendered into `.env` looks like.
+        for blank in ["", "   ", "\t"] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", blank);
+            assert!(
+                !LoyaltyConfig::from_env().channel_enabled,
+                "blank LOYALTY_CHANNEL_ENABLED ({blank:?}) must leave the channel dark"
+            );
+        }
+
+        // 3. Anything that is not `true`/`1` is off, including near-misses.
+        for falsey in [
+            "false", "FALSE", "0", "off", "no", "yes", "enabled", "True ",
+        ] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", falsey);
+            let enabled = LoyaltyConfig::from_env().channel_enabled;
+            let expected = falsey.trim().eq_ignore_ascii_case("true");
+            assert_eq!(
+                enabled, expected,
+                "LOYALTY_CHANNEL_ENABLED={falsey:?} must parse as {expected}"
+            );
+        }
+    }
+
+    /// Flag on but the token file empty (an unset GH secret still yields an
+    /// EMPTY `/run/secrets/loyalty_channel_token`, which the hydrator skips) —
+    /// the gate must still have nothing to accept.
+    #[test]
+    fn loyalty_channel_token_blank_reads_as_unprovisioned() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        for blank in ["", "  "] {
+            env::set_var("LOYALTY_CHANNEL_TOKEN", blank);
+            assert!(
+                LoyaltyConfig::from_env().channel_token.is_none(),
+                "blank LOYALTY_CHANNEL_TOKEN ({blank:?}) must read as unprovisioned"
+            );
+        }
+    }
+
+    /// Accrual needs BOTH halves. Declaring `LOYALTY_APP_URL` blank in the
+    /// deploy manifest must not half-arm the checkout stay hook.
+    #[test]
+    fn loyalty_stay_hook_needs_both_url_and_token() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "both unset ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "URL alone ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "");
+        env::set_var("LOYALTY_SERVICE_TOKEN", "a-real-looking-service-token");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "blank URL + token ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            LoyaltyConfig::from_env().stay_hook_configured(),
+            "both set ⇒ accrual live (the ONLY two settings that do it)"
+        );
+    }
+
+    /// Every env var `hydrate_env_from_secret_files` can write, so the guard
+    /// restores the process to its prior state even if a stray secret file is
+    /// picked up. `SECRETS_DIR` is included because this test re-points it.
+    const SECRET_HYDRATION_VARS: &[&str] = &[
+        "SECRETS_DIR",
+        "DB_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "VILLE_DB_PASSWORD",
+        "NEW_DB_PASSWORD",
+        "SLACK_WEBHOOK_URL",
+        "DATABASE_URL",
+        "POSTGRES_USER",
+        "POSTGRES_DB",
+        "READER_RESOLVE_SECRET",
+        "OTA_BRIDGE_TOKEN",
+        "OTA_BRIDGE_TOKEN_PREVIOUS",
+        "HFID_RESOLVE_SECRET",
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The compose `secrets:` mount (docs/loyalty-channel.md → *Provisioning*
+    /// step 2) must be safe to declare while the two GH secrets are still
+    /// unset. Two shapes have to boot with the channel dark:
+    ///
+    /// * **no file at all** — every local dev box, and any deploy predating the
+    ///   payload keys;
+    /// * **a mounted but EMPTY file** — what production actually has today,
+    ///   because `run-deploy.sh` writes a file for every `.secrets` key
+    ///   including empty values.
+    ///
+    /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// never an empty-string "token" that the constant-time compare would then
+    /// accept), and `LoyaltyConfig` must report the channel dark and the stay
+    /// hook off — including with the flag forced on, which is the state the
+    /// go-live flip lands in if the secret was never minted.
+    #[test]
+    fn loyalty_tokens_stay_unprovisioned_when_the_secret_file_is_missing_or_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(SECRET_HYDRATION_VARS);
+
+        // RAII — the dir is removed even if an assertion below fails.
+        let dir = crate::secrets::SecretsDir::new("hotel-backend-loyalty-secrets");
+        env::set_var("SECRETS_DIR", &dir.path);
+
+        // 1. Nothing mounted.
+        crate::secrets::hydrate_env_from_secret_files();
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "a missing secret file must leave LOYALTY_CHANNEL_TOKEN unset"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(!cfg.channel_enabled, "missing token file ⇒ channel dark");
+        assert!(cfg.channel_token.is_none(), "no token to accept");
+        assert!(!cfg.stay_hook_configured(), "missing token file ⇒ no accrual");
+
+        // 2. Mounted but empty — the unset-GH-secret shape, i.e. what
+        //    production actually has today. Assert at the ENV layer first:
+        //    `optional_env` would map an empty string to `None` anyway, so the
+        //    LoyaltyConfig assertions alone cannot observe the hydrator
+        //    dropping its `trimmed.is_empty()` guard.
+        for name in ["loyalty_channel_token", "loyalty_service_token"] {
+            dir.write(name, "");
+        }
+        let hydrated = crate::secrets::hydrate_env_from_secret_files();
+        assert_eq!(hydrated, 0, "an empty secret file must hydrate nothing");
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "an empty secret file must leave LOYALTY_CHANNEL_TOKEN unset — never an empty-string bearer"
+        );
+        assert!(
+            env::var("LOYALTY_SERVICE_TOKEN").is_err(),
+            "same for the outbound bearer"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(
+            cfg.channel_token.is_none(),
+            "an empty secret file must read as unprovisioned, not as an empty bearer"
+        );
+        assert!(cfg.service_token.is_none(), "same for the outbound bearer");
+        assert!(!cfg.stay_hook_configured(), "empty token file ⇒ no accrual");
+
+        // 3. Flag flipped on with the secret still unminted: the channel must
+        //    have nothing to accept (middleware::channel_token renders 503).
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        let cfg = LoyaltyConfig::from_env();
+        assert!(cfg.channel_enabled);
+        assert!(
+            cfg.channel_token.is_none(),
+            "flag on + no token file must still be closed — the flip alone opens nothing"
+        );
+    }
+
+    /// Overrides are honoured — the deploy topology can move without a code
+    /// change (same contract as `DB_SERVER` / `MSSQL_PORT` for HF Hotel).
+    #[test]
+    fn ville_legacy_overrides_are_honoured() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(VILLE_MSSQL_VARS);
+
+        env::set_var("DB_PASSWORD", "shared-sa");
+        env::set_var("VILLE_MSSQL_SERVER", "10.0.0.9");
+        env::set_var("VILLE_MSSQL_PORT", "1440");
+        env::set_var("VILLE_MSSQL_NAME", "HOTEL2");
+        env::set_var("VILLE_MSSQL_USER", "reader");
+        let cfg = VilleLegacyDbConfig::from_env().expect("resolves");
+        assert_eq!(cfg.server, "10.0.0.9");
+        assert_eq!(cfg.port, 1440);
+        assert_eq!(cfg.database, "HOTEL2");
+        assert_eq!(cfg.user, "reader");
     }
 }

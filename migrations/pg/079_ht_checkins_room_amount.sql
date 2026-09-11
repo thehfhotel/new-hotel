@@ -11,7 +11,9 @@
 -- `ht_checkins.cin_total_amount` mirrors legacy `HT_CheckIn_H.Total_Price_Net`
 -- (`sync/mappers/checkin.rs::project_aggregate`), which is **Room + Product by
 -- definition** — iHOTEL rewrites the whole `Total_Price_*` family on EVERY
--- payment/sale change (`docs/legacy-app/COMPAT_CHEATSHEET.md` §359-362), so by
+-- payment/sale change (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "`Total_Price_*`: aggregated totals; old app updates these on every payment/sale change."
+-- — was a bare line-range citation (359-362) that had drifted onto
+-- `HT_Room_Status`), so by
 -- the time a folio reaches checkout its `Total_Price_Net` already folds in any
 -- POS line iHOTEL knows about.
 --
@@ -57,7 +59,9 @@
 -- would then zero out the room charge on every historical folio — a
 -- catastrophic UNDERcharge on a live money path. `Some(0.00)` must keep meaning
 -- a genuine zero, because legacy `Total_Price_Room` is `float NOT NULL
--- DEFAULT 0` (COMPAT_CHEATSHEET §375) and a product-only folio legitimately has
+-- DEFAULT 0` (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_H`" "Total_Price_Room float NOT NULL DEFAULT 0,"
+-- — was a bare line-375 citation that had drifted onto `HT_Room_Status`)
+-- and a product-only folio legitimately has
 -- a zero room component.
 --
 -- ## Strictly additive

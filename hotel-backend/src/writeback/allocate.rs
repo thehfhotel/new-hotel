@@ -309,10 +309,15 @@ pub async fn allocate_receipt_h_id(conn: &mut LegacyConn<'_>) -> WritebackResult
 
 /// Allocate the next `TB_Pay_History.id` (issue #202 — `CreateCashEntry`).
 ///
-/// Per `docs/legacy-app/COMPAT_CHEATSHEET.md` §1051 / `SCHEMA.sql:777` and the
-/// `cash_entry` recipe module doc: `TB_Pay_History.id` is `int NOT NULL`, NOT
-/// IDENTITY — allocated app-side via `get_id` (MAX+1), same convention as
-/// every other legacy sequential id here.
+/// Per `docs/legacy-app/COMPAT_CHEATSHEET.md` §`TB_Pay_History` "`id int` (NOT IDENTITY) via `get_id`"
+/// and `docs/legacy-app/SCHEMA.sql` §"Table: dbo.TB_Pay_History" "[id] int,"
+/// (an earlier revision cited both by line number — one of those numbers landed
+/// on a blank line, the other on the table marker itself), plus the
+/// `cash_entry` recipe module doc:
+/// `TB_Pay_History.id` is NOT IDENTITY — allocated app-side via `get_id`
+/// (MAX+1), same convention as every other legacy sequential id here.
+/// (The schema dump declares it plain `[id] int`, i.e. nullable; an earlier
+/// revision of this comment said `int NOT NULL`, which neither source states.)
 pub async fn allocate_pay_history_id(conn: &mut LegacyConn<'_>) -> WritebackResult<i32> {
     select_next_int_with_lock(
         conn,
@@ -321,7 +326,12 @@ pub async fn allocate_pay_history_id(conn: &mut LegacyConn<'_>) -> WritebackResu
     .await
 }
 
-/// Format a `Pay_No` for `HT_CheckIn_Pay`. Per `findings.md` §2 line 129 and
+/// Format a `Pay_No` for `HT_CheckIn_Pay`. Per
+/// `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.6 ID generation patterns" "R{yyMM}-{4digit}"
+/// (an earlier revision credited this to `findings.md` by line number;
+/// findings.md documents this format at no revision — those numbers were
+/// always COMPAT_CHEATSHEET's), the immutable
+/// decompile `Module1.GetSIR_PAY` (`Module1.cs:1756`), and
 /// live capture `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154`
 /// the legacy app emits `R{yyMM}-{4digit}` (e.g. `R2604-0241`). The `R` prefix
 /// and 4-digit suffix MUST match exactly — the `LIKE 'R{yyMM}-%'` predicate is
@@ -366,8 +376,11 @@ fn pay_no_prefix(now: DateTime<Utc>) -> String {
     format!("R{:02}{:02}-", bkk.year() % 100, bkk.month())
 }
 
-/// Format a `Receipt_no` for `HT_Receipt_H`. Per `findings.md` §2 line 130 +
-/// `COMPAT_CHEATSHEET.md:130` + live capture
+/// Format a `Receipt_no` for `HT_Receipt_H`. Per
+/// `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.6 ID generation patterns" "B{yyMM}-{4digit}"
+/// (an earlier revision credited one and the same line number to two different
+/// documents; only the cheatsheet one ever resolved),
+/// the immutable decompile `FrmAddSale.GetSIR` (`FrmAddSale.cs:3818`), and live capture
 /// `docs/legacy-spike/raw/walkin-20260424-095304/07-events.txt:120` the legacy
 /// app emits `B{yyMM}-{4digit}` (single `B` is the default; `SB`/`CB` are
 /// SmallBill/CreditBill variants). The prefix and 4-digit suffix MUST match
@@ -498,6 +511,11 @@ mod tests {
     #[test]
     fn allocate_pay_no_emits_r_prefix_with_4_digit_suffix() {
         // CRIT-C1: must be R{yyMM}-{4digit}, not P{yyMM}-{6digit}.
+        // CITATION FIX (assertion message below is stale and NOT edited here —
+        // this package is comment-only): the literal `R2604-0241` comes from
+        // the frozen capture `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154`,
+        // not from findings.md, which carries the string at no revision. The
+        // format itself is `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.6 ID generation patterns" "R{yyMM}-{4digit}".
         let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap(); // 4/24 17:05 BKK
         let id = compose_pay_no(now, 241);
         assert_eq!(id, "R2604-0241", "must match findings.md §2 capture R2604-0241");

@@ -6744,7 +6744,8 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
 }
 
 /// Normalize the legacy `SMS_Readed` varchar marker ('yes' / 'no', lowercase
-/// per `docs/legacy-app/COMPAT_CHEATSHEET.md:98`) into the canonical
+/// per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.5 Boolean conventions"
+/// "`SMS_Readed` (HT_Room_SMS, HT_EMP_SMS) → `'yes'` / `'no'`") into the canonical
 /// `note_is_read` bool. Anything other than a case-insensitive "yes" is treated
 /// as unread (the legacy default on insert is 'no'). PURE.
 fn sms_readed_to_bool(readed: &str) -> bool {
@@ -7311,7 +7312,8 @@ mod cash_sync_tests {
     /// That matters because `TB_Pay_History.Pay_Date` is not derived from the
     /// insert; it is whatever the operator picked in the entry form
     /// (`DateTimePicker1.Value.ToOADate()` —
-    /// `docs/legacy-app/COMPAT_CHEATSHEET.md:85`), so we hold nothing that
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.4 Date/time handling"
+    /// "DateTimePicker1.Value.ToOADate()"), so we hold nothing that
     /// could reconstruct it. Combined with the importer's 120-day rescan
     /// window ([`CASH_WINDOW_DAYS`]), a blanket COALESCE would permanently
     /// freeze whatever value the FIRST poll to see the row happened to

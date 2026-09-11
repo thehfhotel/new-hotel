@@ -1,7 +1,7 @@
 //! `RefundDeposit` recipe — Task #49 (deposit refund / คืนเงินมัดจำ).
 //!
 //! Mirrors iHOTEL `FormShowDEPBack.cs:536`
-//! (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds`, lines 466-467):
+//! (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds` "Refund deposit"):
 //!
 //! ```text
 //! update HT_CheckIn_Ds

@@ -139,7 +139,7 @@ dirty persistent database; clippy clean.
 | `7fc8b59` | docs(legacy-app): SCHEMA.sql regenerated from live prod + CLAUDE.md CT-DDL carve-out |
 | `a558d82` | refactor(backend): drop vestigial `AppState.legacy_pool` |
 | `30d2d72`/`ac4fda4` | fix(sync): FK-defer silent-drop class + customer deletes (migration 055) + inert echo filter removed |
-| `70914fd`/`90bef62` | fix(writeback): payment cart-clear, extend-stay totals, room-change §3.17, N-strips, fingerprint |
+| `70914fd`/`90bef62` | fix(writeback): payment cart-clear, extend-stay totals, room-change (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"3.17 Change Room Mid-Stay"), N-strips, fingerprint |
 | `3a8d358` | fix(sync): coupon id-reuse poison pill + Bangkok pay_date + Conflict-on-enqueue |
 | `d96a4ed` | test: suite determinism on persistent DB (wave 1) |
 | `4311a84` | docs(audit): remediation status |

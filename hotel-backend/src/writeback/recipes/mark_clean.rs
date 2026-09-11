@@ -128,7 +128,8 @@ pub(super) fn build_housewife_audit_insert(
 }
 
 /// SELECT the prior occupant of `room_no` whose per-room check-out
-/// completed (Wave 5b item 1). Filter mirrors `COMPAT_CHEATSHEET.md:864-866`
+/// completed (Wave 5b item 1). Filter mirrors `COMPAT_CHEATSHEET.md`
+/// §"Table: `HT_Housewife` (A)" "order by cin_room_out desc"
 /// (`View_CheckIn_Ds where Cin_room_status='Check-Out' and cin_room_no=…
 /// order by cin_room_out desc`) so a multi-room check-in where one room is
 /// already out and another still occupied returns the freshly-out row, not
@@ -187,7 +188,8 @@ fn build_prior_occupant_sql(room_no: &str) -> String {
     let checked_out_q = sql_quote(CIN_ROOM_STATUS_CHECKED_OUT);
     let cancelled_q = sql_quote(CIN_STATUS_CANCELLED);
     // Wave 5b item 1: per-room status filter (`d.Cin_Room_Status='Check-Out'`)
-    // matches `COMPAT_CHEATSHEET.md:864-866`. The earlier whole-check-in filter
+    // matches `COMPAT_CHEATSHEET.md` §"Table: `HT_Housewife` (A)"
+    // "order by cin_room_out desc". The earlier whole-check-in filter
     // (`h.cin_status NOT IN ('ยกเลิก')`) is kept as belt-and-suspenders so a
     // partially-cancelled multi-room check-in (where one room shows
     // `Check-Out` but the header status was force-set to `ยกเลิก`) doesn't
@@ -332,7 +334,8 @@ mod tests {
     /// multi-room check-in where room A is checked out and room B is still
     /// occupied would return room B's still-occupying detail row as the
     /// "prior occupant" for mark-clean on room A. Per
-    /// `COMPAT_CHEATSHEET.md:864-866`.
+    /// `COMPAT_CHEATSHEET.md` §"Table: `HT_Housewife` (A)"
+    /// "order by cin_room_out desc".
     #[test]
     fn filters_by_per_room_status_not_whole_checkin() {
         let sql = build_prior_occupant_sql("306");

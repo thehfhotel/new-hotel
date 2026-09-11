@@ -18,6 +18,11 @@ use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
     build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
+use crate::outbox::{EventBus, OutboxRepository};
+use crate::repository::{
+    CustomerRepository, PgBookingRepository, PgCustomerRepository,
+};
+use crate::service::{BookingService, ChannelService, CustomerService};
 use super::notification_state::{
     load_watermark, now_thai_local, save_watermark, NotificationType,
 };
@@ -195,6 +200,168 @@ pub async fn init_scheduler(
             ville_covered = ville_pg_pool.is_some(),
             "[Scheduler] - Stale-checkin tripwire: hourly (pure-PG dropped-checkout safety net)"
         );
+
+        // Loyalty-channel hold expiry sweep (docs/loyalty-channel.md).
+        // Belt-and-braces behind the loyalty app's own `release` call: any
+        // `book_channel='loyalty'` hold still `pending` past its
+        // `book_hold_expires_at` is auto-cancelled through the SAME
+        // release path the API uses (status-guarded on 'pending', normal
+        // CancelBooking writeback → iHOTEL sees the room free again).
+        // Registered unconditionally (not gated on LOYALTY_CHANNEL_ENABLED):
+        // the query is a cheap partial-index scan that matches nothing while
+        // the channel is dark, and an operator turning the channel OFF with
+        // holds outstanding still wants those holds to expire. Every 5
+        // minutes; per-hold failures are logged and skipped inside
+        // `sweep_expired_holds` so one bad row can't wedge the tick. Covers
+        // both sites (same pattern as the stale-checkin tripwire above —
+        // the backend is where both canonical pools are co-resident).
+        let sweep_pg = pg.clone();
+        let sweep_ville = ville_pg_pool.clone();
+        let sweep_site = site.id.clone();
+        let sweep_job = Job::new_async("0 */5 * * * *", move |_uuid, _l| {
+            let pg = sweep_pg.clone();
+            let ville = sweep_ville.clone();
+            let site_id = sweep_site.clone();
+            Box::pin(async move {
+                let released = channel_service_for_pool(&pg)
+                    .sweep_expired_holds(&site_id)
+                    .await;
+                if released > 0 {
+                    tracing::info!(site = %site_id, released, "[Scheduler] loyalty hold sweep released expired holds");
+                }
+                // Guard against an unexpected hfville-primary config
+                // double-sweeping the same DB (mirrors the tripwire above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        let released = channel_service_for_pool(vp)
+                            .sweep_expired_holds("hfville")
+                            .await;
+                        if released > 0 {
+                            tracing::info!(site = "hfville", released, "[Scheduler] loyalty hold sweep released expired holds");
+                        }
+                    }
+                }
+            })
+        })?;
+        scheduler.add(sweep_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty hold expiry sweep: every 5 minutes"
+        );
+
+        // Track F5 — loyalty-channel writeback-leg stall tripwire
+        // (docs/runbooks/writeback-leg-degraded.md). A hold is worth nothing
+        // to reception until its writeback reaches iHOTEL's room board as
+        // `จอง`; when the leg is down the hold commits in PG, dies at its 2h
+        // TTL, and no pre-existing alert is fast enough to mention it (the
+        // level digest needs 4h, the burst alert 50 rows/hr, the queue-depth
+        // janitor 500 pending jobs).
+        //
+        // REGISTERED HERE, NOT IN THE WRITEBACK WORKER, ON PURPOSE: the
+        // failure mode is "the worker is not draining the queue", whose most
+        // likely cause is that the worker container itself is down. A
+        // detector inside that worker shares its fate and goes silent in
+        // exactly the case it exists for. The scheduler is a different
+        // container, reads only canonical PG, and therefore keeps reporting
+        // while the legacy leg is unreachable.
+        //
+        // Registered unconditionally, like the sweep above: the query costs
+        // an empty partial-index scan while the channel is dark, and holds
+        // outstanding at the moment an operator turns the channel OFF are
+        // precisely the ones that must not go unwatched. Every 2 minutes at
+        // :30 so the tick never lands on the sweep's or the reconcile's
+        // boundary; worst-case detection is the threshold + 2 minutes.
+        // Covers both sites from the one process where both canonical pools
+        // are co-resident.
+        let stall_pg = pg.clone();
+        let stall_ville = ville_pg_pool.clone();
+        let stall_slack: Option<SlackClient> = if slack_config.is_configured() {
+            Some(SlackClient::new(slack_config.clone()))
+        } else {
+            None
+        };
+        let stall_site = site.id.clone();
+        let stall_job = Job::new_async("30 */2 * * * *", move |_uuid, _l| {
+            let pg = stall_pg.clone();
+            let ville = stall_ville.clone();
+            let slack = stall_slack.clone();
+            let site_id = stall_site.clone();
+            Box::pin(async move {
+                sync::check_loyalty_writeback_stall_and_alert(&pg, slack.as_ref(), &site_id).await;
+                // Guard against an unexpected hfville-primary config
+                // double-alerting on the same DB (mirrors the sweep above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        sync::check_loyalty_writeback_stall_and_alert(
+                            vp,
+                            slack.as_ref(),
+                            "hfville",
+                        )
+                        .await;
+                    }
+                }
+            })
+        })?;
+        scheduler.add(stall_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty writeback-leg stall tripwire: every 2 minutes (pure-PG; \
+             survives a writeback-worker outage)"
+        );
+
+
+        // Room-signal escalation valve (ADR 0008). Every 30 seconds: a
+        // ขอเช็คห้อง still unacked after 2 minutes is POSTed to HF ID, which
+        // LINE-pushes the ON-DUTY maids of that branch once. This is the ONLY
+        // path in the housekeeping feature that spends a metered LINE message;
+        // everything else rides PG + SSE and costs nothing, forever.
+        //
+        // SHIPS DARK: with `HFID_ESCALATE_URL` unset the job is NOT REGISTERED
+        // and this logs the fact ONCE here — never per tick. There is no
+        // default URL, because a guessed path would turn a misconfiguration
+        // into confident spend on a metered channel.
+        //
+        // Covers both sites from the one process where both canonical pools are
+        // co-resident, guarded against an hfville-primary config
+        // double-escalating the same DB — the same pattern as the tripwire and
+        // the loyalty sweep above. Per-signal failures are logged and skipped
+        // inside `run_escalation_tick`, which never returns an error.
+        let escalation_cfg = crate::config::HkEscalationConfig::from_env();
+        if escalation_cfg.is_configured() {
+            let esc_pg = pg.clone();
+            let esc_ville = ville_pg_pool.clone();
+            let esc_site = site.id.clone();
+            let esc_cfg = escalation_cfg.clone();
+            let escalation_job = Job::new_async("0/30 * * * * *", move |_uuid, _l| {
+                let pg = esc_pg.clone();
+                let ville = esc_ville.clone();
+                let site_id = esc_site.clone();
+                let cfg = esc_cfg.clone();
+                Box::pin(async move {
+                    super::hk_escalation::run_escalation_tick(&pg, &site_id, &cfg).await;
+                    if let Some(ref vp) = ville {
+                        if site_id != "hfville" {
+                            super::hk_escalation::run_escalation_tick(vp, "hfville", &cfg).await;
+                        }
+                    }
+                })
+            })?;
+            scheduler.add(escalation_job).await?;
+            tracing::info!(
+                site = %site.id,
+                ville_covered = ville_pg_pool.is_some(),
+                monthly_cap = escalation_cfg.monthly_cap,
+                "[Scheduler] - HK room-check escalation: every 30s (ADR 0008 LINE valve, ENABLED)"
+            );
+        } else {
+            tracing::info!(
+                site = %site.id,
+                "[Scheduler] - HK room-check escalation: DISABLED (HFID_ESCALATE_URL unset) — \
+                 no LINE messages will be sent for unacked ขอเช็คห้อง"
+            );
+        }
     }
 
     // Slack notification jobs only run if Slack is configured
@@ -372,6 +539,31 @@ pub async fn init_scheduler(
     }
 
     Ok(())
+}
+
+/// Build a per-site [`ChannelService`] from stateless parts + the site's
+/// canonical pool — the same construction shape as
+/// `AppState::resolve_write_services` (every collaborator is a stateless
+/// struct; the pool handle is the only real state), so the sweep's cancel
+/// path enqueues its writeback + event into the SAME site DB the hold lives
+/// in (the per-site writeback worker LISTENs there).
+fn channel_service_for_pool(pg: &PgPool) -> ChannelService {
+    let outbox = Arc::new(OutboxRepository::new());
+    let events = Arc::new(EventBus::new());
+    let customers_repo: Arc<dyn CustomerRepository> = Arc::new(PgCustomerRepository::new());
+    let bookings = Arc::new(BookingService::new(
+        Arc::new(PgBookingRepository::new()),
+        outbox.clone(),
+        events.clone(),
+        pg.clone(),
+    ));
+    let customers = Arc::new(CustomerService::new(
+        customers_repo.clone(),
+        outbox,
+        events,
+        pg.clone(),
+    ));
+    ChannelService::new(pg.clone(), bookings, customers, customers_repo)
 }
 
 /// Apply the task #69 site-id prefix to a Block-Kit Slack message in
