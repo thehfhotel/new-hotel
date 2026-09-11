@@ -258,7 +258,7 @@ backend (`services/idempotency.rs`).
 | a DIFFERENT request with K | **422** `{"success": false, "error": "Idempotency-Key '…' was already used for a different booking request; …"}` |
 | two identical requests at once | serialised — exactly one hold; the loser replays the winner's response |
 | key present but blank / with spaces / > 255 chars | **400** (a broken key is loud, never a silent opt-out) |
-| retry more than 24 h later | treated as a first-time request (TTL) |
+| retry more than 24 h later | **for hold-create: still NOT a first-time request.** The `ht_channel_idempotency` row is gone (TTL), but the booking itself still carries the key as `book_ext_ref` and the request fingerprint as `book_ext_ref_fingerprint`, so the key is answered from the booking: a replay if the hold is still live, **409** if it is not, **422** if the request differs. See "The gap between the two writes" below. |
 
 Key facts a caller needs:
 
@@ -269,7 +269,12 @@ Key facts a caller needs:
   SHA-256 of the presented bearer, so rotating `LOYALTY_CHANNEL_TOKEN` starts a
   fresh key space (a rotated token is a different client), and the row lives in
   the property's own database — which is correct, because a retry always targets
-  the property the original request did.
+  the property the original request did. The booking-side copy carries the same
+  scoping inside `book_ext_ref` (`idem:{caller-digest}:{key}`).
+* **A key is one-shot for the LIFE OF THE BOOKING it created, not for 24 h.**
+  The 24 h TTL belongs to `ht_channel_idempotency`, which is now a cache in
+  front of a durable record rather than the record itself. Mint a new key per
+  booking attempt and never recycle one.
 * **"Different request" is judged on a canonicalised fingerprint**, not raw
   bytes: property, room type, both dates, guests, trimmed guest name and phone,
   trimmed membership id, payment plan. Re-serialising the JSON with different
@@ -287,14 +292,65 @@ then finds nothing to insert and reads a COMPLETE row. There is no advisory
 lock and no Redis, and the stored response commits in the same transaction that
 reserved the key — so a rollback loses both, never one without the other.
 
-**Residual gap, documented rather than papered over:** the hold and the
-idempotency record are two transactions (the hold rides `BookingService::create`,
-which owns its own). If the process dies in the gap between them, the hold is
-committed and the key is not, so a retry re-enters as a fresh request and creates
-a second hold — exactly the pre-existing behaviour, not a regression. Closing it
-would mean threading the key through `BookingService::create` as a second
-`book_ext_ref`-style natural key; that is a deliberate follow-up, not something
-to bolt on.
+**The gap between the two writes — CLOSED (B8d / issue #305).** The hold and
+the idempotency record are, and must remain, two transactions: the hold rides
+`BookingService::create`, which owns its own, while the reservation stays open
+across it. A process that died in between left the hold COMMITTED and the key
+GONE, so the retry re-entered as a fresh request and created a second hold.
+
+The key is now threaded through `create_hold` as the hold's own
+`ht_bookings.book_ext_ref` — `idem:{caller-digest}:{key}`, alongside
+`book_channel = 'loyalty'` — so migration **076**'s partial UNIQUE index
+`(book_channel, book_ext_ref)` dedupes INSIDE the booking's transaction, the
+one place a crash cannot separate from the booking itself. (That index was
+ruled out for the general case above because a loyalty hold has no
+channel-native id; it applies perfectly once the KEY plays that role.) The
+caller digest is in the value because `book_ext_ref` is unique only within
+`book_channel`, which is the constant `'loyalty'` for every hold — without it
+two callers, or one caller either side of a token rotation, could collide on a
+key as ordinary as `"1"` and the second would replay the first's booking.
+
+A retry after the crash therefore answers with the SURVIVING hold: same
+**201**, `Idempotency-Replayed: true`, and the payload rendered from the stored
+row — its total, and its ORIGINAL 2 h deadline, never a re-quote of the retry.
+The same path catches two retries racing each other (`BookingService::create`
+rolls its half-built row back on the unique violation and re-selects the
+winner **by the key**, so that arm runs the identical gates below).
+
+In the **crash arm** the lookup runs BEFORE the guest match-or-create, so that
+replay also leaves no duplicate `ht_customers` row behind. (The race arm cannot
+make that claim: it is reached only after `create` has already run, so the
+guest row exists either way — the losing attempt's booking is rolled back, not
+its customer. Matching an existing guest by phone + name keeps this from
+accumulating rows in practice.)
+
+Two gates run before anything is replayed, in this order, because "you reused
+someone else's key" is a different mistake from "the hold this key made is
+gone" and must not be reported as the latter:
+
+1. **Identity — `book_ext_ref_fingerprint` (migration 095).** The booking
+   stores the SHA-256 of the canonicalised request that minted its key, written
+   in the SAME statement as the key itself. A retry whose fingerprint differs
+   is **422**, byte-identical to the 422 the key store gives for the same
+   mistake. Without this the booking held only half of what `ht_channel_idempotency`
+   holds, and a reused key with a different body replayed an unrelated stay as
+   a fresh 201.
+2. **Liveness.** A hold that is cancelled, released, swept, already paid, or
+   simply past its deadline is **409**, naming the booking and its stored
+   status. The 201 contract has no status field, so returning such a booking as
+   a fresh hold would hand the client a `hold_expires_at` in the past with no
+   way to notice. 409 tells them to look it up or mint a new key.
+
+`amount_due_now` on a replay is recomputed rather than read back — it is not a
+stored column (a pending hold has received no money). That is sound *because*
+gate 1 ran first: the payment plan is part of the fingerprint, so a replay's
+plan is provably the one the original attempt quoted.
+
+Unkeyed requests stamp no `book_ext_ref` and are completely unchanged: every
+call mints a new hold. Covered by
+`tests/test_channel.rs::hold_retry_after_a_crash_between_the_two_writes_replays_the_same_hold`,
+which reproduces the crash deterministically by abandoning the reservation
+after the hold commits.
 
 Implementation: `service::channel_idempotency` (policy, fingerprinting, the
 reservation guard) + `repository::channel_idempotency` (SQL) + the keyed branch

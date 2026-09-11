@@ -1,4 +1,5 @@
-//! B8a — parked (roomless) bookings must consume loyalty-channel inventory.
+//! B8a/B8c — parked (roomless) bookings must consume loyalty-channel inventory,
+//! and (since migration 094) consume it from the TYPE they claim.
 //!
 //! A **parked** booking is a live `ht_bookings` row with ZERO
 //! `ht_booking_rooms` rows: an OTA or desk reservation whose room a human
@@ -14,18 +15,32 @@
 //! `common` reads `DATABASE_URL`; CI provides a service container and runs
 //! `--test-threads=1`.
 //!
+//! ## The two terms under test
+//!
+//! B8a could only cap property-wide, because a parked booking recorded no room
+//! type anywhere in the canonical schema. Migration 094 adds
+//! `ht_bookings.book_room_type_id`, so the rule is now
+//!
+//! ```text
+//! available(type) = min( max(free(type) - parked_typed(type), 0), surplus )
+//! surplus         = max(free rooms property-wide - ALL parked claims, 0)
+//! ```
+//!
+//! Scenarios 6 and 7 are a matched pair isolating exactly that difference:
+//! identical pressure, identical slack, and the only variable is whether the
+//! parked claim names a type. A NULL-type claim must still behave exactly as
+//! it did under #304 (scenario 6); a typed one must take its own type's last
+//! room out of the channel's view and leave every other type alone
+//! (scenario 7).
+//!
 //! ## Why the assertions are relative, not absolute
 //!
-//! A parked booking records NO room type anywhere in the canonical schema
-//! (`ht_bookings` has no type column; `ht_booking_rooms.br_room_type_id`
-//! only exists on a row that already carries `br_room_id NOT NULL`). The
-//! implemented rule is therefore property-wide:
-//! `available(type) = min(free rooms of type, max(free rooms - parked, 0))`.
 //! "Free rooms" spans every room in the database, and a developer's machine
 //! carries the real mirrored room list while CI carries only what tests seed
 //! — so each scenario MEASURES the surplus via
 //! `channel_repo::inventory_snapshot` and then drains it to a known value,
-//! instead of assuming a room count.
+//! instead of assuming a room count. The per-type counts ARE absolute: the
+//! two fixture types are unique to this file.
 //!
 //! ## Why one test function
 //!
@@ -131,6 +146,47 @@ async fn seed_parked(
     .execute(pool)
     .await
     .expect("seed parked bookings");
+}
+
+/// Insert `count` PARKED bookings that DO name a room type (B8c / migration
+/// 094) — `book_room_type_id` set, still zero `ht_booking_rooms` rows. This is
+/// what a roomless OTA/desk reservation with a declared `roomTypeId` looks
+/// like, and what the CT mapper persists for an iHOTEL "ระบุประเภทห้อง"
+/// booking whose `HT_Book_Ds.Book_Room_Type` code resolved.
+#[allow(clippy::too_many_arguments)]
+async fn seed_parked_typed(
+    pool: &PgPool,
+    cust_id: i32,
+    type_id: i32,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+    status: &str,
+    seq: &mut i64,
+    count: i64,
+) {
+    if count <= 0 {
+        return;
+    }
+    let from = *seq;
+    let to = *seq + count - 1;
+    *seq = to + 1;
+
+    sqlx::query(
+        "INSERT INTO ht_bookings (book_no, book_cust_id, book_checkin, book_checkout, book_status, book_channel, book_room_type_id) \
+         SELECT $1 || lpad(g::text, 6, '0'), $2, $3::date, $4::date, $5, 'bookingcom', $8 \
+           FROM generate_series($6::bigint, $7::bigint) AS g",
+    )
+    .bind(BOOK_NO_PREFIX)
+    .bind(cust_id)
+    .bind(check_in)
+    .bind(check_out)
+    .bind(status)
+    .bind(from)
+    .bind(to)
+    .bind(type_id)
+    .execute(pool)
+    .await
+    .expect("seed typed parked bookings");
 }
 
 /// Insert one ASSIGNED live booking occupying `room_id` — the shape the
@@ -307,6 +363,9 @@ async fn parked_bookings_consume_channel_inventory() {
     let w3 = (d("2127-07-01"), d("2127-07-05")); // cancelled parked
     let w4 = (d("2127-09-01"), d("2127-09-05")); // surplus absorbs the claim
     let w5 = (d("2127-11-01"), d("2127-11-05")); // counter/picker agreement
+    let w6 = (d("2128-01-01"), d("2128-01-05")); // B8c: NULL-type claim, slack
+    let w7 = (d("2128-03-01"), d("2128-03-05")); // B8c: typed claim, same slack
+    let w8 = (d("2128-05-01"), d("2128-05-05")); // B8c: two types + one untyped
 
     // ── baseline: nothing parked, both types fully available ────────────────
 
@@ -470,6 +529,136 @@ async fn parked_bookings_consume_channel_inventory() {
     assert_eq!(
         assert_counter_and_picker_agree(&pool, type_b, w5.0, w5.1, "B, surplus 0").await,
         0
+    );
+
+    // ── 6. B8c — a NULL-type parked claim still only CAPS property-wide ─────
+    //
+    // The control for scenario 7. Identical setup, identical pressure: type A
+    // is down to its last room (A1) and ONE parked booking overlaps — but the
+    // booking names no type, so nothing tells us it wants an A. While the
+    // property still has slack somewhere, A's last room stays sellable. That
+    // is the #304 rule, and migration 094 must leave it exactly as it was.
+
+    seed_assigned(&pool, cust, room_a2, w6.0, w6.1, &mut seq).await;
+    assert_eq!(
+        counted(&pool, type_a, w6.0, w6.1).await,
+        1,
+        "A2 assigned ⇒ exactly one free room of type A"
+    );
+
+    seed_parked(&pool, cust, w6.0, w6.1, "confirmed", &mut seq, 1).await;
+
+    let untyped = snapshot(&pool, w6.0, w6.1).await;
+    assert_eq!(untyped.parked_claims, 1);
+    assert_eq!(untyped.parked_claims_typed, 0, "the claim names no type");
+    assert_eq!(untyped.parked_claims_untyped, 1);
+    assert!(
+        untyped.surplus >= 1,
+        "the scenario only means something while the property has slack: {untyped:?}"
+    );
+    assert_eq!(
+        counted(&pool, type_a, w6.0, w6.1).await,
+        1,
+        "a NULL-type claim must not single out a type — it can only cap the \
+         property, which still has room"
+    );
+    assert!(picked(&pool, type_a, w6.0, w6.1).await.is_some());
+    assert_eq!(counted(&pool, type_b, w6.0, w6.1).await, 1);
+
+    // ── 7. B8c — a TYPED parked claim blocks the last room of THAT type ─────
+    //
+    // Same pressure as scenario 6, one fact added: the parked booking now
+    // records `book_room_type_id = type_a`. The last type-A room must go
+    // unsellable — and type B must NOT, which is the whole point (before B8c
+    // both stayed sellable and the channel could hand out the A that the
+    // parked booking was waiting for).
+
+    seed_assigned(&pool, cust, room_a2, w7.0, w7.1, &mut seq).await;
+    assert_eq!(counted(&pool, type_a, w7.0, w7.1).await, 1);
+    assert_eq!(counted(&pool, type_b, w7.0, w7.1).await, 1);
+
+    seed_parked_typed(&pool, cust, type_a, w7.0, w7.1, "confirmed", &mut seq, 1).await;
+
+    let typed = snapshot(&pool, w7.0, w7.1).await;
+    assert_eq!(typed.parked_claims, 1);
+    assert_eq!(typed.parked_claims_typed, 1, "the claim names type A");
+    assert_eq!(typed.parked_claims_untyped, 0);
+    assert!(
+        typed.surplus >= 1,
+        "the property must still have slack, or the property-wide cap — not \
+         the per-type term — would be what blocks A: {typed:?}"
+    );
+
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_a, w7.0, w7.1, "A, typed claim").await,
+        0,
+        "a parked claim ON TYPE A must take A's last room out of the channel's \
+         view even though the property has slack elsewhere"
+    );
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_b, w7.0, w7.1, "B, other type").await,
+        1,
+        "and it must NOT touch another type — per-type subtraction, not a \
+         wider sold-out"
+    );
+
+    // A cancelled TYPED claim is as invisible as a cancelled untyped one: the
+    // type split is an extra aggregate over the SAME parked-claim predicate.
+    seed_parked_typed(&pool, cust, type_b, w7.0, w7.1, "cancelled", &mut seq, 3).await;
+    assert_eq!(
+        snapshot(&pool, w7.0, w7.1).await,
+        typed,
+        "cancelled typed parked bookings hold no inventory"
+    );
+    assert_eq!(counted(&pool, type_b, w7.0, w7.1).await, 1);
+
+    // ── 8. B8c — claims of DIFFERENT types are attributed independently ─────
+    //
+    // The scenario a single-type test cannot distinguish: one live parked
+    // claim on A and one on B, in the same window, with the property still
+    // holding slack. Each type must lose exactly its OWN claim — an
+    // implementation that grouped wrongly (or summed all typed claims against
+    // every type) would zero both, and one that ignored the grouping would
+    // zero neither.
+    //
+    // The bookkeeping assertions below are meaningful here for the same
+    // reason: the two columns are fed by rows that are NOT all the same kind,
+    // so a mis-bucketed claim actually moves them.
+
+    seed_assigned(&pool, cust, room_a2, w8.0, w8.1, &mut seq).await;
+    assert_eq!(counted(&pool, type_a, w8.0, w8.1).await, 1, "A1 free");
+    assert_eq!(counted(&pool, type_b, w8.0, w8.1).await, 1, "B1 free");
+
+    seed_parked_typed(&pool, cust, type_a, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+    seed_parked_typed(&pool, cust, type_b, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+    // ...plus one claim that names no type at all, so the two columns disagree
+    // and the split has something real to get wrong.
+    seed_parked(&pool, cust, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+
+    let mixed = snapshot(&pool, w8.0, w8.1).await;
+    assert_eq!(
+        mixed.parked_claims, 3,
+        "three live parked claims: {mixed:?}"
+    );
+    assert_eq!(
+        mixed.parked_claims_typed, 2,
+        "exactly the two that name a type: {mixed:?}"
+    );
+    assert_eq!(
+        mixed.parked_claims_untyped, 1,
+        "exactly the one that does not: {mixed:?}"
+    );
+
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_a, w8.0, w8.1, "A, own claim").await,
+        0,
+        "A loses its last room to the claim that names A"
+    );
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_b, w8.0, w8.1, "B, own claim").await,
+        0,
+        "and B loses its last room to the claim that names B — independently, \
+         not because A's claim spilled over"
     );
 
     cleanup(&pool).await;

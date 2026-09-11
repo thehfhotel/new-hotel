@@ -50,6 +50,8 @@
 //! and the writeback recipes already round-trip; we don't introduce a
 //! new enum.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use uuid::Uuid;
@@ -119,7 +121,10 @@ impl MssqlChangeMapper for BookingHeaderMapper {
         // row is NULL, but the watcher's `pk_<col>` aliasing keeps the
         // value addressable by the same column name (verified in
         // `bin/sync.rs::materialise_row`).
-        row.try_get_str("Book_ID").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_ID")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -170,7 +175,10 @@ impl MssqlChangeMapper for BookingRoomsMapper {
         //         return None and rely on a sibling CT row (header
         //         UPDATE or another child's I/U) to pull this booking
         //         into the aggregate sweep.
-        row.try_get_str("Book_No").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_No")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -212,7 +220,10 @@ impl MssqlChangeMapper for BookingDatesMapper {
     }
 
     fn coalesce_key(&self, row: &dyn MappableRow) -> Option<String> {
-        row.try_get_str("Book_no").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_no")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -278,6 +289,13 @@ struct ExistingBooking {
     /// mismatch against any non-empty value here — see
     /// `HEADER_GATE_FIELDS`'s `book_notes` term.
     book_notes: Option<String>,
+    /// Current `ht_bookings.book_room_type_id` (migration 094 / #304
+    /// B8c). Compared by the `book_room_type_id` gate term so a legacy
+    /// room-TYPE change on a "ระบุประเภทห้อง" booking re-applies instead
+    /// of freezing behind an otherwise-identical header (that booking
+    /// shape has no `ht_booking_rooms` rows either, so the room stage
+    /// cannot notice it).
+    book_room_type_id: Option<i32>,
 }
 
 /// One `ht_booking_rooms` row as it currently lives in PG. Deliberately
@@ -315,6 +333,23 @@ struct CanonicalProjection {
     /// the misleading `Book_Room_Type` column per cheatsheet §3.4) +
     /// optional per-room price.
     rooms: Vec<RoomLine>,
+    /// RAW legacy room-TYPE code, populated ONLY for a
+    /// `HT_Book_H.Book_room_type = 1` booking ("ระบุประเภทห้อง", cheatsheet
+    /// §3.3), where `HT_Book_Ds.Book_Room_Type` holds a type code rather than
+    /// a room number. Taken from the first non-cancelled Ds line — the same
+    /// "first line speaks for the booking" convention `build_event` already
+    /// uses for `room_no`. `None` for a mode-2 booking (there the type is
+    /// DERIVED from the assigned room) and for a header with no usable line.
+    ///
+    /// Kept separate from `book_room_type_id` because projection is PURE:
+    /// resolving a code to a canonical id needs the transaction.
+    book_room_type_code: Option<String>,
+    /// Canonical `ht_bookings.book_room_type_id` (migration 094 / issue #304
+    /// B8c) — filled by [`resolve_projected_room_type`] AFTER projection and
+    /// BEFORE the idempotency gate, so the gate compares what will actually
+    /// be written. `None` = type unknown, which `repository::channel` reads
+    /// as "cap this parked claim property-wide" (the #304 fallback).
+    book_room_type_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -465,7 +500,7 @@ pub async fn apply_booking_aggregate(
         return apply_cancelled(tx, book_id).await;
     }
 
-    let projection = project_aggregate(aggregate, book_id)?;
+    let mut projection = project_aggregate(aggregate, book_id)?;
     let existing = fetch_existing(tx, book_id).await?;
 
     // Resolve the per-line room FKs BEFORE the idempotency check so the
@@ -475,6 +510,12 @@ pub async fn apply_booking_aggregate(
     // what will be WRITTEN against what is STORED, never the raw legacy
     // line list.
     let resolved_rooms = resolve_room_lines(tx, book_id, &projection.rooms).await?;
+
+    // Room-type attribution (B8c / migration 094) — resolved BEFORE the
+    // idempotency gate so the gate compares what will actually be written,
+    // the same discipline `resolved_rooms` follows.
+    projection.book_room_type_id =
+        resolve_projected_room_type(tx, book_id, &projection, &resolved_rooms).await?;
 
     // Idempotent skip — every projected field matches the canonical row,
     // INCLUDING the per-room (room_id, price) set (2026-07-28: a bare
@@ -660,6 +701,11 @@ fn project_aggregate(
     // path).
     let book_room_type = header.try_get_i32("Book_room_type").ok().flatten();
     let mut rooms = Vec::with_capacity(agg.rooms.len());
+    // B8c (migration 094): on a mode-1 booking those same Ds lines carry the
+    // room-TYPE code the reservation wants. It is the ONLY record of what a
+    // parked booking claims, so capture it here instead of dropping the lines
+    // entirely as the pre-B8c code did.
+    let mut book_room_type_code: Option<String> = None;
     if book_room_type != Some(1) {
         for r in &agg.rooms {
             // Skip cancelled lines (Book_status=3 per cheatsheet §3.4).
@@ -679,12 +725,31 @@ fn project_aggregate(
             });
         }
     } else if !agg.rooms.is_empty() {
+        // First non-cancelled line wins — the same "first line speaks for the
+        // booking" rule `build_event` uses for `room_no`, and the same one the
+        // desk path applies when it derives the type from the first assigned
+        // room. A blank code stays `None`: iHOTEL leaves `Book_Room_Type=''`
+        // on cancelled lines (observed on R014826).
+        book_room_type_code = agg
+            .rooms
+            .iter()
+            .filter(|r| r.try_get_i32("Book_status").ok().flatten() != Some(3))
+            .find_map(|r| {
+                r.try_get_str("Book_Room_Type")
+                    .ok()
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+            });
         tracing::debug!(
             target: "sync::booking",
             book_id,
             ds_lines = agg.rooms.len(),
+            room_type_code = ?book_room_type_code,
             "Book_room_type=1 (no specific rooms): Ds lines carry room-TYPE \
-             codes — projecting header-only, no ht_booking_rooms assignments"
+             codes — projecting header-only, no ht_booking_rooms assignments; \
+             the first live line's code becomes book_room_type_id"
         );
     }
 
@@ -698,6 +763,10 @@ fn project_aggregate(
         deposit_amount,
         notes,
         rooms,
+        book_room_type_code,
+        // Resolved against `ht_room_types` by `resolve_projected_room_type`
+        // once a transaction is available — projection stays pure.
+        book_room_type_id: None,
     })
 }
 
@@ -717,18 +786,20 @@ fn legacy_status_to_pg(legacy: &str) -> &'static str {
 /// (legacy stores them at midnight per the booking-create recipe). PG's
 /// `book_checkin/checkout` are `DATE` columns — drop the time component.
 fn derive_stay_range(header: &dyn MappableRow) -> Result<(NaiveDate, NaiveDate), SyncError> {
-    let date_in: NaiveDateTime = header
-        .try_get_datetime("Book_Date_in")?
-        .ok_or_else(|| SyncError::Mapper {
-            table: BOOK_H_TABLE,
-            message: "Book_Date_in is NULL on header".into(),
-        })?;
-    let date_out: NaiveDateTime = header
-        .try_get_datetime("Book_Date_out")?
-        .ok_or_else(|| SyncError::Mapper {
-            table: BOOK_H_TABLE,
-            message: "Book_Date_out is NULL on header".into(),
-        })?;
+    let date_in: NaiveDateTime =
+        header
+            .try_get_datetime("Book_Date_in")?
+            .ok_or_else(|| SyncError::Mapper {
+                table: BOOK_H_TABLE,
+                message: "Book_Date_in is NULL on header".into(),
+            })?;
+    let date_out: NaiveDateTime =
+        header
+            .try_get_datetime("Book_Date_out")?
+            .ok_or_else(|| SyncError::Mapper {
+                table: BOOK_H_TABLE,
+                message: "Book_Date_out is NULL on header".into(),
+            })?;
     Ok((date_in.date(), date_out.date()))
 }
 
@@ -741,21 +812,26 @@ async fn fetch_existing(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_book_id: &str,
 ) -> Result<Option<ExistingBooking>, SyncError> {
-    let row = sqlx::query_as::<_, (
-        i32,
-        Option<Uuid>,
-        Option<String>,
-        i32,
-        Option<f64>,
-        Option<f64>,
-        NaiveDate,
-        NaiveDate,
-        Option<String>,
-        Option<String>,
-    )>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            i32,
+            Option<Uuid>,
+            Option<String>,
+            i32,
+            Option<f64>,
+            Option<f64>,
+            NaiveDate,
+            NaiveDate,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+        ),
+    >(
         "SELECT book_id, aggregate_id, book_status, book_cust_id, \
                 book_total_amount::float8, book_deposit_amount::float8, \
-                book_checkin, book_checkout, legacy_cust_no, book_notes \
+                book_checkin, book_checkout, legacy_cust_no, book_notes, \
+                book_room_type_id \
            FROM ht_bookings \
           WHERE legacy_book_id = $1 \
           LIMIT 1",
@@ -775,6 +851,7 @@ async fn fetch_existing(
         book_checkout,
         legacy_cust_no,
         book_notes,
+        book_room_type_id,
     )) = row
     else {
         return Ok(None);
@@ -811,6 +888,7 @@ async fn fetch_existing(
         rooms,
         legacy_cust_no,
         book_notes,
+        book_room_type_id,
     }))
 }
 
@@ -860,7 +938,7 @@ fn existing_matches(
 /// removes the comparison. Names are the canonical (PG) column, which is
 /// also what `scheduler::sync::booking_canonical_hash` reads, so
 /// [`HASH_INPUTS`] cites them directly. See [`crate::sync::gate_guard`].
-const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 7] = [
+const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 8] = [
     GateField {
         name: "book_status",
         guarded: false,
@@ -910,6 +988,22 @@ const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 7] =
             LegacyNotes::Cleared => matches!(ex.book_notes.as_deref(), None | Some("")),
             LegacyNotes::Value(v) => ex.book_notes.as_deref() == Some(v.as_str()),
         },
+    },
+    // UNGUARDED on purpose (B8c / migration 094). `book_room_type_id` is
+    // written unconditionally — no COALESCE — so the comparison converges in
+    // one apply in BOTH directions, including a legacy type that becomes
+    // unresolvable (Some → None). Guarding it would make a type change
+    // invisible on exactly the booking shape that needs it most: a
+    // "ระบุประเภทห้อง" booking has no `ht_booking_rooms` rows either, so
+    // nothing else in the gate could notice.
+    //
+    // Note the comparison is against the RESOLVED id, which is why
+    // `apply_booking_aggregate` fills `p.book_room_type_id` before calling
+    // `existing_matches` — the same rule the room stage follows.
+    GateField {
+        name: "book_room_type_id",
+        guarded: false,
+        matches: |ex, p| ex.book_room_type_id == p.book_room_type_id,
     },
 ];
 
@@ -1136,8 +1230,9 @@ async fn update_existing(
                 legacy_book_id      = COALESCE(legacy_book_id, $8), \
                 legacy_cust_no      = COALESCE($9, legacy_cust_no), \
                 aggregate_id        = COALESCE(aggregate_id, $10), \
+                book_room_type_id   = $11, \
                 updated_at          = NOW() \
-          WHERE book_id = $11",
+          WHERE book_id = $12",
     )
     .bind(cust_id)
     .bind(p.book_checkin)
@@ -1149,6 +1244,13 @@ async fn update_existing(
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
     .bind(agg_id)
+    // NOT COALESCEd (B8c): the legacy aggregate is the truth for a
+    // legacy-owned booking, so a type that becomes unresolvable must be able
+    // to clear back to NULL. NULL is the honest "unknown", and
+    // `repository::channel` handles it by capping the claim property-wide
+    // (the #304 rule) — strictly safer than freezing a stale type that would
+    // block the WRONG room type forever.
+    .bind(p.book_room_type_id)
     .bind(book_id_serial)
     .execute(&mut **tx)
     .await?;
@@ -1168,9 +1270,10 @@ async fn insert_new(
         "INSERT INTO ht_bookings \
              (book_no, book_cust_id, book_checkin, book_checkout, \
               book_status, book_total_amount, book_deposit_amount, book_notes, \
-              legacy_book_id, legacy_cust_no, book_source) \
+              legacy_book_id, legacy_cust_no, book_room_type_id, book_source) \
          VALUES \
-             ($1, $2, $3, $4, $5, $6::float8, $7::float8, $8, $9, $10, 'legacy_app') \
+             ($1, $2, $3, $4, $5, $6::float8, $7::float8, $8, $9, $10, $11, \
+              'legacy_app') \
          RETURNING book_id",
     )
     .bind(&p.legacy_book_id)
@@ -1183,6 +1286,7 @@ async fn insert_new(
     .bind(notes_bind(&p.notes))
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
+    .bind(p.book_room_type_id)
     .fetch_one(&mut **tx)
     .await?;
     Ok(row.0)
@@ -1195,6 +1299,15 @@ async fn insert_new(
 struct ResolvedRoomLine {
     room_id: i32,
     price_per_night: Option<f64>,
+    /// The room's own `ht_rooms_new.room_type_id`, read in the SAME lookup
+    /// that resolves `room_id` (B8c / migration 094). On a mode-2 booking
+    /// (`HT_Book_H.Book_room_type = 2`) this is what
+    /// `book_room_type_id` is DERIVED from — matching the desk path, which
+    /// derives from the first assigned room rather than trusting a
+    /// caller-supplied type. Deliberately NOT part of the room-set gate
+    /// comparison: `replace_rooms` does not write it, and the gate's job is
+    /// to answer "would `replace_rooms` be a no-op?".
+    room_type_id: Option<i32>,
 }
 
 /// Resolve every projection room line against `ht_rooms_new`. The
@@ -1231,16 +1344,17 @@ async fn resolve_room_lines(
             );
             continue;
         }
-        let room_id_row: Option<(i32,)> = sqlx::query_as(
-            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
+        let room_id_row: Option<(i32, Option<i32>)> = sqlx::query_as(
+            "SELECT room_id, room_type_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
         )
         .bind(&r.room_no)
         .fetch_optional(&mut **tx)
         .await?;
         match room_id_row {
-            Some((room_id,)) => out.push(ResolvedRoomLine {
+            Some((room_id, room_type_id)) => out.push(ResolvedRoomLine {
                 room_id,
                 price_per_night: r.price_per_night,
+                room_type_id,
             }),
             None => {
                 return Err(SyncError::Mapper {
@@ -1257,6 +1371,140 @@ async fn resolve_room_lines(
         }
     }
     Ok(out)
+}
+
+/// Distinct legacy room-TYPE codes we have already warned about, so an
+/// unmappable code logs ONCE per process instead of once per CT tick forever.
+///
+/// A `HashSet` rather than a counter because the interesting fact is WHICH
+/// codes are unknown (an operator adds the missing `ht_room_types` row from
+/// that list); bounded in practice by iHOTEL's eight-row `HT_SET_RoomType`.
+static UNKNOWN_ROOM_TYPE_CODES: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Decide `ht_bookings.book_room_type_id` for this aggregate (B8c /
+/// migration 094 / issue #304).
+///
+/// Two sources, in the order legacy actually carries the fact:
+///
+/// 1. **A mode-1 booking** (`HT_Book_H.Book_room_type = 1`, iHOTEL's
+///    "ระบุประเภทห้อง" form — cheatsheet §3.3) states the type EXPLICITLY in
+///    `HT_Book_Ds.Book_Room_Type`. This is the case the whole feature exists
+///    for: such a booking projects as header-only, so canonical would
+///    otherwise hold a parked claim with no type at all.
+/// 2. **A mode-2 booking** names rooms, so the type is DERIVED from the first
+///    resolved room — the same rule `service::booking::resolve_room_type`
+///    applies at the desk, which is what makes our own write-back echo
+///    converge instead of flapping.
+///
+/// An unresolvable code yields `None` and is logged once (see
+/// [`UNKNOWN_ROOM_TYPE_CODES`]) — never an error. Erroring would hold the CT
+/// watermark on a pure data-quality value, and unlike the customer FK there
+/// is nothing to lose by proceeding: NULL simply means "type unknown", which
+/// `repository::channel` handles with the property-wide cap that predates
+/// this column. Nothing is dropped — the aggregate still applies in full.
+async fn resolve_projected_room_type(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book_id: &str,
+    p: &CanonicalProjection,
+    resolved_rooms: &[ResolvedRoomLine],
+) -> Result<Option<i32>, SyncError> {
+    if let Some(code) = p.book_room_type_code.as_deref() {
+        let resolved = resolve_room_type_code(tx, code).await?;
+        if resolved.is_none() {
+            // `unwrap_or_else(into_inner)` rather than `unwrap_or(false)`: a
+            // poisoned mutex means some other thread panicked while holding
+            // it, which says nothing about the validity of the SET — and
+            // treating it as "already warned" would silence this diagnostic
+            // for the rest of the process's life, exactly when something has
+            // already gone wrong. Take the inner value and carry on.
+            let mut seen = UNKNOWN_ROOM_TYPE_CODES
+                .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let first_sighting = seen.insert(code.to_string());
+            drop(seen);
+            if first_sighting {
+                tracing::warn!(
+                    target: "sync::booking",
+                    book_id,
+                    room_type_code = %code,
+                    "legacy HT_Book_Ds.Book_Room_Type '{code}' matches no \
+                     ht_room_types row (type_code / type_name / type_name_en) AND \
+                     no ht_rooms_new.room_no — leaving \
+                     ht_bookings.book_room_type_id NULL, so this parked claim is \
+                     capped property-wide instead of per type. Logged once per \
+                     distinct value; add the missing room type (or room) to fix."
+                );
+            }
+        }
+        return Ok(resolved);
+    }
+
+    // Mode 2 (or no usable Ds line): derive from the first assigned room.
+    Ok(resolved_rooms.first().and_then(|r| r.room_type_id))
+}
+
+/// Resolve one legacy mode-1 `HT_Book_Ds.Book_Room_Type` value to a canonical
+/// `ht_room_types.type_id`.
+///
+/// Two lookups, in this order, because production data proves the column is
+/// not as pure as the decompile suggested.
+///
+/// ## 1. As a room TYPE (the documented meaning)
+///
+/// iHOTEL's `HT_SET_RoomType` maps onto our table via `backfill_rooms`:
+/// `id_full → type_code` and `name → type_name` (also copied to
+/// `type_name_en`). Which of those the booking grid writes is not pinned by
+/// the decompile — the column is a free varchar(50) — so all three are
+/// accepted, with the UNIQUE `type_code` winning a tie. Comparison is on the
+/// trimmed literal; no case folding, because Thai type names have no case and
+/// a Latin mismatch should surface as an unmapped-code warning rather than be
+/// silently absorbed.
+///
+/// ## 2. As a room NUMBER (observed, 2026-09-11)
+///
+/// The pre-merge verification against BOTH live sites
+/// (`docs/coexistence/PENDING-VERIFICATIONS.md`, V17) found HF Hotel holds 6
+/// `Book_room_type = 1` headers out of 16,208 and 4 joined `HT_Book_Ds` rows —
+/// three carrying a type NAME (`เตียงเดี่ยว`, `HT_SET_RoomType.name` id 2) and
+/// **one, `R014814`, carrying the room number `402`**. HF Ville holds none at
+/// all (0 of 2,460).
+///
+/// So a mode-1 line CAN hold a room number, and the pure-type reading would
+/// have left `R014814` unattributed. Falling back to `ht_rooms_new.room_no`
+/// and taking that room's own type is both correct for it and strictly safer
+/// than the alternative: the type lookup runs FIRST, so a value that is a
+/// genuine type can never be mistaken for a room, and a value that is neither
+/// still lands on `None` (logged once, property-wide cap).
+///
+/// This does NOT turn the line into a room ASSIGNMENT — `project_aggregate`
+/// still projects mode-1 bookings header-only, which is what keeps the
+/// 2026-06-11 forever-re-emitting loop closed. Only the type is borrowed.
+async fn resolve_room_type_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    code: &str,
+) -> Result<Option<i32>, SyncError> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT type_id FROM ht_room_types \
+          WHERE type_code = $1 OR type_name = $1 OR type_name_en = $1 \
+          ORDER BY (type_code = $1) DESC, type_id \
+          LIMIT 1",
+    )
+    .bind(code)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((type_id,)) = row {
+        return Ok(Some(type_id));
+    }
+
+    // Not a type — try it as a room number (the `R014814` shape).
+    let by_room: Option<(Option<i32>,)> =
+        sqlx::query_as("SELECT room_type_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1")
+            .bind(code)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(by_room.and_then(|(room_type_id,)| room_type_id))
 }
 
 /// Replace `ht_booking_rooms` for this booking. Conservative: drop and
@@ -1494,7 +1742,9 @@ mod tests {
     #[test]
     fn project_aggregate_skips_cancelled_ds_rows() {
         let mut cancelled = ds_row("R014810", "402");
-        cancelled.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let agg = BookingAggregate {
             header: Some(header_row("R014810", "C21610", "จอง")),
             rooms: vec![cancelled, ds_row("R014810", "414")],
@@ -1582,8 +1832,8 @@ mod tests {
     /// touch forever. Type-1 must project header-only.
     #[test]
     fn project_aggregate_type1_booking_projects_no_room_assignments() {
-        let header = header_row("R015301", "C21610", "จอง")
-            .with("Book_room_type", MockValue::I32(1));
+        let header =
+            header_row("R015301", "C21610", "จอง").with("Book_room_type", MockValue::I32(1));
         let agg = BookingAggregate {
             header: Some(header),
             // Ds line carries a TYPE code ("4" = some room category),
@@ -1606,8 +1856,8 @@ mod tests {
     /// room-number interpretation.
     #[test]
     fn project_aggregate_type2_booking_projects_room_assignments() {
-        let header = header_row("R015302", "C21610", "จอง")
-            .with("Book_room_type", MockValue::I32(2));
+        let header =
+            header_row("R015302", "C21610", "จอง").with("Book_room_type", MockValue::I32(2));
         let agg = BookingAggregate {
             header: Some(header),
             rooms: vec![ds_row("R015302", "402")],
@@ -1653,7 +1903,10 @@ mod tests {
             nights: vec![],
         };
         let p = project_aggregate(&agg, "R001329").expect("header-only must project");
-        assert!(p.rooms.is_empty(), "header-only aggregate yields zero room lines");
+        assert!(
+            p.rooms.is_empty(),
+            "header-only aggregate yields zero room lines"
+        );
         assert_eq!(p.legacy_book_id, "R001329");
         assert_eq!(p.book_status, "confirmed");
     }
@@ -1664,9 +1917,13 @@ mod tests {
         // line. Projection drops them — same canonical shape as a true
         // header-only aggregate.
         let mut cancelled1 = ds_row("R001388", "402");
-        cancelled1.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled1
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let mut cancelled2 = ds_row("R001388", "414");
-        cancelled2.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled2
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let agg = BookingAggregate {
             header: Some(header_row("R001388", "C21611", "ยกเลิก")),
             rooms: vec![cancelled1, cancelled2],
@@ -1732,6 +1989,8 @@ mod tests {
             deposit_amount: Some(0.0),
             notes: LegacyNotes::Unset,
             rooms: vec![],
+            book_room_type_code: None,
+            book_room_type_id: None,
         }
     }
 
@@ -1746,6 +2005,10 @@ mod tests {
         ResolvedRoomLine {
             room_id,
             price_per_night: Some(price),
+            // Not part of the room-set gate comparison (`replace_rooms` never
+            // writes it); the mode-2 derivation is covered by the integration
+            // suite, which has real `ht_rooms_new` rows to derive from.
+            room_type_id: None,
         }
     }
 
@@ -1785,6 +2048,7 @@ mod tests {
             rooms: Vec::new(),
             legacy_cust_no: p.legacy_cust_no.clone(),
             book_notes: notes_bind(&p.notes).map(str::to_string),
+            book_room_type_id: p.book_room_type_id,
         }
     }
 
@@ -2219,6 +2483,105 @@ mod tests {
         );
     }
 
+    // ----- book_room_type_id gate term (B8c / migration 094) -------------
+
+    /// The `book_room_type_id` term is UNGUARDED, and this is the transition
+    /// that proves it has to be.
+    ///
+    /// `make_existing` builds the stored row FROM the projection, so it copies
+    /// whatever `book_room_type_id` the projection carries and the term
+    /// trivially matches — a test that only used the fixture as-is would pass
+    /// against a gate that never compared the column at all. Every assertion
+    /// below therefore mutates the projection AFTER the fixture is built.
+    #[test]
+    fn gate_notices_a_room_type_change_in_both_directions() {
+        // Some -> None: iHOTEL repointed a "ระบุประเภทห้อง" booking at a code
+        // we can no longer map. If the gate held here, the write that clears
+        // the column would never run and canonical would keep subtracting a
+        // parked claim from the WRONG type forever.
+        let mut p = sample_projection();
+        p.book_room_type_id = Some(7);
+        let ex = make_existing(&p);
+        assert!(
+            existing_matches(&ex, &p, &[]),
+            "fixture sanity: an unmutated projection must match"
+        );
+
+        p.book_room_type_id = None;
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> None must mismatch — the term is unguarded precisely so an \
+             unresolvable legacy type converges to NULL instead of freezing"
+        );
+
+        // Some -> Some: the ordinary receptionist retype.
+        p.book_room_type_id = Some(9);
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> Some must mismatch"
+        );
+
+        // None -> Some: first sighting on a booking canonical had no type for.
+        let mut cleared = sample_projection();
+        cleared.book_room_type_id = None;
+        let ex_cleared = make_existing(&cleared);
+        cleared.book_room_type_id = Some(3);
+        assert!(
+            !existing_matches(&ex_cleared, &cleared, &[]),
+            "None -> Some must mismatch"
+        );
+    }
+
+    /// A `Book_room_type=1` header with NO surviving `HT_Book_Ds` rows carries
+    /// no type code at all — the shape iHOTEL's §3.6 cancel-on-room leaves
+    /// behind (it deletes every Ds line but keeps the header). It must project
+    /// header-only with NO type, not panic and not invent one from thin air.
+    #[test]
+    fn project_aggregate_mode_1_without_ds_rows_carries_no_type_code() {
+        let mut header = header_row("R015401", "C21610", "จอง");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015401").expect("must project");
+        assert!(p.rooms.is_empty(), "no Ds lines ⇒ no room assignments");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "no Ds line ⇒ nothing states a type; the claim stays untyped and \
+             falls back to the property-wide cap"
+        );
+    }
+
+    /// Every Ds line CANCELLED (`Book_status=3`) is the same story: iHOTEL's
+    /// §3.5 cancel marks the lines rather than deleting them, so the rows are
+    /// present but none of them speaks for the booking.
+    #[test]
+    fn project_aggregate_mode_1_ignores_cancelled_ds_lines_for_the_type_code() {
+        let mut header = header_row("R015402", "C21610", "ยกเลิก");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let mut cancelled = ds_row("R015402", "DELUXE");
+        cancelled
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![cancelled],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015402").expect("must project");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "a cancelled line must not attribute a type — the same status set \
+             that keeps it out of the room assignments keeps it out of here"
+        );
+    }
+
     /// The gate table must expose exactly the terms the contract
     /// registry advertises — including the `rooms` set-comparison stage,
     /// which is a separate function and would otherwise be invisible to
@@ -2408,8 +2771,7 @@ mod tests {
         let h_row = header_row("R014810", "C21610", "จอง");
         let ds_row1 = ds_row("R014810", "402");
         let ds_row2 = ds_row("R014810", "414");
-        let date_rows: Vec<HashMapRow> =
-            (0..5).map(|_| date_row("R014810", "402")).collect();
+        let date_rows: Vec<HashMapRow> = (0..5).map(|_| date_row("R014810", "402")).collect();
 
         let mut keys = std::collections::HashSet::new();
         if let Some(k) = header.coalesce_key(&h_row) {

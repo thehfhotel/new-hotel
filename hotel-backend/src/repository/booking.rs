@@ -150,10 +150,7 @@ pub trait BookingRepository: Send + Sync {
 
     /// Look up the latest YYYYMMDD sequence used in `book_no` so the route can
     /// generate the next number. Returns the last `book_no` (or None).
-    async fn latest_book_no_today(
-        &self,
-        pool: &PgPool,
-    ) -> Result<Option<String>, sqlx::Error>;
+    async fn latest_book_no_today(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error>;
 
     /// Render today's date as `YYYYMMDD` via the database (preserves the
     /// original behavior — important if the DB is on a different TZ than the
@@ -182,12 +179,21 @@ pub trait BookingRepository: Send + Sync {
     /// (migration 076). Only called when both `channel` and `ext_ref` are
     /// present; the partial UNIQUE index `ux_ht_bookings_channel_ext_ref` is
     /// the concurrent-race backstop and surfaces here as a 23505 error.
+    ///
+    /// `fingerprint` (migration 095) is the SHA-256 of the canonicalised
+    /// request that minted `ext_ref`. It is written in the SAME statement, not
+    /// a follow-up one, so there is no window in which a booking carries a key
+    /// without the request it is bound to — a booking in that state would let
+    /// a reused key carrying a DIFFERENT request replay it. `None` for callers
+    /// that have no fingerprint (the OTA path), which the comparison treats as
+    /// "no opinion".
     async fn set_booking_provenance(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
         channel: &str,
         ext_ref: &str,
+        fingerprint: Option<&str>,
     ) -> Result<(), sqlx::Error>;
 
     /// Read the two facts the modify path needs to choose its legacy write-back
@@ -224,11 +230,8 @@ pub trait BookingRepository: Send + Sync {
 
     /// Look up booking_no for an existing booking; used by update flow to
     /// 404 vs 200.
-    async fn get_book_no(
-        &self,
-        pool: &PgPool,
-        book_id: i32,
-    ) -> Result<Option<String>, sqlx::Error>;
+    async fn get_book_no(&self, pool: &PgPool, book_id: i32)
+        -> Result<Option<String>, sqlx::Error>;
 
     /// Update an existing booking (does NOT touch its rooms).
     async fn update_booking(
@@ -288,6 +291,46 @@ pub trait BookingRepository: Send + Sync {
         book_id: i32,
         channel: &str,
     ) -> Result<(), sqlx::Error>;
+
+    /// The room type of one room (`ht_rooms_new.room_type_id`), for the
+    /// agree-or-derive rule on `ht_bookings.book_room_type_id` (migration 094).
+    ///
+    /// Double `Option` on purpose and both arms are meaningful: the OUTER
+    /// `None` means "no such room" (the caller rejects the request), the INNER
+    /// `None` means "the room exists but carries no type" — legitimate, since
+    /// `room_type_id` is nullable and the room mapper leaves it NULL until the
+    /// rate-tier pass fills it in. An untyped room derives an untyped booking,
+    /// which simply falls back to the property-wide parked-claim cap.
+    async fn room_type_for_room(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        room_id: i32,
+    ) -> Result<Option<Option<i32>>, sqlx::Error>;
+
+    /// Whether `type_id` names a row in `ht_room_types` (migration 094).
+    /// Existence only — an INACTIVE type is still a legitimate attribution for
+    /// a booking taken while it was active, and refusing it would break editing
+    /// an old booking after a type is retired. `fk_ht_bookings_room_type` is the
+    /// backstop; this exists so a bad id is a 400 instead of a 500.
+    async fn room_type_exists(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        type_id: i32,
+    ) -> Result<bool, sqlx::Error>;
+
+    /// Stamp (or clear) `ht_bookings.book_room_type_id` — migration 094, issue
+    /// #304 B8c. Runs in the SAME transaction as the insert/update so a booking
+    /// can never commit with a room set and a contradicting type. Runtime
+    /// `sqlx::query()`, the same convention as `set_aggregate_id` /
+    /// `set_hold_expiry` / `set_booking_channel`: the column postdates the
+    /// committed `.sqlx` offline snapshot, so a `query!` macro would fail the
+    /// offline build. PG-canonical only — never mirrored to legacy.
+    async fn set_booking_room_type(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        type_id: Option<i32>,
+    ) -> Result<(), sqlx::Error>;
 }
 
 /// Default `BookingRepository` impl backed by sqlx + PostgreSQL.
@@ -311,7 +354,13 @@ impl BookingRepository for PgBookingRepository {
         let sort_order = params
             .sort_order
             .as_ref()
-            .map(|s| if s.to_lowercase() == "desc" { "DESC" } else { "ASC" })
+            .map(|s| {
+                if s.to_lowercase() == "desc" {
+                    "DESC"
+                } else {
+                    "ASC"
+                }
+            })
             .unwrap_or("DESC");
 
         let order_by_column = match params.sort_by.as_deref() {
@@ -609,10 +658,7 @@ impl BookingRepository for PgBookingRepository {
             .collect())
     }
 
-    async fn latest_book_no_today(
-        &self,
-        pool: &PgPool,
-    ) -> Result<Option<String>, sqlx::Error> {
+    async fn latest_book_no_today(&self, pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
         let rec = sqlx::query!(
             r#"SELECT book_no FROM ht_bookings
         WHERE book_no LIKE TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
@@ -706,23 +752,31 @@ impl BookingRepository for PgBookingRepository {
         book_id: i32,
         channel: &str,
         ext_ref: &str,
+        fingerprint: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         // Runtime query (not `query!`): `book_ext_ref` postdates the committed
         // `.sqlx` offline snapshot. A 23505 here means a concurrent create won
         // the (book_channel, book_ext_ref) race — the caller rolls back and
         // re-selects the winner's row.
+        //
+        // One statement for all three columns (migration 095): the key and the
+        // fingerprint of the request it is bound to must land together or not
+        // at all.
         sqlx::query(
-            "UPDATE ht_bookings SET book_channel = $1, book_ext_ref = $2 WHERE book_id = $3",
+            "UPDATE ht_bookings \
+                SET book_channel = $1, \
+                    book_ext_ref = $2, \
+                    book_ext_ref_fingerprint = $3 \
+              WHERE book_id = $4",
         )
         .bind(channel)
         .bind(ext_ref)
+        .bind(fingerprint)
         .bind(book_id)
         .execute(&mut **tx)
         .await?;
         Ok(())
     }
-
-
 
     async fn insert_booking_room(
         &self,
@@ -849,13 +903,11 @@ impl BookingRepository for PgBookingRepository {
         book_id: i32,
         aggregate_id: uuid::Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE ht_bookings SET aggregate_id = $2 WHERE book_id = $1",
-        )
-        .bind(book_id)
-        .bind(aggregate_id)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query("UPDATE ht_bookings SET aggregate_id = $2 WHERE book_id = $1")
+            .bind(book_id)
+            .bind(aggregate_id)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 
@@ -884,6 +936,49 @@ impl BookingRepository for PgBookingRepository {
         sqlx::query("UPDATE ht_bookings SET book_channel = $2 WHERE book_id = $1")
             .bind(book_id)
             .bind(channel)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn room_type_for_room(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        room_id: i32,
+    ) -> Result<Option<Option<i32>>, sqlx::Error> {
+        let row: Option<(Option<i32>,)> =
+            sqlx::query_as("SELECT room_type_id FROM ht_rooms_new WHERE room_id = $1")
+                .bind(room_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(row.map(|(type_id,)| type_id))
+    }
+
+    async fn room_type_exists(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        type_id: i32,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(i32,)> =
+            sqlx::query_as("SELECT type_id FROM ht_room_types WHERE type_id = $1")
+                .bind(type_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    async fn set_booking_room_type(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        type_id: Option<i32>,
+    ) -> Result<(), sqlx::Error> {
+        // Runtime query (not `query!`): `book_room_type_id` postdates the
+        // committed `.sqlx` offline snapshot — same rationale as
+        // `set_booking_provenance` / `insert_booking_product`.
+        sqlx::query("UPDATE ht_bookings SET book_room_type_id = $2 WHERE book_id = $1")
+            .bind(book_id)
+            .bind(type_id)
             .execute(&mut **tx)
             .await?;
         Ok(())
