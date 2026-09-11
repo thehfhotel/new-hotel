@@ -234,7 +234,7 @@ rust_xlsxwriter = "0.96"
 resvg = "0.47"
 usvg = "0.47"
 tiny-skia = "0.12"
-fontdb = "0.23"
+fontdb = "0.24"
 
 # Minimal PNG/JPEG decode+crop+encode for the guest-image sync-in: iHOTEL saves
 # the landscape Thai-ID card on a tall white canvas (703×996, card at the top),
