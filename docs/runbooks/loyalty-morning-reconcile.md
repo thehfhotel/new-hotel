@@ -435,11 +435,12 @@ needs the runbook, not a longer list.
 ## Related
 
 - [`writeback-leg-degraded.md`](writeback-leg-degraded.md) — การแจ้งเตือน Track F5 ที่ยิงสด ๆ
-  ตอนกลางคืน สำหรับแถวชนิดเดียวกับ §2.1 / the live Track F5 alert for the same rows as §2.1,
-  including the escalation ladder (§4) and the 02:00 responsibilities (§6).
+  ตอนกลางคืน สำหรับแถวชนิด `writeback_stalled` / the live Track F5 alert for the same rows as the
+  `writeback_stalled` kind above, including the escalation ladder (§4) and the 02:00
+  responsibilities (§6).
 - `docs/loyalty-channel.md` — สัญญาของช่องทางแอป: hold TTL 2 ชม., ทำไม hold ถึงเขียนลง iHOTEL ทันที,
   มัดจำที่ไม่ถูกมิเรอร์, การเช็คอินสองทาง (B7a) / the channel contract.
-- hf-tasks **B8** (`direct-booking-designs/b8-overbooking-analysis.md`) §4 — checklist **L6**,
+- hf-tasks task **B8** (`direct-booking-designs/b8-overbooking-analysis`), section 4 — checklist **L6**,
   the line this runbook and its route implement, and the other controls (**L2** last-room guard,
   **L3** serialized pick→create, **L4** late-slip status filter, **L5** client timeout +
   idempotency key, **L7** the F5 tripwire) that this one does **not** replace.

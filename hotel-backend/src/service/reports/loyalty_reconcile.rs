@@ -3,7 +3,7 @@
 //! The five-minute read reception runs at shift open, before the desk gets
 //! busy, to answer one question: **is there an app booking that iHOTEL and our
 //! app disagree about?** Task B8's checklist line **L6**
-//! (`hf-tasks/tasks/direct-booking-designs/b8-overbooking-analysis.md` §4) —
+//! (hf-tasks `direct-booking-designs/b8-overbooking-analysis`, section 4) —
 //! a PRE-FLIP control, so it must work while the channel is still dark.
 //!
 //! Pure read-path, per `docs/architecture.md` §1: no outbox, no writeback, no
