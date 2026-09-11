@@ -3,7 +3,11 @@
  */
 
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
-import RoomCleaningCard, { HousekeepingRoom } from '@/components/housekeeping/RoomCleaningCard'
+import RoomCleaningCard, {
+  HousekeepingRoom,
+  formatInstant,
+  formatDateTime,
+} from '@/components/housekeeping/RoomCleaningCard'
 
 // Mock lucide-react icons
 jest.mock('lucide-react', () => ({
@@ -424,5 +428,108 @@ describe('RoomCleaningCard Component', () => {
         jest.advanceTimersByTime(1000)
       })
     })
+  })
+})
+
+// -----------------------------------------------------------------------------
+// Wave-4 hk-interfaces.md's "single highest-risk spot for a silent 7-hour
+// display bug": `GET /api/housekeeping/cleaning`'s `at` is a genuine PG
+// `timestamptz` (a real instant), NOT a naive legacy MSSQL datetime — so it
+// must NEVER be rendered through the `timeZone: 'UTC'` hack that
+// `formatDateTime` deliberately applies for legacy-mirrored fields like
+// `lastCheckoutTime`.
+//
+// This does NOT rely on forcing `process.env.TZ` mid-test — verified
+// empirically that jest's jsdom environment resolves `Intl`'s default zone
+// once and ignores later `process.env.TZ` mutations
+// (`Intl.DateTimeFormat().resolvedOptions().timeZone` stayed pinned to the
+// host's zone across reassignment), so a TZ-mutation-based test would
+// silently pass for the wrong reason locally and could pass OR fail for the
+// wrong reason in CI depending on the runner's own zone. Instead this
+// verifies the actual mechanism directly and deterministically, regardless
+// of which timezone the test runner happens to be in:
+//
+//   1. Spies on `Date.prototype.toLocaleTimeString` and asserts `formatInstant`
+//      never passes `timeZone: 'UTC'`, while `formatDateTime` (the
+//      legacy-hack path) always does.
+//   2. Cross-checks the RENDERED digits against `Date`'s own local
+//      (`getHours`/`getMinutes`) vs UTC (`getUTCHours`/`getUTCMinutes`)
+//      accessors for the same instant.
+// -----------------------------------------------------------------------------
+
+function baseTzRoom(overrides: Partial<HousekeepingRoom>): HousekeepingRoom {
+  return {
+    id: 1,
+    roomNo: '101',
+    roomTypeName: null,
+    floor: 1,
+    status: 'cleaning',
+    lastCheckoutTime: null,
+    statusChangedAt: null,
+    housekeeperName: null,
+    notes: null,
+    ...overrides,
+  }
+}
+
+const TZ_UTC_INSTANT = '2026-08-14T09:00:00Z'
+
+function tzPad(n: number): string {
+  return String(n).padStart(2, '0')
+}
+/** What a formatter with NO explicit timeZone should print — the runner's
+ * own local wall-clock time for this instant. */
+function expectedLocalHHMM(iso: string): string {
+  const d = new Date(iso)
+  return `${tzPad(d.getHours())}:${tzPad(d.getMinutes())}`
+}
+/** What a formatter pinned to `timeZone: 'UTC'` should print — the raw UTC
+ * digits, unaffected by the runner's local zone. */
+function expectedUtcHHMM(iso: string): string {
+  const d = new Date(iso)
+  return `${tzPad(d.getUTCHours())}:${tzPad(d.getUTCMinutes())}`
+}
+
+describe('RoomCleaningCard — statusChangedAt must NOT get the legacy UTC-hack', () => {
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it('formatInstant (used for statusChangedAt) calls toLocaleTimeString WITHOUT timeZone: "UTC"', () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleTimeString')
+    formatInstant(TZ_UTC_INSTANT)
+    expect(spy).toHaveBeenCalledTimes(1)
+    const [, options] = spy.mock.calls[0]
+    expect(options).not.toEqual(expect.objectContaining({ timeZone: 'UTC' }))
+  })
+
+  it('formatDateTime (the legacy-naive-datetime hack, used only for lastCheckoutTime) DOES pass timeZone: "UTC" — proving the two are genuinely separate code paths', () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleTimeString')
+    formatDateTime(TZ_UTC_INSTANT)
+    expect(spy).toHaveBeenCalledTimes(1)
+    const [, options] = spy.mock.calls[0]
+    expect(options).toEqual(expect.objectContaining({ timeZone: 'UTC' }))
+  })
+
+  it('formatInstant renders the LOCAL wall-clock hour/minute for a real timestamptz, on whatever zone this runner is in', () => {
+    expect(formatInstant(TZ_UTC_INSTANT)).toBe(expectedLocalHHMM(TZ_UTC_INSTANT))
+  })
+
+  it('formatDateTime renders the RAW UTC hour/minute — the behavior that would be a 7-hour skew bug if applied to statusChangedAt in Bangkok', () => {
+    expect(formatDateTime(TZ_UTC_INSTANT)).toBe(expectedUtcHHMM(TZ_UTC_INSTANT))
+  })
+
+  it('the reception card renders housekeeperName + statusChangedAt (sourced from the cleaning feed`s `at`) using LOCAL time, matching formatInstant — not the UTC-locked digits', () => {
+    render(
+      <RoomCleaningCard
+        room={baseTzRoom({
+          status: 'cleaning',
+          housekeeperName: 'นก',
+          statusChangedAt: TZ_UTC_INSTANT,
+        })}
+        onStatusChange={jest.fn()}
+      />
+    )
+    expect(screen.getByText(`นก · ${expectedLocalHHMM(TZ_UTC_INSTANT)}`)).toBeInTheDocument()
   })
 })

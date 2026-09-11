@@ -44,6 +44,14 @@ export interface RegistrationSlipData {
   bookingAdvance?: number
   /** Originating booking number (จากการจองเลขที่ …). */
   bookingNo?: string
+  /**
+   * `ht_bookings.book_channel` of the originating booking — `'loyalty'` for a
+   * guest-app booking. Not printed on the card; the v2 page uses it with
+   * `bookingAdvance` to decide whether to show the app-deposit signpost
+   * (`AppDepositNotice`), because iHOTEL shows an app booking's deposit as 0
+   * until checkout.
+   */
+  bookChannel?: string | null
   /** Room deposit collected (เงินมัดจำ), baht. 0 / undefined ⇒ none. */
   deposit?: number
   adults?: number

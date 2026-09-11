@@ -38,6 +38,7 @@
 
 pub mod backfill;
 pub mod change_op;
+pub mod gate_guard;
 pub mod mapper;
 pub mod mappers;
 pub mod parent_loader;

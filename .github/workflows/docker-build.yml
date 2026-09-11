@@ -6,6 +6,39 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      # Issue #260. Without this there is NO sanctioned way to redeploy when
+      # no file changed — needed to rotate a secret in /home/deploy/secrets or
+      # restart a wedged worker, both of which CLAUDE.md forbids doing by hand.
+      #
+      # The two obvious workarounds don't work. An empty commit changes no
+      # paths, so the `changes` filter reports nothing, `build-*` skip, and the
+      # deploy job's final disjunct is false on every arm — the run goes GREEN
+      # WITHOUT DEPLOYING (this happened 2026-07-27). A bare workflow_dispatch
+      # has the same problem: `dorny/paths-filter` diffs against the previous
+      # commit, so whether deploy fires depends on whatever the LAST commit
+      # happened to touch — non-deterministic.
+      #
+      # Setting this true adds an explicit disjunct to the deploy job's `if`,
+      # so the deploy runs against the existing :latest images regardless of
+      # what changed. It does NOT rebuild — pair it with a real code push if
+      # you need new images.
+      #
+      # Since the `promote` job landed (incident 2026-08-31), ":latest" means
+      # "the last web+backend pair a fully-green run promoted", not "whatever
+      # the last build job happened to push". force_deploy therefore re-rolls
+      # a KNOWN-COHERENT pair: the promote job never moves a tag for an image
+      # this run did not successfully build, so a force_deploy that builds
+      # nothing moves nothing and redeploys exactly what is already promoted.
+      #
+      # NOTE: flag flips do NOT need this. Since ADR 0004 flag state lives in
+      # docker-compose.yml, which is in the `deploy` paths filter, so editing a
+      # flag triggers its own deploy.
+      force_deploy:
+        description: 'Deploy even when no files changed (secret rotation, wedged worker)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -19,10 +52,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 # Workflow-level concurrency: cancel an in-flight test/build run when a
-# fresh push lands on the same ref. The `deploy` job overrides this with
-# its own group (`deploy-prod-evergreen`, cancel-in-progress: false) so
-# in-flight deploys are NEVER cancelled — a partially-rolled deploy is
-# worse than a wasted runner minute.
+# fresh push lands on the same ref.
+#
+# CORRECTION (incident 2026-08-31, runs 33441012355 vs 33441186346). This
+# block used to claim that the `deploy` job's own group
+# (`deploy-prod-evergreen`, cancel-in-progress: false) meant "in-flight
+# deploys are NEVER cancelled". THAT IS FALSE. A job-level `concurrency:`
+# only orders jobs against each other; it does not exempt a job from
+# workflow-level cancellation. `cancel-in-progress: true` here cancels the
+# ENTIRE RUN — every job in it, whatever group each one declares.
+#
+# That is what broke production: push A's build-frontend had already pushed
+# a new web image to :latest when push B superseded the run; A's
+# build-backend was cancelled before it pushed; B path-filtered both builds
+# away and deployed, pairing A's new frontend with a 3-hour-old backend.
+#
+# The fix is NOT to stop cancelling — cancellation is what guarantees that
+# the newest push is the one that reaches production (see the `promote` job
+# for why removing it would be worse). The fix is to make cancellation
+# HARMLESS: build jobs now push immutable sha-tagged images only, and a
+# single `promote` job moves :latest for the pair at the very end. A run
+# cancelled at any point before `promote` leaves the promoted pair exactly
+# as it was, so a later run always deploys a coherent pair.
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -49,11 +100,13 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       # `deploy` — files that ONLY affect the running services (compose,
       # migrations, deploy/runner scripts). When any of these fires WITHOUT
-      # a build, the deploy job re-rolls the existing :latest images.
+      # a build, the deploy job re-rolls the currently promoted images —
+      # `promote` moves no tag for a half this run did not build, so the
+      # pair stays exactly as the last green run left it.
       deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Check for changes
         # v4.0.1 pinned to commit SHA. Bumped 2026-04-30 from v3 to clear
@@ -72,13 +125,22 @@ jobs:
         # If you add a new top-level path, decide which filter it belongs
         # under and add it. Catch-all globs (`**` at the root) are deliberately
         # NOT used here — explicit lists make the test/build matrix legible.
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
         id: filter
         with:
           filters: |
             frontend:
               - 'app/**'
               - 'components/**'
+              # `contexts/**` + `types/**` were MISSING until 2026-08-15 while
+              # the block above claimed to be "the COMPLETE list". Both are
+              # real, imported Next.js source (contexts/AuthContext.tsx,
+              # BranchContext.tsx, ModeContext.tsx, SkinContext.tsx;
+              # types/*.ts), so a commit touching only one of them passed CI
+              # GREEN, built nothing, and deployed nothing — a change that
+              # looks shipped and is not.
+              - 'contexts/**'
+              - 'types/**'
               - 'lib/**'
               - 'public/**'
               - '__tests__/**'
@@ -140,7 +202,8 @@ jobs:
   # - test-frontend / test-backend — cheap, keep the green-CI signal honest
   #   even on a release-merge commit.
   # - lint-cardinality-map, lint-bin-hydrate, lint-no-changelog-version-edits,
-  #   init-db-migrations-drift-check — same rationale (lints are seconds).
+  #   lint-doc-anchors, init-db-migrations-drift-check — same rationale (lints
+  #   are seconds).
   # - The `should-deploy` check itself.
   #
   # Only the docker build + push and the evergreen SSH deploy step are
@@ -175,7 +238,7 @@ jobs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
         with:
           # Need HEAD and HEAD~1 locally to compute the diff. fetch-depth: 2
           # is the minimum: 1 commit gives us no parent to diff against.
@@ -262,7 +325,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Self-test the check script
         run: ./scripts/check-cardinality-map.sh --self-test
@@ -311,13 +374,61 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Self-test the check script
         run: ./scripts/check-write-pool-routing.sh --self-test
 
       - name: Enforce per-site write-pool routing for mutating handlers
         run: ./scripts/check-write-pool-routing.sh
+
+  # Documentation-citation guard (chore/doc-anchor-hardening).
+  #
+  # This repo cites its own living documents constantly, and it used to do so by
+  # LINE NUMBER. Editing either document silently invalidated every citation
+  # pointing into it — PR #291's doc growth broke ~40 citations across 25 files,
+  # several of which had already been wrong for months because nothing checked
+  # them. `scripts/check-doc-anchors.sh` makes a citation resolve or fail: the
+  # target file must exist, the `§` anchor must match exactly one heading, and
+  # the optional quoted phrase must actually appear inside that section.
+  #
+  # NEW LINT ON AN EXISTING CODEBASE, so it ships with a recorded baseline of
+  # pre-existing debt (`scripts/doc-anchors-baseline.tsv`) rather than holding a
+  # focused branch hostage to a tree-wide sweep. The baseline is a ledger, not a
+  # mute — an unlisted failure still fails; a listed one occurring more times
+  # than recorded fails too; every row must carry a real scope and a real reason
+  # (an `unclassified` scope or a TODO reason exits 2); and raising a row's count
+  # against the merge-base version of the ledger is itself an error. `--self-test`
+  # covers every one of those directions, so a refactor of the script cannot
+  # quietly turn the baseline into a blanket suppression.
+  #
+  # `fetch-depth: 0` IS LOAD-BEARING HERE. The ledger-growth check compares this
+  # file against its version at the merge base, and the default shallow checkout
+  # has no merge base to compare against — the guard would print "growth NOT
+  # compared" and carry on. History for this repo is ~450 commits / ~50 MB, a
+  # second or two, which is cheap for turning "do not raise the count" from a
+  # sentence in a header into a rule CI enforces.
+  #
+  # Same shape and tier as lint-bin-hydrate: pure text over `git ls-files` — no
+  # network, no database, no cargo, no docker — so it is cheap enough to always
+  # run and is deliberately NOT in test-backend/build-backend `needs:` or the
+  # deploy gate. A stale doc citation should turn the PR check red; it should not
+  # serialise the backend build or block a production deploy.
+  lint-doc-anchors:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        with:
+          fetch-depth: 0   # merge base needed by the ledger-growth check
+
+      - name: Self-test the check script
+        run: ./scripts/check-doc-anchors.sh --self-test
+
+      - name: Enforce document-citation anchors (Rule A resolve / Rule B no line numbers)
+        run: ./scripts/check-doc-anchors.sh
 
   # Track J2 guard (audit-2026-05-14 follow-on to PR #99).
   #
@@ -341,7 +452,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Verify every binary main() calls hydrate_env_from_secret_files
         run: |
@@ -359,6 +470,82 @@ jobs:
             exit 1
           fi
           echo "OK: all $(echo $BIN_FILES | wc -w) binaries call the hydrator"
+
+  # ADR-0004 tripwire, made load-bearing (PR #296 review).
+  #
+  # ADR 0004 says operational flag state lives in docker-compose.yml defaults
+  # and those keys are deliberately ABSENT from this workflow — because
+  # run-deploy.sh materialises .env WHOLESALE from the deploy payload, so any
+  # key this workflow ships makes the matching `${X:-default}` in compose
+  # unreachable. Until now the only guards were two comments, and the sibling
+  # invariant for the keys that DO ride both files ("the workflow fallback and
+  # the compose default are the same literal") was enforced by nothing at all.
+  # Drift there is invisible: CI stays green, and the compose diff that looks
+  # like a shipped flip is a no-op in production.
+  #
+  # ADR 0004 rejected a CI drift check that needed `gh` API access to compare a
+  # live repo variable. This is not that: it is pure text over two committed
+  # files, no network, no credentials, ~1s.
+  lint-deploy-flag-ownership:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+
+      - name: Compose-owned keys stay out of the workflow; shared keys agree
+        run: |
+          set -euo pipefail
+          WF=.github/workflows/docker-build.yml
+          CF=docker-compose.yml
+
+          # ADR-0004 compose-owned keys (and their HFVILLE_ siblings) must not
+          # appear here as `vars.X || '...'`.
+          OWNED="RECONCILE_FORCE_CONVERGE_ENABLED RECONCILE_REINGEST_MISSING_PG_ENABLED WORKER_RECONCILE_ENABLED SYNC_PER_TABLE_WATERMARK OTA_BRIDGE_ENABLED OTA_BRIDGE_ENFORCE LOYALTY_CHANNEL_ENABLED"
+          bad=0
+          for k in $OWNED; do
+            for name in "$k" "HFVILLE_$k"; do
+              if grep -qE "vars\.${name}[[:space:]]*\|\|" "$WF"; then
+                echo "::error file=$WF::$name is ADR-0004 compose-owned (docs/adr/0004-flag-state-in-compose.md) but appears here as a repo variable — that makes its docker-compose.yml default unreachable and silently reverts the committed value on the next deploy. Remove it."
+                bad=1
+              fi
+            done
+          done
+
+          # Every key that rides BOTH files must carry the SAME literal on each
+          # side, or an unset repo variable stops being a no-op.
+          #
+          # RUST_LOG is the one legitimate divergence: each one-shot job service
+          # in compose carries its own per-binary filter, so a single workflow
+          # fallback cannot equal all of them. Add a key here only with a reason.
+          DIVERGENT_OK=" RUST_LOG "
+
+          # `\\$` (not `\$`): bash collapses it to a literal `$` for ERE, and the
+          # doubled backslash is also what keeps this out of GitHub Actions'
+          # own expression scanner (which evaluates a literal dollar-brace-brace
+          # anywhere in this file, comments included).
+          grep -oE "^[[:space:]]+[A-Z0-9_]+:[[:space:]]+\\$\{\{[[:space:]]*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'[^']*'" "$WF" \
+            | sed -E "s/^[[:space:]]*([A-Z0-9_]+):.*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'([^']*)'.*/\1\t\2/" \
+            | sort -u > /tmp/wf_pairs.tsv || true
+
+          checked=0
+          while IFS=$'\t' read -r key lit; do
+            [ -z "$key" ] && continue
+            case "$DIVERGENT_OK" in *" $key "*) continue ;; esac
+            defaults=$(grep -oE "[-[:space:]]${key}=\\$\{${key}:-[^}]*\}" "$CF" | sed -E "s/.*:-([^}]*)\}/\1/" | sort -u || true)
+            [ -z "$defaults" ] && continue
+            checked=$((checked + 1))
+            while IFS= read -r d; do
+              if [ "$d" != "$lit" ]; then
+                echo "::error file=$CF::$key: the workflow fallback is '$lit' but the docker-compose default is '$d'. run-deploy.sh writes .env wholesale, so the compose default here is dead and editing it is a no-op in production. Make the two literals identical (or move the key to the compose-owned set)."
+                bad=1
+              fi
+            done <<< "$defaults"
+          done < /tmp/wf_pairs.tsv
+
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "OK: $checked shared workflow/compose keys agree; no compose-owned key leaked into the workflow"
 
   # Track J7 guard (audit-2026-05-14 follow-on to PR #102).
   #
@@ -389,7 +576,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
         with:
           # PR events default to a refs/pull/N/merge checkout with depth=1.
           # We need the base ref locally so `git diff origin/<base>...HEAD`
@@ -426,7 +613,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Setup pnpm
         # v4 pinned to SHA. Resolved via gh api git/refs/tags/v4.
@@ -479,7 +666,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       # Install mold (NOT in the github-hosted ubuntu-latest image; required by
       # hotel-backend/.cargo/config.toml's `-fuse-ld=mold` pin). clang and
@@ -617,7 +804,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       # postgresql-client ships on ubuntu-latest; this step is belt-and-suspenders
       # in case the image rotates a future major that drops it. `apt install -y`
@@ -673,8 +860,10 @@ jobs:
     # Build runs in PARALLEL with test-frontend (Track F CI optimization).
     # The deploy job still gates on `test-frontend.result == success` so a
     # red test never reaches prod — but the build doesn't have to WAIT
-    # for tests. Worst case: tests fail, an unused :latest image lands on
-    # GHCR and gets garbage-collected by the next green build.
+    # for tests. Worst case: tests fail, an orphan sha-tagged image lands on
+    # GHCR and gets garbage-collected later. It is NOT reachable by the
+    # deploy: only the `promote` job moves :latest, and it requires the same
+    # green test results the deploy does (incident 2026-08-31).
     #
     # `should-deploy` (Track J8) is in `needs:` so a release-please-only
     # push skips the build entirely. `skip != 'true'` keeps the original
@@ -684,16 +873,23 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # Digest of the manifest this job pushed. `promote` retags BY DIGEST
+      # rather than by the sha tag: the digest is what was actually pushed,
+      # it cannot be re-pointed by a later run, and it survives any change
+      # to metadata-action's tag formatting. Empty on pull_request events
+      # (push: false below) — `promote` never runs on those.
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -704,11 +900,16 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # sha tag ONLY. `type=raw,value=latest` was removed 2026-08-31:
+          # a build job moving :latest is exactly how a cancelled run got to
+          # change what the NEXT run's deploy consumed. :latest is now moved
+          # solely by the `promote` job, once, for both images, at the end of
+          # a fully-green run. Read that job's header before adding a tag here.
           tags: |
             type=sha,prefix=
-            type=raw,value=latest
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
@@ -725,6 +926,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend
           build-args: |
             NEXT_PUBLIC_CARD_READER_URL=${{ secrets.CARD_READER_URL }}
+            NEXT_PUBLIC_HOUSEKEEPING_URL=${{ vars.HOUSEKEEPING_URL || 'https://housekeeping.thehfhotel.org' }}
             NEXT_PUBLIC_AUTH_REQUIRED=${{ vars.AUTH_REQUIRED || 'false' }}
 
   build-backend:
@@ -732,8 +934,9 @@ jobs:
     # Build runs in PARALLEL with test-backend (Track F CI optimization).
     # The deploy job still gates on `test-backend.result == success` so a
     # red test never reaches prod — but the build doesn't have to WAIT
-    # for tests. Worst case: tests fail, an unused :latest image lands on
-    # GHCR and gets garbage-collected by the next green build.
+    # for tests. Worst case: tests fail, an orphan sha-tagged image lands on
+    # GHCR and gets garbage-collected later. It is NOT reachable by the
+    # deploy: only the `promote` job moves :latest (incident 2026-08-31).
     #
     # `lint-cardinality-map` is added to needs so a P1 violation blocks the
     # backend image build too — pairs with the same dependency on
@@ -746,16 +949,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # See the identical output on build-frontend for why this is a digest
+      # and not a tag.
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -766,11 +973,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          # sha tag ONLY — see the equivalent comment in build-frontend.
+          # :latest is moved exclusively by the `promote` job.
           tags: |
             type=sha,prefix=
-            type=raw,value=latest
 
       - name: Build and push backend
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: ./hotel-backend
@@ -783,10 +992,241 @@ jobs:
           # `scope: backend` per Batch D — isolates GHA cache namespace.
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+          # Baked into the image as ENV GIT_SHA and surfaced by /health as
+          # `revision`, so a live probe proves WHICH COMMIT is serving
+          # instead of inferring it from the promote job's ghcr digest.
+          # The ARG is declared last in hotel-backend/Dockerfile, so this
+          # per-commit value invalidates only the final ENV layer — the
+          # cargo-chef cook + build layers above it still cache-hit.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+  # ===========================================================================
+  # promote — the single writer of :latest  (incident 2026-08-31)
+  # ===========================================================================
+  #
+  # ## The incident
+  #
+  # Push A (large feature) and push B (workflow + compose only) landed minutes
+  # apart. The workflow-level concurrency group cancelled A's run in favour of
+  # B's (runs 33441012355 vs 33441186346). By cancel time A's build-frontend
+  # had ALREADY pushed a new web image to :latest; A's build-backend was
+  # cancelled before pushing. B's own path filters skipped both builds, so B
+  # deployed — pulling A's brand-new :latest web image next to a 3-hour-old
+  # :latest backend image. Production served a frontend calling routes the
+  # backend did not have.
+  #
+  # ## The invariant this job enforces
+  #
+  #   A cancelled or failed run must not be able to change what a subsequent
+  #   deploy consumes.
+  #
+  # Build jobs no longer tag :latest at all — they push an immutable
+  # sha-tagged manifest and report its digest. Nothing a deploy reads moves
+  # while a build is in flight. This job is the ONLY writer of :latest, it
+  # runs after every build the run set out to do has SUCCEEDED, and it moves
+  # both tags back to back in one step with nothing between them. So the
+  # promoted pair is always "what some fully-green run intended", never a
+  # half of one run stitched to a half of another.
+  #
+  # It gates on the same green test / lint / drift results the deploy does,
+  # which is a second (deliberate) tightening: before this job existed, a run
+  # whose tests went RED still pushed :latest, and the next deploy-only push
+  # would happily ship it. Now a red run leaves an orphan sha tag and nothing
+  # else.
+  #
+  # ## Why the tags are moved by digest
+  #
+  # `docker buildx imagetools create` copies a manifest registry-side (no
+  # layer pull), and the source is the exact digest build-push-action reported.
+  # A sha TAG would be a second mutable name that a concurrent run could in
+  # principle re-point; the digest cannot be.
+  #
+  # ## Why cancel-in-progress stays TRUE at workflow level
+  #
+  # Tempting fix: stop cancelling master runs, so nothing is ever interrupted.
+  # Rejected — it trades a sub-second hazard for a likelier one. Without
+  # cancellation, a SLOW older run finishes after a FAST newer one and its
+  # promote + deploy land last, reverting production to the older commit's
+  # images. Cancellation is what makes "newest push wins" true. With this job
+  # in place, being cancelled is simply harmless.
+  #
+  # ## Why not a separate workflow_run workflow
+  #
+  # Also rejected: the post-push CI-watch hook watches the run of the pushed
+  # sha. A workflow_run-triggered promote/deploy is a DIFFERENT run, so the
+  # hook would report green before production had been touched at all.
+  #
+  # ## Interleavings this survives
+  #
+  # 1. The incident itself. A builds web (sha only), is cancelled mid-backend.
+  #    :latest never moved. B skips both builds, promote no-ops, B deploys the
+  #    previous coherent pair. A's work is simply not shipped — correct, since
+  #    A never finished.
+  # 2. A fully promotes, THEN cancellation lands. :latest holds A's coherent
+  #    pair. B promotes nothing and deploys A's pair. Coherent.
+  # 3. Only backend changed. build-frontend is `skipped`, promote moves only
+  #    the backend tag, web:latest stays on the previously promoted digest.
+  #    Coherent by requirement — unchanged source, unchanged behaviour.
+  # 4. force_deploy with nothing built. Both builds `skipped`, promote moves
+  #    nothing, deploy re-rolls exactly the promoted pair. This is what the
+  #    force_deploy input's own comment at the top of the file promises.
+  # 5. force_deploy racing a push. `promote-prod-evergreen` serialises the two
+  #    promotes and `deploy-prod-evergreen` serialises the two deploys, so the
+  #    worst ordering is "the dispatch deploys the push's pair a moment early,
+  #    then the push deploys the same pair again" — idempotent and coherent.
+  # 6. One build succeeds, the other FAILS (not cancelled). promote's `if`
+  #    requires success-or-skipped on BOTH, so nothing is promoted and the
+  #    deploy is blocked by `needs.promote.result == 'success'`. Before this
+  #    job, deploy's `build-frontend.result == 'success' || ...` disjunct
+  #    would have shipped the half that worked.
+  #
+  # ## Residual risk (accepted, documented)
+  #
+  # The two `imagetools create` calls are adjacent but not one registry
+  # operation — two tags in two repositories cannot be moved atomically by any
+  # registry API, and pinning the deploy to digests instead would require
+  # editing docker-compose.yml, which hardcodes both :latest refs. A run
+  # cancelled in the sub-second gap between the two calls would still leave a
+  # torn pair. That window is ~1s at the very end of a run instead of the
+  # entire backend build (minutes), and it requires a push to land inside it.
+  # If it ever does happen, the repair is a workflow_dispatch of the last good
+  # commit or a fresh push — same as any bad deploy.
+  promote:
+    runs-on: ubuntu-latest
+    needs:
+      - should-deploy
+      - lint-cardinality-map
+      - lint-write-pool-routing
+      - test-frontend
+      - test-backend
+      - init-db-migrations-drift-check
+      - build-frontend
+      - build-backend
+    # packages: write is what moves a tag in GHCR. No checkout, so no
+    # contents scope is needed beyond the default read.
+    permissions:
+      contents: read
+      packages: write
+    # Serialise promotion the same way deploys are serialised, and for the
+    # same reason: two runs must never interleave their tag moves and leave
+    # web from one run beside backend from another. Its OWN group, not
+    # `deploy-prod-evergreen` — sharing that group would make this job and the
+    # deploy job of the SAME run queue against each other.
+    concurrency:
+      group: promote-prod-evergreen
+      cancel-in-progress: false
+    # Mirrors the deploy gate exactly, minus deploy's "is there anything to
+    # do" disjunct, PLUS the load-bearing new clause: every build must have
+    # ended in success or been legitimately skipped. `failure` or `cancelled`
+    # on either half promotes NOTHING.
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/master' &&
+      needs.should-deploy.outputs.skip != 'true' &&
+      needs.lint-cardinality-map.result == 'success' &&
+      needs.lint-write-pool-routing.result == 'success' &&
+      (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
+      (needs.build-frontend.result == 'success' || needs.build-frontend.result == 'skipped') &&
+      (needs.build-backend.result == 'success' || needs.build-backend.result == 'skipped')
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote this run's images to :latest
+        env:
+          WEB_IMAGE:      ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BACKEND_IMAGE:  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          WEB_RESULT:     ${{ needs.build-frontend.result }}
+          BACKEND_RESULT: ${{ needs.build-backend.result }}
+          # Empty unless that half actually built in THIS run. The `&& ... ||`
+          # form is GitHub's ternary; both arms are strings.
+          WEB_DIGEST:     ${{ needs.build-frontend.result == 'success' && needs.build-frontend.outputs.digest || '' }}
+          BACKEND_DIGEST: ${{ needs.build-backend.result == 'success' && needs.build-backend.outputs.digest || '' }}
+        run: |
+          set -euo pipefail
+
+          # --- phase 1: validate. NOTHING is written to the registry here, so
+          # a bad input aborts before either tag has moved. ---------------
+          check() {
+            case "$2" in
+              success)
+                if [ -z "$3" ]; then
+                  echo "::error::$1 build reported success but no image digest — refusing to promote a pair we cannot name"
+                  exit 1
+                fi
+                ;;
+              skipped)
+                # Not built by this run: its :latest stays where the last
+                # green run put it. This is the "unchanged source implies
+                # unchanged behaviour" case.
+                ;;
+              *)
+                # Unreachable: the job `if` already excluded failure/cancelled.
+                # Kept as a tripwire in case that condition is ever loosened.
+                echo "::error::$1 build result '$2' reached promote — the job \`if\` is wrong"
+                exit 1
+                ;;
+            esac
+          }
+          check build-frontend "$WEB_RESULT"     "$WEB_DIGEST"
+          check build-backend  "$BACKEND_RESULT" "$BACKEND_DIGEST"
+
+          # --- phase 2: move the tags, back to back, nothing in between. ---
+          # `imagetools create` is a registry-side manifest copy: no layer
+          # pull, so each call is a single round trip.
+          if [ -n "$WEB_DIGEST" ]; then
+            docker buildx imagetools create --tag "${WEB_IMAGE}:latest" "${WEB_IMAGE}@${WEB_DIGEST}"
+          fi
+          if [ -n "$BACKEND_DIGEST" ]; then
+            docker buildx imagetools create --tag "${BACKEND_IMAGE}:latest" "${BACKEND_IMAGE}@${BACKEND_DIGEST}"
+          fi
+
+          echo "[promote] web:     ${WEB_RESULT}${WEB_DIGEST:+ -> ${WEB_DIGEST}}"
+          echo "[promote] backend: ${BACKEND_RESULT}${BACKEND_DIGEST:+ -> ${BACKEND_DIGEST}}"
+
+      - name: Verify the promoted pair is resolvable
+        env:
+          WEB_IMAGE:     ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          BACKEND_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+        # Both :latest refs must resolve BEFORE the deploy tries to pull them,
+        # and run-deploy.sh additionally `docker run`s the backend :latest for
+        # its pre-worker CT gate. A tag that does not resolve here would fail
+        # the deploy on evergreen instead, mid-roll — much worse place to find
+        # out. Digests are recorded in the job summary for post-mortems.
+        run: |
+          set -euo pipefail
+          fail=0
+          for image in "$WEB_IMAGE" "$BACKEND_IMAGE"; do
+            if ! digest=$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+              # Fall back to a plain inspect: older buildx may not know the
+              # --format field, and that must not be mistaken for a missing tag.
+              if docker buildx imagetools inspect "${image}:latest" >/dev/null 2>&1; then
+                digest="(unreported)"
+              else
+                echo "::error::${image}:latest does not resolve — the deploy would fail on evergreen"
+                fail=1
+                continue
+              fi
+            fi
+            echo "- \`${image}:latest\` -> \`${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "[promote] ${image}:latest -> ${digest}"
+          done
+          exit "$fail"
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [changes, lint-cardinality-map, lint-write-pool-routing, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, should-deploy]
+    needs: [changes, lint-cardinality-map, lint-write-pool-routing, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, promote, should-deploy]
     # Least-privilege: the deploy step only needs to pull images from GHCR
     # (read on packages) and read the working tree.
     permissions:
@@ -815,20 +1255,42 @@ jobs:
     # Track J8: `needs.should-deploy.outputs.skip != 'true'` short-circuits the
     # deploy step on release-please-only pushes. See the `should-deploy` job's
     # comment block for the matcher's behaviour and failure modes.
+    #
+    # `inputs.force_deploy` (issue #260) is the manual escape hatch in the last
+    # disjunct below: it lets a workflow_dispatch deploy the existing :latest
+    # images when NO file changed — secret rotation, restarting a wedged
+    # worker. It is false/null on push and pull_request events, so it cannot
+    # affect normal pushes. Read the input's own comment at the top of this
+    # file before using it; in particular, an empty commit is NOT an
+    # alternative — it produces a green run that deploys nothing.
+    #
+    # `needs.promote.result == 'success'` (incident 2026-08-31) is the clause
+    # that makes everything below trustworthy. `:latest` is what evergreen
+    # pulls (docker-compose.yml hardcodes both refs, and run-deploy.sh's
+    # pre-worker CT gate `docker run`s the backend :latest), and `promote` is
+    # now the only job that moves it. Requiring promote to have SUCCEEDED
+    # means the deploy can only ever consume a pair that a fully-green run
+    # published on purpose:
+    #   - a build that failed or was cancelled => promote skipped => no deploy,
+    #     where the old `build-frontend.result == 'success' || ...` disjunct
+    #     alone would have shipped the half that worked;
+    #   - a run that built nothing => promote succeeded having moved nothing
+    #     => the disjuncts below decide, and the pair on :latest is untouched.
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/master' &&
       needs.should-deploy.outputs.skip != 'true' &&
+      needs.promote.result == 'success' &&
       needs.lint-cardinality-map.result == 'success' &&
       needs.lint-write-pool-routing.result == 'success' &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
-      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
+      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || inputs.force_deploy || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Cache cloudflared binary
         id: cf-cache
@@ -903,7 +1365,100 @@ jobs:
           VILLE_DB_PASSWORD:       ${{ secrets.POSTGRES_PASSWORD }}
           SLACK_WEBHOOK_URL:       ${{ secrets.SLACK_WEBHOOK }}
           READER_RESOLVE_SECRET:   ${{ secrets.READER_RESOLVE_SECRET }}
+          # OTA booking bridge shared bearer (docs/ota-bridge.md). Delivered via
+          # the payload's `secrets:` block ONLY — never as an `env:` entry in the
+          # container. MUST equal ota-desk's `PMS_BRIDGE_TOKEN`.
+          #
+          # These two land BEFORE anything reads them, on purpose: run-deploy.sh
+          # writes a file for EVERY key in `.secrets`, including empty values, so
+          # with the GH secret unset the file exists but is empty — the Rust
+          # hydrator skips it (empty == missing), the env var stays unset, and the
+          # gate has nothing to accept. A compose `secrets:` entry pointing at a
+          # MISSING file, by contrast, aborts the entire stack start. Hence the
+          # payload key ships one deploy ahead of the compose declaration.
+          OTA_BRIDGE_TOKEN:          ${{ secrets.OTA_BRIDGE_TOKEN }}
+          OTA_BRIDGE_TOKEN_PREVIOUS: ${{ secrets.OTA_BRIDGE_TOKEN_PREVIOUS }}
           CF_ACCESS_HK_AUD:        ${{ secrets.CF_ACCESS_HK_AUD }}
+          # /hk maid surface policy (wave-4 housekeeping) — non-secret ship-dark
+          # flags, so GH *variables* not secrets. Same empty-safe-fallback
+          # pattern as the ROUND_WRITEBACK_ENABLED-style flags below; unset
+          # variables reproduce docker-compose.yml's own defaults exactly
+          # (HkPolicy::from_env() in hotel-backend/src/main.rs). Flip via
+          # `gh variable set HK_MARK_DIRTY_ENABLED -b true` (or HK_BRANCHES)
+          # + redeploy — see PENDING-VERIFICATIONS.md V12/V13.
+          HK_MARK_DIRTY_ENABLED:   ${{ vars.HK_MARK_DIRTY_ENABLED || 'false' }}
+          HK_BRANCHES:             ${{ vars.HK_BRANCHES || 'hfhotel' }}
+          # Per-employee location enforcement (wave-4 housekeeping C). Same
+          # GH-variable pattern as the two above; unset variables reproduce
+          # docker-compose.yml's own defaults exactly (HkPolicy::from_env()).
+          #
+          # HFID_LOCATION_URL is the FULL endpoint URL of HF ID's badge →
+          # location lookup, path included. It is a VARIABLE, not a secret — a
+          # LAN address is not a credential, and carrying it as config means
+          # the peer settling its final path costs a `gh variable set`, not a
+          # code change. Empty default = unconfigured = fail closed (503).
+          #
+          # Flip order matters and is NOT "just config" — enforcement locks out
+          # any employee whose HF ID location is NULL. See
+          # PENDING-VERIFICATIONS.md V14 for the checklist.
+          HK_LOCATION_ENFORCEMENT_ENABLED: ${{ vars.HK_LOCATION_ENFORCEMENT_ENABLED || 'false' }}
+          HFID_LOCATION_URL:               ${{ vars.HFID_LOCATION_URL || '' }}
+          # HF ID's on-duty escalation endpoint (ADR 0008 room signals) — same
+          # variable-not-secret reasoning as HFID_LOCATION_URL; the secret it
+          # authenticates with is the SAME HFID_RESOLVE_SECRET below. Empty =
+          # escalation disabled (scheduler logs once and never fires).
+          HFID_ESCALATE_URL:               ${{ vars.HFID_ESCALATE_URL || '' }}
+          # Shared secret for that lookup, sent as `X-Reader-Secret`. Delivered
+          # via the payload's `secrets:` block ONLY — never as an `env:` entry
+          # in the container.
+          #
+          # It carries the SAME VALUE as the estate's READER_RESOLVE_SECRET
+          # (above): HF ID guards its whole app↔central surface with one
+          # secret. The distinct name keeps the two consumers independently
+          # rotatable. Do not hunt for a separate upstream credential.
+          #
+          # Lands one deploy BEFORE the compose `secrets:` declaration, for the
+          # reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh writes
+          # a file for every `.secrets` key including empty values (harmless —
+          # the hydrator skips empty), whereas a compose `secrets:` entry
+          # pointing at a MISSING file aborts the entire stack start.
+          HFID_RESOLVE_SECRET:     ${{ secrets.HFID_RESOLVE_SECRET }}
+          # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+          # Declared here blank so the go-live (board items B4/B12) is a VALUE
+          # change — `gh variable set` / `gh secret set` + redeploy — rather
+          # than a code change.
+          #
+          # LOYALTY_CHANNEL_ENABLED is deliberately NOT here: it is an
+          # operational flag guarding a legacy write (a channel hold lands in
+          # the shared legacy DB as a normal จอง the moment it is created,
+          # coexistence invariant #6), which is the ADR-0004 compose-owned
+          # shape exactly as OTA_BRIDGE_ENABLED is. Its state lives in the
+          # docker-compose.yml default and the flip is a one-line reviewable
+          # diff there. See the NOTE further down; `lint-deploy-flag-ownership`
+          # fails CI if anyone adds it back.
+          #
+          # LOYALTY_APP_URL is a per-environment base URL, not a flag and not a
+          # credential — that is the category ADR 0004 explicitly leaves on the
+          # variable path (ROUND_WRITEBACK_ENABLED / HFID_LOCATION_URL family).
+          # The fallback below reproduces docker-compose.yml's own default
+          # EXACTLY, so an unset repo variable is a no-op — `lint-deploy-flag-
+          # ownership` asserts the two literals stay equal.
+          LOYALTY_APP_URL:         ${{ vars.LOYALTY_APP_URL || '' }}
+          # The two loyalty bearers are SECRETS: delivered via the payload's
+          # `secrets:` block ONLY, never as an `env:` entry in the container.
+          # `LOYALTY_CHANNEL_TOKEN` is the inbound bearer the loyalty app
+          # presents on /api/channel/*; `LOYALTY_SERVICE_TOKEN` is the outbound
+          # bearer this PMS presents on the stay hook and MUST hold the same
+          # string as the loyalty app's own service token.
+          #
+          # These land one deploy BEFORE the compose `secrets:` declaration, for
+          # the reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh
+          # writes a file for every `.secrets` key including empty values
+          # (harmless — the hydrator skips empty and both gates stay closed),
+          # whereas a compose `secrets:` entry pointing at a MISSING file aborts
+          # the ENTIRE stack start.
+          LOYALTY_CHANNEL_TOKEN:   ${{ secrets.LOYALTY_CHANNEL_TOKEN }}
+          LOYALTY_SERVICE_TOKEN:   ${{ secrets.LOYALTY_SERVICE_TOKEN }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -914,23 +1469,56 @@ jobs:
           CHECKOUT_SERVER_TOTAL_ENABLED:  ${{ vars.CHECKOUT_SERVER_TOTAL_ENABLED || 'false' }}
           BOOKING_VALIDATION_ENABLED:     ${{ vars.BOOKING_VALIDATION_ENABLED || 'false' }}
           HFVILLE_WRITES_ENABLED:         ${{ vars.HFVILLE_WRITES_ENABLED || 'false' }}
+          # HF Ville per-intent writeback allowlist. NOT a ship-dark flag — the
+          # empty default means INERT (every intent dispatches, i.e. today's
+          # behavior), and setting it RESTRICTS the Ville worker to the listed
+          # intents. Ville coequal writes have been live since 2026-06-29, so a
+          # non-empty value here parks genuine writebacks as 'skipped' — that is
+          # its purpose as a break-glass restriction, not a launch posture.
+          # Must be plumbed even while empty: the host .env is re-materialized
+          # from this payload on every deploy, so a hand-set value on the box
+          # would be wiped. Entries are validated at Ville-worker startup and an
+          # unknown intent PANICS the worker (see config::hfville_writeback_intents).
+          HFVILLE_WRITEBACK_INTENTS:      ${{ vars.HFVILLE_WRITEBACK_INTENTS || '' }}
           # Check-in registration legacy mirrors (Task #8) — Tb_Save_Image image
           # mirror + HT_CheckIn_Other_People companion mirror.
           GUEST_DOCUMENT_STORAGE_ENABLED:   ${{ vars.GUEST_DOCUMENT_STORAGE_ENABLED || 'false' }}
           TM30_COMPANION_WRITEBACK_ENABLED: ${{ vars.TM30_COMPANION_WRITEBACK_ENABLED || 'false' }}
           # Layout-edit mode (จัดผัง, #236) — shared-board room_x/room_y writeback.
           LAYOUT_WRITEBACK_ENABLED:         ${{ vars.LAYOUT_WRITEBACK_ENABLED || 'false' }}
-          # Self-healing reconcile sweep — per-site so Ville can soak first.
-          RECONCILE_FORCE_CONVERGE_ENABLED:         ${{ vars.RECONCILE_FORCE_CONVERGE_ENABLED || 'false' }}
-          HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED: ${{ vars.HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED || 'false' }}
+          # NOTE (ADR 0004): the reconcile / CT-watermark operational flags
+          # (RECONCILE_FORCE_CONVERGE_ENABLED, RECONCILE_REINGEST_MISSING_PG_ENABLED,
+          # WORKER_RECONCILE_ENABLED, SYNC_PER_TABLE_WATERMARK, and their
+          # HFVILLE_ siblings) — AND the OTA booking-bridge flags
+          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md), AND
+          # LOYALTY_CHANNEL_ENABLED (docs/loyalty-channel.md) — are
+          # deliberately NOT listed here. Their state
+          # lives in docker-compose.yml defaults, which is the single source of
+          # truth. Adding any of them back would make those defaults
+          # unreachable — run-deploy.sh materialises .env wholesale from this
+          # payload, so a `vars.X || 'false'` here silently reverts the
+          # committed value on the next deploy. Do not "restore" them.
           # Per-job slack notification kill-switches (2026-05-15).
-          # Default 'true' preserves prior behavior. Operators flip to
-          # 'false' via `gh variable set HOURLY_REPORT_ENABLED -b false`
-          # during a CT-watcher backfill window to silence the cron noise.
-          HOURLY_REPORT_ENABLED:          ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
-          CHECKIN_NOTIFICATIONS_ENABLED:  ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
-          CHECKOUT_NOTIFICATIONS_ENABLED: ${{ vars.CHECKOUT_NOTIFICATIONS_ENABLED || 'true' }}
-          BOOKING_NOTIFICATIONS_ENABLED:  ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'true' }}
+          #
+          # Fallback flipped 'true' -> 'false' 2026-07-28. These four are purely
+          # informational and POST to Slack once PER ROW on the same webhook that
+          # carries every `:rotating_light:` page — there is no severity routing.
+          # A 'true' fallback meant a fork, a fresh environment, or an
+          # accidentally-deleted repo variable would drown the alert channel in a
+          # booking feed. Absence of config must mean quiet.
+          #
+          # Production no-op: all four repo variables have been explicitly
+          # 'false' since 2026-05-19, so `vars.X` supplies the value and this
+          # fallback is unreachable there. Matching fail-closed defaults in
+          # docker-compose.yml and `scheduler::jobs::notification_flag_enabled`.
+          #
+          # These are NOT the ADR-0004 compose-owned set (see the NOTE above) —
+          # those keys are deliberately absent from this workflow. Keeping these
+          # four here is correct; only their fallback changed.
+          HOURLY_REPORT_ENABLED:          ${{ vars.HOURLY_REPORT_ENABLED || 'false' }}
+          CHECKIN_NOTIFICATIONS_ENABLED:  ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'false' }}
+          CHECKOUT_NOTIFICATIONS_ENABLED: ${{ vars.CHECKOUT_NOTIFICATIONS_ENABLED || 'false' }}
+          BOOKING_NOTIFICATIONS_ENABLED:  ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'false' }}
           # Tracing log level. Pinned to debug for scheduler::sync +
           # scheduler::jobs until Track B junction-table migration ships
           # and reconcile noise drops to a steady-state baseline (incident
@@ -941,6 +1529,25 @@ jobs:
           # quiet-mode is needed (e.g. major version cutovers); unset
           # restores the debug-pinned default.
           RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info' }}
+          # Post-deploy bake assertion (NOT a container env var — it rides the
+          # payload's TOP LEVEL, so it never lands in the materialised .env).
+          # run-deploy.sh probes /health inside the backend container and
+          # compares `.revision` to this value, hard-failing on a mismatch.
+          # Without it the whole `revision` feature can rot silently: every
+          # unit test passes with a value of "unknown" (nothing in CI can bake
+          # a SHA), so deleting the `build-args` block below, or moving the
+          # Dockerfile ARG above a COPY in a refactor, would leave every gate
+          # green and /health reporting "unknown" forever.
+          #
+          # EMPTY unless `build-backend` actually RAN AND SUCCEEDED — that is
+          # load-bearing, not defensive padding. `build-backend` is
+          # path-filtered (`needs.changes.outputs.backend == 'true'` plus the
+          # should-deploy skip), so on a frontend-only or release-please push
+          # the promoted backend image legitimately carries an OLDER sha than
+          # this run's. Asserting unconditionally would fire on every such
+          # deploy, and a check that cries wolf gets disabled. Empty =>
+          # run-deploy.sh logs the observed revision and asserts nothing.
+          EXPECTED_BACKEND_REVISION: ${{ needs.build-backend.result == 'success' && github.sha || '' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -998,8 +1605,15 @@ jobs:
           # 2026-05-18 — sync_checkins broke silently for 2+ days). Keep
           # in sync with the vars.RUST_LOG default in the `env:` block
           # above.
+          # `expected_backend_revision` is a TOP-LEVEL payload key, not an
+          # `env` entry: run-deploy.sh materialises .env wholesale from the
+          # `env` block, and this value is a per-run deploy assertion, not
+          # container configuration. Older deploy scripts simply ignore the
+          # key, so this is additive — the assertion goes live one deploy
+          # later, when /srv/run-deploy.sh has self-updated from the tarball.
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
+            --arg expected_backend_revision "${EXPECTED_BACKEND_REVISION:-}" \
             --rawfile deploy_payload_b64 /tmp/deploy.b64 \
             --arg ghcr_user           "$GHCR_USER" \
             --arg ghcr_token          "$GHCR_TOKEN" \
@@ -1014,7 +1628,18 @@ jobs:
             --arg VILLE_DB_PASSWORD   "$VILLE_DB_PASSWORD" \
             --arg SLACK_WEBHOOK_URL   "$SLACK_WEBHOOK_URL" \
             --arg READER_RESOLVE_SECRET "$READER_RESOLVE_SECRET" \
+            --arg OTA_BRIDGE_TOKEN          "${OTA_BRIDGE_TOKEN:-}" \
+            --arg OTA_BRIDGE_TOKEN_PREVIOUS "${OTA_BRIDGE_TOKEN_PREVIOUS:-}" \
             --arg CF_ACCESS_HK_AUD    "$CF_ACCESS_HK_AUD" \
+            --arg HK_MARK_DIRTY_ENABLED "${HK_MARK_DIRTY_ENABLED:-false}" \
+            --arg HK_BRANCHES           "${HK_BRANCHES:-hfhotel}" \
+            --arg HK_LOCATION_ENFORCEMENT_ENABLED "${HK_LOCATION_ENFORCEMENT_ENABLED:-false}" \
+            --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
+            --arg HFID_ESCALATE_URL               "${HFID_ESCALATE_URL:-}" \
+            --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
+            --arg LOYALTY_APP_URL         "${LOYALTY_APP_URL:-}" \
+            --arg LOYALTY_CHANNEL_TOKEN   "${LOYALTY_CHANNEL_TOKEN:-}" \
+            --arg LOYALTY_SERVICE_TOKEN   "${LOYALTY_SERVICE_TOKEN:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1022,18 +1647,18 @@ jobs:
             --arg CHECKOUT_SERVER_TOTAL_ENABLED  "${CHECKOUT_SERVER_TOTAL_ENABLED:-false}" \
             --arg BOOKING_VALIDATION_ENABLED     "${BOOKING_VALIDATION_ENABLED:-false}" \
             --arg HFVILLE_WRITES_ENABLED         "${HFVILLE_WRITES_ENABLED:-false}" \
+            --arg HFVILLE_WRITEBACK_INTENTS      "${HFVILLE_WRITEBACK_INTENTS:-}" \
             --arg GUEST_DOCUMENT_STORAGE_ENABLED   "${GUEST_DOCUMENT_STORAGE_ENABLED:-false}" \
             --arg TM30_COMPANION_WRITEBACK_ENABLED "${TM30_COMPANION_WRITEBACK_ENABLED:-false}" \
             --arg LAYOUT_WRITEBACK_ENABLED         "${LAYOUT_WRITEBACK_ENABLED:-false}" \
-            --arg RECONCILE_FORCE_CONVERGE_ENABLED         "${RECONCILE_FORCE_CONVERGE_ENABLED:-false}" \
-            --arg HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED "${HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED:-false}" \
-            --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-true}" \
-            --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
-            --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-true}" \
-            --arg BOOKING_NOTIFICATIONS_ENABLED  "${BOOKING_NOTIFICATIONS_ENABLED:-true}" \
+            --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-false}" \
+            --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-false}" \
+            --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-false}" \
+            --arg BOOKING_NOTIFICATIONS_ENABLED  "${BOOKING_NOTIFICATIONS_ENABLED:-false}" \
             --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
+              expected_backend_revision: $expected_backend_revision,
               deploy_payload_b64: $deploy_payload_b64,
               ghcr: { user: $ghcr_user, token: $ghcr_token },
               env: {
@@ -1048,6 +1673,12 @@ jobs:
                 SLACK_WEBHOOK_URL:            $SLACK_WEBHOOK_URL,
                 READER_RESOLVE_SECRET:        $READER_RESOLVE_SECRET,
                 CF_ACCESS_HK_AUD:             $CF_ACCESS_HK_AUD,
+                HK_MARK_DIRTY_ENABLED:        $HK_MARK_DIRTY_ENABLED,
+                HK_BRANCHES:                  $HK_BRANCHES,
+                HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
+                HFID_LOCATION_URL:            $HFID_LOCATION_URL,
+                HFID_ESCALATE_URL:            $HFID_ESCALATE_URL,
+                LOYALTY_APP_URL:              $LOYALTY_APP_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
@@ -1055,11 +1686,10 @@ jobs:
                 CHECKOUT_SERVER_TOTAL_ENABLED:  $CHECKOUT_SERVER_TOTAL_ENABLED,
                 BOOKING_VALIDATION_ENABLED:     $BOOKING_VALIDATION_ENABLED,
                 HFVILLE_WRITES_ENABLED:         $HFVILLE_WRITES_ENABLED,
+                HFVILLE_WRITEBACK_INTENTS:      $HFVILLE_WRITEBACK_INTENTS,
                 GUEST_DOCUMENT_STORAGE_ENABLED:   $GUEST_DOCUMENT_STORAGE_ENABLED,
                 TM30_COMPANION_WRITEBACK_ENABLED: $TM30_COMPANION_WRITEBACK_ENABLED,
                 LAYOUT_WRITEBACK_ENABLED:         $LAYOUT_WRITEBACK_ENABLED,
-                RECONCILE_FORCE_CONVERGE_ENABLED:         $RECONCILE_FORCE_CONVERGE_ENABLED,
-                HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED: $HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED,
                 HOURLY_REPORT_ENABLED:          $HOURLY_REPORT_ENABLED,
                 CHECKIN_NOTIFICATIONS_ENABLED:  $CHECKIN_NOTIFICATIONS_ENABLED,
                 CHECKOUT_NOTIFICATIONS_ENABLED: $CHECKOUT_NOTIFICATIONS_ENABLED,
@@ -1071,6 +1701,11 @@ jobs:
                 postgres_password:  $POSTGRES_PASSWORD,
                 ville_db_password:  $VILLE_DB_PASSWORD,
                 slack_webhook_url:  $SLACK_WEBHOOK_URL,
+                ota_bridge_token:          $OTA_BRIDGE_TOKEN,
+                ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
+                hfid_resolve_secret:       $HFID_RESOLVE_SECRET,
+                loyalty_channel_token:     $LOYALTY_CHANNEL_TOKEN,
+                loyalty_service_token:     $LOYALTY_SERVICE_TOKEN,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

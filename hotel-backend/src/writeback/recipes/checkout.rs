@@ -165,7 +165,8 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
         //    risk exists there.
         //
         //    `cin_status <> 'ยกเลิก'` filter on the Pay rows excludes
-        //    cancelled tender rows (T2 CRIT-2 — COMPAT_CHEATSHEET line 106).
+        //    cancelled tender rows (T2 CRIT-2 — `COMPAT_CHEATSHEET.md`
+        //    §"1.5 Boolean conventions" "`Cin_Pay_Status` (HT_CheckIn_Pay)").
         format!(
             "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
              [Total_Price_Room]={room_price},\
@@ -696,7 +697,8 @@ mod tests {
     }
 
     /// Fix for audit H2: Room_Use_Count is bumped by the real nights count
-    /// (per COMPAT_CHEATSHEET.md:289), not always +1. Spike captures were
+    /// (per `COMPAT_CHEATSHEET.md` §"Table: `HT_Rooms` (A)"
+    /// "Room_Use_Count=Room_Use_Count+<nights>"), not always +1. Spike captures were
     /// 1-night stays so the bug was hidden.
     #[test]
     fn room_use_count_increments_by_nights_not_one() {
