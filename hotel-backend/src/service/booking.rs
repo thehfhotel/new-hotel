@@ -37,6 +37,53 @@ pub struct BookingRoomCommand {
     pub price_per_night: Option<f64>,
 }
 
+/// What an edit says about `ht_bookings.book_room_type_id` (migration 094).
+///
+/// The distinction only bites on a PARKED (roomless) booking, where this
+/// column is the ONLY record of what the reservation claims — but that is
+/// exactly the booking the desk edits most, and both savers omit the field.
+/// With rooms assigned the room is authoritative and all three variants
+/// converge on the room's own type.
+///
+/// | rooms | edit | result |
+/// |---|---|---|
+/// | non-empty | `Keep` / `Clear` | DERIVED from the first assigned room (the room decides; a stored type may never contradict a stored room) |
+/// | non-empty | `Set(t)` | `t` iff it equals the first room's type, else a validation error |
+/// | empty | `Keep` | **no write** — the existing value survives the edit |
+/// | empty | `Clear` | `NULL` — an explicit `"roomTypeId": null` |
+/// | empty | `Set(t)` | `t`, after an existence check |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomTypeEdit {
+    /// Field absent from the request — say nothing, change nothing.
+    Keep,
+    /// Explicit JSON `null` — the caller means "no type".
+    Clear,
+    /// Explicit id.
+    Set(i32),
+}
+
+impl RoomTypeEdit {
+    /// Wire form → edit. `None` (field absent) is [`Self::Keep`];
+    /// `Some(None)` (explicit `null`) is [`Self::Clear`].
+    pub fn from_wire(value: Option<Option<i32>>) -> Self {
+        match value {
+            None => Self::Keep,
+            Some(None) => Self::Clear,
+            Some(Some(id)) => Self::Set(id),
+        }
+    }
+}
+
+/// What [`resolve_room_type`] decided the write should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoomTypeResolution {
+    /// Leave the stored value alone — the caller did not mention it and there
+    /// is no room to derive one from.
+    Skip,
+    /// Write exactly this (including `None`, a deliberate clear).
+    Write(Option<i32>),
+}
+
 /// One pre-ordered product line within a create-booking command (task #52).
 /// Persisted canonically in `ht_booking_products`; the legacy `HT_Book_Pro`
 /// write-back is deferred (shape unverified), so these never enqueue a
@@ -99,6 +146,13 @@ pub struct CreateBookingCommand {
     pub book_channel: Option<String>,
     pub book_ext_ref: Option<String>,
 
+    /// SHA-256 of the canonicalised request that minted `book_ext_ref`
+    /// (migration 095 / issue #305 B8d). Persisted in the SAME statement as
+    /// the key, so the booking can answer "same key, different request" with a
+    /// 422 long after `ht_channel_idempotency` has expired or been lost to a
+    /// crash. `None` for callers with no fingerprint (the OTA path).
+    pub book_ext_ref_fingerprint: Option<String>,
+
     /// Payment-hold deadline (migration 086 — loyalty-channel TENTATIVE
     /// holds). `Some(_)` ⇒ the row is stamped with `book_hold_expires_at`
     /// in the SAME transaction as the insert, so a hold can never commit
@@ -126,12 +180,19 @@ pub struct ModifyBookingCommand {
     pub notes: Option<String>,
     pub rooms: Vec<BookingRoomCommand>,
 
-    /// Room type this booking claims after the edit (migration 094). Same
-    /// agree-or-derive rule as the create command — an edit that assigns the
-    /// first room to a parked booking derives the type from that room, and an
-    /// edit that clears every room keeps whatever the caller sent (commonly
-    /// `None`, back to "type unknown").
-    pub room_type_id: Option<i32>,
+    /// Room type this booking claims after the edit (migration 094) —
+    /// TRI-STATE, not `Option<i32>`.
+    ///
+    /// `Option<i32>` was wrong here and shipped a data-loss bug: both desk
+    /// savers omit `roomTypeId` and send `rooms: []` when editing a PARKED
+    /// booking, so "absent" and "clear it" collapsed onto `None` and every
+    /// ordinary edit (a note, a date) silently wiped the attribution the
+    /// channel relies on. Same shape, same reason, as `LegacyNotes` on the CT
+    /// mapper side (ADR 0005 §4 / issue #269): a field that can be CLEARED
+    /// needs a third state for "not mentioned".
+    ///
+    /// See [`RoomTypeEdit`] for the resolution table.
+    pub room_type_id: RoomTypeEdit,
 
     /// Field-level diff carried straight through to
     /// [`WritebackIntent::ModifyBooking`].
@@ -317,7 +378,13 @@ impl BookingService {
         {
             match self
                 .repo
-                .set_booking_provenance(&mut tx, book_id, channel, ext_ref)
+                .set_booking_provenance(
+                    &mut tx,
+                    book_id,
+                    channel,
+                    ext_ref,
+                    cmd.book_ext_ref_fingerprint.as_deref(),
+                )
                 .await
             {
                 Ok(()) => {}
@@ -365,11 +432,18 @@ impl BookingService {
         // room and a type that contradict each other — which is what lets
         // `repository::channel` trust the column when it subtracts a parked
         // claim per type.
-        let room_type_id =
-            resolve_room_type(self.repo.as_ref(), &mut tx, cmd.room_type_id, &cmd.rooms).await?;
-        if room_type_id.is_some() {
+        // A fresh row is already NULL, so `Skip` and `Write(None)` are the
+        // same thing here — only a real value needs a statement.
+        if let RoomTypeResolution::Write(Some(type_id)) = resolve_room_type(
+            self.repo.as_ref(),
+            &mut tx,
+            RoomTypeEdit::from_wire(cmd.room_type_id.map(Some)),
+            &cmd.rooms,
+        )
+        .await?
+        {
             self.repo
-                .set_booking_room_type(&mut tx, book_id, room_type_id)
+                .set_booking_room_type(&mut tx, book_id, Some(type_id))
                 .await?;
         }
 
@@ -545,15 +619,18 @@ impl BookingService {
                 .await?;
         }
 
-        // Room-type attribution (migration 094). Unlike create this ALWAYS
-        // writes, including `None`: an edit is a full rewrite of the booking's
-        // rooms, so an edit that clears them back to parked must be able to
-        // clear a now-meaningless type too.
-        let room_type_id =
-            resolve_room_type(self.repo.as_ref(), &mut tx, cmd.room_type_id, &cmd.rooms).await?;
-        self.repo
-            .set_booking_room_type(&mut tx, cmd.book_id, room_type_id)
-            .await?;
+        // Room-type attribution (migration 094). The write is CONDITIONAL:
+        // `RoomTypeEdit::Keep` on a roomless booking means the caller never
+        // mentioned the field, and an unconditional write there wiped the
+        // attribution on every ordinary edit of a parked booking (both desk
+        // savers omit `roomTypeId` and send `rooms: []`).
+        if let RoomTypeResolution::Write(room_type_id) =
+            resolve_room_type(self.repo.as_ref(), &mut tx, cmd.room_type_id, &cmd.rooms).await?
+        {
+            self.repo
+                .set_booking_room_type(&mut tx, cmd.book_id, room_type_id)
+                .await?;
+        }
 
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, cmd.book_id);
 
@@ -721,22 +798,27 @@ impl BookingService {
 async fn resolve_room_type(
     repo: &dyn BookingRepository,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    requested: Option<i32>,
+    edit: RoomTypeEdit,
     rooms: &[BookingRoomCommand],
-) -> ServiceResult<Option<i32>> {
+) -> ServiceResult<RoomTypeResolution> {
     let Some(first) = rooms.first() else {
-        // Parked (roomless): nothing to derive from, so the caller's value
-        // stands — but it must name a real type, or the FK would turn a client
-        // typo into a 500.
-        let Some(type_id) = requested else {
-            return Ok(None);
+        // Parked (roomless): there is nothing to derive from, so the caller's
+        // intent is the whole answer — and "said nothing" must not read as
+        // "clear it".
+        return match edit {
+            RoomTypeEdit::Keep => Ok(RoomTypeResolution::Skip),
+            RoomTypeEdit::Clear => Ok(RoomTypeResolution::Write(None)),
+            RoomTypeEdit::Set(type_id) => {
+                // Must name a real type, or `fk_ht_bookings_room_type` would
+                // turn a client typo into a 500.
+                if !repo.room_type_exists(tx, type_id).await? {
+                    return Err(ServiceError::validation(format!(
+                        "roomTypeId {type_id} does not exist"
+                    )));
+                }
+                Ok(RoomTypeResolution::Write(Some(type_id)))
+            }
         };
-        if !repo.room_type_exists(tx, type_id).await? {
-            return Err(ServiceError::validation(format!(
-                "roomTypeId {type_id} does not exist"
-            )));
-        }
-        return Ok(Some(type_id));
     };
 
     let derived = repo
@@ -746,17 +828,34 @@ async fn resolve_room_type(
             ServiceError::validation(format!("room {} does not exist", first.room_id))
         })?;
 
-    match (requested, derived) {
-        (None, derived) => Ok(derived),
-        (Some(req), Some(actual)) if req == actual => Ok(Some(req)),
-        (Some(req), actual) => Err(ServiceError::validation(format!(
-            "roomTypeId {req} disagrees with the assigned room {}'s type ({}); \
-             omit roomTypeId to derive it, or assign a room of that type",
-            first.room_id,
-            actual
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-        ))),
+    match edit {
+        // The room is the authoritative fact once one is assigned, so a
+        // caller who said nothing — or who asked to clear — still gets the
+        // room's own type. Anything else would let a stored type contradict a
+        // stored room, which is precisely what `repository::channel` trusts
+        // this column not to do.
+        RoomTypeEdit::Keep | RoomTypeEdit::Clear => Ok(RoomTypeResolution::Write(derived)),
+        RoomTypeEdit::Set(req) => match derived {
+            Some(actual) if req == actual => Ok(RoomTypeResolution::Write(Some(req))),
+            // The room carries NO type of its own (`room_type_id` is nullable
+            // and the room mapper leaves it NULL until the rate-tier pass
+            // fills it in). There is nothing to contradict, so adopt what the
+            // caller asked for rather than refuse an edit the desk cannot
+            // fix — but it still has to name a real type.
+            None => {
+                if !repo.room_type_exists(tx, req).await? {
+                    return Err(ServiceError::validation(format!(
+                        "roomTypeId {req} does not exist"
+                    )));
+                }
+                Ok(RoomTypeResolution::Write(Some(req)))
+            }
+            Some(actual) => Err(ServiceError::validation(format!(
+                "roomTypeId {req} disagrees with the assigned room {}'s type ({actual}); \
+                 omit roomTypeId to derive it, or assign a room of that type",
+                first.room_id,
+            ))),
+        },
     }
 }
 

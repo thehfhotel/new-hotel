@@ -582,6 +582,50 @@ async fn mapper_records_the_room_type_of_a_parked_legacy_booking() {
     );
     assert_eq!(rooms, 0);
 
+    // --- (b2) mode 1, the line holds a ROOM NUMBER (observed R014814) ----
+    //
+    // The pre-merge verification (PENDING-VERIFICATIONS V17, 2026-09-11) found
+    // one of HF Hotel's four live mode-1 Ds rows carrying `402` — a room
+    // number — where the decompile said a type code would be. The resolver
+    // falls back to `ht_rooms_new.room_no` and borrows that room's type; the
+    // booking still projects header-only (a mode-1 line is never a room
+    // assignment).
+    let numbered_room = unique_room_no();
+    sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_type_id, room_clean, room_notes) \
+         VALUES ($1, $2, true, 'TEST_phase53_room') \
+         ON CONFLICT (room_no) DO UPDATE SET room_type_id = EXCLUDED.room_type_id",
+    )
+    .bind(&numbered_room)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed the numbered room");
+
+    let numbered_book = unique_book_id();
+    let mut header = header_row(&numbered_book, &cust_no, "จอง", 2000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(1));
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&numbered_book, &numbered_room, 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &aggregate, &numbered_book).await;
+    let (_, recorded, rooms) = read_type(&pool, &numbered_book).await;
+    assert_eq!(
+        recorded,
+        Some(type_id),
+        "a mode-1 line holding a ROOM NUMBER must still attribute a type, via \
+         that room (the R014814 shape)"
+    );
+    assert_eq!(
+        rooms, 0,
+        "...but it is still NOT a room assignment — mode 1 stays header-only, \
+         which is what keeps the 2026-06-11 re-emit loop closed"
+    );
+
     // --- (c) mode 2, type DERIVED from the assigned room -----------------
     let roomed_book = unique_book_id();
     let room_no = unique_room_no();
@@ -615,9 +659,14 @@ async fn mapper_records_the_room_type_of_a_parked_legacy_booking() {
     );
     assert_eq!(rooms, 1);
 
-    for book in [&mapped_book, &unknown_book, &roomed_book] {
+    for book in [&mapped_book, &unknown_book, &roomed_book, &numbered_book] {
         cleanup(&pool, book, &cust_no, &room_no).await;
     }
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&numbered_room)
+        .execute(&pool)
+        .await
+        .ok();
     sqlx::query("DELETE FROM ht_room_types WHERE type_code = ANY($1)")
         .bind(vec![type_code, other_code])
         .execute(&pool)

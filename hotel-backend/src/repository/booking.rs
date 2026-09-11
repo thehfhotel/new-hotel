@@ -179,12 +179,21 @@ pub trait BookingRepository: Send + Sync {
     /// (migration 076). Only called when both `channel` and `ext_ref` are
     /// present; the partial UNIQUE index `ux_ht_bookings_channel_ext_ref` is
     /// the concurrent-race backstop and surfaces here as a 23505 error.
+    ///
+    /// `fingerprint` (migration 095) is the SHA-256 of the canonicalised
+    /// request that minted `ext_ref`. It is written in the SAME statement, not
+    /// a follow-up one, so there is no window in which a booking carries a key
+    /// without the request it is bound to — a booking in that state would let
+    /// a reused key carrying a DIFFERENT request replay it. `None` for callers
+    /// that have no fingerprint (the OTA path), which the comparison treats as
+    /// "no opinion".
     async fn set_booking_provenance(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
         channel: &str,
         ext_ref: &str,
+        fingerprint: Option<&str>,
     ) -> Result<(), sqlx::Error>;
 
     /// Read the two facts the modify path needs to choose its legacy write-back
@@ -743,16 +752,26 @@ impl BookingRepository for PgBookingRepository {
         book_id: i32,
         channel: &str,
         ext_ref: &str,
+        fingerprint: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         // Runtime query (not `query!`): `book_ext_ref` postdates the committed
         // `.sqlx` offline snapshot. A 23505 here means a concurrent create won
         // the (book_channel, book_ext_ref) race — the caller rolls back and
         // re-selects the winner's row.
+        //
+        // One statement for all three columns (migration 095): the key and the
+        // fingerprint of the request it is bound to must land together or not
+        // at all.
         sqlx::query(
-            "UPDATE ht_bookings SET book_channel = $1, book_ext_ref = $2 WHERE book_id = $3",
+            "UPDATE ht_bookings \
+                SET book_channel = $1, \
+                    book_ext_ref = $2, \
+                    book_ext_ref_fingerprint = $3 \
+              WHERE book_id = $4",
         )
         .bind(channel)
         .bind(ext_ref)
+        .bind(fingerprint)
         .bind(book_id)
         .execute(&mut **tx)
         .await?;

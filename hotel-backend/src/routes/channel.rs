@@ -89,8 +89,8 @@ use crate::error::ApiError;
 use crate::outbox::event::EventSource;
 use crate::service::{
     caller_identity, fingerprint_of, hold_ext_ref, normalize_key, ChannelIdempotency,
-    ChannelService, CreateHoldCommand, PaymentPlan, Reserved, ServiceError, StoredResponse,
-    ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
+    ChannelService, CreateHoldCommand, HoldCreateOutcome, PaymentPlan, Reserved, ServiceError,
+    StoredResponse, ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
 };
 
 // ---------------------------------------------------------------------------
@@ -479,6 +479,8 @@ async fn perform_create_hold(
     check_out: NaiveDate,
     body: &CreateChannelBookingRequest,
     ext_ref: Option<String>,
+    ext_ref_fingerprint: Option<String>,
+    idempotency_key_label: &str,
 ) -> Result<(String, i32, bool), Response> {
     // Same daily allocator as the booking form (per-branch pool).
     let pool = state.write_pool(Some(branch)).map_err(api_error_response)?;
@@ -498,10 +500,23 @@ async fn perform_create_hold(
             membership_id: body.membership_id.clone(),
             payment: body.payment.into(),
             ext_ref,
+            ext_ref_fingerprint,
             source: channel_event_source(),
         })
         .await
         .map_err(service_error_response)?;
+
+    let (outcome, replayed) = match outcome {
+        HoldCreateOutcome::Created(o) => (o, false),
+        HoldCreateOutcome::Replayed(o) => (o, true),
+        // The surviving booking is bound to a materially DIFFERENT request.
+        // Render the SAME 422 the `ht_channel_idempotency` store renders for
+        // the same client mistake — which of the two records caught it is an
+        // implementation detail the client neither sees nor needs.
+        HoldCreateOutcome::KeyReusedForDifferentRequest => {
+            return Err(mismatch_response(idempotency_key_label))
+        }
+    };
 
     let payload = CreateChannelBookingResponse {
         pms_booking_id: format_pms_booking_id(property, outcome.book_id),
@@ -516,7 +531,7 @@ async fn perform_create_hold(
         )
     })?;
 
-    Ok((body, outcome.book_id, outcome.replayed))
+    Ok((body, outcome.book_id, replayed))
 }
 
 pub async fn create_booking(
@@ -572,7 +587,11 @@ pub async fn create_booking(
             check_in,
             check_out,
             &body,
+            // Unkeyed: nothing to stamp, nothing to bind, and the 422 arm is
+            // unreachable because no stored key can be matched.
             None,
+            None,
+            "",
         )
         .await
         {
@@ -621,6 +640,11 @@ pub async fn create_booking(
         // B8d: the hold carries the key itself, so the (book_channel,
         // book_ext_ref) index dedupes even when this reservation never commits.
         Some(hold_ext_ref(&caller, &key)),
+        // ...and the fingerprint of THIS request (migration 095), so a later
+        // retry carrying a different body is refused rather than replayed.
+        // Same value the reservation above was fingerprinted with.
+        Some(fingerprint.clone()),
+        &key,
     )
     .await
     {

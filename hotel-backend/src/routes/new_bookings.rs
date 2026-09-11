@@ -29,7 +29,7 @@ use crate::outbox::intent::BookingChanges;
 use crate::repository::booking::{BookingDetailRow, BookingListRow, BookingRoomRow};
 use crate::service::{
     BookingProductCommand, BookingRoomCommand, BookingWritebackContext, CancelBookingCommand,
-    CreateBookingCommand, ModifyBookingCommand,
+    CreateBookingCommand, ModifyBookingCommand, RoomTypeEdit,
 };
 
 /// Booking status enum
@@ -274,6 +274,22 @@ pub struct BookingProductRequest {
     pub note: Option<String>,
 }
 
+/// serde shim that keeps "field absent" distinguishable from "field is
+/// explicitly `null`" — `Option<Option<T>>` where the OUTER option is
+/// presence and the inner one is the JSON value.
+///
+/// serde's derive treats a bare `Option<T>` field as absent-or-null collapsed
+/// onto `None`, which is exactly the ambiguity that made an edit of a parked
+/// booking clear its room type. Pairs with
+/// `#[serde(default, deserialize_with = "double_option")]`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// Request body for creating/updating booking
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -302,7 +318,22 @@ pub struct CreateUpdateBookingRequest {
     /// enforces AGREEMENT with the first assigned room's type (400 on a
     /// conflict) or DERIVES it, so the stored value can never contradict the
     /// stored room.
-    pub room_type_id: Option<i32>,
+    ///
+    /// TRI-STATE on the UPDATE path (`Option<Option<i32>>` via
+    /// [`double_option`]), and the nesting is load-bearing rather than
+    /// decorative:
+    ///
+    /// * **absent** ⇒ `None` ⇒ keep whatever is stored. Both desk savers omit
+    ///   this field and send `rooms: []` when editing a parked booking, so
+    ///   without the distinction every ordinary edit (renaming a note,
+    ///   shifting a date) silently wiped the attribution.
+    /// * **`"roomTypeId": null`** ⇒ `Some(None)` ⇒ clear it deliberately.
+    /// * **`"roomTypeId": 7`** ⇒ `Some(Some(7))` ⇒ set it.
+    ///
+    /// On CREATE the distinction is immaterial (a new row starts NULL), so the
+    /// create path flattens it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub room_type_id: Option<Option<i32>>,
     /// Pre-ordered products. Optional; defaults to empty.
     #[serde(default)]
     pub products: Vec<BookingProductRequest>,
@@ -471,7 +502,9 @@ pub async fn create_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
-        room_type_id: body.room_type_id,
+        // Create has no "keep" semantics — a fresh row starts NULL, so absent
+        // and explicit-null are the same request.
+        room_type_id: body.room_type_id.flatten(),
         products: body
             .products
             .iter()
@@ -480,6 +513,10 @@ pub async fn create_booking(
         writeback_context,
         book_channel: body.book_channel.clone(),
         book_ext_ref: body.book_ext_ref.clone(),
+        // OTA/desk creates supply a channel-native booking id, not a request
+        // key, so there is no request fingerprint to bind (migration 095).
+        // Only the loyalty channel sets this.
+        book_ext_ref_fingerprint: None,
         // Manual / OTA-desk creates are never payment-holds (migration 086);
         // only the loyalty channel (`routes::channel`) sets a deadline.
         hold_expires_at: None,
@@ -555,7 +592,7 @@ pub async fn update_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
-        room_type_id: body.room_type_id,
+        room_type_id: RoomTypeEdit::from_wire(body.room_type_id),
         // TODO: diff against the loaded prior row to populate per-field changes.
         changes: BookingChanges {
             new_stay: Some(DateRange::new(

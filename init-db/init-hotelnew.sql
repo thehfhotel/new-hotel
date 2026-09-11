@@ -191,6 +191,14 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     -- key so a double-POST of one OTA reservation can't create two bookings.
     -- PG-canonical only (not mirrored to legacy).
     book_ext_ref TEXT,
+    -- Migration 095 (issue #305 B8d) — SHA-256 over the canonicalised request
+    -- that minted book_ext_ref, written in the SAME statement so a crash can
+    -- never leave a key without the request it is bound to. Lets the
+    -- booking-side idempotency replay answer 422 on a reused key with a
+    -- different request once the ht_channel_idempotency row is gone (crash, or
+    -- its 24 h TTL). A key is therefore one-shot for the LIFE OF THE BOOKING.
+    -- NULL = no fingerprint recorded (the OTA path). PG-canonical only.
+    book_ext_ref_fingerprint TEXT,
     book_total_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_date TIMESTAMP,
@@ -3256,6 +3264,18 @@ ON CONFLICT (version) DO NOTHING;
 -- zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('094', '094_ht_bookings_room_type.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 095 — ht_bookings.book_ext_ref_fingerprint (issue #305 B8d): the
+-- SHA-256 of the canonicalised request that minted book_ext_ref, inlined into
+-- the ht_bookings block above. Binds a stored caller-idempotency key to the
+-- request it came from, so a reused key carrying a DIFFERENT request is
+-- answered 422 instead of replaying an unrelated booking, even after the
+-- ht_channel_idempotency row is gone. PG-canonical only: no legacy counterpart,
+-- no sync mapper, no writeback, no dark flag. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('095', '095_ht_bookings_ext_ref_fingerprint.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

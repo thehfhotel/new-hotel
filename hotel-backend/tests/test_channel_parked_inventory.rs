@@ -365,6 +365,7 @@ async fn parked_bookings_consume_channel_inventory() {
     let w5 = (d("2127-11-01"), d("2127-11-05")); // counter/picker agreement
     let w6 = (d("2128-01-01"), d("2128-01-05")); // B8c: NULL-type claim, slack
     let w7 = (d("2128-03-01"), d("2128-03-05")); // B8c: typed claim, same slack
+    let w8 = (d("2128-05-01"), d("2128-05-05")); // B8c: two types + one untyped
 
     // ── baseline: nothing parked, both types fully available ────────────────
 
@@ -405,13 +406,6 @@ async fn parked_bookings_consume_channel_inventory() {
     assert_eq!(
         after.surplus, 0,
         "one more parked claim exhausts the property"
-    );
-    // Every claim in this scenario is UNTYPED, so B8c changes nothing about
-    // it — the property-wide term is arithmetically what #304 shipped.
-    assert_eq!(after.parked_claims_typed, 0);
-    assert_eq!(
-        after.parked_claims_untyped, after.parked_claims,
-        "typed + untyped must account for every parked claim"
     );
     assert_eq!(
         counted(&pool, type_a, w1.0, w1.1).await,
@@ -617,6 +611,55 @@ async fn parked_bookings_consume_channel_inventory() {
         "cancelled typed parked bookings hold no inventory"
     );
     assert_eq!(counted(&pool, type_b, w7.0, w7.1).await, 1);
+
+    // ── 8. B8c — claims of DIFFERENT types are attributed independently ─────
+    //
+    // The scenario a single-type test cannot distinguish: one live parked
+    // claim on A and one on B, in the same window, with the property still
+    // holding slack. Each type must lose exactly its OWN claim — an
+    // implementation that grouped wrongly (or summed all typed claims against
+    // every type) would zero both, and one that ignored the grouping would
+    // zero neither.
+    //
+    // The bookkeeping assertions below are meaningful here for the same
+    // reason: the two columns are fed by rows that are NOT all the same kind,
+    // so a mis-bucketed claim actually moves them.
+
+    seed_assigned(&pool, cust, room_a2, w8.0, w8.1, &mut seq).await;
+    assert_eq!(counted(&pool, type_a, w8.0, w8.1).await, 1, "A1 free");
+    assert_eq!(counted(&pool, type_b, w8.0, w8.1).await, 1, "B1 free");
+
+    seed_parked_typed(&pool, cust, type_a, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+    seed_parked_typed(&pool, cust, type_b, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+    // ...plus one claim that names no type at all, so the two columns disagree
+    // and the split has something real to get wrong.
+    seed_parked(&pool, cust, w8.0, w8.1, "confirmed", &mut seq, 1).await;
+
+    let mixed = snapshot(&pool, w8.0, w8.1).await;
+    assert_eq!(
+        mixed.parked_claims, 3,
+        "three live parked claims: {mixed:?}"
+    );
+    assert_eq!(
+        mixed.parked_claims_typed, 2,
+        "exactly the two that name a type: {mixed:?}"
+    );
+    assert_eq!(
+        mixed.parked_claims_untyped, 1,
+        "exactly the one that does not: {mixed:?}"
+    );
+
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_a, w8.0, w8.1, "A, own claim").await,
+        0,
+        "A loses its last room to the claim that names A"
+    );
+    assert_eq!(
+        assert_counter_and_picker_agree(&pool, type_b, w8.0, w8.1, "B, own claim").await,
+        0,
+        "and B loses its last room to the claim that names B — independently, \
+         not because A's claim spilled over"
+    );
 
     cleanup(&pool).await;
 }

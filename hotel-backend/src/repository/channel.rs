@@ -145,6 +145,24 @@ pub struct ChannelBookingRow {
     pub hold_expires_at: Option<DateTime<Utc>>,
 }
 
+/// A booking found BY its caller-idempotency key, plus the fingerprint of the
+/// request that minted it (migration 095 / issue #305 B8d).
+///
+/// A separate type rather than a field on [`ChannelBookingRow`] because only
+/// this lookup selects the fingerprint: the by-id reads
+/// ([`get_channel_booking`] / [`lock_channel_booking`]) are compile-time
+/// `query!` macros serving other endpoints that have no key in hand, and
+/// carrying a column they never SELECT would be a `None` that reads as
+/// "no fingerprint recorded" when it actually means "not asked for" — the
+/// same absent-vs-null conflation `RoomTypeEdit` exists to avoid.
+#[derive(Debug, Clone)]
+pub struct KeyedHold {
+    pub booking: ChannelBookingRow,
+    /// `None` = no fingerprint stored: a pre-095 booking, or the OTA path,
+    /// which has a key but records no request fingerprint.
+    pub ext_ref_fingerprint: Option<String>,
+}
+
 /// Checkout snapshot for the loyalty stay hook (`service::loyalty`).
 #[derive(Debug, Clone)]
 pub struct StaySnapshot {
@@ -449,12 +467,17 @@ pub async fn inventory_snapshot(
         .fetch_one(pool)
         .await?;
 
+    // `?`, not `unwrap_or(0)`: this is a diagnostic whose whole job is to say
+    // WHY a type reads sold out, and a decode failure that silently reports
+    // zero pressure is worse than no answer at all (it is how the
+    // `SUM(bigint)` -> NUMERIC mismatch hid). Every column here is
+    // non-nullable by construction.
     Ok(InventorySnapshot {
-        free_rooms: row.try_get("free_rooms").unwrap_or(0),
-        parked_claims: row.try_get("parked_claims").unwrap_or(0),
-        parked_claims_typed: row.try_get("parked_claims_typed").unwrap_or(0),
-        parked_claims_untyped: row.try_get("parked_claims_untyped").unwrap_or(0),
-        surplus: row.try_get("surplus").unwrap_or(0),
+        free_rooms: row.try_get("free_rooms")?,
+        parked_claims: row.try_get("parked_claims")?,
+        parked_claims_typed: row.try_get("parked_claims_typed")?,
+        parked_claims_untyped: row.try_get("parked_claims_untyped")?,
+        surplus: row.try_get("surplus")?,
     })
 }
 
@@ -530,17 +553,26 @@ pub async fn get_channel_booking(
 /// this lookup is how the service recognises the survivor and replays it
 /// instead of creating another.
 ///
-/// Returns the same shape as [`get_channel_booking`] so the replay payload is
-/// rendered from the STORED hold (its own total, its own 2 h deadline), never
-/// re-quoted from the retry's request.
+/// Returns the stored hold plus the fingerprint of the request that minted
+/// its key (migration 095), so the replay payload is rendered from the STORED
+/// hold (its own total, its own 2 h deadline) and a key reused for a
+/// DIFFERENT request is refused instead of replayed.
 pub async fn channel_booking_by_ext_ref(
     pool: &PgPool,
     channel: &str,
     ext_ref: &str,
-) -> Result<Option<ChannelBookingRow>, sqlx::Error> {
-    // Runtime query (not `query!`): `book_ext_ref` postdates the committed
-    // `.sqlx` offline snapshot — same rationale as
+) -> Result<Option<KeyedHold>, sqlx::Error> {
+    // Runtime query (not `query!`): `book_ext_ref` / `book_ext_ref_fingerprint`
+    // postdate the committed `.sqlx` offline snapshot — same rationale as
     // `repository::booking::find_by_channel_ext_ref`.
+    //
+    // Deliberately UNFILTERED on status and expiry. The caller needs to tell
+    // "this key made a hold that is still live" from "this key made a hold
+    // that was cancelled / paid / swept", and a `WHERE book_status='pending'`
+    // here would collapse the second onto "key never used" — which would mint
+    // a SECOND booking under a spent key, the exact bug B8d exists to close.
+    // The liveness decision belongs to `service::channel`, which has the row.
+    #[allow(clippy::type_complexity)]
     let row: Option<(
         i32,
         String,
@@ -552,11 +584,12 @@ pub async fn channel_booking_by_ext_ref(
         Option<f64>,
         Option<f64>,
         Option<DateTime<Utc>>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT book_id, book_no, book_status, book_channel, book_cust_id, \
                 book_checkin, book_checkout, \
                 book_total_amount::float8, book_deposit_amount::float8, \
-                book_hold_expires_at \
+                book_hold_expires_at, book_ext_ref_fingerprint \
            FROM ht_bookings \
           WHERE book_channel = $1 AND book_ext_ref = $2 \
           ORDER BY book_id LIMIT 1",
@@ -578,17 +611,21 @@ pub async fn channel_booking_by_ext_ref(
             total_amount,
             deposit_amount,
             hold_expires_at,
-        )| ChannelBookingRow {
-            book_id,
-            book_no,
-            status: status.unwrap_or_else(|| "pending".to_string()),
-            channel,
-            customer_id,
-            check_in,
-            check_out,
-            total_amount: total_amount.unwrap_or(0.0),
-            deposit_amount: deposit_amount.unwrap_or(0.0),
-            hold_expires_at,
+            ext_ref_fingerprint,
+        )| KeyedHold {
+            booking: ChannelBookingRow {
+                book_id,
+                book_no,
+                status: status.unwrap_or_else(|| "pending".to_string()),
+                channel,
+                customer_id,
+                check_in,
+                check_out,
+                total_amount: total_amount.unwrap_or(0.0),
+                deposit_amount: deposit_amount.unwrap_or(0.0),
+                hold_expires_at,
+            },
+            ext_ref_fingerprint,
         },
     ))
 }

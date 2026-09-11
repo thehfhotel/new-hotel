@@ -89,6 +89,14 @@ pub struct CreateHoldCommand {
     /// `None` = an unkeyed request, which behaves exactly as it always has:
     /// every call mints a new hold.
     pub ext_ref: Option<String>,
+    /// SHA-256 of the canonicalised request (migration 095 / issue #305), the
+    /// SAME value `ht_channel_idempotency.idem_fingerprint` carries. Stored
+    /// with the hold so a key reused for a materially DIFFERENT request is
+    /// refused (422) rather than replaying an unrelated stay, even once the
+    /// 093 row is gone — after a crash, or after its 24 h TTL.
+    ///
+    /// `None` only on an unkeyed request, where there is no key to bind.
+    pub ext_ref_fingerprint: Option<String>,
     pub source: EventSource,
 }
 
@@ -128,6 +136,23 @@ pub struct HoldOutcome {
     pub replayed: bool,
 }
 
+/// What [`ChannelService::create_hold`] did — three genuinely different
+/// answers that `Result<HoldOutcome, _>` used to flatten into two.
+#[derive(Debug, Clone)]
+pub enum HoldCreateOutcome {
+    /// A new hold was minted. **201**.
+    Created(HoldOutcome),
+    /// This key already made this hold and it is still live; the payload is
+    /// rendered from the STORED row. **201** + `Idempotency-Replayed: true`.
+    Replayed(HoldOutcome),
+    /// The key is bound to a materially DIFFERENT request (the fingerprint
+    /// stored with the surviving booking does not match this one). The route
+    /// renders the SAME 422 `ht_channel_idempotency` renders for the same
+    /// mistake, so a client cannot tell — and need not care — which of the two
+    /// records caught it.
+    KeyReusedForDifferentRequest,
+}
+
 /// Outcome of `confirm_payment` (payment-verified). `already_confirmed` is
 /// the idempotent-replay marker — the contract requires replays to succeed.
 #[derive(Debug, Clone)]
@@ -154,31 +179,87 @@ pub struct ChannelService {
     customers_repo: Arc<dyn CustomerRepository>,
 }
 
-/// Render a [`HoldOutcome`] from a hold that ALREADY exists (B8d replay).
+/// Decide what a surviving keyed booking means for THIS request (B8d).
 ///
-/// Every number comes from the stored row, not from a re-quote: `total_baht`
-/// is what the guest was originally charged and `hold_expires_at` is the
-/// ORIGINAL 2 h deadline, so a retry never silently extends a hold or moves
-/// its price. `amount_due_baht` is recomputed by the same pure
-/// [`amount_due_satang`] the first attempt used — the plan is part of the
-/// request fingerprint, so a replay always carries the same one.
+/// Three outcomes, and the order matters: identity is checked before
+/// liveness, because "you reused someone else's key" is a different mistake
+/// from "the hold this key made is gone" and must not be reported as the
+/// latter.
 ///
-/// `hold_expires_at` falls back to `now` when the stored value is NULL. That
-/// cannot happen for a hold (`BookingService::create` stamps the deadline in
-/// the insert's own transaction — migration 086), and reading it as
-/// already-expired is the safe interpretation if it ever did: the guest is
-/// told to start again rather than handed a hold with no deadline.
-fn replayed_hold(existing: channel_repo::ChannelBookingRow, payment: PaymentPlan) -> HoldOutcome {
-    let total = Money::from_satang((existing.total_amount * 100.0).round() as i64);
+/// 1. **Fingerprint mismatch** ⇒ [`HoldCreateOutcome::KeyReusedForDifferentRequest`]
+///    (422). `None` on either side is "no opinion" and does not mismatch — a
+///    pre-095 booking, or an unkeyed path, has nothing to compare.
+/// 2. **Not a live hold** ⇒ [`ServiceError::Conflict`] (409). The 201 contract
+///    has no status field, so returning a cancelled, swept or already-paid
+///    booking as a fresh hold would hand the client a `hold_expires_at` in the
+///    past and no way to notice. The error names the stored status and the
+///    booking id instead, which is actionable: look it up, or mint a new key.
+/// 3. **Live hold** ⇒ [`HoldCreateOutcome::Replayed`] rendered from the STORED
+///    row.
+///
+/// On the amount: `amount_due` is recomputed with [`amount_due_satang`]
+/// rather than read back, because it is not a stored column (a pending hold's
+/// `book_deposit_amount` is 0 — no money has moved). That is sound precisely
+/// BECAUSE gate 1 ran first: the payment plan is part of the request
+/// fingerprint, so by the time we get here the plan is proven identical to the
+/// one the original attempt quoted. A replay can therefore never quote a
+/// different figure than the original — the property the reviewer asked for,
+/// enforced by the fingerprint rather than by a redundant column.
+fn replay_keyed_hold(
+    found: channel_repo::KeyedHold,
+    requested_fingerprint: Option<&str>,
+    payment: PaymentPlan,
+    now: DateTime<Utc>,
+) -> ServiceResult<HoldCreateOutcome> {
+    let stored = found.booking;
+
+    // 1. identity
+    if let (Some(stored_fp), Some(requested_fp)) =
+        (found.ext_ref_fingerprint.as_deref(), requested_fingerprint)
+    {
+        if stored_fp != requested_fp {
+            tracing::warn!(
+                book_id = stored.book_id,
+                "loyalty hold create reused an Idempotency-Key for a different \
+                 request; refusing rather than replaying an unrelated booking"
+            );
+            return Ok(HoldCreateOutcome::KeyReusedForDifferentRequest);
+        }
+    }
+
+    // 2. liveness
+    let expired = stored
+        .hold_expires_at
+        .is_none_or(|deadline| deadline <= now);
+    if stored.status != "pending" || expired {
+        return Err(ServiceError::conflict(format!(
+            "this Idempotency-Key already created booking {} (status '{}', hold \
+             deadline {}); it is no longer a live hold, so it cannot be replayed \
+             as one — look the booking up, or retry with a NEW key",
+            stored.book_no,
+            stored.status,
+            stored
+                .hold_expires_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "none".to_string()),
+        )));
+    }
+
+    // 3. replay from the stored row
+    let total = Money::from_satang((stored.total_amount * 100.0).round() as i64);
     let due = Money::from_satang(amount_due_satang(total.as_satang(), payment));
-    HoldOutcome {
-        book_id: existing.book_id,
-        book_no: existing.book_no,
+    Ok(HoldCreateOutcome::Replayed(HoldOutcome {
+        book_id: stored.book_id,
+        book_no: stored.book_no,
         total_baht: total.as_satang() as f64 / 100.0,
         amount_due_baht: due.as_satang() as f64 / 100.0,
-        hold_expires_at: existing.hold_expires_at.unwrap_or_else(Utc::now),
+        // The ORIGINAL deadline, never `now + TTL`: a retry must not silently
+        // extend a 2 h hold.
+        hold_expires_at: stored
+            .hold_expires_at
+            .expect("liveness gate above rejects a hold with no deadline"),
         replayed: true,
-    }
+    }))
 }
 
 impl ChannelService {
@@ -241,25 +322,32 @@ impl ChannelService {
     /// The replay payload is rendered from the STORED hold — its total, its
     /// original deadline — never re-quoted from the retry's request, so a
     /// price change between attempts cannot alter what the guest was told.
-    pub async fn create_hold(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldOutcome> {
+    pub async fn create_hold(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldCreateOutcome> {
         validate_stay(cmd.check_in, cmd.check_out)?;
         if cmd.guests < 1 {
             return Err(ServiceError::validation("guests must be >= 1"));
         }
 
         // Crash-recovery replay: a prior attempt committed the hold but never
-        // recorded its key. Answer with that hold and touch nothing else.
+        // recorded its key. Answer from that hold and touch nothing else —
+        // note this runs BEFORE the guest match-or-create below, which is what
+        // keeps a replay from leaving a duplicate `ht_customers` row behind.
         if let Some(ext_ref) = cmd.ext_ref.as_deref() {
-            if let Some(existing) =
+            if let Some(found) =
                 channel_repo::channel_booking_by_ext_ref(&self.pg, LOYALTY_CHANNEL, ext_ref).await?
             {
                 tracing::info!(
-                    book_id = existing.book_id,
+                    book_id = found.booking.book_id,
                     ext_ref,
-                    "loyalty hold create replayed from the booking's own ext_ref \
+                    "loyalty hold create matched an existing booking by its own ext_ref \
                      (the idempotency record did not survive the first attempt)"
                 );
-                return Ok(replayed_hold(existing, cmd.payment));
+                return replay_keyed_hold(
+                    found,
+                    cmd.ext_ref_fingerprint.as_deref(),
+                    cmd.payment,
+                    Utc::now(),
+                );
             }
         }
         let (first_name, last_name) = split_guest_name(&cmd.guest_name)?;
@@ -391,36 +479,60 @@ impl ChannelService {
                 // the (book_channel, book_ext_ref) index dedupes the hold in
                 // the same transaction that creates it.
                 book_ext_ref: cmd.ext_ref.clone(),
+                // Migration 095 — bound to the key in the same statement, so
+                // a surviving booking can refuse a key reused for a DIFFERENT
+                // request instead of replaying an unrelated stay.
+                book_ext_ref_fingerprint: cmd.ext_ref_fingerprint.clone(),
                 hold_expires_at: Some(hold_expires_at),
                 source: cmd.source,
             })
             .await?;
 
         // Lost the concurrent race inside `BookingService::create` — our row
-        // was rolled back and the winner's booking came back instead. Report
-        // the winner's stored numbers, not the ones we just quoted.
+        // was rolled back and the winner's booking came back instead. Re-select
+        // BY THE KEY (not by id) so this arm gets the winner's fingerprint too
+        // and runs the identical identity + liveness gates as the pre-check.
         if outcome.deduped {
-            if let Some(existing) =
-                channel_repo::get_channel_booking(&self.pg, outcome.book_id).await?
-            {
-                tracing::info!(
-                    book_id = existing.book_id,
-                    ext_ref = ?cmd.ext_ref,
-                    "loyalty hold create lost the (book_channel, book_ext_ref) race; \
-                     replaying the winning hold"
-                );
-                return Ok(replayed_hold(existing, cmd.payment));
-            }
+            let ext_ref = cmd.ext_ref.as_deref().ok_or_else(|| {
+                ServiceError::internal(
+                    "BookingService::create reported a (book_channel, book_ext_ref) \
+                     dedupe for a hold that carries no ext_ref",
+                )
+            })?;
+            let found =
+                channel_repo::channel_booking_by_ext_ref(&self.pg, LOYALTY_CHANNEL, ext_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        // Never fall through to a fresh-looking 201 here: our own
+                        // row was rolled back, so "no winner found" means the
+                        // caller would be told a hold exists that does not.
+                        ServiceError::internal(format!(
+                            "lost the (book_channel, book_ext_ref) race for '{ext_ref}' but the \
+                         winning booking could not be re-selected"
+                        ))
+                    })?;
+            tracing::info!(
+                book_id = found.booking.book_id,
+                ext_ref,
+                "loyalty hold create lost the (book_channel, book_ext_ref) race; \
+                 replaying the winning hold"
+            );
+            return replay_keyed_hold(
+                found,
+                cmd.ext_ref_fingerprint.as_deref(),
+                cmd.payment,
+                Utc::now(),
+            );
         }
 
-        Ok(HoldOutcome {
+        Ok(HoldCreateOutcome::Created(HoldOutcome {
             book_id: outcome.book_id,
             book_no: outcome.book_no.unwrap_or(cmd.book_no),
             total_baht: total.as_satang() as f64 / 100.0,
             amount_due_baht: due.as_satang() as f64 / 100.0,
             hold_expires_at,
             replayed: false,
-        })
+        }))
     }
 
     /// Payment-verified: flip a `pending` hold to `confirmed`, recording the

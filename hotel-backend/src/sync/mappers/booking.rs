@@ -1412,23 +1412,29 @@ async fn resolve_projected_room_type(
     if let Some(code) = p.book_room_type_code.as_deref() {
         let resolved = resolve_room_type_code(tx, code).await?;
         if resolved.is_none() {
-            let seen = UNKNOWN_ROOM_TYPE_CODES
+            // `unwrap_or_else(into_inner)` rather than `unwrap_or(false)`: a
+            // poisoned mutex means some other thread panicked while holding
+            // it, which says nothing about the validity of the SET — and
+            // treating it as "already warned" would silence this diagnostic
+            // for the rest of the process's life, exactly when something has
+            // already gone wrong. Take the inner value and carry on.
+            let mut seen = UNKNOWN_ROOM_TYPE_CODES
                 .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
                 .lock()
-                // A poisoned mutex here would mean a panic inside the logging
-                // path; the set is advisory, so recover rather than propagate.
-                .map(|mut set| set.insert(code.to_string()))
-                .unwrap_or(false);
-            if seen {
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let first_sighting = seen.insert(code.to_string());
+            drop(seen);
+            if first_sighting {
                 tracing::warn!(
                     target: "sync::booking",
                     book_id,
                     room_type_code = %code,
                     "legacy HT_Book_Ds.Book_Room_Type '{code}' matches no \
-                     ht_room_types row (type_code / type_name / type_name_en) — \
-                     leaving ht_bookings.book_room_type_id NULL, so this parked \
-                     claim is capped property-wide instead of per type. Logged \
-                     once per distinct code; add the missing room type to fix."
+                     ht_room_types row (type_code / type_name / type_name_en) AND \
+                     no ht_rooms_new.room_no — leaving \
+                     ht_bookings.book_room_type_id NULL, so this parked claim is \
+                     capped property-wide instead of per type. Logged once per \
+                     distinct value; add the missing room type (or room) to fix."
                 );
             }
         }
@@ -1439,17 +1445,42 @@ async fn resolve_projected_room_type(
     Ok(resolved_rooms.first().and_then(|r| r.room_type_id))
 }
 
-/// Resolve one legacy room-TYPE code against `ht_room_types`.
+/// Resolve one legacy mode-1 `HT_Book_Ds.Book_Room_Type` value to a canonical
+/// `ht_room_types.type_id`.
+///
+/// Two lookups, in this order, because production data proves the column is
+/// not as pure as the decompile suggested.
+///
+/// ## 1. As a room TYPE (the documented meaning)
 ///
 /// iHOTEL's `HT_SET_RoomType` maps onto our table via `backfill_rooms`:
 /// `id_full → type_code` and `name → type_name` (also copied to
-/// `type_name_en`). Which of those the receptionist's booking grid writes
-/// into `HT_Book_Ds.Book_Room_Type` is not pinned by the decompile — the
-/// column is a free varchar(50) — so all three are accepted, with the UNIQUE
-/// `type_code` winning when a code happens to equal another type's name.
-/// Comparison is on the trimmed literal; no case folding, because Thai type
-/// names have no case and a Latin code mismatch should surface as an
-/// unmapped-code warning rather than be silently absorbed.
+/// `type_name_en`). Which of those the booking grid writes is not pinned by
+/// the decompile — the column is a free varchar(50) — so all three are
+/// accepted, with the UNIQUE `type_code` winning a tie. Comparison is on the
+/// trimmed literal; no case folding, because Thai type names have no case and
+/// a Latin mismatch should surface as an unmapped-code warning rather than be
+/// silently absorbed.
+///
+/// ## 2. As a room NUMBER (observed, 2026-09-11)
+///
+/// The pre-merge verification against BOTH live sites
+/// (`docs/coexistence/PENDING-VERIFICATIONS.md`, V17) found HF Hotel holds 6
+/// `Book_room_type = 1` headers out of 16,208 and 4 joined `HT_Book_Ds` rows —
+/// three carrying a type NAME (`เตียงเดี่ยว`, `HT_SET_RoomType.name` id 2) and
+/// **one, `R014814`, carrying the room number `402`**. HF Ville holds none at
+/// all (0 of 2,460).
+///
+/// So a mode-1 line CAN hold a room number, and the pure-type reading would
+/// have left `R014814` unattributed. Falling back to `ht_rooms_new.room_no`
+/// and taking that room's own type is both correct for it and strictly safer
+/// than the alternative: the type lookup runs FIRST, so a value that is a
+/// genuine type can never be mistaken for a room, and a value that is neither
+/// still lands on `None` (logged once, property-wide cap).
+///
+/// This does NOT turn the line into a room ASSIGNMENT — `project_aggregate`
+/// still projects mode-1 bookings header-only, which is what keeps the
+/// 2026-06-11 forever-re-emitting loop closed. Only the type is borrowed.
 async fn resolve_room_type_code(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     code: &str,
@@ -1463,7 +1494,17 @@ async fn resolve_room_type_code(
     .bind(code)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(|(type_id,)| type_id))
+    if let Some((type_id,)) = row {
+        return Ok(Some(type_id));
+    }
+
+    // Not a type — try it as a room number (the `R014814` shape).
+    let by_room: Option<(Option<i32>,)> =
+        sqlx::query_as("SELECT room_type_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1")
+            .bind(code)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(by_room.and_then(|(room_type_id,)| room_type_id))
 }
 
 /// Replace `ht_booking_rooms` for this booking. Conservative: drop and
@@ -2439,6 +2480,105 @@ mod tests {
             sha256(&hash_body(&p)),
             expected,
             "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    // ----- book_room_type_id gate term (B8c / migration 094) -------------
+
+    /// The `book_room_type_id` term is UNGUARDED, and this is the transition
+    /// that proves it has to be.
+    ///
+    /// `make_existing` builds the stored row FROM the projection, so it copies
+    /// whatever `book_room_type_id` the projection carries and the term
+    /// trivially matches — a test that only used the fixture as-is would pass
+    /// against a gate that never compared the column at all. Every assertion
+    /// below therefore mutates the projection AFTER the fixture is built.
+    #[test]
+    fn gate_notices_a_room_type_change_in_both_directions() {
+        // Some -> None: iHOTEL repointed a "ระบุประเภทห้อง" booking at a code
+        // we can no longer map. If the gate held here, the write that clears
+        // the column would never run and canonical would keep subtracting a
+        // parked claim from the WRONG type forever.
+        let mut p = sample_projection();
+        p.book_room_type_id = Some(7);
+        let ex = make_existing(&p);
+        assert!(
+            existing_matches(&ex, &p, &[]),
+            "fixture sanity: an unmutated projection must match"
+        );
+
+        p.book_room_type_id = None;
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> None must mismatch — the term is unguarded precisely so an \
+             unresolvable legacy type converges to NULL instead of freezing"
+        );
+
+        // Some -> Some: the ordinary receptionist retype.
+        p.book_room_type_id = Some(9);
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> Some must mismatch"
+        );
+
+        // None -> Some: first sighting on a booking canonical had no type for.
+        let mut cleared = sample_projection();
+        cleared.book_room_type_id = None;
+        let ex_cleared = make_existing(&cleared);
+        cleared.book_room_type_id = Some(3);
+        assert!(
+            !existing_matches(&ex_cleared, &cleared, &[]),
+            "None -> Some must mismatch"
+        );
+    }
+
+    /// A `Book_room_type=1` header with NO surviving `HT_Book_Ds` rows carries
+    /// no type code at all — the shape iHOTEL's §3.6 cancel-on-room leaves
+    /// behind (it deletes every Ds line but keeps the header). It must project
+    /// header-only with NO type, not panic and not invent one from thin air.
+    #[test]
+    fn project_aggregate_mode_1_without_ds_rows_carries_no_type_code() {
+        let mut header = header_row("R015401", "C21610", "จอง");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015401").expect("must project");
+        assert!(p.rooms.is_empty(), "no Ds lines ⇒ no room assignments");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "no Ds line ⇒ nothing states a type; the claim stays untyped and \
+             falls back to the property-wide cap"
+        );
+    }
+
+    /// Every Ds line CANCELLED (`Book_status=3`) is the same story: iHOTEL's
+    /// §3.5 cancel marks the lines rather than deleting them, so the rows are
+    /// present but none of them speaks for the booking.
+    #[test]
+    fn project_aggregate_mode_1_ignores_cancelled_ds_lines_for_the_type_code() {
+        let mut header = header_row("R015402", "C21610", "ยกเลิก");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let mut cancelled = ds_row("R015402", "DELUXE");
+        cancelled
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![cancelled],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015402").expect("must project");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "a cancelled line must not attribute a type — the same status set \
+             that keeps it out of the room assignments keeps it out of here"
         );
     }
 
