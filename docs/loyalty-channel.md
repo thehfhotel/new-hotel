@@ -423,8 +423,8 @@ Properties of the guard, all deliberate:
   rejected. With `surplus = 8` and floor 1 the channel behaves exactly as
   before.
 * **Reception is not gated.** The desk can book the very room the channel just
-  declined — that is the point. This converts every B8 §2 race from a
-  double-sell into a phone call.
+  declined — that is the point. This converts every race in the B8 overbooking
+  analysis (hf-tasks) from a double-sell into a phone call.
 * **Type-independent.** At the floor the channel stands down whatever type was
   asked for. "No Deluxe available" while reception can still sell the Deluxe
   would be a false sold-out; "the desk is holding the last rooms" is true.
