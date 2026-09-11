@@ -158,11 +158,13 @@ Both messages are prefixed by the site tag, e.g. `[site=hfhotel] ` / `[site=hfvi
 2 booking(s) made in the guest app committed to PostgreSQL but their legacy writeback job has not applied for more than 10 minute(s). iHOTEL does NOT show these rooms as `จอง`, so the desk can double-book them — and a hold that expires before the leg recovers disappears without ever reaching the room board:
 • `BK26-000412` — `create_booking` pending for 12m, hold expires in 108m
 • `BK26-000413` — `create_booking` in_progress for 31m, HOLD ALREADY EXPIRED
+• `BK26-000414` — `create_booking` failed for 44m, booking is confirmed — NOT a live hold
 _Runbook:_ `docs/runbooks/writeback-leg-degraded.md` _— check the writeback worker and the legacy leg first. Per-site cooldown 30 min; a_ `:white_check_mark:` _all-clear fires once the backlog drains._
 ```
 
-Per row: `• <book_no> — <intent> <status> for <age>m[, hold expires in <n>m | , HOLD ALREADY EXPIRED]`.
-At most 15 rows are listed, then `…and N more`.
+Per row: `• <book_no> — <intent> <status> for <age>m<hold suffix>`, where the suffix is one
+of `, hold expires in <n>m`, `, HOLD ALREADY EXPIRED`, or `, booking is <status> — NOT a
+live hold`. At most 15 rows are listed, then `…and N more`.
 
 Read the row, not just the headline:
 
@@ -170,6 +172,12 @@ Read the row, not just the headline:
   self-cancels. Below ~20m, go to §6 and block the room by hand rather than waiting.
 - **`HOLD ALREADY EXPIRED`** — the hold died during the outage. The room is free in our
   app; the guest may still believe they have it. See §5.
+- **`booking is confirmed — NOT a live hold`** — **the guest has PAID.** This booking is
+  not going to expire and the room is genuinely sold; it is simply invisible to iHOTEL.
+  Treat it as the most certain of the three. (The alert says this explicitly because
+  `book_hold_expires_at` is *not* cleared when a deposit is verified — reading the
+  timestamp alone would have labelled a paid booking "expired", which is the one thing
+  this alert must never tell a night receptionist.)
 - **`cancel_booking` as the intent** — the inverse harm: a cancellation that never
   reached iHOTEL leaves a **phantom `จอง`** and reception is holding a room that is
   actually free. Do not skip these because "nothing was sold".

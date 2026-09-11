@@ -2068,11 +2068,65 @@ pub struct StalledLoyaltyWriteback {
     pub status: String,
     /// Whole minutes since the job row was enqueued.
     pub age_minutes: i64,
-    /// `ht_bookings.book_hold_expires_at`, when the booking is still a hold.
-    /// `None` once the hold has been confirmed (payment verified) — the
-    /// booking is then a normal reservation whose iHOTEL twin still matters.
+    /// `ht_bookings.book_status` — `pending` while the booking is still an
+    /// unpaid hold, `confirmed` once the deposit has been verified.
+    ///
+    /// Carried purely so the Slack body can tell those two apart. It MUST be:
+    /// `confirm_booking_payment` flips the status but deliberately leaves
+    /// `book_hold_expires_at` in place (the expiry sweep is guarded on
+    /// `book_status='pending'`, so it does not need clearing). Reading the
+    /// timestamp alone would therefore label a PAID, confirmed booking as
+    /// "HOLD ALREADY EXPIRED" — telling a night receptionist that a guest
+    /// lost a room they have actually bought.
+    pub book_status: String,
+    /// `ht_bookings.book_hold_expires_at` — the payment deadline stamped on
+    /// every channel booking at creation. NOT cleared on confirmation, so it
+    /// is only meaningful while `book_status == 'pending'`; see above.
     pub hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// Pure renderer for the per-row hold suffix in the Slack body.
+///
+/// The three cases a night receptionist must be able to tell apart:
+///
+///   * still a live hold — show the minutes left, so they know how long the
+///     leg has to recover before the booking self-cancels;
+///   * an expired hold — the guest no longer holds the room, so a walk-in
+///     must NOT be turned away for it;
+///   * a confirmed booking — the guest has PAID. This one is never "expired"
+///     however old its `book_hold_expires_at` is, because
+///     `confirm_booking_payment` leaves that timestamp behind. Getting this
+///     wrong is worse than saying nothing: it invites the desk to resell a
+///     room that is genuinely sold.
+///
+/// Pure (clock injected) so all three branches are unit-testable.
+fn format_hold_suffix(
+    book_status: &str,
+    hold_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    if book_status != CHANNEL_HOLD_STATUS {
+        // Confirmed (or cancelled) — the deadline no longer governs anything.
+        return format!(", booking is {book_status} — NOT a live hold");
+    }
+    match hold_expires_at {
+        Some(exp) => {
+            let left = (exp - now).num_minutes();
+            if left > 0 {
+                format!(", hold expires in {left}m")
+            } else {
+                // Never render a negative countdown: "expires in -12m" at
+                // 02:00 is a puzzle, not an instruction.
+                ", HOLD ALREADY EXPIRED".to_string()
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// `ht_bookings.book_status` of an unpaid loyalty hold. The expiry sweep is
+/// guarded on the same literal (`repository::channel::expired_hold_ids`).
+const CHANNEL_HOLD_STATUS: &str = "pending";
 
 /// Pure decision function — is this one job a confirmed loyalty-leg stall?
 ///
@@ -2223,19 +2277,7 @@ pub async fn check_loyalty_writeback_stall_and_alert(
             .iter()
             .take(shown)
             .map(|row| {
-                let hold = match row.hold_expires_at {
-                    // Minutes of hold left, floored at 0 — a negative number
-                    // would read as "expires in -12 minutes" at 02:00.
-                    Some(exp) => {
-                        let left = (exp - now).num_minutes();
-                        if left > 0 {
-                            format!(", hold expires in {left}m")
-                        } else {
-                            ", HOLD ALREADY EXPIRED".to_string()
-                        }
-                    }
-                    None => String::new(),
-                };
+                let hold = format_hold_suffix(&row.book_status, row.hold_expires_at, now);
                 format!(
                     "• `{book_no}` — `{intent}` {status} for {age}m{hold}",
                     book_no = row.book_no,
@@ -2360,6 +2402,7 @@ async fn fetch_stalled_loyalty_writebacks(
             String,
             String,
             i64,
+            String,
             Option<chrono::DateTime<chrono::Utc>>,
         ),
     >(
@@ -2367,6 +2410,7 @@ async fn fetch_stalled_loyalty_writebacks(
                 j.intent, \
                 j.status, \
                 (EXTRACT(EPOCH FROM (now() - j.created_at)) / 60)::bigint AS age_minutes, \
+                b.book_status, \
                 b.book_hold_expires_at \
            FROM writeback_jobs j \
            JOIN ht_bookings b ON b.aggregate_id = j.aggregate_id \
@@ -2383,15 +2427,18 @@ async fn fetch_stalled_loyalty_writebacks(
     .await
     .map(|rows| {
         rows.into_iter()
-            .map(|(book_no, intent, status, age_minutes, hold_expires_at)| {
-                StalledLoyaltyWriteback {
-                    book_no,
-                    intent,
-                    status,
-                    age_minutes,
-                    hold_expires_at,
-                }
-            })
+            .map(
+                |(book_no, intent, status, age_minutes, book_status, hold_expires_at)| {
+                    StalledLoyaltyWriteback {
+                        book_no,
+                        intent,
+                        status,
+                        age_minutes,
+                        book_status,
+                        hold_expires_at,
+                    }
+                },
+            )
             .collect()
     })
 }
@@ -14780,6 +14827,70 @@ mod tests {
         // And the sweep must not list it as a "recovered table".
         let recovered = tables_recovered(&[LOYALTY_WRITEBACK_STALL_COOLDOWN_KEY.to_string()], &[]);
         assert!(recovered.is_empty());
+    }
+
+    /// A PAID, confirmed booking must NEVER be rendered as an expired hold.
+    ///
+    /// `confirm_booking_payment` flips `book_status` to `confirmed` but leaves
+    /// `book_hold_expires_at` in place (the expiry sweep is guarded on the
+    /// status, so it has no reason to clear it). Reading the timestamp alone
+    /// would tell a night receptionist that a guest who has paid a deposit
+    /// lost their room — inviting the desk to resell a room that is genuinely
+    /// sold. This is the single most harmful thing this alert could say.
+    #[test]
+    fn hold_suffix_never_calls_a_confirmed_booking_expired() {
+        let now = chrono::Utc::now();
+        let long_past = now - chrono::Duration::hours(6);
+        let suffix = format_hold_suffix("confirmed", Some(long_past), now);
+        assert!(
+            !suffix.contains("EXPIRED"),
+            "a paid booking must never read as an expired hold, got: {suffix}"
+        );
+        assert!(suffix.contains("NOT a live hold"));
+        assert!(suffix.contains("confirmed"));
+    }
+
+    /// A live hold shows the minutes remaining, so the operator knows how long
+    /// the leg has to recover before the booking self-cancels.
+    #[test]
+    fn hold_suffix_counts_down_a_live_hold() {
+        let now = chrono::Utc::now();
+        let suffix = format_hold_suffix(
+            CHANNEL_HOLD_STATUS,
+            Some(now + chrono::Duration::minutes(108)),
+            now,
+        );
+        assert_eq!(suffix, ", hold expires in 108m");
+    }
+
+    /// An expired hold says so plainly, and never as a negative countdown —
+    /// "expires in -12m" at 02:00 is a puzzle, not an instruction.
+    #[test]
+    fn hold_suffix_reports_an_expired_hold_without_a_negative_countdown() {
+        let now = chrono::Utc::now();
+        let suffix = format_hold_suffix(
+            CHANNEL_HOLD_STATUS,
+            Some(now - chrono::Duration::minutes(12)),
+            now,
+        );
+        assert_eq!(suffix, ", HOLD ALREADY EXPIRED");
+        assert!(!suffix.contains('-'));
+    }
+
+    /// A pending booking with no deadline stamped adds nothing rather than
+    /// inventing a state.
+    #[test]
+    fn hold_suffix_is_empty_when_no_deadline_is_stamped() {
+        let now = chrono::Utc::now();
+        assert_eq!(format_hold_suffix(CHANNEL_HOLD_STATUS, None, now), "");
+    }
+
+    /// The hold-status literal must match the one the expiry sweep is guarded
+    /// on (`repository::channel::expired_hold_ids`), or the two disagree about
+    /// what a live hold is.
+    #[test]
+    fn channel_hold_status_matches_the_sweep_guard() {
+        assert_eq!(CHANNEL_HOLD_STATUS, "pending");
     }
 
     /// The operator-facing text must carry the three things that make it
