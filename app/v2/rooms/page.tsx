@@ -11,7 +11,9 @@ import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/p
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
 import SpatialRoomGrid, { type LayoutDropTarget } from '@/components/v2/SpatialRoomGrid'
 import GuestMoveConfirmModal from '@/components/v2/GuestMoveConfirmModal'
-import CheckInModal from '@/components/CheckInModal'
+import CheckInModal, { type CheckInBookingContext } from '@/components/CheckInModal'
+import { pickTodaysBookingIdForRoom, todayYmd } from '@/lib/v2/checkin-from-booking'
+import type { BookingDetail } from '@/types/booking'
 import CheckOutModal from '@/components/CheckOutModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
@@ -76,6 +78,12 @@ export default function V2Rooms() {
   // a canonical-only rearrange would fork the two boards.
   const [layoutMode, setLayoutMode] = useState(false)
   const [layoutError, setLayoutError] = useState<string | null>(null)
+  // Task B7a — the reservation a `booked` room's check-in is being started
+  // from, resolved on click. `null` = walk-in (the `available` path, unchanged).
+  const [checkInBooking, setCheckInBooking] = useState<CheckInBookingContext | null>(null)
+  // Inline message shown in the action sheet when a booked room's reservation
+  // cannot be resolved — better than a button that appears to do nothing.
+  const [sheetNotice, setSheetNotice] = useState<string | null>(null)
 
   useEffect(() => {
     try {
@@ -169,11 +177,75 @@ export default function V2Rooms() {
     fetchRooms()
     setModal(null)
     setSelected(null)
+    setCheckInBooking(null)
   }
+
+  /**
+   * Task B7a — find the reservation that makes `room` read จองแล้ว today and
+   * load enough of it to pre-fill the check-in.
+   *
+   * Two reads, both existing endpoints: the calendar answers "which canonical
+   * booking sits on this room number today" (same predicate the room board is
+   * painted with), then the booking detail supplies guest / dates / pax /
+   * deposit / channel. Returns `null` when nothing matches — an iHOTEL-only
+   * booking, or a board that has drifted from the data behind it.
+   */
+  const resolveBookingForRoom = useCallback(
+    async (room: RoomItem): Promise<CheckInBookingContext | null> => {
+      const today = todayYmd()
+      const calRes = await branchFetch(`/api/calendar?startDate=${today}&endDate=${today}`)
+      if (!calRes.ok) return null
+      const cal = await calRes.json()
+      const bookingId = pickTodaysBookingIdForRoom(cal?.data?.bookings, room.roomNo, today)
+      if (bookingId == null) return null
+
+      const detRes = await branchFetch(`/api/bookings/${bookingId}`)
+      if (!detRes.ok) return null
+      const det = await detRes.json()
+      if (!det?.success || !det.booking) return null
+      const b = det.booking as BookingDetail
+      return {
+        id: b.id,
+        bookNo: b.bookNo,
+        customerName: b.customerName,
+        checkIn: b.checkIn,
+        checkOut: b.checkOut,
+        adults: b.adults,
+        children: b.children,
+        depositAmount: b.depositAmount,
+        bookChannel: b.bookChannel,
+      }
+    },
+    [branchFetch],
+  )
 
   const handleAction = async (a: RoomAction) => {
     if (!selected) return
+    setSheetNotice(null)
+    // Task B7a — a `booked` room checks in FROM its reservation, so the POST
+    // carries bookingId and the stay lands linked. `available` stays the
+    // walk-in path, byte-identical to before.
+    if (a === 'checkin' && selected.status === 'booked') {
+      setBusy(true)
+      try {
+        const resolved = await resolveBookingForRoom(selected)
+        if (!resolved) {
+          setSheetNotice(
+            'ไม่พบการจองของห้องนี้ในระบบใหม่สำหรับวันนี้ — ถ้าเป็นการจองที่ทำใน iHOTEL ให้เช็คอินที่ iHOTEL',
+          )
+          return
+        }
+        setCheckInBooking(resolved)
+        setModal('checkin')
+      } catch {
+        setSheetNotice('อ่านข้อมูลการจองไม่สำเร็จ กรุณาลองใหม่')
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
     if (MODAL_ACTIONS.includes(a)) {
+      setCheckInBooking(null)
       setModal(a as ModalKind)
       return // keep `selected`; sheet is replaced by the modal overlay
     }
@@ -433,14 +505,28 @@ export default function V2Rooms() {
 
       {/* Action sheet — hidden while a transactional modal is open */}
       {selected && !modal && (
-        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} readOnly={!canWrite} />
+        <RoomActionSheet
+          room={selected}
+          onClose={() => {
+            setSelected(null)
+            setSheetNotice(null)
+          }}
+          onAction={handleAction}
+          busy={busy}
+          readOnly={!canWrite}
+          notice={sheetNotice}
+        />
       )}
 
       {/* Transactional modals (reused from the classic app for contract safety) */}
       {modal === 'checkin' && selected && (
         <CheckInModal
           room={{ id: selected.id, roomNo: selected.roomNo, roomTypeName: selected.roomTypeName }}
-          onClose={() => setModal(null)}
+          booking={checkInBooking}
+          onClose={() => {
+            setModal(null)
+            setCheckInBooking(null)
+          }}
           onSuccess={refreshAfterModal}
         />
       )}
