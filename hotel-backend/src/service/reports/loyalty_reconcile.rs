@@ -294,7 +294,19 @@ pub struct ReconcileRow {
     pub book_id: i32,
     /// `ht_bookings.book_no` — the reference reception types into iHOTEL.
     pub book_no: String,
-    /// `ht_bookings.book_status`.
+    /// `ht_bookings.book_status`, `COALESCE`d to `""`.
+    ///
+    /// The column is **nullable** (`VARCHAR(20) DEFAULT 'confirmed'`, no NOT
+    /// NULL), and a NULL-status booking is deliberately IN scope — every
+    /// predicate here tests it with `IS DISTINCT FROM 'cancelled'` rather than
+    /// `<>` precisely so such a row is not silently dropped from both sides.
+    /// Having included it, the decode must survive it: every loader
+    /// `COALESCE`s to `''`, the same idiom
+    /// `repository::channel::stay_snapshot_for_loyalty` uses for `cin_status`.
+    /// An empty string reads as "no status recorded" at the desk and buckets
+    /// as [`ReconcileKind::WritebackStalled`] (never the phantom kind, which
+    /// requires a literal `cancelled`), which is the correct, conservative
+    /// answer for a booking whose state nobody recorded.
     pub book_status: String,
     pub check_in: NaiveDate,
     pub check_out: NaiveDate,
@@ -554,7 +566,7 @@ pub async fn load_writeback_gaps(
         r#"
         SELECT b.book_id,
                b.book_no,
-               b.book_status,
+               COALESCE(b.book_status, '') AS book_status,
                b.book_checkin,
                b.book_checkout,
                b.book_hold_expires_at,
@@ -647,7 +659,7 @@ pub async fn load_sweep_lag(
         r#"
         SELECT b.book_id,
                b.book_no,
-               b.book_status,
+               COALESCE(b.book_status, '') AS book_status,
                b.book_checkin,
                b.book_checkout,
                b.book_hold_expires_at,
@@ -731,7 +743,7 @@ pub async fn load_deposit_divergence(
         r#"
         SELECT b.book_id,
                b.book_no,
-               b.book_status,
+               COALESCE(b.book_status, '') AS book_status,
                b.book_checkin,
                b.book_checkout,
                b.book_hold_expires_at,
@@ -832,7 +844,7 @@ pub async fn load_unlinked_checkins(
         r#"
         SELECT b.book_id,
                b.book_no,
-               b.book_status,
+               COALESCE(b.book_status, '') AS book_status,
                b.book_checkin,
                b.book_checkout,
                COALESCE(b.book_deposit_amount, 0)::float8 AS deposit_amount,

@@ -625,6 +625,10 @@ async fn a_cancelled_booking_is_not_in_the_deposit_lookahead() {
     let null_status = find(&out, "TESTB8F-DEPNULL");
     assert_eq!(null_status.kind, "deposit_divergence");
     assert_eq!(null_status.arrival, "tomorrow");
+    assert_eq!(
+        null_status.book_status, "",
+        "book_status is nullable, and a row the predicate deliberately INCLUDES          must also decode — every loader COALESCEs it to ''"
+    );
     assert_eq!(out.summary.deposit_total, 700.0);
 
     cleanup_b8f(&pool).await;
