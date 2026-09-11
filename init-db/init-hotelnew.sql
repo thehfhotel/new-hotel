@@ -3181,6 +3181,50 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('084', '084_reconcile_era_floor_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- -----------------------------------------------------------------------------
+-- Migration 093 - Caller-side request idempotency for the loyalty-app booking
+-- channel (docs/loyalty-channel.md). One row per (caller identity,
+-- Idempotency-Key) carrying the response that request produced, so a client
+-- retry REPLAYS it instead of creating a second hold. The UNIQUE constraint is
+-- load-bearing twice: it is the replay lookup AND the concurrency serializer --
+-- the reserving INSERT holds an uncommitted index entry for the whole create,
+-- so a simultaneous duplicate blocks and then replays. PG-canonical only: no
+-- legacy counterpart, no sync mapper, no writeback, no domain event. Requests
+-- without a key write no row and behave exactly as before.
+-- See migrations/pg/093_create_ht_channel_idempotency.sql.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_channel_idempotency (
+    idem_id           BIGSERIAL   PRIMARY KEY,
+    idem_caller       TEXT        NOT NULL,
+    idem_key          TEXT        NOT NULL,
+    idem_endpoint     TEXT        NOT NULL,
+    idem_fingerprint  TEXT        NOT NULL,
+    idem_status       SMALLINT    NULL,
+    idem_body         TEXT        NULL,
+    idem_book_id      INTEGER     NULL,
+    idem_created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    idem_completed_at TIMESTAMPTZ NULL,
+    idem_expires_at   TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+    CONSTRAINT ux_ht_channel_idempotency_caller_key UNIQUE (idem_caller, idem_key)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_channel_idempotency_expires
+    ON ht_channel_idempotency (idem_expires_at);
+
+COMMENT ON TABLE ht_channel_idempotency IS
+    'Caller-side request idempotency for the loyalty-app booking channel, migration 093. '
+    'One row per (idem_caller, idem_key): the SHA-256 of the presented channel bearer '
+    'plus the client''s Idempotency-Key header. Stores the response status + body that '
+    'key produced so a retry REPLAYS it instead of creating a second hold, and the '
+    'UNIQUE constraint doubles as the concurrency serializer. idem_fingerprint is a '
+    'SHA-256 over the CANONICALISED request; the same key with a different request is '
+    'answered 422. 24 h TTL (idem_expires_at), swept opportunistically; an expired row '
+    'reads as absent. PG-CANONICAL ONLY. Per-site (connection-level scoping).';
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('093', '093_create_ht_channel_idempotency.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

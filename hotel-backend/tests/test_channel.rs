@@ -25,11 +25,10 @@ use sqlx::{PgPool, Row};
 use hotel_backend::outbox::event::EventSource;
 use hotel_backend::outbox::{EventBus, OutboxRepository};
 use hotel_backend::repository::channel as channel_repo;
-use hotel_backend::repository::{
-    CustomerRepository, PgBookingRepository, PgCustomerRepository,
-};
+use hotel_backend::repository::{CustomerRepository, PgBookingRepository, PgCustomerRepository};
 use hotel_backend::service::{
-    BookingService, ChannelService, CreateHoldCommand, CustomerService, PaymentPlan, ServiceError,
+    fingerprint_of, BookingService, ChannelIdempotency, ChannelService, CreateHoldCommand,
+    CustomerService, PaymentPlan, Reserved, ServiceError, ENDPOINT_CREATE_BOOKING,
 };
 use uuid::Uuid;
 
@@ -209,28 +208,33 @@ async fn loyalty_channel_end_to_end() {
     // ---------- availability math ----------
 
     // Both rooms free.
-    let rows = svc.availability(d(w1.0), d(w1.1), 2).await.expect("availability");
+    let rows = svc
+        .availability(d(w1.0), d(w1.1), 2)
+        .await
+        .expect("availability");
     let t = count_for(&rows, type_id).expect("test type present");
     assert_eq!(t.available_count, 2, "both rooms free");
     assert_eq!(t.nightly_price, 1200.0, "quoted from type_base_price");
     assert_eq!(t.name, TYPE_NAME);
 
     // Guest-capacity filter: type sleeps 2, ask for 3 → type excluded.
-    let rows = svc.availability(d(w1.0), d(w1.1), 3).await.expect("availability");
+    let rows = svc
+        .availability(d(w1.0), d(w1.1), 3)
+        .await
+        .expect("availability");
     assert!(
         count_for(&rows, type_id).is_none(),
         "type_max_guests=2 must exclude the type for guests=3"
     );
 
     // Confirmed booking on ROOM_A overlapping w1 blocks it.
-    let cust_id: i32 = sqlx::query(
-        "INSERT INTO ht_customers (cust_firstname) VALUES ($1) RETURNING cust_id",
-    )
-    .bind(GUEST_FIRST)
-    .fetch_one(&pool)
-    .await
-    .expect("seed conflict customer")
-    .get("cust_id");
+    let cust_id: i32 =
+        sqlx::query("INSERT INTO ht_customers (cust_firstname) VALUES ($1) RETURNING cust_id")
+            .bind(GUEST_FIRST)
+            .fetch_one(&pool)
+            .await
+            .expect("seed conflict customer")
+            .get("cust_id");
     let room_a_id: i32 = sqlx::query("SELECT room_id FROM ht_rooms_new WHERE room_no = $1")
         .bind(ROOM_A)
         .fetch_one(&pool)
@@ -256,7 +260,10 @@ async fn loyalty_channel_end_to_end() {
         .await
         .expect("seed conflict booking room");
 
-    let rows = svc.availability(d(w1.0), d(w1.1), 2).await.expect("availability");
+    let rows = svc
+        .availability(d(w1.0), d(w1.1), 2)
+        .await
+        .expect("availability");
     assert_eq!(
         count_for(&rows, type_id).unwrap().available_count,
         1,
@@ -295,7 +302,10 @@ async fn loyalty_channel_end_to_end() {
     .await
     .expect("seed occupancy conflict");
 
-    let rows = svc.availability(d(w1.0), d(w1.1), 2).await.expect("availability");
+    let rows = svc
+        .availability(d(w1.0), d(w1.1), 2)
+        .await
+        .expect("availability");
     assert_eq!(
         count_for(&rows, type_id).unwrap().available_count,
         0,
@@ -303,7 +313,15 @@ async fn loyalty_channel_end_to_end() {
     );
 
     // Sold out ⇒ hold create must refuse with Conflict.
-    match svc.create_hold(hold_cmd(&format!("{BOOK_NO_PREFIX}-X1"), type_id, w1.0, w1.1)).await {
+    match svc
+        .create_hold(hold_cmd(
+            &format!("{BOOK_NO_PREFIX}-X1"),
+            type_id,
+            w1.0,
+            w1.1,
+        ))
+        .await
+    {
         Err(ServiceError::Conflict(_)) => {}
         other => panic!("expected Conflict for sold-out window, got {other:?}"),
     }
@@ -332,7 +350,12 @@ async fn loyalty_channel_end_to_end() {
 
     let before = Utc::now();
     let hold = svc
-        .create_hold(hold_cmd(&format!("{BOOK_NO_PREFIX}-H1"), type_id, w1.0, w1.1))
+        .create_hold(hold_cmd(
+            &format!("{BOOK_NO_PREFIX}-H1"),
+            type_id,
+            w1.0,
+            w1.1,
+        ))
         .await
         .expect("create hold");
 
@@ -360,12 +383,21 @@ async fn loyalty_channel_end_to_end() {
     assert_eq!(row.get::<String, _>("book_status"), "pending");
     assert_eq!(row.get::<String, _>("book_channel"), "loyalty");
     assert_eq!(row.get::<String, _>("book_source"), "loyalty");
-    assert!(row.get::<Option<chrono::DateTime<Utc>>, _>("book_hold_expires_at").is_some());
+    assert!(row
+        .get::<Option<chrono::DateTime<Utc>>, _>("book_hold_expires_at")
+        .is_some());
     assert_eq!(row.get::<f64, _>("total"), 2400.0);
-    assert_eq!(row.get::<i64, _>("rooms"), 1, "hold consumes exactly one room");
+    assert_eq!(
+        row.get::<i64, _>("rooms"),
+        1,
+        "hold consumes exactly one room"
+    );
 
     // The hold consumed availability.
-    let rows = svc.availability(d(w1.0), d(w1.1), 2).await.expect("availability");
+    let rows = svc
+        .availability(d(w1.0), d(w1.1), 2)
+        .await
+        .expect("availability");
     assert_eq!(
         count_for(&rows, type_id).unwrap().available_count,
         1,
@@ -383,7 +415,10 @@ async fn loyalty_channel_end_to_end() {
     .await
     .expect("writeback count")
     .get("n");
-    assert_eq!(jobs, 1, "roomed pending hold rides the normal create writeback");
+    assert_eq!(
+        jobs, 1,
+        "roomed pending hold rides the normal create writeback"
+    );
 
     // Guest was created + membership attached.
     let guest = sqlx::query(
@@ -395,23 +430,30 @@ async fn loyalty_channel_end_to_end() {
     .fetch_one(&pool)
     .await
     .expect("guest row");
-    assert_eq!(guest.get::<String, _>("cust_membership_id"), "TEST-LOYAL-M1");
+    assert_eq!(
+        guest.get::<String, _>("cust_membership_id"),
+        "TEST-LOYAL-M1"
+    );
     let first_guest_id: i32 = guest.get("cust_id");
 
     // ---------- match-or-create: same phone+name reuses the profile ----------
 
     let hold2 = svc
-        .create_hold(hold_cmd(&format!("{BOOK_NO_PREFIX}-H2"), type_id, w2.0, w2.1))
+        .create_hold(hold_cmd(
+            &format!("{BOOK_NO_PREFIX}-H2"),
+            type_id,
+            w2.0,
+            w2.1,
+        ))
         .await
         .expect("second hold");
-    let second_guest_id: i32 = sqlx::query(
-        "SELECT book_cust_id FROM ht_bookings WHERE book_id = $1",
-    )
-    .bind(hold2.book_id)
-    .fetch_one(&pool)
-    .await
-    .expect("second hold row")
-    .get("book_cust_id");
+    let second_guest_id: i32 =
+        sqlx::query("SELECT book_cust_id FROM ht_bookings WHERE book_id = $1")
+            .bind(hold2.book_id)
+            .fetch_one(&pool)
+            .await
+            .expect("second hold row")
+            .get("book_cust_id");
     assert_eq!(
         second_guest_id, first_guest_id,
         "same phone+name must match the existing profile, not mint a duplicate"
@@ -427,13 +469,12 @@ async fn loyalty_channel_end_to_end() {
     assert_eq!(confirm.deposit_baht, 1200.0);
     assert_eq!(confirm.balance_due_baht, 1200.0);
 
-    let status: String =
-        sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
-            .bind(hold.book_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("book_status");
+    let status: String = sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+        .bind(hold.book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("book_status");
     assert_eq!(status, "confirmed");
 
     // Replay tolerates + reports the stored numbers, writes nothing.
@@ -452,15 +493,17 @@ async fn loyalty_channel_end_to_end() {
 
     // ---------- release: cancel + idempotent replay ----------
 
-    let release = svc.release(hold2.book_id, "test release").await.expect("release");
+    let release = svc
+        .release(hold2.book_id, "test release")
+        .await
+        .expect("release");
     assert!(!release.already_released);
-    let status: String =
-        sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
-            .bind(hold2.book_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("book_status");
+    let status: String = sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+        .bind(hold2.book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("book_status");
     assert_eq!(status, "cancelled");
 
     // Cancel writeback enqueued so iHOTEL frees the room.
@@ -476,7 +519,10 @@ async fn loyalty_channel_end_to_end() {
     .get("n");
     assert_eq!(cancel_jobs, 1, "release rides the normal cancel writeback");
 
-    let replay = svc.release(hold2.book_id, "test release").await.expect("release replay");
+    let replay = svc
+        .release(hold2.book_id, "test release")
+        .await
+        .expect("release replay");
     assert!(replay.already_released, "release must tolerate replays");
 
     // Confirming a released hold refuses.
@@ -488,19 +534,26 @@ async fn loyalty_channel_end_to_end() {
     // ---------- expiry sweep ----------
 
     let hold3 = svc
-        .create_hold(hold_cmd(&format!("{BOOK_NO_PREFIX}-H3"), type_id, w3.0, w3.1))
+        .create_hold(hold_cmd(
+            &format!("{BOOK_NO_PREFIX}-H3"),
+            type_id,
+            w3.0,
+            w3.1,
+        ))
         .await
         .expect("third hold");
     // Not expired yet → sweep must NOT touch it.
     let released = svc.sweep_expired_holds("test").await;
-    let status: String =
-        sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
-            .bind(hold3.book_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("book_status");
-    assert_eq!(status, "pending", "unexpired hold must survive the sweep (released={released})");
+    let status: String = sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+        .bind(hold3.book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("book_status");
+    assert_eq!(
+        status, "pending",
+        "unexpired hold must survive the sweep (released={released})"
+    );
 
     // Force the deadline into the past → sweep releases it.
     sqlx::query(
@@ -512,23 +565,21 @@ async fn loyalty_channel_end_to_end() {
     .unwrap();
     let released = svc.sweep_expired_holds("test").await;
     assert!(released >= 1, "sweep must release the expired hold");
-    let status: String =
-        sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
-            .bind(hold3.book_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("book_status");
+    let status: String = sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+        .bind(hold3.book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("book_status");
     assert_eq!(status, "cancelled", "expired hold must be auto-released");
 
     // The confirmed booking (hold 1) is never touched by the sweep.
-    let status: String =
-        sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
-            .bind(hold.book_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("book_status");
+    let status: String = sqlx::query("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+        .bind(hold.book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("book_status");
     assert_eq!(status, "confirmed");
 
     cleanup(&pool).await;
@@ -569,7 +620,10 @@ async fn membership_set_and_clear() {
 
     // Clear.
     let mut tx = pool.begin().await.unwrap();
-    let n = repo.set_membership(&mut tx, cust_id, None).await.expect("clear membership");
+    let n = repo
+        .set_membership(&mut tx, cust_id, None)
+        .await
+        .expect("clear membership");
     tx.commit().await.unwrap();
     assert_eq!(n, 1);
     let row = repo.get(&pool, cust_id).await.unwrap().unwrap();
@@ -577,7 +631,10 @@ async fn membership_set_and_clear() {
 
     // Unknown customer → 0 rows (route maps to 404).
     let mut tx = pool.begin().await.unwrap();
-    let n = repo.set_membership(&mut tx, -1, Some("X")).await.expect("no-op");
+    let n = repo
+        .set_membership(&mut tx, -1, Some("X"))
+        .await
+        .expect("no-op");
     tx.commit().await.unwrap();
     assert_eq!(n, 0);
 
@@ -588,4 +645,394 @@ async fn membership_set_and_clear() {
         .execute(&pool)
         .await
         .ok();
+}
+
+// ---------------------------------------------------------------------------
+// Hold-create request idempotency (`Idempotency-Key`, migration 093)
+// ---------------------------------------------------------------------------
+//
+// Own fixture markers, own cleanup — these tests must not be able to race the
+// mega-test's `cleanup` (tests/common/mod.rs marker-scoping rule).
+
+const IDEM_TYPE_CODE: &str = "TSTLI";
+const IDEM_TYPE_NAME: &str = "TEST_loyalty_idem_type";
+const IDEM_ROOMS: [&str; 2] = ["TL91", "TL92"];
+const IDEM_GUEST_FIRST: &str = "TEST_loyalty_idem_guest";
+const IDEM_BOOK_NO_PREFIX: &str = "TESTLI";
+/// Stands in for `caller_identity(bearer)` — the shape does not matter to the
+/// store, only that it is stable and exact-matchable for cleanup.
+const IDEM_CALLER: &str = "sha256:TEST_loyalty_idem_caller";
+
+async fn seed_idem_rooms(pool: &PgPool) -> i32 {
+    let type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_description, type_base_price, type_max_guests, type_active) \
+         VALUES ($1, $2, 'loyalty idempotency test type', 1200.00, 2, true) RETURNING type_id",
+    )
+    .bind(IDEM_TYPE_CODE)
+    .bind(IDEM_TYPE_NAME)
+    .fetch_one(pool)
+    .await
+    .expect("seed room type")
+    .get("type_id");
+
+    for room_no in IDEM_ROOMS {
+        sqlx::query(
+            "INSERT INTO ht_rooms_new (room_no, room_type_id, room_status, room_active, room_maintenance) \
+             VALUES ($1, $2, 'available', true, false)",
+        )
+        .bind(room_no)
+        .bind(type_id)
+        .execute(pool)
+        .await
+        .expect("seed room");
+    }
+    type_id
+}
+
+async fn cleanup_idem(pool: &PgPool) {
+    sqlx::query("DELETE FROM ht_channel_idempotency WHERE idem_caller = $1")
+        .bind(IDEM_CALLER)
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query(
+        "DELETE FROM writeback_jobs WHERE aggregate_id IN \
+         (SELECT aggregate_id FROM ht_bookings WHERE book_no LIKE $1 AND aggregate_id IS NOT NULL)",
+    )
+    .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(
+        "DELETE FROM event_log WHERE aggregate_id IN \
+         (SELECT aggregate_id FROM ht_bookings WHERE book_no LIKE $1 AND aggregate_id IS NOT NULL)",
+    )
+    .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+    .execute(pool)
+    .await
+    .ok();
+    if let Ok(rows) = sqlx::query("SELECT cust_id FROM ht_customers WHERE cust_firstname = $1")
+        .bind(IDEM_GUEST_FIRST)
+        .fetch_all(pool)
+        .await
+    {
+        for row in rows {
+            let cust_id: i32 = row.get("cust_id");
+            let agg = hotel_backend::service::aggregate_uuid(
+                hotel_backend::service::AggregateKind::Customer,
+                cust_id,
+            );
+            sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+                .bind(agg)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+    sqlx::query("DELETE FROM ht_bookings WHERE book_no LIKE $1")
+        .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ht_customers WHERE cust_firstname = $1")
+        .bind(IDEM_GUEST_FIRST)
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = ANY($1)")
+        .bind(IDEM_ROOMS.as_slice())
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code = $1")
+        .bind(IDEM_TYPE_CODE)
+        .execute(pool)
+        .await
+        .ok();
+}
+
+fn idem_hold_cmd(book_no: &str, type_id: i32) -> CreateHoldCommand {
+    CreateHoldCommand {
+        book_no: book_no.to_string(),
+        room_type_id: type_id,
+        check_in: d("2026-11-02"),
+        check_out: d("2026-11-04"),
+        guests: 2,
+        guest_name: format!("{IDEM_GUEST_FIRST} Somsri"),
+        guest_phone: "0899990091".to_string(),
+        membership_id: None,
+        payment: PaymentPlan::Deposit50,
+        source: source(),
+    }
+}
+
+/// What the keyed branch of `routes::channel::create_booking` does, minus HTTP:
+/// reserve → create → record the response (or free the key on failure).
+#[derive(Debug)]
+enum KeyedCreate {
+    Created {
+        body: String,
+        book_id: i32,
+    },
+    Replayed {
+        body: String,
+        book_id: Option<i32>,
+    },
+    /// The route renders this as 422.
+    Mismatch,
+}
+
+async fn create_hold_with_key(
+    pool: PgPool,
+    service: ChannelService,
+    key: String,
+    fingerprint: String,
+    cmd: CreateHoldCommand,
+) -> Result<KeyedCreate, ServiceError> {
+    let store = ChannelIdempotency::new(pool);
+    match store
+        .reserve(IDEM_CALLER, &key, ENDPOINT_CREATE_BOOKING, &fingerprint)
+        .await?
+    {
+        Reserved::Mismatch => Ok(KeyedCreate::Mismatch),
+        Reserved::Replay(stored) => Ok(KeyedCreate::Replayed {
+            body: stored.body,
+            book_id: stored.book_id,
+        }),
+        Reserved::Fresh(reservation) => match service.create_hold(cmd).await {
+            Ok(outcome) => {
+                // Stand-in for the real 201 payload; the point is that the
+                // stored bytes come back verbatim.
+                let body = format!(
+                    "{{\"pms_booking_id\":\"hf-{}\",\"total\":{}}}",
+                    outcome.book_id, outcome.total_baht
+                );
+                reservation
+                    .complete(201, &body, Some(outcome.book_id))
+                    .await?;
+                Ok(KeyedCreate::Created {
+                    body,
+                    book_id: outcome.book_id,
+                })
+            }
+            Err(err) => {
+                reservation.abandon().await;
+                Err(err)
+            }
+        },
+    }
+}
+
+async fn count_idem_bookings(pool: &PgPool) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS n FROM ht_bookings WHERE book_no LIKE $1")
+        .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+        .fetch_one(pool)
+        .await
+        .expect("count bookings")
+        .get("n")
+}
+
+#[tokio::test]
+async fn hold_create_is_idempotent_per_key() {
+    let pool = common::create_test_pool().await;
+    cleanup_idem(&pool).await;
+    let type_id = seed_idem_rooms(&pool).await;
+    let svc = service_for(&pool);
+
+    let key = "TEST-idem-key-1".to_string();
+    let fingerprint = fingerprint_of(&["hf", "2026-11-02", "2026-11-04", "2"]);
+
+    // 1. First request creates the hold.
+    let first = create_hold_with_key(
+        pool.clone(),
+        svc.clone(),
+        key.clone(),
+        fingerprint.clone(),
+        idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0001"), type_id),
+    )
+    .await
+    .expect("first create");
+    let (first_body, book_id) = match first {
+        KeyedCreate::Created { body, book_id } => (body, book_id),
+        other => panic!("first request must create, got {other:?}"),
+    };
+    assert_eq!(count_idem_bookings(&pool).await, 1);
+
+    // 2. The retry replays the SAME stored response and creates nothing.
+    let replay = create_hold_with_key(
+        pool.clone(),
+        svc.clone(),
+        key.clone(),
+        fingerprint.clone(),
+        // A retry would allocate a fresh book_no; it must never be used.
+        idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0002"), type_id),
+    )
+    .await
+    .expect("replay");
+    match replay {
+        KeyedCreate::Replayed { body, book_id: id } => {
+            assert_eq!(body, first_body, "a replay must be byte-identical");
+            assert_eq!(id, Some(book_id), "a replay must name the same booking");
+        }
+        other => panic!("second request must replay, got {other:?}"),
+    }
+    assert_eq!(
+        count_idem_bookings(&pool).await,
+        1,
+        "a retry must not create a second hold"
+    );
+
+    // 3. Same key, materially different request → Mismatch (422 on the wire).
+    let mismatch = create_hold_with_key(
+        pool.clone(),
+        svc.clone(),
+        key.clone(),
+        fingerprint_of(&["hf", "2026-12-24", "2026-12-26", "2"]),
+        idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0003"), type_id),
+    )
+    .await
+    .expect("mismatch is not an error at this layer");
+    assert!(
+        matches!(mismatch, KeyedCreate::Mismatch),
+        "a different request under a spent key must be refused, got {mismatch:?}"
+    );
+    assert_eq!(count_idem_bookings(&pool).await, 1);
+
+    // 4. No key at all → unchanged behaviour: a second hold IS created, and no
+    //    idempotency row is written.
+    let unkeyed = svc
+        .create_hold(idem_hold_cmd(
+            &format!("{IDEM_BOOK_NO_PREFIX}-0004"),
+            type_id,
+        ))
+        .await
+        .expect("unkeyed create still works");
+    assert_ne!(unkeyed.book_id, book_id);
+    assert_eq!(count_idem_bookings(&pool).await, 2);
+    let keys: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM ht_channel_idempotency WHERE idem_caller = $1")
+            .bind(IDEM_CALLER)
+            .fetch_one(&pool)
+            .await
+            .expect("count keys")
+            .get("n");
+    assert_eq!(keys, 1, "an unkeyed request must write no idempotency row");
+
+    cleanup_idem(&pool).await;
+}
+
+#[tokio::test]
+async fn concurrent_identical_hold_creates_produce_one_hold() {
+    let pool = common::create_test_pool().await;
+    cleanup_idem(&pool).await;
+    let type_id = seed_idem_rooms(&pool).await;
+    let svc = service_for(&pool);
+
+    let key = "TEST-idem-key-concurrent".to_string();
+    let fingerprint = fingerprint_of(&["hf", "2026-11-02", "2026-11-04", "2"]);
+
+    // Both tasks race the same key. The loser's INSERT blocks on the winner's
+    // uncommitted unique-index entry, then replays what the winner stored.
+    let a = tokio::spawn(create_hold_with_key(
+        pool.clone(),
+        svc.clone(),
+        key.clone(),
+        fingerprint.clone(),
+        idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0101"), type_id),
+    ));
+    let b = tokio::spawn(create_hold_with_key(
+        pool.clone(),
+        svc.clone(),
+        key.clone(),
+        fingerprint.clone(),
+        idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0102"), type_id),
+    ));
+
+    let first = a.await.expect("task a").expect("create a");
+    let second = b.await.expect("task b").expect("create b");
+
+    let (created, replayed) = match (first, second) {
+        (
+            KeyedCreate::Created { body, book_id },
+            KeyedCreate::Replayed {
+                body: rb,
+                book_id: rid,
+            },
+        )
+        | (
+            KeyedCreate::Replayed {
+                body: rb,
+                book_id: rid,
+            },
+            KeyedCreate::Created { body, book_id },
+        ) => ((body, book_id), (rb, rid)),
+        (x, y) => panic!("exactly one side must create and the other replay; got {x:?} / {y:?}"),
+    };
+    assert_eq!(
+        replayed.0, created.0,
+        "the loser replays the winner's bytes"
+    );
+    assert_eq!(replayed.1, Some(created.1));
+    assert_eq!(
+        count_idem_bookings(&pool).await,
+        1,
+        "two simultaneous identical requests must leave exactly one hold"
+    );
+
+    cleanup_idem(&pool).await;
+}
+
+#[tokio::test]
+async fn payment_verified_replays_for_every_settled_spelling() {
+    let pool = common::create_test_pool().await;
+    cleanup_idem(&pool).await;
+    let type_id = seed_idem_rooms(&pool).await;
+    let svc = service_for(&pool);
+
+    let hold = svc
+        .create_hold(idem_hold_cmd(
+            &format!("{IDEM_BOOK_NO_PREFIX}-0201"),
+            type_id,
+        ))
+        .await
+        .expect("hold");
+    let confirm = svc
+        .confirm_payment(hold.book_id, hold.amount_due_baht)
+        .await
+        .expect("confirm");
+    assert!(!confirm.already_confirmed);
+
+    // The CT sync mapper writes `checked_in` (from iHOTEL's `เข้าพัก`) where
+    // this app writes `checkedin`; a late payment-verified retry against either
+    // spelling is a REPLAY, not a 409. `checkedout` / `checked_out` /
+    // `completed` (legacy `ออกแล้ว`) are settled for the same reason.
+    for status in [
+        "checkedin",
+        "checked_in",
+        "checkedout",
+        "checked_out",
+        "completed",
+    ] {
+        sqlx::query("UPDATE ht_bookings SET book_status = $1 WHERE book_id = $2")
+            .bind(status)
+            .bind(hold.book_id)
+            .execute(&pool)
+            .await
+            .expect("set status");
+
+        let replay = svc
+            .confirm_payment(hold.book_id, hold.amount_due_baht)
+            .await
+            .unwrap_or_else(|e| panic!("status '{status}' must replay, got error: {e:?}"));
+        assert!(
+            replay.already_confirmed,
+            "status '{status}' must report an idempotent replay"
+        );
+        assert!(
+            (replay.deposit_baht - confirm.deposit_baht).abs() < 0.01,
+            "status '{status}' must report the stored deposit, not rewrite it"
+        );
+    }
+
+    cleanup_idem(&pool).await;
 }

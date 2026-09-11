@@ -183,7 +183,9 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   `room_type_id` is the `type_id` SERIAL as a string (stable per property).
 
 * `POST /api/channel/bookings` → **201**
-  `{pms_booking_id, total, amount_due_now, hold_expires_at}`.
+  `{pms_booking_id, total, amount_due_now, hold_expires_at}`. Accepts an
+  OPTIONAL **`Idempotency-Key`** header so a client retry replays the first
+  response instead of creating a second hold — see §Idempotency below.
   Creates a **TENTATIVE HOLD** that consumes availability immediately:
   - match-or-create guest (exact phone + case-insensitive name; else create
     via `CustomerService::create`), attach `membership_id` when supplied
@@ -202,9 +204,16 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   body `{"amount": <THB received>}` → flips `pending → confirmed`, records
   `book_deposit_amount` + `book_deposit_date`; response carries
   `deposit_recorded` + `balance_due`. **Idempotent** — replay against an
-  already-confirmed booking succeeds (`already_confirmed: true`) without
-  writing. Refuses released/expired holds with 409. `FOR UPDATE` serializes
-  against the sweep/release.
+  already-settled booking succeeds (`already_confirmed: true`) without writing.
+  The settled set accepts **both spellings of each state**
+  (`service::channel::is_settled_status`): this app writes `'checkedin'` while
+  the CT sync mapper writes `'checked_in'` for iHOTEL's `เข้าพัก`, and the
+  underscored spelling is the steady state — so a late payment-verified retry
+  for a guest the desk has since checked in through iHOTEL replays instead of
+  answering 409. `'checkedout'` / `'checked_out'` / `'completed'` (legacy
+  `ออกแล้ว`) are settled for the same reason. **What the mapper writes is
+  unchanged** — only what we accept. Refuses released/expired holds with 409.
+  `FOR UPDATE` serializes against the sweep/release.
 
 * `POST /api/channel/bookings/{pms_booking_id}/release` → cancels the hold.
   **Idempotent** (`already_released: true` on replay). Guarded on
@@ -217,6 +226,81 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   load-bearing. Registered unconditionally: it filters
   `book_channel='loyalty' AND book_status='pending'` via the partial index
   `ix_ht_bookings_hold_expiry`, a no-op while the channel is dark.
+
+### Idempotency on the hold create (`Idempotency-Key`)
+
+**Header name: `Idempotency-Key`. Response marker: `Idempotency-Replayed: true`.**
+Optional — a request without the header behaves exactly as it always has.
+
+`payment-verified` and `release` are naturally replay-tolerant (they converge on
+a state). `POST /api/channel/bookings` is not: it mints a NEW hold every time it
+runs. A loyalty-app client whose request hung and was retried therefore ended up
+with **two** holds → two `ht_bookings` rows → **two real iHOTEL `จอง` bookings**,
+one of which nobody releases before its 2h deadline. The loyalty app worked
+around this with a 20 s Redis lock — a timing heuristic, not a guarantee.
+
+Migration **093** (`ht_channel_idempotency`) closes it properly. Migration 076's
+`(book_channel, book_ext_ref)` natural key does NOT apply here: a loyalty hold
+has no channel-native booking id at request time — the id the app knows is the
+one we mint. What the app CAN supply is a client-generated key.
+
+**It is a HEADER, not a body field.** The request body is a locked snake_case
+contract the two systems agree on field by field, and a `idempotencyKey` member
+would both break that shape and put transport policy inside booking data. It is
+also where every client library already looks, including the loyalty app's own
+backend (`services/idempotency.rs`).
+
+| case | response |
+|---|---|
+| no `Idempotency-Key` | unchanged behaviour; no row is written |
+| first request with key K | **201**, the hold is created, K records the response |
+| retry of the SAME request with K | the stored response, **verbatim** — same status, same body, same `pms_booking_id` — plus `Idempotency-Replayed: true`. No second hold. |
+| a DIFFERENT request with K | **422** `{"success": false, "error": "Idempotency-Key '…' was already used for a different booking request; …"}` |
+| two identical requests at once | serialised — exactly one hold; the loser replays the winner's response |
+| key present but blank / with spaces / > 255 chars | **400** (a broken key is loud, never a silent opt-out) |
+| retry more than 24 h later | treated as a first-time request (TTL) |
+
+Key facts a caller needs:
+
+* **Any printable-ASCII string, 1..=255 characters**; a UUID v4 per booking
+  attempt is the intended usage. Keep the key across retries of the SAME
+  attempt; mint a new one for a new booking.
+* **The key space is per caller and per property.** `idem_caller` is the
+  SHA-256 of the presented bearer, so rotating `LOYALTY_CHANNEL_TOKEN` starts a
+  fresh key space (a rotated token is a different client), and the row lives in
+  the property's own database — which is correct, because a retry always targets
+  the property the original request did.
+* **"Different request" is judged on a canonicalised fingerprint**, not raw
+  bytes: property, room type, both dates, guests, trimmed guest name and phone,
+  trimmed membership id, payment plan. Re-serialising the JSON with different
+  whitespace or key order, or sending `" 3 "` where the first attempt sent
+  `"3"`, still REPLAYS. Changing anything that changes what gets booked is 422.
+* **Errors are never cached.** A request that failed (no room available, bad
+  dates, HF Ville writes disabled) frees its key immediately, so the client may
+  retry the same key once the cause is fixed.
+
+How the concurrent case is actually safe, since it is the part that is easy to
+get wrong: the reserving `INSERT` runs inside a transaction that is held open
+across the whole create. A simultaneous duplicate blocks on the uncommitted
+unique-index entry (PostgreSQL speculative insertion) until the winner commits,
+then finds nothing to insert and reads a COMPLETE row. There is no advisory
+lock and no Redis, and the stored response commits in the same transaction that
+reserved the key — so a rollback loses both, never one without the other.
+
+**Residual gap, documented rather than papered over:** the hold and the
+idempotency record are two transactions (the hold rides `BookingService::create`,
+which owns its own). If the process dies in the gap between them, the hold is
+committed and the key is not, so a retry re-enters as a fresh request and creates
+a second hold — exactly the pre-existing behaviour, not a regression. Closing it
+would mean threading the key through `BookingService::create` as a second
+`book_ext_ref`-style natural key; that is a deliberate follow-up, not something
+to bolt on.
+
+Implementation: `service::channel_idempotency` (policy, fingerprinting, the
+reservation guard) + `repository::channel_idempotency` (SQL) + the keyed branch
+of `routes::channel::create_booking`. Integration tests:
+`hotel-backend/tests/test_channel.rs::hold_create_is_idempotent_per_key` and
+`::concurrent_identical_hold_creates_produce_one_hold`.
 
 ### Dual-write policy for holds (the load-bearing decision)
 
