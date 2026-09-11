@@ -11,6 +11,7 @@ import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
 import PaymentModal from '@/components/modals/PaymentModal'
 import IssueCouponModal from '@/components/modals/IssueCouponModal'
+import AppDepositNotice from '@/components/v2/AppDepositNotice'
 import { useAuth } from '@/contexts/AuthContext'
 import { InvoiceData } from '@/types/invoice'
 import { mapInvoiceResponse, type InvoiceApiResponse } from '@/lib/invoice'
@@ -31,6 +32,11 @@ interface DepositRow {
 interface DepositsApiResponse {
   success: boolean
   deposits: DepositRow[]
+  /** Task B7 — `ht_bookings.book_channel` of the originating booking. */
+  bookChannel?: string | null
+  /** Task B7 — `ht_bookings.book_deposit_amount` in baht. Booking-level money,
+   *  NOT the per-room `deposits[].amount` taken at the desk. */
+  bookingDepositAmount?: number | null
 }
 
 export default function InvoiceDetailPage({
@@ -59,6 +65,13 @@ export default function InvoiceDetailPage({
   // button can show a spinner / disable itself during the POST).
   const [deposits, setDeposits] = useState<DepositRow[]>([])
   const [refundingCrId, setRefundingCrId] = useState<number | null>(null)
+  // Task B7: the ORIGINATING BOOKING's channel + deposit, carried on the same
+  // deposits response. Held separately from `deposits` because an app booking
+  // whose rooms took no desk deposit has zero rows but still needs the signpost.
+  const [bookingDeposit, setBookingDeposit] = useState<{
+    bookChannel: string | null
+    amount: number | null
+  }>({ bookChannel: null, amount: null })
 
   // Best-effort folio summary (total billed + already paid) so the payment
   // modal pre-fills the outstanding balance. Falls back to the invoice grand
@@ -85,9 +98,15 @@ export default function InvoiceDetailPage({
       const res = await branchFetch(`/api/checkins/${resolvedParams.id}/deposits`)
       const data: DepositsApiResponse = await res.json()
       setDeposits(data.success ? data.deposits : [])
+      setBookingDeposit(
+        data.success
+          ? { bookChannel: data.bookChannel ?? null, amount: data.bookingDepositAmount ?? null }
+          : { bookChannel: null, amount: null },
+      )
     } catch {
       // ignore — the deposit panel simply stays hidden on failure
       setDeposits([])
+      setBookingDeposit({ bookChannel: null, amount: null })
     }
   }, [resolvedParams.id, branchFetch])
 
@@ -246,6 +265,16 @@ export default function InvoiceDetailPage({
         taxInvoice
       />
 
+      {/* Task B7 — the stay's booking was paid in the guest app, but iHOTEL
+          shows that booking's deposit as 0 until checkout. Sits ABOVE the
+          per-room deposit panel (and renders even when that panel is empty,
+          which is the normal case for an app booking) so a receptionist working
+          the folio cannot read "unpaid" on a guest who has already paid. */}
+      <AppDepositNotice
+        bookChannel={bookingDeposit.bookChannel}
+        depositAmount={bookingDeposit.amount}
+      />
+
       {/* Task #49 — deposit refund (คืนเงินมัดจำ). One row per room that took
           a deposit; an unrefunded room shows the refund button, a refunded one
           shows a badge. Mirrors iHOTEL FormShowDEPBack. Hidden in print. */}
@@ -315,6 +344,10 @@ export default function InvoiceDetailPage({
         checkinId={invoiceData.checkInId}
         totalAmount={paySummary?.totalAmount ?? invoiceData.grandTotal}
         totalPaid={paySummary?.totalPaid ?? 0}
+        // Task B7 — the moment reception is about to take money is the moment
+        // the app-deposit divergence costs the guest a second payment.
+        bookChannel={bookingDeposit.bookChannel}
+        bookingDepositAmount={bookingDeposit.amount}
         onSuccess={() => {
           fetchPaySummary()
           fetchInvoice()

@@ -26,6 +26,8 @@ import { hotelInfoForBranch } from '@/lib/hotel-info'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import BookingChannelChip from '@/components/v2/BookingChannelChip'
+import AppDepositNotice, { appDepositNoticeView } from '@/components/v2/AppDepositNotice'
+import AppDepositNote from '@/components/documents/AppDepositNote'
 
 /** A pre-ordered product line attached to a booking (task #52 — the canonical
  *  analog of iHOTEL's FrmAddBook2 / `HT_Book_Pro`). `name`/`unitPrice` are
@@ -510,6 +512,44 @@ export default function BookingForm({
               <X className="w-5 h-5" />
             </button>
           </div>
+
+          {/* Task B7 — app-deposit signpost. The saved `initialData` values are
+              used (not the editable `formData`) because this states what the
+              loyalty app already collected, not what a receptionist is halfway
+              through typing. Renders nothing unless this is a loyalty booking
+              with a deposit recorded. */}
+          {appDepositNoticeView(initialData?.bookChannel, initialData?.depositAmount ?? null) && (
+            <div className="px-4 pt-4 space-y-2">
+              <AppDepositNotice
+                bookChannel={initialData?.bookChannel}
+                depositAmount={initialData?.depositAmount ?? null}
+              />
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-100"
+                >
+                  พิมพ์ใบแจ้งมัดจำ A6
+                </button>
+              </div>
+              {/* Print-only portal — nothing on screen, one A6 note on paper. */}
+              <AppDepositNote
+                bookChannel={initialData?.bookChannel}
+                depositAmount={initialData?.depositAmount ?? null}
+                bookingNo={initialData?.bookNo}
+                guestName={
+                  selectedCustomer
+                    ? `${selectedCustomer.firstName || ''} ${selectedCustomer.lastName || ''}`.trim()
+                    : initialData?.customerName
+                }
+                roomNo={selectedRooms.map((r) => r.roomNo).join(', ') || null}
+                checkIn={formData.checkIn}
+                checkOut={formData.checkOut}
+                hotelName={hotelInfoForBranch(branch).name}
+              />
+            </div>
+          )}
 
           {/* Success → booking-confirmation print panel */}
           {created ? (
