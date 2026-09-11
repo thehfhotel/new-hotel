@@ -81,6 +81,39 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     // unset/empty var. (The old device↔PMS `reader_secret` was retired when
     // the reader moved to posting taps to central HF-ID.)
     ("reader_resolve_secret", "READER_RESOLVE_SECRET"),
+    // Loyalty-app integration (docs/loyalty-channel.md). Inbound shared
+    // bearer for /api/channel/* (loyalty app → PMS) and outbound bearer for
+    // the checkout stay hook (PMS → loyalty app). Both fail closed when
+    // absent — the channel rejects every request, the hook stays off.
+    // Both are declared in docker-compose.yml `secrets:` and mounted on the
+    // `backend` service only (no worker serves /api/channel/* or fires the
+    // stay hook). The mount is dark by construction: an unset GH secret yields
+    // an EMPTY file, which `read_secret_file` skips, so the env var stays unset
+    // and both gates fail closed. Env vars still win for local dev.
+    ("loyalty_channel_token", "LOYALTY_CHANNEL_TOKEN"),
+    ("loyalty_service_token", "LOYALTY_SERVICE_TOKEN"),
+    // OTA booking bridge (docs/ota-bridge.md). Shared bearer ota-desk
+    // presents on /api/ota/* — MUST hold the identical string as ota-desk's
+    // `PMS_BRIDGE_TOKEN`. `..._PREVIOUS` is the rotation slot. Unset/empty ⇒
+    // the gate has nothing to accept: with OTA_BRIDGE_ENFORCE on that is a
+    // 503 (fail closed), and the surface is 503 anyway until
+    // OTA_BRIDGE_ENABLED is flipped.
+    ("ota_bridge_token", "OTA_BRIDGE_TOKEN"),
+    ("ota_bridge_token_previous", "OTA_BRIDGE_TOKEN_PREVIOUS"),
+    // `/hk` employee-location enforcement (crate::hfid_location). Shared
+    // secret sent as `X-Reader-Secret` on the HF ID badge → location lookup.
+    //
+    // SAME VALUE as `reader_resolve_secret` / `READER_RESOLVE_SECRET` above —
+    // HF ID guards its whole app↔central surface with ONE secret
+    // (`READER_RESOLVE_SECRET` over there). The second name exists so the two
+    // consumers (card-login pairing, location lookup) stay independently
+    // rotatable. Do not go looking for a distinct upstream credential; there
+    // isn't one. See CLAUDE.md → "Credentials & Docker secrets".
+    //
+    // Unset/empty ⇒ the lookup client is never built, and with
+    // HK_LOCATION_ENFORCEMENT_ENABLED on that is `lookup_unavailable`
+    // (503 / `branches: []`) — never a fallback to the HK_BRANCHES allowlist.
+    ("hfid_resolve_secret", "HFID_RESOLVE_SECRET"),
 ];
 
 /// Hydrate env vars from Docker secret files, then reconstruct
@@ -220,13 +253,67 @@ fn reconstruct_database_url() -> Option<String> {
     Some(format!("postgres://{user}:{password}@{host}:{port}/{db}"))
 }
 
+/// ONE process-wide lock for every env-mutating unit test in this crate.
+///
+/// `std::env::set_var` is process-global and `cargo test` runs the unit tests
+/// of a crate as threads in a SINGLE process, so two test modules with two
+/// private mutexes do not actually serialise against each other — the hydrator
+/// tests here and `config::tests` guard overlapping vars (`DB_PASSWORD`,
+/// `POSTGRES_PASSWORD`, `LOYALTY_*`, …) and would race. One test binary per
+/// crate is exactly why a single unified static suffices; it lives in this
+/// module (not `config`) because `secrets` is the module every env-mutating
+/// test ultimately exercises.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Per-test temp directory acting as a fake `/run/secrets`.
+///
+/// RAII: the directory is removed on drop, so a failing assertion (or a panic
+/// inside the hydrator) still cleans up instead of leaking a temp dir into
+/// every CI run. `pub(crate)` because `config::tests` re-points `SECRETS_DIR`
+/// the same way and must not re-implement the guard.
+#[cfg(test)]
+pub(crate) struct SecretsDir {
+    pub(crate) path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+impl SecretsDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), rand_suffix()));
+        fs::create_dir_all(&path).expect("create temp secrets dir");
+        Self { path }
+    }
+
+    pub(crate) fn write(&self, name: &str, contents: &str) {
+        fs::write(self.path.join(name), contents).expect("write secret file");
+    }
+}
+
+#[cfg(test)]
+impl Drop for SecretsDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Lightweight unique suffix — we don't want to pull in `rand` just
+/// for this. Nanosecond timestamps collide rarely enough that a
+/// retry isn't worth coding.
+#[cfg(test)]
+fn rand_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serialise env-mutating tests — same rationale as `config::tests`.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    use super::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// Snapshot env vars touched by a test, restore on drop.
     struct EnvGuard {
@@ -257,43 +344,6 @@ mod tests {
         }
     }
 
-    /// Per-test temp directory acting as a fake `/run/secrets`.
-    struct SecretsDir {
-        path: std::path::PathBuf,
-    }
-
-    impl SecretsDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "hotel-backend-secrets-test-{}-{}",
-                std::process::id(),
-                rand_suffix()
-            ));
-            fs::create_dir_all(&path).expect("create temp secrets dir");
-            Self { path }
-        }
-
-        fn write(&self, name: &str, contents: &str) {
-            fs::write(self.path.join(name), contents).expect("write secret file");
-        }
-    }
-
-    impl Drop for SecretsDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    /// Lightweight unique suffix — we don't want to pull in `rand` just
-    /// for this. Nanosecond timestamps collide rarely enough that a
-    /// retry isn't worth coding.
-    fn rand_suffix() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    }
-
     #[test]
     fn hydrates_db_password_from_file_when_env_unset() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
@@ -312,7 +362,7 @@ mod tests {
             "PGPORT",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "from-file-secret");
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -335,7 +385,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "from-file");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("DB_PASSWORD", "from-env");
@@ -360,7 +410,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "from-file");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("DB_PASSWORD", ""); // botched CI rewrite mode
@@ -385,7 +435,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "secret-with-newline\n");
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -407,7 +457,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "windows-style\r\n");
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -429,7 +479,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "");
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -454,7 +504,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         // Intentionally write NO files.
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -483,7 +533,7 @@ mod tests {
             "PGPORT",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("postgres_password", "pg-pass");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("POSTGRES_USER", "postgres");
@@ -523,7 +573,7 @@ mod tests {
             "PGPORT",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("postgres_password", "pg-pass");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("POSTGRES_USER", "postgres");
@@ -553,7 +603,7 @@ mod tests {
             "POSTGRES_DB",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("postgres_password", "pg-pass");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("POSTGRES_USER", "postgres");
@@ -589,7 +639,7 @@ mod tests {
             "POSTGRES_DB",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         // No postgres_password file, no POSTGRES_USER env.
         env::set_var("SECRETS_DIR", &dir.path);
 
@@ -616,7 +666,7 @@ mod tests {
             "POSTGRES_DB",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("postgres_password", "shared-pg-pass");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("POSTGRES_USER", "postgres");
@@ -643,7 +693,7 @@ mod tests {
             "DATABASE_URL",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("postgres_password", "secret-pg-pass");
         env::set_var("SECRETS_DIR", &dir.path);
         env::set_var("NEW_DB_PASSWORD", "explicit-override");
@@ -672,7 +722,7 @@ mod tests {
             "POSTGRES_DB",
         ]);
 
-        let dir = SecretsDir::new();
+        let dir = SecretsDir::new("hotel-backend-secrets-test");
         dir.write("db_password", "mssql-pass");
         dir.write("postgres_password", "pg-pass");
         dir.write(

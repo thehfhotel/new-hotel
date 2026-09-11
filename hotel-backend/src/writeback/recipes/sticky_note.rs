@@ -1,8 +1,10 @@
 //! Sticky-note recipes — Task #47 (room & staff notes / โน้ตห้อง / โน้ตพนักงาน).
 //!
 //! Mirrors iHOTEL's `Room_Note.cs` / `EMP_Note.cs` against the two legacy SMS
-//! tables (`docs/legacy-app/COMPAT_CHEATSHEET.md` §932-942 / §3.22;
-//! `docs/legacy-app/SCHEMA.sql:385,596`). Both tables share one shape —
+//! tables — `docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Room_SMS" and
+//! §"Table: dbo.HT_EMP_SMS" for the shape; `docs/legacy-app/COMPAT_CHEATSHEET.md`
+//! §"Table: `HT_Room_SMS` (A)", §"Table: `HT_EMP_SMS` (A)" and §3.22 for the
+//! flow. Both tables share one shape —
 //! `SMS_ID int IDENTITY, <key> varchar(50), SMS_Details text, SMS_By
 //! varchar(250), SMS_Readed varchar(50)` — differing only in the target key
 //! column (`HT_Room_SMS.SMS_Room` = room number vs `HT_EMP_SMS.SMS_TO` = staff

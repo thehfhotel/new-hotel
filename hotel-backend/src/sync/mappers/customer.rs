@@ -65,6 +65,12 @@
 //! `SYS_CHANGE_CONTEXT`, so there was never a SQL-layer filter — see
 //! `db/mssql_session.rs`.)
 //!
+//! The comparison must cover every reconcile-hash input, or a row can
+//! hash as unconverged while the gate reports "no change" — and since
+//! `force_converge_reconcile_row` repairs by re-driving this same gate,
+//! the self-heal path dies with it. `cust_address` was that gap until
+//! 2026-07-28; see the field doc on [`ExistingEqualityKeys`].
+//!
 //! ## Aggregate UUID
 //!
 //! `aggregate_id` is derived once via
@@ -78,6 +84,7 @@ use uuid::Uuid;
 use crate::outbox::event::{CustomerSnapshot, DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, GateField, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
@@ -333,6 +340,26 @@ struct ExistingEqualityKeys {
     cust_type: Option<String>,
     cust_email: Option<String>,
     cust_add_no: Option<String>,
+    /// Legacy single-line mirror of `cust_add_no`. Compared since
+    /// 2026-07-28 — same structural class as the d09e756 checkin-gate
+    /// gap: a reconcile-hash input invisible to the skip comparator.
+    ///
+    /// The UPSERT writes the two in lock-step (`cust_address = $9`, the
+    /// `cust_add_no` bind), so a mapper-written row can never diverge —
+    /// but other canonical writers break the invariant. The Thai-ID
+    /// check-in prefill (`repository::customer::update`) stores the full
+    /// unsplit address here and leaves `cust_add_no` alone; historical
+    /// backfills and pre-lock-step rows left their own residue. Because
+    /// `scheduler::sync::customer_canonical_hash` reads `cust_address`
+    /// on the canonical side and `Cust_Add_no` on the MSSQL side, such a
+    /// row hashes as unconverged while this gate reported "no change" —
+    /// and `force_converge_reconcile_row` repairs by re-driving this
+    /// same gate, so self-heal was disabled along with it.
+    ///
+    /// Compared UNGUARDED (contrast `legacy_id` on [`ExistingRow`]):
+    /// neither branch COALESCEs it, so one re-apply always converges and
+    /// a `None` projection must be allowed to blank a stale value.
+    cust_address: Option<String>,
     cust_add_moo: Option<String>,
     cust_add_soi: Option<String>,
     cust_add_road: Option<String>,
@@ -362,6 +389,290 @@ struct ExistingEqualityKeys {
     cust_price_over: Option<f64>,
 }
 
+/// The idempotency gate, as a table of NAMED comparators.
+///
+/// [`matches`] is nothing but `.all()` over this table, so removing a
+/// name removes the comparison — there is no separate list that can
+/// drift away from the behaviour. Names are the CANONICAL (PG) column,
+/// which is also what `scheduler::sync::customer_canonical_hash` reads,
+/// so [`HASH_INPUTS`] can cite them directly. See
+/// [`crate::sync::gate_guard`] for the invariant this exists to keep.
+const GATE_FIELDS: [GateField<ExistingRow, CustomerProjection>; 35] = [
+    // -- identity / name ---------------------------------------------
+    GateField {
+        name: "cust_firstname",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_name == p.cust_name,
+    },
+    GateField {
+        name: "cust_name2",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_name2 == p.cust_name2,
+    },
+    GateField {
+        name: "cust_title",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_title == p.cust_title,
+    },
+    GateField {
+        name: "cust_sex",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_sex == p.cust_sex,
+    },
+    GateField {
+        name: "cust_idcard",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_idcard == p.cust_idcard,
+    },
+    GateField {
+        name: "cust_price_tier",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_price_tier == p.cust_price_tier,
+    },
+    GateField {
+        name: "cust_type",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_type == p.cust_type,
+    },
+    GateField {
+        name: "cust_email",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_email == p.cust_email,
+    },
+    // -- home address ------------------------------------------------
+    GateField {
+        name: "cust_add_no",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_no == p.cust_add_no,
+    },
+    // Legacy single-line mirror. Compares against the SAME projection
+    // field as `cust_add_no` because the UPSERT binds $9 to both columns
+    // (see UPDATE_SQL / INSERT_SQL) — the lock-step write is why
+    // `HASH_INPUTS`'s `cust_address` entry names both terms.
+    GateField {
+        name: "cust_address",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_address == p.cust_add_no,
+    },
+    GateField {
+        name: "cust_add_moo",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_moo == p.cust_add_moo,
+    },
+    GateField {
+        name: "cust_add_soi",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_soi == p.cust_add_soi,
+    },
+    GateField {
+        name: "cust_add_road",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_road == p.cust_add_road,
+    },
+    GateField {
+        name: "cust_add_tambon",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_tambon == p.cust_add_tambon,
+    },
+    GateField {
+        name: "cust_add_ampore",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_ampore == p.cust_add_ampore,
+    },
+    GateField {
+        name: "cust_add_province",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_province == p.cust_add_province,
+    },
+    GateField {
+        name: "cust_add_code",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_code == p.cust_add_code,
+    },
+    GateField {
+        name: "cust_phone",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_phone == p.cust_phone,
+    },
+    GateField {
+        name: "cust_add_fax",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_add_fax == p.cust_add_fax,
+    },
+    // -- work address ------------------------------------------------
+    GateField {
+        name: "cust_work_name",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_name == p.cust_work_name,
+    },
+    GateField {
+        name: "cust_work_no",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_no == p.cust_work_no,
+    },
+    GateField {
+        name: "cust_work_moo",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_moo == p.cust_work_moo,
+    },
+    GateField {
+        name: "cust_work_soi",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_soi == p.cust_work_soi,
+    },
+    GateField {
+        name: "cust_work_road",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_road == p.cust_work_road,
+    },
+    GateField {
+        name: "cust_work_tambon",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_tambon == p.cust_work_tambon,
+    },
+    GateField {
+        name: "cust_work_ampore",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_ampore == p.cust_work_ampore,
+    },
+    GateField {
+        name: "cust_work_province",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_province == p.cust_work_province,
+    },
+    GateField {
+        name: "cust_work_code",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_code == p.cust_work_code,
+    },
+    GateField {
+        name: "cust_work_tel",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_tel == p.cust_work_tel,
+    },
+    GateField {
+        name: "cust_work_fax",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_fax == p.cust_work_fax,
+    },
+    GateField {
+        name: "cust_work_tax",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_work_tax == p.cust_work_tax,
+    },
+    // -- misc ---------------------------------------------------------
+    GateField {
+        name: "cust_last_change",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_last_change == p.cust_last_change,
+    },
+    GateField {
+        name: "cust_contry",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_contry == p.cust_contry,
+    },
+    GateField {
+        name: "cust_price_over",
+        guarded: false,
+        matches: |ex, p| ex.keys.cust_price_over == p.cust_price_over,
+    },
+    // Guarded (migration 055): a `None` projection (sparse fixture /
+    // pre-widening load) must not force a re-apply, but a `Some`
+    // projection against a still-NULL stored value MUST mismatch once so
+    // the UPSERT backfills the column.
+    GateField {
+        name: "legacy_id",
+        guarded: true,
+        matches: |ex, p| p.legacy_id.is_none() || ex.legacy_id == p.legacy_id,
+    },
+];
+
+/// Gate term names, for [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    gate_guard::gate_field_names(&GATE_FIELDS)
+}
+
+/// The inputs `scheduler::sync::customer_canonical_hash` consumes, as a
+/// descriptor table over the SAME projection the gate compares.
+///
+/// Order IS the hash-body order — `hash_body` joins these with `|` and
+/// the result must stay byte-identical to the pre-table `format!`. That
+/// is pinned by `customers_hash_bytes_unchanged_for_golden_inputs`.
+const HASH_INPUTS: [HashInput<CustomerProjection>; 6] = [
+    HashInput {
+        name: "legacy_cust_no",
+        // Row identity: `fetch_existing` SELECTs `WHERE legacy_cust_no =
+        // $1`, so a changed `Cust_no` resolves a different canonical row
+        // (or none → INSERT) instead of reaching any comparator.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.cust_no.clone(),
+        mutate: |p| p.cust_no = "C99999".into(),
+    },
+    HashInput {
+        name: "cust_firstname",
+        gated_by: &["cust_firstname"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.cust_name.clone(),
+        mutate: |p| p.cust_name = "เปลี่ยนชื่อ".into(),
+    },
+    HashInput {
+        name: "cust_type",
+        gated_by: &["cust_type"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.cust_type.clone().unwrap_or_default(),
+        mutate: |p| p.cust_type = Some("นิติบุคคล".into()),
+    },
+    HashInput {
+        name: "cust_phone",
+        gated_by: &["cust_phone"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.cust_phone.clone().unwrap_or_default(),
+        mutate: |p| p.cust_phone = Some("0899999999".into()),
+    },
+    HashInput {
+        name: "cust_idcard",
+        gated_by: &["cust_idcard"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.cust_idcard.clone().unwrap_or_default(),
+        mutate: |p| p.cust_idcard = Some("9999999999999".into()),
+    },
+    HashInput {
+        name: "cust_address",
+        // ALIAS, declared explicitly (2026-07-28 incident). The hash
+        // reads canonical `cust_address` on the PG side and
+        // `Cust_Add_no` on the MSSQL side; the UPSERT writes the two in
+        // lock-step from ONE projection field, so both gate terms cover
+        // this input and both must exist.
+        gated_by: &["cust_add_no", "cust_address"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.cust_add_no.clone().unwrap_or_default(),
+        mutate: |p| p.cust_add_no = Some("999/9".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// Render the `customers` reconcile-hash body for a projection, from
+/// [`HASH_INPUTS`]. Test-only: production hashes both sides from loose
+/// column values in `scheduler::sync`, and the golden-vector test pins
+/// this against that function byte-for-byte.
+#[cfg(test)]
+fn hash_body(p: &CustomerProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
+}
+
+#[cfg(test)]
 fn projection_equality_keys(p: &CustomerProjection) -> ExistingEqualityKeys {
     ExistingEqualityKeys {
         cust_name: p.cust_name.clone(),
@@ -373,6 +684,9 @@ fn projection_equality_keys(p: &CustomerProjection) -> ExistingEqualityKeys {
         cust_type: p.cust_type.clone(),
         cust_email: p.cust_email.clone(),
         cust_add_no: p.cust_add_no.clone(),
+        // Same source value as `cust_add_no` — the UPSERT binds $9 to
+        // both columns, so the projected `cust_address` IS `Cust_Add_no`.
+        cust_address: p.cust_add_no.clone(),
         cust_add_moo: p.cust_add_moo.clone(),
         cust_add_soi: p.cust_add_soi.clone(),
         cust_add_road: p.cust_add_road.clone(),
@@ -408,12 +722,13 @@ async fn fetch_existing(
 
     // Dynamic query — keeps this file out of the `.sqlx` offline cache
     // (which would have to be regenerated for every column tweak). The
-    // 35 columns we read mirror everything the UPSERT writes, plus
+    // 37 identifiers we read mirror everything the UPSERT writes
+    // (including the `cust_address` lock-step mirror), plus
     // (cust_id, aggregate_id) for FK resolution.
     let opt = sqlx::query(
         "SELECT cust_id, aggregate_id, legacy_id, cust_firstname, cust_name2, \
                 cust_title, cust_sex, cust_idcard, cust_price_tier, \
-                cust_type, cust_email, cust_add_no, cust_add_moo, \
+                cust_type, cust_email, cust_add_no, cust_address, cust_add_moo, \
                 cust_add_soi, cust_add_road, cust_add_tambon, cust_add_ampore, \
                 cust_add_province, cust_add_code, cust_phone, cust_add_fax, \
                 cust_work_name, cust_work_no, cust_work_moo, cust_work_soi, \
@@ -446,6 +761,7 @@ async fn fetch_existing(
             cust_type: row.try_get("cust_type")?,
             cust_email: row.try_get("cust_email")?,
             cust_add_no: row.try_get("cust_add_no")?,
+            cust_address: row.try_get("cust_address")?,
             cust_add_moo: row.try_get("cust_add_moo")?,
             cust_add_soi: row.try_get("cust_add_soi")?,
             cust_add_road: row.try_get("cust_add_road")?,
@@ -477,13 +793,24 @@ async fn fetch_existing(
 /// Returns true when every mirrored column already matches the legacy
 /// projection. Used to skip event publication on a re-applied row.
 ///
-/// `legacy_id` (migration 055) is compared with a guard: a `None`
+/// The comparison IS [`GATE_FIELDS`] — one named comparator per mirrored
+/// column, `.all()`-ed. Deleting a term from that table deletes the
+/// comparison, which is what makes the gate/hash superset invariant
+/// mechanically checkable (see [`crate::sync::gate_guard`]).
+///
+/// `legacy_id` (migration 055) is the one guarded term: a `None`
 /// projection (fixture / pre-widening load) must not force a re-apply,
 /// but a `Some` projection against a still-NULL stored value MUST
 /// mismatch once so the UPSERT backfills the column.
+///
+/// Every other term is UNGUARDED, because the UPSERT writes those
+/// columns through plainly. A guard would be wrong for `cust_address`:
+/// the write carries no COALESCE, so a `None` `Cust_Add_no` has to be
+/// allowed to blank a stale stored value.
 fn matches(existing: &ExistingRow, projected: &CustomerProjection) -> bool {
-    existing.keys == projection_equality_keys(projected)
-        && (projected.legacy_id.is_none() || existing.legacy_id == projected.legacy_id)
+    GATE_FIELDS
+        .iter()
+        .all(|f| (f.matches)(existing, projected))
 }
 
 async fn apply_upsert(
@@ -937,7 +1264,7 @@ pub(crate) async fn upsert_customer_from_row(
 }
 
 /// iHOTEL's reserved "deleted customer" sentinel (cheatsheet §3.24 /
-/// §HT_Customers invariants). The delete cascade rewrites every FK-style
+/// §`HT_Customers` invariants). The delete cascade rewrites every FK-style
 /// reference (`Cin_cust_no`, `Book_Cust_ID`, …) to `'C0000'`, and NO
 /// real `HT_Customers` row with that `Cust_no` exists — so the
 /// eager-mirror fetch can never satisfy it.
@@ -1157,6 +1484,66 @@ mod tests {
         assert!(!matches(&ex, &p));
     }
 
+    // ----- cust_address lock-step mirror (2026-07-28 gate gap) ----------
+
+    /// The gate must see a canonical `cust_address` that drifted away
+    /// from the projected `Cust_Add_no`. This mapper writes the two in
+    /// lock-step, but other canonical writers do not: the Thai-ID
+    /// check-in prefill (`repository::customer::update`) stores the full
+    /// unsplit address in `cust_address` and leaves `cust_add_no` alone.
+    /// `cust_address` is a reconcile-hash input, so before this test the
+    /// row hashed as unconverged forever while the gate said "no change"
+    /// — and `force_converge_reconcile_row` re-drives this same gate, so
+    /// the self-heal path was dead too. Same class as d09e756.
+    #[test]
+    fn matches_returns_false_when_cust_address_drifted_from_add_no() {
+        let p = make_projection_all_set(); // cust_add_no = Some("123/4")
+        let mut ex = make_existing_matching(&p);
+        // What a check-in prefill leaves behind: the collapsed
+        // single-line address, while cust_add_no still holds the door no.
+        ex.keys.cust_address =
+            Some("123/4 ม.5 ซ.1 ถ.สุขุมวิท คลองตัน วัฒนา กรุงเทพ 10110".into());
+        assert_eq!(
+            ex.keys.cust_add_no, p.cust_add_no,
+            "only cust_address may differ in this fixture"
+        );
+        assert!(
+            !matches(&ex, &p),
+            "a cust_address diverged from cust_add_no MUST force a re-apply"
+        );
+    }
+
+    /// Steady state stays idempotent: `cust_address` mirroring
+    /// `cust_add_no` is exactly what the UPSERT leaves behind
+    /// (`cust_address = $9`, the `cust_add_no` bind), so the re-apply
+    /// converges in ONE pass instead of re-firing every tick.
+    #[test]
+    fn matches_returns_true_when_cust_address_mirrors_add_no() {
+        let p = make_projection_all_set();
+        let ex = make_existing_matching(&p);
+        assert_eq!(ex.keys.cust_address, p.cust_add_no);
+        assert!(
+            matches(&ex, &p),
+            "the lock-step steady state must not force a spurious re-apply"
+        );
+    }
+
+    /// Unguarded on purpose: a legacy row whose `Cust_Add_no` went NULL
+    /// must still defeat the gate so the UPSERT blanks the stale
+    /// canonical `cust_address`. A Some-only guard (the `legacy_id`
+    /// shape) would leave the stale value hashing as unconverged.
+    #[test]
+    fn matches_returns_false_when_add_no_null_but_address_still_stored() {
+        let mut p = make_projection_all_set();
+        p.cust_add_no = None;
+        let mut ex = make_existing_matching(&p); // both keys now None
+        ex.keys.cust_address = Some("123/4".into());
+        assert!(
+            !matches(&ex, &p),
+            "a NULL Cust_Add_no must re-apply so the stale mirror is blanked"
+        );
+    }
+
     // ----- legacy_id (migration 055, customer hard-delete handling) ------
 
     /// The projection must capture the legacy SERIAL `id` so the UPSERT
@@ -1200,6 +1587,240 @@ mod tests {
         let mut ex = make_existing_matching(&p);
         ex.legacy_id = Some(21607);
         assert!(matches(&ex, &p));
+    }
+
+    // ----- gate ⊇ reconcile-hash (see `crate::sync::gate_guard`) ---------
+
+    /// THE behavioural half of the gate/hash invariant, for customers.
+    ///
+    /// For every reconcile-hash input: apply a realistic legacy-side
+    /// edit, then assert (i) the hashed segment actually moved — so a
+    /// no-op mutator can't fake a pass — and (ii) the PRODUCTION gate
+    /// refuses to idempotency-skip it.
+    ///
+    /// This cannot be satisfied by editing a list: it executes
+    /// `matches()` against a genuinely mutated projection. It catches
+    /// both directions — a hash input added without a gate term, and a
+    /// gate term deleted while still hashed. The 2026-07-28
+    /// `cust_address` gap (hashed on both sides, invisible to the gate)
+    /// is exactly what it would have caught.
+    #[test]
+    fn customers_hash_mutations_all_defeat_the_idempotency_gate() {
+        let base = make_projection_all_set();
+        let ex = make_existing_matching(&base);
+        assert!(
+            matches(&ex, &base),
+            "fixture must start converged, else the test proves nothing"
+        );
+
+        for input in HASH_INPUTS.iter() {
+            if input.lookup_key {
+                // Identity, not a compared field — `fetch_existing`
+                // resolves BY it. See `HashInput::lookup_key`.
+                continue;
+            }
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment — \
+                 a self-validating mutator is what stops this test passing \
+                 vacuously",
+                input.name,
+            );
+            assert!(
+                !matches(&ex, &mutated),
+                "GATE/HASH INVARIANT VIOLATED — customers: a legacy edit that \
+                 moves reconcile-hash input `{}` is idempotency-SKIPPED by the \
+                 mapper. The CT delta then ages out inside the 2-day retention \
+                 window and the reconcile sweep flags a row it can never close \
+                 (force_converge re-drives this same gate). Widen GATE_FIELDS. \
+                 Mechanism: d09e756.",
+                input.name,
+            );
+        }
+    }
+
+    /// Byte-parity pin. `ht_reconcile_log.mssql_hash` and every
+    /// `ht_customers_legacy.sync_hash` ack are stored SHA256s of this
+    /// exact body — one byte of drift invalidates all of them and
+    /// triggers a full re-diff storm on the next tick.
+    ///
+    /// The expected value is built from the LITERAL pre-table format
+    /// string (`"{}|{}|{}|{}|{}|{}"`), not from the new code, and is
+    /// checked against BOTH the production hash function and the
+    /// descriptor-table join.
+    #[test]
+    fn customers_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{customer_canonical_hash, sha256};
+
+        // Pin explicit values rather than reusing the shared fixture, so
+        // a fixture tweak can never move the golden vector.
+        let mut p = make_projection_all_set();
+        p.cust_no = "C00001".into();
+        p.cust_name = "Alice".into();
+        p.cust_type = Some("บุคคลธรรมดา".into());
+        p.cust_phone = Some("0899999999".into());
+        p.cust_idcard = Some("9876543210987".into());
+        p.cust_add_no = Some("123/4".into());
+
+        // Literal body under the format string this table replaced:
+        //   format!("{}|{}|{}|{}|{}|{}", cust_no, name, type, phone,
+        //           idcard, address)  with `.unwrap_or("")` per Option.
+        let expected = sha256("C00001|Alice|บุคคลธรรมดา|0899999999|9876543210987|123/4");
+
+        assert_eq!(
+            customer_canonical_hash(
+                &p.cust_no,
+                &p.cust_name,
+                p.cust_type.as_deref(),
+                p.cust_phone.as_deref(),
+                p.cust_idcard.as_deref(),
+                // Canonical side reads `cust_address`; the projection
+                // holds it as `cust_add_no` (lock-step mirror).
+                p.cust_add_no.as_deref(),
+            ),
+            expected,
+            "production customer hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body — \
+             an entry was added, removed, reordered, or mis-rendered"
+        );
+    }
+
+    /// Compile-time completeness: every mirrored column has a gate term.
+    ///
+    /// The destructuring below has NO `..` rest pattern, so adding a
+    /// column to `ExistingEqualityKeys` stops this test COMPILING
+    /// (E0027). The engineer must then add it here, and the set-equality
+    /// assert forces the matching [`GATE_FIELDS`] entry. That closes the
+    /// loop a plain name list leaves open.
+    #[test]
+    fn every_equality_key_column_has_a_gate_term() {
+        use std::collections::HashSet;
+
+        let ExistingEqualityKeys {
+            cust_name: _,
+            cust_name2: _,
+            cust_title: _,
+            cust_sex: _,
+            cust_idcard: _,
+            cust_price_tier: _,
+            cust_type: _,
+            cust_email: _,
+            cust_add_no: _,
+            cust_address: _,
+            cust_add_moo: _,
+            cust_add_soi: _,
+            cust_add_road: _,
+            cust_add_tambon: _,
+            cust_add_ampore: _,
+            cust_add_province: _,
+            cust_add_code: _,
+            cust_phone: _,
+            cust_add_fax: _,
+            cust_work_name: _,
+            cust_work_no: _,
+            cust_work_moo: _,
+            cust_work_soi: _,
+            cust_work_road: _,
+            cust_work_tambon: _,
+            cust_work_ampore: _,
+            cust_work_province: _,
+            cust_work_code: _,
+            cust_work_tel: _,
+            cust_work_fax: _,
+            cust_work_tax: _,
+            cust_last_change: _,
+            cust_contry: _,
+            cust_price_over: _,
+        } = projection_equality_keys(&make_projection_all_set());
+
+        // `cust_name` holds PG `cust_firstname`; the gate term is named
+        // after the PG column so the hash table can cite it directly.
+        let expected: HashSet<&str> = [
+            "cust_firstname",
+            "cust_name2",
+            "cust_title",
+            "cust_sex",
+            "cust_idcard",
+            "cust_price_tier",
+            "cust_type",
+            "cust_email",
+            "cust_add_no",
+            "cust_address",
+            "cust_add_moo",
+            "cust_add_soi",
+            "cust_add_road",
+            "cust_add_tambon",
+            "cust_add_ampore",
+            "cust_add_province",
+            "cust_add_code",
+            "cust_phone",
+            "cust_add_fax",
+            "cust_work_name",
+            "cust_work_no",
+            "cust_work_moo",
+            "cust_work_soi",
+            "cust_work_road",
+            "cust_work_tambon",
+            "cust_work_ampore",
+            "cust_work_province",
+            "cust_work_code",
+            "cust_work_tel",
+            "cust_work_fax",
+            "cust_work_tax",
+            "cust_last_change",
+            "cust_contry",
+            "cust_price_over",
+            // Not an `ExistingEqualityKeys` column — lives on
+            // `ExistingRow` because its comparison is guarded.
+            "legacy_id",
+        ]
+        .into_iter()
+        .collect();
+
+        let actual: HashSet<&str> = gate_field_names().into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "GATE_FIELDS drifted from the mirrored-column set"
+        );
+    }
+
+    /// No customer hash input rests on a guarded (Some-only) term, so
+    /// every hashed movement — including a legacy value being cleared —
+    /// is visible to the gate. `legacy_id` is the sole guarded term and
+    /// is not hashed.
+    #[test]
+    fn no_customer_hash_input_rests_on_a_guarded_gate_term() {
+        use std::collections::HashSet;
+
+        let guarded: HashSet<&str> = gate_guard::guarded_gate_field_names(&GATE_FIELDS)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            guarded,
+            ["legacy_id"].into_iter().collect::<HashSet<&str>>(),
+            "guarding a term is a decision with a residual Some→None \
+             weakness — record it here deliberately"
+        );
+        for input in HASH_INPUTS.iter() {
+            for name in input.gated_by {
+                assert!(
+                    !guarded.contains(name),
+                    "hash input `{}` is gated only via guarded term `{}` — a \
+                     legacy NULL would then be invisible to the gate but \
+                     visible to the hash",
+                    input.name,
+                    name,
+                );
+            }
+        }
     }
 
     #[test]

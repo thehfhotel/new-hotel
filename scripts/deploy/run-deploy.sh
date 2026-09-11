@@ -11,9 +11,15 @@
 # Reads JSON from stdin:
 # {
 #   "commit_sha": "abc123...",
+#   "expected_backend_revision": "abc123...",   # OPTIONAL; "" = don't assert
 #   "deploy_payload_b64": "<base64 tarball: docker-compose.yml + init-db/ + migrations/pg/ + scripts/migrate.sh + scripts/deploy/run-deploy.sh>",
 #   "env": { "DB_SERVER": "...", "DB_PASSWORD": "...", ... }
 # }
+#
+# `expected_backend_revision` is the sha the backend image was built from THIS
+# run, or "" when this run did not rebuild the backend (a frontend-only push
+# leaves an older, perfectly correct sha on the promoted image). Non-empty =>
+# the post-deploy check asserts /health's `revision` equals it.
 #
 # Self-update: the tarball ships `scripts/deploy/run-deploy.sh` so the
 # script can replace itself in /srv/run-deploy.sh on each deploy — see
@@ -69,6 +75,14 @@ echo "$PAYLOAD" | jq -e 'has("commit_sha") and has("deploy_payload_b64") and has
 
 COMMIT_SHA=$(echo "$PAYLOAD" | jq -r '.commit_sha')
 echo "[deploy] commit: $COMMIT_SHA"
+
+# Bake assertion input (see the post-deploy `revision` check near the end).
+# OPTIONAL and NOT in the has(...) validation above: a payload from a
+# workflow older than this key is still well-formed, it just asserts nothing.
+# Non-empty ONLY when this run's `build-backend` job actually built the image
+# — on a frontend-only push the promoted backend legitimately carries an
+# older sha, and asserting there would be a routine false alarm.
+EXPECTED_BACKEND_REVISION=$(echo "$PAYLOAD" | jq -r '.expected_backend_revision // ""')
 
 # --- ghcr.io login --------------------------------------------------------
 # The GH-hosted runner's GITHUB_TOKEN has `packages: read` scope on this
@@ -179,8 +193,17 @@ echo "[deploy] artifacts staged at $DEPLOY_DIR, .env mode $(stat -c '%a' .env)"
 #
 # Writes are atomic: `install` creates the destination + sets mode + owner
 # in one syscall, so a concurrent `docker compose up` can never see a
-# half-written file. Mode 0400 (read-only, owner-only) matches the same
-# tight perms `docker secret create` would use in swarm mode.
+# half-written file.
+#
+# Mode is 0444 — read-only, but world-readable, so every local account on the
+# box can read every secret file here. That is looser than the 0400 `docker
+# secret create` uses in swarm mode. It is deliberate only in the sense that it
+# has always been so and the container uid's read path has never been tested
+# against a tighter bit; 0440 (owner deploy, group docker) is the value to try,
+# but tightening it blind can wedge the whole stack, so it needs a real test on
+# the running containers. Tracked as a follow-up — do not "fix" it in passing.
+# The directory itself is 0755 deploy:docker (below), so the perms here are the
+# only thing standing between a local account and the bearers.
 SECRETS_DIR_HOST=/home/deploy/secrets
 mkdir -p "$SECRETS_DIR_HOST"
 chmod 0755 "$SECRETS_DIR_HOST"
@@ -309,6 +332,43 @@ if ! wait_healthy new-hotel-production-backend-1 30; then
   exit 1
 fi
 echo "[deploy] backend healthy"
+
+# --- which build is actually serving? ---------------------------------------
+#
+# `wait_healthy` above proves A backend answers; it says nothing about WHICH
+# image the container loaded. /health reports `revision` — the git SHA baked
+# into the image by `build-backend` (ARG GIT_SHA / ENV GIT_SHA in
+# hotel-backend/Dockerfile). Probe it INSIDE the container: /health is
+# backend-network-internal (the `backend` service publishes no ports and the
+# Next rewrites proxy only /api/* and /hk/api/*), so there is no host-side or
+# public URL for it. curl ships in the backend image — the container's own
+# HEALTHCHECK uses it.
+#
+# This is the only gate that can catch the bake regressing: every unit test
+# passes with revision="unknown", so without this check, dropping the
+# `build-args` block would leave CI fully green and /health blind again.
+BACKEND_REVISION=$(docker exec new-hotel-production-backend-1 \
+  curl -fsS --max-time 3 localhost:3003/health 2>/dev/null | jq -r '.revision // "absent"' 2>/dev/null || echo "probe_failed")
+echo "[deploy] backend revision: $BACKEND_REVISION"
+
+if [ -n "$EXPECTED_BACKEND_REVISION" ]; then
+  if [ "$BACKEND_REVISION" = "$EXPECTED_BACKEND_REVISION" ]; then
+    echo "[deploy] revision matches this run's build"
+  else
+    # Hard fail. A mismatch means the container is NOT running the image this
+    # run built — a stale :latest, a pull that silently no-op'd, or a bake that
+    # stopped happening. "unknown" specifically means the image predates the
+    # GIT_SHA bake or the build-arg was dropped; "absent" means the field is
+    # gone from the payload; "probe_failed" means /health did not answer.
+    echo "::error::backend revision mismatch — expected $EXPECTED_BACKEND_REVISION, got $BACKEND_REVISION"
+    docker logs new-hotel-production-backend-1 --tail 30 2>&1 || true
+    exit 1
+  fi
+else
+  # Frontend-only / release-please / force_deploy run: the backend image was
+  # not rebuilt, so an older sha here is correct. Logged, never asserted.
+  echo "[deploy] no backend build this run — revision not asserted"
+fi
 
 # Worker status warnings (don't fail the deploy — outbox jobs queue if writeback is down,
 # recoverable when worker comes back, but operator needs to know).

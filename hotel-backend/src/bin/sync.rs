@@ -125,6 +125,12 @@ pub const EV_WATERMARK_ADVANCE_FAIL: &str = "sync.watermark_advance_fail";
 /// flap or pool exhaustion. Short-circuits the entire tick.
 pub const EV_LEGACY_PROBE_FAIL: &str = "sync.legacy_probe_fail";
 
+/// Failed to sample `CHANGE_TRACKING_CURRENT_VERSION()` before the
+/// mapper loop. The tick still runs every mapper — only the end-of-tick
+/// GLOBAL watermark advance is skipped (no ceiling ⇒ nothing safe to
+/// write). Self-healing: the next tick re-samples.
+pub const EV_CT_CEILING_PROBE_FAIL: &str = "sync.ct_ceiling_probe_fail";
+
 /// CT retention guard failed — could not query `CHANGE_TRACKING_MIN_VALID_VERSION`
 /// for the table. NOT the same as a retention OVERFLOW (that's
 /// `EV_CT_RETENTION_OVERFLOW`); this is the round-trip itself failing.
@@ -195,6 +201,7 @@ const KNOWN_SYNC_EVENT_NAMES: &[&str] = &[
     EV_WATERMARK_READ_FAIL,
     EV_WATERMARK_ADVANCE_FAIL,
     EV_LEGACY_PROBE_FAIL,
+    EV_CT_CEILING_PROBE_FAIL,
     EV_RETENTION_CHECK_FAIL,
     EV_CT_RETENTION_OVERFLOW,
     EV_CT_COUNT_FAIL,
@@ -290,6 +297,90 @@ fn format_last_error(event_name: &str, raw: &str) -> String {
 
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 
+/// How long a sampled `CHANGE_TRACKING_CURRENT_VERSION()` must SETTLE
+/// before it may be used as a watermark advance target — issue #283.
+///
+/// ## Why a settle window exists at all
+///
+/// `CHANGE_TRACKING_CURRENT_VERSION()` and `CHANGETABLE(CHANGES …)` are
+/// separate statements on separate pooled connections, and the legacy
+/// databases run with `ALLOW_SNAPSHOT_ISOLATION OFF` (verified on HF
+/// Ville's `HOTEL` DB, 2026-08-10: `snapshot_isolation_state_desc =
+/// OFF`, `is_read_committed_snapshot_on = 0`). Microsoft's guidance for
+/// "obtain the next sync version, then enumerate changes" is to put BOTH
+/// inside ONE snapshot transaction, precisely because outside one there
+/// is no ordering guarantee between the version counter a probe reads
+/// and what a subsequent `CHANGETABLE` read can see: a transaction whose
+/// commit is already in flight has contributed to the counter but its
+/// `sys.syscommittab` row is not yet visible to a READ COMMITTED reader.
+///
+/// The pre-#283 code assumed the opposite — that sampling the ceiling
+/// BEFORE the mapper loop made it "immune by construction" because every
+/// table is polled at or after the sample instant. Production falsified
+/// that on HF Ville: at `2026-08-05T07:20:06Z` the tick sampled ceiling
+/// v41516, `HT_Room_Status` read 40ms later returned nothing above
+/// v41510, and the watermark still advanced to v41516 — stranding
+/// `HT_Room_Status.id=4799` (room 107, night 2026-08-05) forever once CT
+/// retention aged the range out. Same shape lost ids 4692 / 4815 / 4832.
+///
+/// ## What the window buys
+///
+/// Enabling snapshot isolation would be DDL on the shared legacy server
+/// (see CLAUDE.md — prohibited outside the CT-prerequisite carve-out), so
+/// instead we only ever advance to a ceiling that was sampled at least
+/// this long BEFORE the current tick's reads began. A commit that was
+/// in flight at sample time is visible microseconds-to-milliseconds
+/// later; 2s is four orders of magnitude of margin.
+///
+/// Data application latency is UNCHANGED — `CHANGETABLE(CHANGES t, @v)`
+/// has no upper bound, so rows are still applied on the tick they first
+/// become visible. Only the resume point trails, which costs one extra
+/// idempotent re-read of a ~2s version range per tick.
+///
+/// Override via `LEGACY_SYNC_CT_CEILING_SETTLE_MS`.
+const DEFAULT_CT_CEILING_SETTLE_MS: u64 = 2000;
+
+/// Cross-tick holder for the CT ceiling settle window (issue #283).
+///
+/// Holds at most ONE un-consumed `CHANGE_TRACKING_CURRENT_VERSION()`
+/// sample together with the `Instant` it was taken. [`take_settled`]
+/// releases it only once it is old enough; [`record`] deliberately does
+/// NOT overwrite a sample that is still maturing, so a poll cadence
+/// faster than the settle window can never starve the watermark by
+/// endlessly replacing the pending sample with a fresher one.
+///
+/// [`take_settled`]: CeilingGate::take_settled
+/// [`record`]: CeilingGate::record
+#[derive(Debug, Default, Clone, Copy)]
+struct CeilingGate {
+    pending: Option<(i64, Instant)>,
+}
+
+impl CeilingGate {
+    /// Release the pending ceiling iff it has settled for `settle` as of
+    /// `now`. MUST be called BEFORE the tick polls any table: that is
+    /// what makes "every `CHANGETABLE` read in this tick happened at
+    /// least `settle` after the sample instant" true by construction.
+    fn take_settled(&mut self, now: Instant, settle: Duration) -> Option<i64> {
+        let (version, sampled_at) = self.pending?;
+        if now.duration_since(sampled_at) >= settle {
+            self.pending = None;
+            Some(version)
+        } else {
+            None
+        }
+    }
+
+    /// Record a fresh sample. No-op when one is still pending — keeping
+    /// the OLDER sample is what guarantees forward progress under a tick
+    /// interval shorter than the settle window.
+    fn record(&mut self, version: i64, sampled_at: Instant) {
+        if self.pending.is_none() {
+            self.pending = Some((version, sampled_at));
+        }
+    }
+}
+
 /// How often to verify each table's CT retention window
 /// (`MIN_VALID_VERSION(<table>) <= last_seen_version`).
 ///
@@ -302,6 +393,260 @@ const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 ///
 /// Override at runtime via `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS`.
 const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// How long to suppress repeat `CT retention overflow` pages for the same
+/// (site, table) once one has been sent.
+///
+/// The condition is NOT self-healing — it persists until an operator runs
+/// `--bootstrap` — and it hits every CT-tracked table simultaneously because
+/// they share one watermark. Without this, the retention-check gate above is
+/// the only throttle, giving ~19 pages every 5 minutes indefinitely, per
+/// site. One page per table per day is enough to keep the condition visible
+/// without burying every other alert in the channel.
+const RETENTION_ALERT_COOLDOWN_HOURS: i64 = 24;
+
+/// Cooldown key namespace for retention-overflow pages inside
+/// `ht_level_drift_alert_cooldowns` (migration 053). That table is keyed
+/// `(site_id, table_name)`, and the reconcile digest already stores real
+/// entity names (`bookings`, `customers`) plus the `stale_active_checkin`
+/// sentinel there — so CT table names are namespaced to guarantee they can
+/// never collide with a canonical entity name.
+fn retention_cooldown_key(table: &str) -> String {
+    format!("{CT_RETENTION_KEY_PREFIX}{table}")
+}
+
+/// Namespace prefixes this binary parks in the SHARED
+/// `ht_level_drift_alert_cooldowns` table. Every key this file writes MUST
+/// start with one of these, and no two may be a prefix of one another —
+/// see `cooldown_key_namespaces_cannot_collide` in `mod tests`.
+///
+/// The table is keyed `(site_id, table_name)` and is shared with
+/// `scheduler::sync` (reconcile entity names + the `stale_active_checkin`
+/// sentinel). Prefixing is the only thing keeping a CT table name
+/// (`HT_Customers`) from colliding with a canonical entity name
+/// (`customers`), or one watcher tripwire from stealing another's slot.
+const CT_RETENTION_KEY_PREFIX: &str = "ct_retention_overflow:";
+/// Durable slot for the level-triggered CT-lag page (one per site).
+const CT_LAG_COOLDOWN_KEY: &str = "ct_watcher_lag:global";
+/// Durable slot for the watermark-STALL page (one per site).
+///
+/// Unlike its siblings this key is NOT a cooldown — the stall page's
+/// cooldown is [`stall_page_passes_cooldown`], which stays process-local
+/// because it carries severity (a confirmed-backlog critical must be able
+/// to bypass the window left by a probe-outage escalation, and losing that
+/// window on restart fails LOUD, which is the safe direction).
+///
+/// What this row records is the OPEN-EPISODE latch: "we paged a stall and
+/// have not yet announced the all-clear". Written by [`hold_alert_slot`]
+/// after every stall page, deleted by [`release_alert_slot`] after the
+/// paired `CT watermark RECOVERED`. Exactly the semantics
+/// `scheduler::sync::cooldown_row_exists_pg` already reads out of this
+/// table for the stale-checkin tripwire. Issue #265.
+const CT_STALL_COOLDOWN_KEY: &str = "ct_watermark_stall:global";
+/// Durable slot for the shadow-mode-ceiling page (one per site).
+const SHADOW_CEILING_COOLDOWN_KEY: &str = "shadow_mode:ceiling";
+/// Namespace prefix for the refuse-to-start pages; one slot per reason
+/// (see [`BootRefusal::cooldown_key`]).
+const BOOT_REFUSAL_KEY_PREFIX: &str = "boot_refusal:";
+
+/// What a PG failure means for an [`claim_alert_slot`] call.
+///
+/// The right answer is per-alert, not global:
+/// * [`ClaimFallback::Suppress`] — the alert's failure mode is a page
+///   STORM (fires every tick while the condition holds). When we cannot
+///   prove the cooldown has elapsed, stay quiet. Retention overflow.
+/// * [`ClaimFallback::Send`] — the alert fires at most a handful of times
+///   and its failure mode is SILENCE (the process is about to die). A
+///   duplicate page beats a missing one. Refuse-to-start guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimFallback {
+    Suppress,
+    Send,
+}
+
+/// Atomically claim the right to send ONE page for `(site_id, key)`,
+/// returning `true` at most once per `cooldown_mins`.
+///
+/// The claim is a single conditional UPSERT against
+/// `ht_level_drift_alert_cooldowns` (migration 053) so two workers — or a
+/// Docker restart loop, which is the whole point for the boot guards —
+/// cannot both decide they're the one to alert. Durable by construction:
+/// the window survives process restarts, unlike a process-local `Instant`.
+///
+/// `key` must be namespaced with one of the `*_KEY_PREFIX` constants
+/// above; the table is shared with the reconcile digest.
+async fn claim_alert_slot(
+    pg: &PgPool,
+    site_id: &str,
+    key: &str,
+    cooldown_mins: i64,
+    fallback: ClaimFallback,
+) -> bool {
+    let claimed: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+        "INSERT INTO ht_level_drift_alert_cooldowns (site_id, table_name, last_alerted_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (site_id, table_name) DO UPDATE \
+             SET last_alerted_at = now(), updated_at = now() \
+           WHERE ht_level_drift_alert_cooldowns.last_alerted_at \
+                 < now() - ($3 || ' minutes')::interval \
+         RETURNING table_name",
+    )
+    .bind(site_id)
+    .bind(key)
+    .bind(cooldown_mins.to_string())
+    .fetch_optional(pg)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(err) => {
+            let send = fallback == ClaimFallback::Send;
+            tracing::warn!(
+                site = %site_id,
+                key,
+                error = %err,
+                fallback = if send { "send" } else { "suppress" },
+                "Alert cooldown claim failed — falling back per this alert's policy"
+            );
+            send
+        }
+    }
+}
+
+/// Drop the `(site_id, key)` cooldown row so a RECURRENCE pages on the
+/// very next observation instead of being swallowed by a stale window.
+/// Called only after the paired all-clear has been emitted.
+///
+/// Best-effort: a PG failure logs and leaves the row in place, so the
+/// worst case is that a recurrence stays suppressed until the window
+/// lapses on its own. Mirrors
+/// `scheduler::sync::clear_level_alert_cooldown_pg`.
+async fn release_alert_slot(pg: &PgPool, site_id: &str, key: &str) {
+    let result = sqlx::query(
+        "DELETE FROM ht_level_drift_alert_cooldowns WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(key)
+    .execute(pg)
+    .await;
+
+    if let Err(err) = result {
+        tracing::warn!(
+            site = %site_id,
+            key,
+            error = %err,
+            "Failed to release alert cooldown slot after all-clear — a recurrence may \
+             stay suppressed until the window lapses"
+        );
+    }
+}
+
+/// Mark `(site_id, key)` as an OPEN alert episode — "we paged and have
+/// not yet announced the all-clear" — without consulting any cooldown
+/// window. The unconditional sibling of [`claim_alert_slot`], mirroring
+/// `scheduler::sync::mark_level_alert_sent_pg`.
+///
+/// Used by the pages whose de-dup gate is NOT the cooldown row (currently
+/// the watermark stall, which needs severity-aware cooldown logic the row
+/// cannot express) but which still need the episode itself to survive a
+/// restart so the paired all-clear can fire. Paired 1:1 with
+/// [`release_alert_slot`].
+///
+/// Best-effort: a PG failure logs and leaves the row absent, which
+/// degrades to the pre-#265 behaviour (a restart mid-episode loses the
+/// all-clear) rather than breaking the page that just went out.
+async fn hold_alert_slot(pg: &PgPool, site_id: &str, key: &str) {
+    let result = sqlx::query(
+        "INSERT INTO ht_level_drift_alert_cooldowns (site_id, table_name, last_alerted_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (site_id, table_name) DO UPDATE \
+             SET last_alerted_at = now(), updated_at = now()",
+    )
+    .bind(site_id)
+    .bind(key)
+    .execute(pg)
+    .await;
+
+    if let Err(err) = result {
+        tracing::warn!(
+            site = %site_id,
+            key,
+            error = %err,
+            "Failed to record the open alert episode — a restart before the all-clear \
+             would lose it (issue #265 degradation, not a page failure)"
+        );
+    }
+}
+
+/// The two watchdog episodes that must survive a process restart, as read
+/// back from their durable rows. `None` = slot released (or never
+/// claimed) = no episode open. `Some(t)` = `last_alerted_at`, i.e. when
+/// the page fired.
+#[derive(Debug, Clone, Copy, Default)]
+struct OpenAlertEpisodes {
+    ct_lag: Option<chrono::DateTime<chrono::Utc>>,
+    stall: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read both watchdog episode slots in one round-trip (issue #265).
+///
+/// A live row for either key means the same thing it means everywhere
+/// else in this table: an alert was announced and its all-clear was not.
+/// The cooldown WINDOW is irrelevant to this read — a row inside its
+/// window whose condition has since gone healthy is precisely the
+/// un-all-cleared episode we are hunting for, and a row outside its
+/// window is one that has been open even longer.
+///
+/// Errors propagate so the caller can retry on the next tick instead of
+/// silently deciding "no episode open" — the fail-closed reading is what
+/// loses the all-clear in the first place.
+async fn read_open_alert_episodes(
+    pg: &PgPool,
+    site_id: &str,
+) -> Result<OpenAlertEpisodes, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT table_name, last_alerted_at FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = ANY($2)",
+    )
+    .bind(site_id)
+    .bind(vec![
+        CT_LAG_COOLDOWN_KEY.to_string(),
+        CT_STALL_COOLDOWN_KEY.to_string(),
+    ])
+    .fetch_all(pg)
+    .await?;
+
+    let mut open = OpenAlertEpisodes::default();
+    for (key, last_alerted_at) in rows {
+        if key == CT_LAG_COOLDOWN_KEY {
+            open.ct_lag = Some(last_alerted_at);
+        } else if key == CT_STALL_COOLDOWN_KEY {
+            open.stall = Some(last_alerted_at);
+        }
+    }
+    Ok(open)
+}
+
+/// Atomically claim the right to send ONE retention-overflow page for this
+/// (site, table). Returns `true` at most once per
+/// [`RETENTION_ALERT_COOLDOWN_HOURS`].
+///
+/// **Fails CLOSED on a PG error** — deliberately the opposite of the
+/// reconcile digest's fail-open eligibility check: this alert's failure
+/// mode is a page storm, so when in doubt, stay quiet. The condition still
+/// surfaces via the `ERROR`-level `EV_CT_RETENTION_OVERFLOW` log on every
+/// check.
+async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> bool {
+    claim_alert_slot(
+        pg,
+        site_id,
+        &retention_cooldown_key(table),
+        RETENTION_ALERT_COOLDOWN_HOURS * 60,
+        ClaimFallback::Suppress,
+    )
+    .await
+}
 
 /// Mid-run pool-outage handling (v2.58.4). HF Ville's WG tunnel flaps
 /// for ~2 min every couple of days; when the legacy MSSQL is
@@ -343,6 +688,230 @@ const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 const DEFAULT_INIT_RETRY_INITIAL_SECS: u64 = 5;
 const DEFAULT_INIT_RETRY_MAX_SECS: u64 = 60;
 const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
+
+// =============================================================================
+// Refuse-to-start pages — per-reason durable dedup (2026-07-28 alert audit)
+// =============================================================================
+//
+// Five startup guards below refuse to start and fire a Slack page: the
+// live-bootstrap refusal, the schema-fingerprint mismatch, the cold-replay
+// refusal, the retention-overflow refusal and the CT-not-enabled refusal.
+// Each used to send a BARE POST with no dedup at all. Compose runs these
+// workers with `restart: on-failure:5`, and every guard sleeps 60s before
+// exiting to throttle the loop — so one bad deploy produced up to SIX
+// identical pages per service, times two sites, and THEN the container gave
+// up permanently with no further message. Both halves are wrong: a storm
+// followed by silence that reads exactly like recovery.
+//
+// The fix is the durable cooldown already used by the retention-overflow
+// page (`claim_alert_slot` over `ht_level_drift_alert_cooldowns`), keyed per
+// REASON so a different failure on the next attempt still pages
+// immediately. Fail-OPEN on a PG error (`ClaimFallback::Send`): the failure
+// mode of these guards is silence, and a duplicate page beats none.
+//
+// What we CANNOT do from here: emit a "gave up after 5 restarts" alert. By
+// definition that message would have to come from a process that no longer
+// runs. Every page therefore states the restart-cap contract in its body so
+// an operator reads continued silence as "gave up", not "recovered". An
+// external liveness monitor is the real backstop and is tracked separately.
+
+/// How long to suppress a repeat refuse-to-start page for the SAME reason.
+///
+/// Sizing: the restart burst is 5 attempts × (60s guard sleep + startup),
+/// i.e. ~6-10 minutes. 30 minutes squashes the burst with margin while
+/// staying short enough that a fix-and-redeploy cycle which fails for a
+/// DIFFERENT reason pages instantly (different key) and one that fails the
+/// same way again pages within the hour. Override via
+/// `LEGACY_SYNC_BOOT_ALERT_COOLDOWN_MINS`.
+const DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS: i64 = 30;
+
+/// Docker's `restart: on-failure:<N>` cap for the sync/writeback workers in
+/// `docker-compose.yml`. Quoted in the page body — the number itself is the
+/// operationally load-bearing part ("after this many, silence means dead").
+const COMPOSE_RESTART_CAP: u32 = 5;
+
+/// The distinct refuse-to-start reasons. Each gets its OWN durable cooldown
+/// slot so a deploy that fixes the fingerprint but trips the CT gate still
+/// pages immediately instead of being swallowed by the previous reason's
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootRefusal {
+    /// `--bootstrap` requested against a live watcher (audit finding N1).
+    LiveBootstrap,
+    /// `verify_ct_schema_fingerprint` mismatch.
+    SchemaFingerprint,
+    /// Watermark at 0 without `LEGACY_SYNC_ALLOW_COLD_REPLAY`.
+    ColdReplay,
+    /// `MIN_VALID_VERSION > watermark` on at least one tracked table.
+    RetentionOverflow,
+    /// A `CT_ENABLED_TABLES` entry whose legacy CT subscription is missing.
+    CtNotEnabled,
+}
+
+impl BootRefusal {
+    /// Stable, greppable slug. Changing one resets that reason's dedup
+    /// window exactly once (the old row simply ages out), so renames are
+    /// safe but pointless.
+    fn slug(self) -> &'static str {
+        match self {
+            BootRefusal::LiveBootstrap => "live_bootstrap",
+            BootRefusal::SchemaFingerprint => "schema_fingerprint",
+            BootRefusal::ColdReplay => "cold_replay",
+            BootRefusal::RetentionOverflow => "retention_overflow",
+            BootRefusal::CtNotEnabled => "ct_not_enabled",
+        }
+    }
+
+    /// Durable cooldown key, namespaced under [`BOOT_REFUSAL_KEY_PREFIX`].
+    fn cooldown_key(self) -> String {
+        format!("{BOOT_REFUSAL_KEY_PREFIX}{}", self.slug())
+    }
+}
+
+/// Resolve the refuse-to-start dedup window.
+fn boot_refusal_cooldown_mins() -> i64 {
+    env::var("LEGACY_SYNC_BOOT_ALERT_COOLDOWN_MINS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS)
+}
+
+/// The restart-cap contract, appended to every refuse-to-start page.
+///
+/// This is the half of the fix that dedup alone does not buy. Without it an
+/// operator sees one page, then nothing, and reasonably concludes the next
+/// restart succeeded — when in fact Docker exhausted its retries and the
+/// worker is DEAD. The process cannot announce its own give-up, so the
+/// warning has to ride along with the last message it can still send.
+fn format_restart_cap_note(cooldown_mins: i64) -> String {
+    format!(
+        "\n\n:hourglass: *Silence after this page does NOT mean recovered.* Compose \
+         restarts this worker at most {COMPOSE_RESTART_CAP}× (`restart: \
+         on-failure:{COMPOSE_RESTART_CAP}`); after that the container stays down and \
+         cannot page again — a dead worker is quiet. Confirm with `docker compose ps` \
+         / the container logs before assuming it recovered. Repeat pages for THIS \
+         reason are suppressed for {cooldown_mins}min (a different failure reason \
+         still pages immediately)."
+    )
+}
+
+/// Full body of a refuse-to-start page — pure, so the composition is
+/// unit-testable without a PG pool or a live Slack webhook. Pager tier
+/// (issue #261, re-scoped 2026-07-29): [`send_boot_refusal_alert`] wraps
+/// this in [`SlackMessage::with_site_text_paged`], not `with_site_text`.
+/// All five refuse-to-start reasons (live-bootstrap, schema-fingerprint,
+/// cold-replay, retention-overflow, CT-not-enabled) route through this
+/// one function, so there is a single place to get the mention right.
+fn format_boot_refusal_message(headline: &str, body: &str, cooldown_mins: i64) -> String {
+    format!("{headline}\n{body}{}", format_restart_cap_note(cooldown_mins))
+}
+
+/// Pure dedup verdict for a refuse-to-start page.
+///
+/// * `dedup_available` — was there a usable PG pool to claim a slot with?
+/// * `claimed` — did [`claim_alert_slot`] hand us the slot?
+///
+/// With no dedup backend we FAIL OPEN. These guards fire a handful of times
+/// and their failure mode is silence about a process that will not run, so a
+/// duplicate page beats a missing one — the opposite trade from the
+/// retention-overflow page, whose failure mode is a storm.
+fn boot_refusal_should_send(dedup_available: bool, claimed: bool) -> bool {
+    !dedup_available || claimed
+}
+
+/// Send ONE deduplicated refuse-to-start page.
+///
+/// `pg` is `Option` on purpose: the live-bootstrap guard runs before the
+/// watcher's pool exists, and PG itself may be the thing that is down. With
+/// no pool we cannot dedup, so we **send** and say so in the log — silence
+/// is the worse failure for a guard whose whole job is announcing that the
+/// process refuses to run.
+async fn send_boot_refusal_alert(
+    pg: Option<&PgPool>,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    reason: BootRefusal,
+    headline: &str,
+    body: &str,
+) {
+    let Some(slack) = slack else {
+        tracing::warn!(
+            site = %site_id,
+            reason = ?reason,
+            "Refusing to start but Slack is not configured — refusal is log-only"
+        );
+        return;
+    };
+
+    let cooldown_mins = boot_refusal_cooldown_mins();
+    let claimed = match pg {
+        Some(pg) => {
+            claim_alert_slot(
+                pg,
+                site_id,
+                &reason.cooldown_key(),
+                cooldown_mins,
+                ClaimFallback::Send,
+            )
+            .await
+        }
+        None => {
+            tracing::warn!(
+                site = %site_id,
+                reason = ?reason,
+                "No PG pool available for refuse-to-start dedup — paging unconditionally \
+                 (fail-open); a restart loop may repeat this page"
+            );
+            false
+        }
+    };
+
+    if !boot_refusal_should_send(pg.is_some(), claimed) {
+        tracing::warn!(
+            site = %site_id,
+            reason = ?reason,
+            cooldown_mins,
+            "Refuse-to-start page suppressed — same reason already paged inside the \
+             dedup window (this is the Docker restart loop, not a new failure)"
+        );
+        return;
+    }
+
+    let payload = SlackMessage::with_site_text_paged(
+        site_id,
+        format_boot_refusal_message(headline, body, cooldown_mins),
+    );
+    let _ = slack.send_message(&payload).await;
+}
+
+/// Best-effort throwaway PG pool used ONLY to dedup the live-bootstrap
+/// refusal, which fires before the bootstrap path builds its own pool.
+///
+/// One connection, short acquire budget, and every failure returns `None`
+/// so the caller falls open to sending the page. Deliberately NOT reused
+/// for anything else — the guard exits within 60s of this call.
+async fn boot_dedup_pool() -> Option<PgPool> {
+    let url = env::var("DATABASE_URL")
+        .or_else(|_| env::var("NEW_DATABASE_URL"))
+        .ok()?;
+    match PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => Some(pool),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Could not reach PG for refuse-to-start dedup — page will be sent \
+                 unconditionally"
+            );
+            None
+        }
+    }
+}
 
 /// Quiet-aware watchdog probe budget. The stall watchdog fires its
 /// `CHANGE_TRACKING_CURRENT_VERSION()` probe inside the alert path, so
@@ -464,6 +1033,85 @@ const DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD: u32 = 3;
 /// fires on first observation. Override via
 /// `LEGACY_SYNC_BACKLOG_PERSIST_STREAK` (1 reproduces the old hair-trigger).
 const DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD: u32 = 2;
+
+// =============================================================================
+// CT-lag pager (2026-07-28 alert audit) — a paging path for the detector of
+// the 2026-05-18 lost-UPDATE class.
+// =============================================================================
+//
+// `scheduler::sync::check_ct_watcher_lag` observes CT lag on every reconcile
+// tick and logs `[Sync] CT watcher lag detected` at WARN. It fires ~170×/day
+// across both sites and has NO Slack path — the single loudest instance of
+// "the channel is quiet because the detectors are mute". It is also the
+// second line of defence for exactly the silent-loss family this workstream
+// exists to catch, so leaving it log-only is the wrong trade.
+//
+// This is the paging half. It deliberately does NOT re-emit that observation
+// (no second WARN, no competing log line); it consumes the SAME state
+// (`legacy_ct_state` vs `CHANGE_TRACKING_CURRENT_VERSION()`) with the SAME
+// thresholds — `DEFAULT_CT_LAG_WARN_VERSIONS` / `..._SECONDS` are imported
+// from that module rather than re-declared — and adds the three things a
+// pager needs that a log line does not: persistence, a durable cooldown, and
+// an all-clear.
+//
+// ## Why only the VERSION arm pages
+//
+// `ct_lag_is_warning` breaches on `version_lag > N` **or**
+// `poll_age_seconds > M`. The poll-age arm is a structural false positive:
+// `legacy_ct_state.last_polled_at` is written only by
+// `sync::watermark::advance`, and `global_watermark_target` returns `None`
+// when the sampled ceiling equals the watermark — i.e. a perfectly healthy
+// watcher that is caught up on a QUIET legacy never touches the row. Poll
+// age therefore grows without bound every quiet night, which is a large part
+// of that ~170/day. Shadow mode freezes the row outright, for the same
+// reason. Paging on it would manufacture nightly noise, so the page keys on
+// the probe-confirmed version arm only; poll age still rides along in the
+// message as context. The "watcher is not ticking at all" case it might
+// otherwise have covered is already owned by the watermark-stall watchdog
+// and the probe-outage escalation in this same task.
+//
+// ## Why it cannot double-report against the stall watchdog
+//
+// The stall page requires the watermark to be FROZEN (30min) with a backlog
+// persisting two ticks. This one fires while the watermark is still moving
+// but falling steadily behind — the shape that silently walks toward the
+// 2-day CT retention cliff without ever tripping "stuck". Where the two do
+// overlap (frozen AND far behind), the lag page defers: it is skipped
+// entirely while a stall alert is open.
+
+/// How long the version-lag breach must hold CONTINUOUSLY before it pages.
+///
+/// Level-triggered, not edge-triggered: a single reconcile tick observing
+/// >100 versions of lag is routine (one iHOTEL batch save, a slow poll
+/// cycle, a redeploy gap) and drains within seconds. 30 minutes of
+/// UNBROKEN lag is not routine, and still leaves ~47h of the 2-day CT
+/// retention window to act in. Any healthy observation resets the timer.
+/// Override via `LEGACY_SYNC_CT_LAG_PERSIST_SECS`.
+const DEFAULT_CT_LAG_PERSIST_SECS: u64 = 1800;
+
+/// Durable cooldown between CT-lag pages for a site, in hours. Matches the
+/// reconcile digest's 24h window (`scheduler::sync`'s level-drift cooldown),
+/// and like that digest the slot is RELEASED by the all-clear — so a
+/// genuine recurrence after a recovery pages immediately rather than
+/// waiting out the window.
+const CT_LAG_ALERT_COOLDOWN_HOURS: i64 = 24;
+
+/// Minimum spacing between CT probes issued SOLELY for the lag check.
+///
+/// The watchdog already probes `CHANGE_TRACKING_CURRENT_VERSION()` inside
+/// the stall and recovery branches; those results are reused for free. This
+/// only bounds the extra probes on otherwise-healthy ticks. 300s matches the
+/// reconcile-tick lag observation's own cadence order and adds ~288
+/// read-only scalar queries/day to the SHARED legacy server. Override via
+/// `LEGACY_SYNC_CT_LAG_PROBE_INTERVAL_SECS`.
+const DEFAULT_CT_LAG_PROBE_INTERVAL_SECS: u64 = 300;
+
+/// How stale a cached probe may be and still drive a lag decision,
+/// expressed as a multiple of the probe interval. One missed probe is
+/// tolerated; beyond that the lag state machine holds its current state
+/// rather than guessing — the same "never declare recovery on uncertainty"
+/// posture as [`recovery_alert_eligible`].
+const CT_LAG_PROBE_STALENESS_FACTOR: u32 = 2;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seeds in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
@@ -670,15 +1318,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 };
                 let msg = build_live_bootstrap_refusal_message();
                 tracing::error!(site = %site.id, "{msg}");
-                if let Some(s) = &slack {
-                    let payload = SlackMessage::with_site_text(
-                        &site.id,
-                        format!(
-                            ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:\n{msg}"
-                        ),
-                    );
-                    let _ = s.send_message(&payload).await;
-                }
+                // This guard runs before the bootstrap path opens its own
+                // pool, so borrow a throwaway one purely for dedup. `None`
+                // (PG unreachable / no DATABASE_URL) falls open to sending.
+                let dedup_pg = boot_dedup_pool().await;
+                send_boot_refusal_alert(
+                    dedup_pg.as_ref(),
+                    slack.as_ref(),
+                    &site.id,
+                    BootRefusal::LiveBootstrap,
+                    ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:",
+                    msg,
+                )
+                .await;
                 // Sleep before exit so Docker `restart: unless-stopped`
                 // doesn't turn this into a tight loop + alert flood.
                 tracing::warn!(
@@ -715,6 +1367,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RETENTION_CHECK_INTERVAL_SECS),
+    );
+
+    // Issue #283 — CT ceiling settle window. See
+    // `DEFAULT_CT_CEILING_SETTLE_MS`. Floored at one poll interval: a
+    // window shorter than the tick cadence would release a ceiling
+    // sampled inside the SAME tick's read window and reinstate the bug.
+    let ceiling_settle = Duration::from_millis(
+        env::var("LEGACY_SYNC_CT_CEILING_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CT_CEILING_SETTLE_MS)
+            .max(poll_interval_ms),
     );
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
@@ -792,20 +1456,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             error = %e,
             "Schema fingerprint check failed — refusing to start"
         );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *CT watcher REFUSED TO START* :warning:\n\
-                     Legacy MSSQL schema fingerprint mismatch.\n\
-                     *Error:* `{e}`\n\
-                     _The legacy DB columns drifted from the captured baseline. \
-                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                     README to update the baseline before restarting._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::SchemaFingerprint,
+            ":warning: *CT watcher REFUSED TO START* :warning:",
+            &format!(
+                "Legacy MSSQL schema fingerprint mismatch.\n\
+                 *Error:* `{e}`\n\
+                 _The legacy DB columns drifted from the captured baseline. \
+                 Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+                 README to update the baseline before restarting._"
+            ),
+        )
+        .await;
         tracing::warn!(site = %site.id, "Sleeping 60s before exit to throttle Docker restart cadence");
         tokio::time::sleep(Duration::from_secs(60)).await;
         return Err(format!("Schema fingerprint check failed: {e}").into());
@@ -822,9 +1487,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cold_replay_allowed = env::var("LEGACY_SYNC_ALLOW_COLD_REPLAY")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let current_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
+
+    // The tables this process will actually poll. Hoisted above the
+    // pre-flight gates (it used to sit between them) because BOTH gates
+    // now pre-flight on the per-table floor, and an allowlisted-out
+    // table's stale row must not drag that floor down.
+    let allowed_tables: Vec<&'static str> = CT_ENABLED_TABLES
+        .iter()
+        .filter(|t| {
+            allowlist
+                .as_ref()
+                .map(|a| a.contains(**t))
+                .unwrap_or(true)
+        })
+        .copied()
+        .collect();
+
+    // Pre-flight watermark. Under `SYNC_PER_TABLE_WATERMARK=true` the
+    // global row is only a conservative FLOOR (`run_one_tick` writes it
+    // from `global_floor_from_per_table` after each tick, issue #259) —
+    // it can never be MORE current than the tables, but it is written
+    // by whichever process last ticked and is not allowlist-aware. Both
+    // gates below therefore reason about the MINIMUM per-table watermark
+    // across the tables THIS process polls. See `preflight_watermark`.
+    let global_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
         .await
         .map_err(|e| format!("Failed to read CT watermark: {e}"))?;
+    let per_table_watermarks = if per_table_watermark {
+        hotel_backend::sync::watermark::read_per_table(&pg)
+            .await
+            .map_err(|e| format!("Failed to read per-table CT watermarks: {e}"))?
+    } else {
+        HashMap::new()
+    };
+    let current_watermark = preflight_watermark(
+        per_table_watermark,
+        global_watermark,
+        &per_table_watermarks,
+        &allowed_tables,
+    );
+    if per_table_watermark {
+        tracing::info!(
+            site = %site.id,
+            global_watermark,
+            preflight_watermark = current_watermark,
+            tables = allowed_tables.len(),
+            "Per-table watermark mode — pre-flighting gates on the MIN per-table watermark"
+        );
+    }
     if current_watermark == 0 && !cold_replay_allowed {
         let msg = "CT watermark is 0 (cold start) and \
                    LEGACY_SYNC_ALLOW_COLD_REPLAY != true — refusing to start. \
@@ -833,13 +1543,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                    to override (will replay all CT history). \
                    See docs/runbook-sync.md for the full cutover procedure.";
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(":no_entry: *CT watcher REFUSED TO START* :no_entry:\n{msg}"),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::ColdReplay,
+            ":no_entry: *CT watcher REFUSED TO START* :no_entry:",
+            msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -853,19 +1565,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // shadow-mode 2-day trap (watermark frozen by TX rollback while
     // MIN_VALID_VERSION marches forward), but a long worker outage
     // hits the same wall. Force the operator to --bootstrap.
+    //
+    // In per-table mode `current_watermark` is the MIN across tables, so
+    // one aged-out table makes every table report overflow. That
+    // over-report is deliberate and harmless: the remedy (--bootstrap,
+    // which re-stamps ALL rows via `stamp_all_per_table`) is the same
+    // whether one table or eighteen fell behind.
     let allow_overflow = env::var("LEGACY_SYNC_ALLOW_OVERFLOW")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let allowed_tables: Vec<&'static str> = CT_ENABLED_TABLES
-        .iter()
-        .filter(|t| {
-            allowlist
-                .as_ref()
-                .map(|a| a.contains(**t))
-                .unwrap_or(true)
-        })
-        .copied()
-        .collect();
     let mut overflowed: Vec<String> = Vec::new();
     for table in &allowed_tables {
         match check_retention(&mssql, table, current_watermark).await {
@@ -901,15 +1609,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             overflowed.join("\n    - "),
         );
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
-                ),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::RetentionOverflow,
+            ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:",
+            &msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -963,15 +1671,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ct_missing.join("\n    - "),
         );
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":no_entry: *CT watcher REFUSED TO START — Change Tracking not enabled* :no_entry:\n{msg}"
-                ),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::CtNotEnabled,
+            ":no_entry: *CT watcher REFUSED TO START — Change Tracking not enabled* :no_entry:",
+            &msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1172,6 +1880,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // needed and the map dies cleanly with the worker on SIGTERM.
     let mut retention_last_checked: HashMap<String, Instant> = HashMap::new();
 
+    // Issue #283 — the CT ceiling settle gate. Process-local like
+    // `retention_last_checked`: it starts empty, so the FIRST tick after
+    // a restart advances no watermark (nothing has settled yet) and the
+    // second one does. That is the correct posture — a fresh process has
+    // no proof about what any pre-restart read covered.
+    let mut ceiling_gate = CeilingGate::default();
+
     // Task #69: wrap the main loop in a tracing span so every log line
     // emitted from inside the watcher (mapper warnings, watermark
     // advances, retention probes) carries `site=<id>`. With both HF
@@ -1190,6 +1905,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             per_table_watermark,
             &mut retention_last_checked,
             retention_check_interval,
+            &mut ceiling_gate,
+            ceiling_settle,
             &site.id,
         )
         .await;
@@ -1326,7 +2043,9 @@ async fn run_bootstrap(
         tracing::info!(
             current_watermark,
             would_stamp_watermark = snapshot_version,
-            "[bootstrap:dry-run] watermark: a real bootstrap would overwrite the global watermark"
+            would_stamp_per_table_rows = CT_ENABLED_TABLES.len(),
+            "[bootstrap:dry-run] watermark: a real bootstrap would overwrite the global \
+             watermark AND force every per-table row to the same version"
         );
 
         // Per transactional mirror table: legacy source count vs current PG
@@ -1423,10 +2142,24 @@ async fn run_bootstrap(
     .bind(snapshot_version)
     .execute(&pg)
     .await?;
+
+    // …and the per-table sibling rows. Bootstrap must stamp BOTH shapes
+    // unconditionally (not gated on `SYNC_PER_TABLE_WATERMARK`): the flag
+    // is read by the watcher process, and the documented recovery is
+    // "bootstrap, then restart the watcher" — which may well restart it
+    // with the flag ON. Stamping only `legacy_ct_state` left all 18
+    // per-table rows at their pre-bootstrap versions, so the watcher came
+    // straight back up and re-tripped the retention-overflow refusal the
+    // bootstrap was run to clear. Same unguarded-overwrite semantics as
+    // the global UPDATE above.
+    hotel_backend::sync::watermark::stamp_all_per_table(&pg, CT_ENABLED_TABLES, snapshot_version)
+        .await?;
+
     tracing::info!(
         watermark = snapshot_version,
-        "[bootstrap] CT watermark stamped — bootstrap complete. \
-         Operator may now flip LEGACY_SYNC_ENABLED=true."
+        per_table_rows = CT_ENABLED_TABLES.len(),
+        "[bootstrap] CT watermark stamped (global + per-table) — bootstrap \
+         complete. Operator may now flip LEGACY_SYNC_ENABLED=true."
     );
 
     Ok(())
@@ -2073,32 +2806,370 @@ fn format_recovery_message(decision: &RecoveryDecision, now: Instant) -> String 
 }
 
 /// Pure decision function for the shadow-mode-too-long alert. Returns
-/// `Some(reason)` when shadow mode has been running for longer than
-/// the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`], 36h).
+/// `Some(reason)` when the CT watermark has been frozen by shadow mode for
+/// longer than the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`],
+/// 36h).
 ///
 /// The MSSQL CT retention default is 2 days; staying in shadow mode
 /// past 36h leaves <12h before the retention cliff silently drops
 /// changes the next tick would have replayed.
+///
+/// ## S11 fix (2026-07-28 alert audit) — the clock is now durable
+///
+/// This used to measure `now - started_at` where `started_at` was an
+/// `Instant` captured when the watchdog task spawned, i.e. PROCESS UPTIME.
+/// The clock reset on every restart, and with a normal deploy cadence
+/// (~6 restarts/day) it could never reach 36h. The guard was unfireable —
+/// worse than absent, because it read as coverage in the alert inventory.
+///
+/// The replacement anchor needs no new state and no migration, because PG
+/// already holds it: `legacy_ct_state.last_polled_at` is written ONLY by
+/// `sync::watermark::advance`, and `run_one_tick` skips every watermark
+/// write in shadow mode (`if !per_table_watermark && !shadow_mode`, and the
+/// per-table floor's `if per_table_watermark && !shadow_mode`). So in
+/// shadow mode that column freezes at the last live tick — which is exactly
+/// "when the shadow soak began" — and it survives restarts, redeploys and
+/// container replacement. It is also strictly closer to the hazard than
+/// process uptime ever was: the thing that ages toward
+/// `MIN_VALID_VERSION` is the frozen watermark, not the process.
+///
+/// `frozen_since` is `None` only if the single `legacy_ct_state` row is
+/// missing (pre-bootstrap); treat that as "unknown" and stay silent.
+/// Clock skew (`now < frozen_since`) is likewise treated as not-yet-due.
 fn shadow_mode_pager_eligible(
     shadow_mode: bool,
-    started_at: Instant,
-    now: Instant,
+    frozen_since: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
     if !shadow_mode {
         return None;
     }
-    let duration = now.duration_since(started_at);
-    let max = Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS);
-    if duration < max {
+    let frozen_since = frozen_since?;
+    let frozen_secs = now.signed_duration_since(frozen_since).num_seconds();
+    if frozen_secs < SHADOW_MODE_MAX_DURATION_SECS as i64 {
         return None;
     }
     Some(format!(
-        "Shadow mode has been running for {}s (ceiling {}s, ≈36h). \
-         MSSQL CT retention is 2 days; staying in shadow much longer \
+        "Shadow mode has held the CT watermark frozen since {} — {}s (ceiling {}s, \
+         ≈36h). MSSQL CT retention is 2 days; staying in shadow much longer \
          risks the watermark dropping behind MIN_VALID_VERSION.",
-        duration.as_secs(),
-        max.as_secs(),
+        frozen_since.to_rfc3339(),
+        frozen_secs,
+        SHADOW_MODE_MAX_DURATION_SECS,
     ))
+}
+
+// -----------------------------------------------------------------------------
+// CT-lag pager — thresholds, level-trigger state machine, message bodies.
+// See the block comment above `DEFAULT_CT_LAG_PERSIST_SECS`.
+// -----------------------------------------------------------------------------
+
+/// CT-lag thresholds, resolved exactly as
+/// `scheduler::sync::ct_lag_thresholds_from_env` resolves them.
+///
+/// The struct and resolver are private over there, so the shape is
+/// re-declared here — but the NUMBERS are imported
+/// (`DEFAULT_CT_LAG_WARN_VERSIONS` / `DEFAULT_CT_LAG_WARN_SECONDS` are
+/// `pub`), which is the part that must never drift between the observation
+/// and the page. `ct_lag_env_contract_matches_scheduler` in `mod tests`
+/// locks the env-var names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CtLagThresholds {
+    version_lag: i64,
+    poll_age_seconds: i64,
+}
+
+/// Positive-integer env threshold, mirroring
+/// `scheduler::sync::parse_threshold_env` (invalid / non-positive values
+/// are ignored so a typo can't silently disable the pager).
+fn parse_ct_lag_threshold_env(var_name: &str) -> Option<i64> {
+    match env::var(var_name) {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                tracing::warn!(
+                    var = var_name,
+                    value = %raw,
+                    "[watchdog] Invalid CT-lag threshold env var; ignoring"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Per-site override first (`LEGACY_CT_LAG_WARN_VERSIONS_<SITE>`), then the
+/// global var, then the shared default — identical precedence to the
+/// reconcile-tick observation so the two can never disagree about what
+/// "lagging" means.
+fn ct_lag_thresholds_from_env(site_id: &str) -> CtLagThresholds {
+    let site_upper = site_id.to_uppercase();
+    let per_site_version = format!("LEGACY_CT_LAG_WARN_VERSIONS_{site_upper}");
+    let per_site_seconds = format!("LEGACY_CT_LAG_WARN_SECONDS_{site_upper}");
+    CtLagThresholds {
+        version_lag: parse_ct_lag_threshold_env(&per_site_version)
+            .or_else(|| parse_ct_lag_threshold_env("LEGACY_CT_LAG_WARN_VERSIONS"))
+            .unwrap_or(hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_VERSIONS),
+        poll_age_seconds: parse_ct_lag_threshold_env(&per_site_seconds)
+            .or_else(|| parse_ct_lag_threshold_env("LEGACY_CT_LAG_WARN_SECONDS"))
+            .unwrap_or(hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_SECONDS),
+    }
+}
+
+/// Is this observation page-worthy? Strictly the VERSION arm — see the
+/// "Why only the VERSION arm pages" note above
+/// [`DEFAULT_CT_LAG_PERSIST_SECS`]. Strictly-greater-than, matching
+/// `scheduler::sync::ct_lag_is_warning`.
+fn ct_lag_is_pageable(version_lag: i64, thresholds: CtLagThresholds) -> bool {
+    version_lag > thresholds.version_lag
+}
+
+/// What the CT-lag state machine wants the watchdog to do this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtLagAction {
+    /// Not lagging and nothing outstanding.
+    Quiet,
+    /// Lagging, but it has not persisted past the threshold yet.
+    Building,
+    /// Lagging past the threshold and we have not paged this episode.
+    Page,
+    /// Lagging past the threshold but already paged this episode.
+    Holding,
+    /// Lag cleared after we paged — fire the all-clear.
+    Recovered,
+}
+
+/// Pure level-trigger for the CT-lag pager. No clock reads, no env, no PG,
+/// so the truth table is a plain unit test.
+///
+/// * `lagging` — [`ct_lag_is_pageable`] on a FRESH probe. Callers must not
+///   pass a value derived from a stale/absent probe; hold state instead.
+/// * `lag_since` — when the current unbroken lag episode began. The caller
+///   anchors it on the first breach and clears it on any healthy
+///   observation; `None` alongside `lagging == true` is the defensive
+///   "just started" reading and yields `Building`.
+/// * `paged` — whether this episode has already been announced.
+fn ct_lag_next_action(
+    lagging: bool,
+    lag_since: Option<Instant>,
+    paged: bool,
+    now: Instant,
+    persist_threshold: Duration,
+) -> CtLagAction {
+    if !lagging {
+        return if paged {
+            CtLagAction::Recovered
+        } else {
+            CtLagAction::Quiet
+        };
+    }
+    if paged {
+        return CtLagAction::Holding;
+    }
+    match lag_since {
+        // First breach of this episode — the caller anchors the timer now,
+        // so by definition it has not persisted yet.
+        None => CtLagAction::Building,
+        Some(since) if now.duration_since(since) >= persist_threshold => CtLagAction::Page,
+        Some(_) => CtLagAction::Building,
+    }
+}
+
+/// Everything the CT-lag messages need, captured at decision time.
+#[derive(Debug, Clone)]
+struct CtLagSnapshot {
+    watermark: i64,
+    ct_current: i64,
+    version_lag: i64,
+    /// `i64::MAX` for a never-polled row, matching the reconcile-tick
+    /// observation's sentinel.
+    poll_age_seconds: i64,
+    /// Stalest table, in per-table watermark mode only.
+    table: Option<String>,
+}
+
+impl CtLagSnapshot {
+    /// Human-readable poll age, collapsing the never-polled sentinel.
+    fn poll_age_text(&self) -> String {
+        if self.poll_age_seconds == i64::MAX {
+            "never".to_string()
+        } else {
+            format!("{}s ago", self.poll_age_seconds)
+        }
+    }
+}
+
+/// Slack body for the level-triggered CT-lag page.
+fn format_ct_lag_alert_message(
+    snap: &CtLagSnapshot,
+    thresholds: CtLagThresholds,
+    lagging_for: Duration,
+    persist_threshold: Duration,
+) -> String {
+    let CtLagSnapshot {
+        watermark,
+        ct_current,
+        version_lag,
+        ..
+    } = snap;
+    let for_mins = lagging_for.as_secs() / 60;
+    let persist_mins = persist_threshold.as_secs() / 60;
+    let version_threshold = thresholds.version_lag;
+    let poll_age = snap.poll_age_text();
+    let table_note = match &snap.table {
+        Some(t) => format!(
+            "\nPer-table mode: stalest table is `{t}` — it is holding the global floor down."
+        ),
+        None => String::new(),
+    };
+    format!(
+        ":warning: *CT watcher LAG sustained {for_mins}min* :warning:\n\
+         Canonical watermark is v{watermark} while legacy CT current is v{ct_current} \
+         — {version_lag} versions behind (page threshold {version_threshold}), and it \
+         has stayed behind for {for_mins}min without a break (persistence gate \
+         {persist_mins}min). Watermark last written {poll_age}.{table_note}\n\
+         This is the 2026-05-18 lost-UPDATE shape: the watcher is still running and \
+         still advancing, just never catching up. MSSQL CT retention is 2 days — \
+         anything still unread when a version ages out is lost SILENTLY.\n\
+         _Check `legacy_sync_status.last_error` for a table stuck in a retry loop, then \
+         the dashboard at `/api/new/sync/status`. Grep the worker logs for \
+         `[Sync] CT watcher lag detected` for the per-tick history._"
+    )
+}
+
+/// Slack body for the paired CT-lag all-clear.
+fn format_ct_lag_recovery_message(snap: &CtLagSnapshot, lagged_for: Duration) -> String {
+    let CtLagSnapshot {
+        watermark,
+        ct_current,
+        version_lag,
+        ..
+    } = snap;
+    let duration = format_alert_duration(lagged_for);
+    format!(
+        ":white_check_mark: *CT watcher lag RECOVERED*\n\
+         Watermark v{watermark} is back within threshold of legacy CT current \
+         v{ct_current} ({version_lag} versions behind). The lag alert raised \
+         {duration} is cleared, and its cooldown slot is released so a recurrence \
+         pages immediately.\n\
+         _Dashboard: `/api/new/sync/status`._"
+    )
+}
+
+// =============================================================================
+// Cross-restart episode state (issue #265)
+// =============================================================================
+//
+// The watchdog's alert episodes used to live entirely in `let mut` bindings
+// inside the loop, so a restart mid-episode lost them. The failure was
+// asymmetric and nasty: the durable cooldown row correctly suppressed a
+// RE-page after the restart, but the in-process `paged` latch that owns the
+// ALL-CLEAR was gone — operator sees a page, then eternal silence.
+//
+// The fix needs no new state, because the durable row IS the latch: it is
+// written when we page and DELETED by the all-clear (`release_alert_slot`),
+// so "row exists" == "announced, not yet cleared". On boot we read it back
+// ([`read_open_alert_episodes`]) and rebuild the episode. The only piece
+// that cannot be recovered from a `(site_id, table_name, last_alerted_at)`
+// row is a monotonic `Instant`, so the two helpers below convert the
+// durable wall clock into one; every reconstruction is a LOWER bound on the
+// real episode age, never an over-claim.
+//
+// Same idea as the S11 shadow-ceiling fix above: prefer a durable anchor PG
+// already holds over process uptime, which resets ~6x/day on this deploy
+// cadence.
+
+/// Wall-clock age of a durable timestamp, clamped at zero.
+///
+/// Clock skew between the PG server and this container (or an NTP step)
+/// can put `at` in the future; a negative age would backdate an episode
+/// into the future and is never what we want. Zero degrades to "as if it
+/// had just happened", which is the pre-#265 behaviour.
+fn durable_age(
+    at: chrono::DateTime<chrono::Utc>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    now_utc
+        .signed_duration_since(at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Project a wall-clock age onto the monotonic clock: `anchor - age`.
+///
+/// `Instant` in a container counts from HOST boot, so subtracting a
+/// multi-hour age moments after a fresh host boot can underflow.
+/// `checked_sub` returning `None` degrades to `anchor` — the episode is
+/// then reported as younger than it is, which only understates a duration
+/// in a Slack message and never invents or suppresses one.
+fn backdated_instant(anchor: Instant, age: Duration) -> Instant {
+    anchor.checked_sub(age).unwrap_or(anchor)
+}
+
+/// A watchdog alert episode rebuilt from its durable slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumedEpisode {
+    /// Monotonic reconstruction of when the page fired — feeds the
+    /// "raised N ago" figure in the all-clear.
+    paged_at: Instant,
+    /// How long ago that was, for the resume log line.
+    paged_ago: Duration,
+}
+
+/// Pure rebuild of an open episode from `last_alerted_at`.
+///
+/// `None` in ⇒ `None` out: a released (or never-claimed) slot must NOT
+/// resurrect a latch, or the next healthy tick would invent an all-clear
+/// for an episode nobody was ever told about.
+fn resume_episode(
+    slot_held_since: Option<chrono::DateTime<chrono::Utc>>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    now: Instant,
+) -> Option<ResumedEpisode> {
+    let paged_ago = durable_age(slot_held_since?, now_utc);
+    Some(ResumedEpisode {
+        paged_at: backdated_instant(now, paged_ago),
+        paged_ago,
+    })
+}
+
+/// How far to backdate the FIRST watermark observation after a restart,
+/// so the stall detector doesn't re-serve its full 30-minute threshold
+/// from process start (~31min blind window after every deploy, 6x/day).
+///
+/// The anchor is `legacy_ct_state.last_polled_at`, and it is only valid in
+/// GLOBAL watermark mode. There, `run_one_tick` writes that row via
+/// `sync::watermark::advance` **only when `global_watermark_target` yields
+/// a ceiling strictly greater than the current watermark** — so the column
+/// moves if and only if the version moves, making it a durable "last
+/// advance" clock. Under `SYNC_PER_TABLE_WATERMARK=true` the post-loop
+/// FLOOR write calls `advance` on every tick regardless of progress
+/// (`WHERE last_seen_version <= $1` makes an equal floor a real write), so
+/// the column degenerates to "last tick" and carries no freeze
+/// information; return `ZERO` and keep the pre-#265 process-anchored
+/// behaviour there.
+///
+/// `ZERO` also for a missing row (pre-bootstrap) — unknown, so claim
+/// nothing.
+///
+/// Backdating can only ever bring the stall check FORWARD to the true
+/// freeze duration; it cannot manufacture a stall, because the page still
+/// requires the version to be observed frozen AND a probe to confirm a
+/// backlog for [`DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD`] consecutive
+/// ticks.
+fn stall_anchor_age(
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    per_table_watermark: bool,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    if per_table_watermark {
+        return Duration::ZERO;
+    }
+    match last_polled_at {
+        Some(t) => durable_age(t, now_utc),
+        None => Duration::ZERO,
+    }
 }
 
 /// Track D / T7 CRIT-3 — spawn the watermark-stall watchdog. Runs as a
@@ -2123,7 +3194,6 @@ async fn run_watermark_watchdog(
     stall_alert_secs: u64,
     shutdown: Arc<Notify>,
 ) {
-    let started_at = Instant::now();
     let stall_threshold = Duration::from_secs(stall_alert_secs);
     let cooldown = Duration::from_secs(WATCHDOG_ALERT_COOLDOWN_SECS);
     let mut prior: Option<WatermarkObservation> = None;
@@ -2131,7 +3201,6 @@ async fn run_watermark_watchdog(
     // a confirmed-backlog page can bypass the cooldown left by a mere
     // probe-timeout informational note (see `stall_page_passes_cooldown`).
     let mut last_stall_alert: Option<(Instant, bool)> = None;
-    let mut last_shadow_alert: Option<Instant> = None;
     // Open-alert tracking for the recovery notification (PR D,
     // 2026-05-19). Parallel to `last_stall_alert` — that one encodes
     // cooldown, this one encodes "we paged and haven't yet declared
@@ -2158,8 +3227,36 @@ async fn run_watermark_watchdog(
     // probe success, or a no-stall tick (same lifecycle as the streak).
     let mut info_outage_since: Option<Instant> = None;
     let mut info_outage_escalated: bool = false;
+    // 2026-07-28 — CT-lag pager state. `ct_lag_since` anchors the current
+    // unbroken lag episode (cleared by any healthy observation);
+    // `ct_lag_paged` latches once the episode has been announced so the
+    // page is once-per-episode even before the durable cooldown is
+    // consulted; `ct_lag_paged_at` is the "raised N ago" figure for the
+    // all-clear. `ct_lag_probe` caches the most recent successful CT probe
+    // — the stall/recovery branches donate theirs for free, and a dedicated
+    // probe only runs when none was taken this tick and the interval has
+    // elapsed.
+    let mut ct_lag_since: Option<Instant> = None;
+    let mut ct_lag_paged: bool = false;
+    let mut ct_lag_paged_at: Option<Instant> = None;
+    let mut ct_lag_probe: Option<(Instant, i64)> = None;
+    // 2026-07-28 / issue #265 — one-shot rebuild of any episode that was
+    // still open when the previous process died. Stays `true` until the
+    // durable read SUCCEEDS, so a PG blip at boot costs one tick instead of
+    // the whole episode; cleared for good after the first clean read.
+    let mut episode_resume_pending: bool = true;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Issue #259 — per-table context on the pages. Same strict `== "true"`
+    // idiom as `run()` and `scheduler::sync::per_table_watermark_enabled`
+    // so the three can never disagree about which watermark is
+    // authoritative. The stall logic itself still reads the GLOBAL row:
+    // under per-table mode `run_one_tick` keeps that row at the MIN across
+    // tables, so it is the conservative floor and stalls in it are real.
+    let per_table_watermark = env::var("SYNC_PER_TABLE_WATERMARK")
         .map(|v| v == "true")
         .unwrap_or(false);
 
@@ -2187,6 +3284,29 @@ async fn run_watermark_watchdog(
             .unwrap_or(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS),
     );
 
+    // CT-lag pager (2026-07-28). Default ON — the whole point is that this
+    // detector had no paging path. `LEGACY_SYNC_CT_LAG_PAGER_ENABLED=false`
+    // is the kill switch if it ever proves noisy in production.
+    let ct_lag_pager_enabled = env::var("LEGACY_SYNC_CT_LAG_PAGER_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let ct_lag_thresholds = ct_lag_thresholds_from_env(&site_id);
+    let ct_lag_persist = Duration::from_secs(
+        env::var("LEGACY_SYNC_CT_LAG_PERSIST_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s: &u64| *s > 0)
+            .unwrap_or(DEFAULT_CT_LAG_PERSIST_SECS),
+    );
+    let ct_lag_probe_interval = Duration::from_secs(
+        env::var("LEGACY_SYNC_CT_LAG_PROBE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s: &u64| *s > 0)
+            .unwrap_or(DEFAULT_CT_LAG_PROBE_INTERVAL_SECS),
+    );
+    let ct_lag_probe_staleness = ct_lag_probe_interval * CT_LAG_PROBE_STALENESS_FACTOR;
+
     tracing::info!(
         site = %site_id,
         stall_alert_secs,
@@ -2198,6 +3318,28 @@ async fn run_watermark_watchdog(
         "[watchdog] Watermark-stall watchdog starting"
     );
 
+    tracing::info!(
+        site = %site_id,
+        enabled = ct_lag_pager_enabled,
+        version_threshold = ct_lag_thresholds.version_lag,
+        poll_age_threshold_secs = ct_lag_thresholds.poll_age_seconds,
+        persist_secs = ct_lag_persist.as_secs(),
+        probe_interval_secs = ct_lag_probe_interval.as_secs(),
+        cooldown_hours = CT_LAG_ALERT_COOLDOWN_HOURS,
+        "[watchdog] CT-lag pager configured (pages on the version arm only; \
+         the reconcile tick keeps logging both arms)"
+    );
+
+    // Emitted only when the flag is ON so global-mode log output stays
+    // byte-identical (the line above is the pre-#259 startup record).
+    if per_table_watermark {
+        tracing::info!(
+            site = %site_id,
+            "[watchdog] Per-table watermark mode — legacy_ct_state is the MIN-across-tables \
+             floor; stall pages will name the stalest table"
+        );
+    }
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(WATERMARK_WATCHDOG_POLL_INTERVAL_SECS)) => {}
@@ -2208,6 +3350,9 @@ async fn run_watermark_watchdog(
         }
 
         let now = Instant::now();
+        // Any successful CT probe taken anywhere in THIS iteration, donated
+        // to the CT-lag pager so it does not pay for a second round-trip.
+        let mut tick_ct_current: Option<i64> = None;
 
         // Read both watermark + last_polled_at in one round-trip.
         let observation = match read_ct_state(&pg).await {
@@ -2221,6 +3366,68 @@ async fn run_watermark_watchdog(
                 continue;
             }
         };
+
+        // ------------------------------------------------------------------
+        // Episode resume (issue #265). Rebuild any alert episode that was
+        // open when the previous process died, BEFORE anything else in this
+        // tick reads that state: the stall recovery check below consumes
+        // `pending_stall_alert`, and the CT-lag block at the bottom is gated
+        // on it. Runs once per process (retried while PG is unhappy).
+        // ------------------------------------------------------------------
+        if episode_resume_pending {
+            match read_open_alert_episodes(&pg, &site_id).await {
+                Ok(open) => {
+                    episode_resume_pending = false;
+                    let now_utc = chrono::Utc::now();
+                    if let Some(resumed) = resume_episode(open.ct_lag, now_utc, now) {
+                        // The durable slot IS the paged latch. Re-arming it
+                        // means (a) no double page while the lag persists —
+                        // the state machine answers `Holding` — and (b) the
+                        // all-clear can still fire, which is the whole bug.
+                        ct_lag_paged = true;
+                        ct_lag_paged_at = Some(resumed.paged_at);
+                        // The episode necessarily predates its page by at
+                        // least the persistence gate (that is what the gate
+                        // means), so this is a lower bound on the true start.
+                        // Only feeds the "lagging_for" figure in the log —
+                        // with `paged` latched the state machine ignores it.
+                        ct_lag_since =
+                            Some(backdated_instant(resumed.paged_at, ct_lag_persist));
+                        tracing::warn!(
+                            site = %site_id,
+                            paged_secs_ago = resumed.paged_ago.as_secs(),
+                            "[watchdog] Resumed an OPEN CT-lag episode from its durable \
+                             slot — the previous process died before the all-clear"
+                        );
+                    }
+                    if let Some(resumed) = resume_episode(open.stall, now_utc, now) {
+                        // `paged_version` is the one field the row cannot
+                        // carry. Seeding it with the CURRENT watermark is the
+                        // conservative choice: recovery then needs either a
+                        // fresh advance past it or a probe confirming legacy
+                        // is idle at it, so the worst case is the all-clear
+                        // arriving one tick late — never a false all-clear.
+                        pending_stall_alert =
+                            Some((resumed.paged_at, observation.last_seen_version));
+                        tracing::warn!(
+                            site = %site_id,
+                            paged_secs_ago = resumed.paged_ago.as_secs(),
+                            watermark = observation.last_seen_version,
+                            "[watchdog] Resumed an OPEN watermark-stall episode from its \
+                             durable slot — the previous process died before the all-clear"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        site = %site_id,
+                        error = %err,
+                        "[watchdog] Could not read the durable alert-episode slots — \
+                         retrying next tick (an all-clear may be delayed)"
+                    );
+                }
+            }
+        }
 
         // Recovery check (PR D, 2026-05-19). If we have an open stall
         // alert, decide whether to fire the all-clear THIS iteration.
@@ -2239,7 +3446,10 @@ async fn run_watermark_watchdog(
                 // failure we DON'T declare recovery (uncertainty
                 // holds the open alert).
                 recovery_probe = match probe_change_tracking_current_version(&mssql, probe_timeout).await {
-                    Ok(v) => Some(v),
+                    Ok(v) => {
+                        tick_ct_current = Some(v);
+                        Some(v)
+                    }
                     Err(err) => {
                         tracing::warn!(
                             site = %site_id,
@@ -2271,6 +3481,10 @@ async fn run_watermark_watchdog(
                     let _ = s.send_message(&payload).await;
                 }
                 pending_stall_alert = None;
+                // The episode is closed on BOTH clocks — drop the durable
+                // latch too, or the next restart would resume a phantom
+                // episode (issue #265).
+                release_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                 // Outage is over — reset the escalation anchor so the
                 // next unrecovered run starts fresh.
                 info_outage_since = None;
@@ -2299,6 +3513,7 @@ async fn run_watermark_watchdog(
                         // outage is over; clear the escalation anchor.
                         info_outage_since = None;
                         info_outage_escalated = false;
+                        tick_ct_current = Some(v);
                         Some(v)
                     }
                     Err(err) => {
@@ -2383,6 +3598,7 @@ async fn run_watermark_watchdog(
                         // bypass), so this doesn't reintroduce spam.
                         last_stall_alert = Some((now, false));
                         pending_stall_alert = Some((now, observation.last_seen_version));
+                        hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                     } else {
                         // Probe TIMED OUT — formerly the "informational" page.
                         // 2026-06-30 (operator request): we no longer Slack this
@@ -2421,6 +3637,13 @@ async fn run_watermark_watchdog(
                         backlog_since = None;
                         if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
                             let stuck_for = now.duration_since(prior_obs.observed_at);
+                            let stalest = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await;
                             tracing::error!(
                                 site = %site_id,
                                 version = observation.last_seen_version,
@@ -2428,20 +3651,29 @@ async fn run_watermark_watchdog(
                                 reason,
                                 "[watchdog] Watermark monotonicity violation — paging operator"
                             );
+                            log_stalest_table(stalest.as_ref(), &site_id);
                             if let Some(s) = slack.as_ref() {
+                                let note = stalest
+                                    .as_ref()
+                                    .map(format_stalest_table_note)
+                                    .unwrap_or_default();
                                 let payload = SlackMessage::with_site_text(
                                     &site_id,
-                                    format_stall_alert_message(
-                                        observation.last_seen_version,
-                                        probe,
-                                        stuck_for,
-                                        stall_threshold,
+                                    format!(
+                                        "{}{note}",
+                                        format_stall_alert_message(
+                                            observation.last_seen_version,
+                                            probe,
+                                            stuck_for,
+                                            stall_threshold,
+                                        )
                                     ),
                                 );
                                 let _ = s.send_message(&payload).await;
                             }
                             last_stall_alert = Some((now, true));
                             pending_stall_alert = Some((now, observation.last_seen_version));
+                            hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                         }
                     } else {
                         // `ct_current > watermark` — confirmed backlog.
@@ -2470,6 +3702,13 @@ async fn run_watermark_watchdog(
                                 "[watchdog] backlog observed — suppressing critical page until it persists past the streak gate"
                             );
                         } else if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
+                            let stalest = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await;
                             tracing::error!(
                                 site = %site_id,
                                 version = observation.last_seen_version,
@@ -2479,14 +3718,22 @@ async fn run_watermark_watchdog(
                                 reason,
                                 "[watchdog] Watermark stall detected (backlog persisted) — paging operator"
                             );
+                            log_stalest_table(stalest.as_ref(), &site_id);
                             if let Some(s) = slack.as_ref() {
+                                let note = stalest
+                                    .as_ref()
+                                    .map(format_stalest_table_note)
+                                    .unwrap_or_default();
                                 let payload = SlackMessage::with_site_text(
                                     &site_id,
-                                    format_stall_alert_message(
-                                        observation.last_seen_version,
-                                        probe,
-                                        backlog_for,
-                                        stall_threshold,
+                                    format!(
+                                        "{}{note}",
+                                        format_stall_alert_message(
+                                            observation.last_seen_version,
+                                            probe,
+                                            backlog_for,
+                                            stall_threshold,
+                                        )
                                     ),
                                 );
                                 let _ = s.send_message(&payload).await;
@@ -2494,7 +3741,10 @@ async fn run_watermark_watchdog(
                             last_stall_alert = Some((now, true));
                             // Open-alert state for the recovery notification
                             // (PR D, 2026-05-19). Always set after a page.
+                            // Durably too, since #265 — a restart before the
+                            // all-clear used to bury it.
                             pending_stall_alert = Some((now, observation.last_seen_version));
+                            hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                         }
                     }
                 }
@@ -2542,21 +3792,254 @@ async fn run_watermark_watchdog(
                 }
             }
         } else {
-            // First observation — anchor the stuck-timer here.
+            // First observation. Anchoring the stuck-timer at `now` would
+            // re-serve the full 30-min stall threshold from process start —
+            // the ~31-min post-deploy blind window in issue #265. Backdate
+            // it to the durable last-ADVANCE moment instead, when the
+            // watermark mode makes that column trustworthy
+            // ([`stall_anchor_age`]). A freeze that began 25min before the
+            // deploy then pages 5min after boot, not 31.
+            let anchor_age = stall_anchor_age(
+                observation.last_polled_at,
+                per_table_watermark,
+                chrono::Utc::now(),
+            );
+            if anchor_age > Duration::from_secs(WATERMARK_WATCHDOG_POLL_INTERVAL_SECS) {
+                tracing::info!(
+                    site = %site_id,
+                    version = observation.last_seen_version,
+                    frozen_secs = anchor_age.as_secs(),
+                    stall_threshold_secs = stall_threshold.as_secs(),
+                    "[watchdog] First observation backdated to the durable last-advance \
+                     moment — the stall timer resumes instead of restarting"
+                );
+            }
             WatermarkObservation {
-                observed_at: now,
+                observed_at: backdated_instant(now, anchor_age),
                 ..observation
             }
         };
         prior = Some(new_prior);
 
-        // Shadow-mode-too-long check.
-        if let Some(reason) = shadow_mode_pager_eligible(shadow_mode, started_at, now) {
-            let cooldown_elapsed = match last_shadow_alert {
-                Some(t) => now.duration_since(t) >= cooldown,
-                None => true,
+        // ------------------------------------------------------------------
+        // CT-lag pager (2026-07-28). Level-triggered, durably cooled, paired
+        // with an all-clear. Skipped in shadow mode (the watermark is frozen
+        // BY DESIGN there — that is the shadow-ceiling guard's job) and while
+        // a stall alert is open (the stall page already owns that operator's
+        // attention; see "Why it cannot double-report" above
+        // `DEFAULT_CT_LAG_PERSIST_SECS`).
+        // ------------------------------------------------------------------
+        if ct_lag_pager_enabled && !shadow_mode && pending_stall_alert.is_none() {
+            // Reuse any probe this iteration already took; otherwise take one
+            // at most every `ct_lag_probe_interval`.
+            if let Some(v) = tick_ct_current {
+                ct_lag_probe = Some((now, v));
+            } else if ct_lag_probe
+                .map(|(t, _)| now.duration_since(t) >= ct_lag_probe_interval)
+                .unwrap_or(true)
+            {
+                match probe_change_tracking_current_version(&mssql, probe_timeout).await {
+                    Ok(v) => ct_lag_probe = Some((now, v)),
+                    Err(err) => tracing::debug!(
+                        site = %site_id,
+                        error = %err,
+                        "[watchdog] CT-lag probe failed — holding lag state (uncertainty \
+                         never advances or clears the episode)"
+                    ),
+                }
+            }
+
+            // A stale probe must not drive a decision in EITHER direction:
+            // it could invent a lag that has already drained, or declare an
+            // all-clear for a lag we simply cannot see.
+            let fresh_ct_current = match ct_lag_probe {
+                Some((t, v)) if now.duration_since(t) <= ct_lag_probe_staleness => Some(v),
+                _ => None,
             };
-            if cooldown_elapsed {
+
+            if let Some(ct_current) = fresh_ct_current {
+                let watermark = observation.last_seen_version;
+                let version_lag = ct_current.saturating_sub(watermark).max(0);
+                let poll_age_seconds = observation
+                    .last_polled_at
+                    .map(|p| {
+                        chrono::Utc::now()
+                            .signed_duration_since(p)
+                            .num_seconds()
+                            .max(0)
+                    })
+                    .unwrap_or(i64::MAX);
+                let lagging = ct_lag_is_pageable(version_lag, ct_lag_thresholds);
+                if lagging && ct_lag_since.is_none() {
+                    ct_lag_since = Some(now);
+                }
+                let action = ct_lag_next_action(
+                    lagging,
+                    ct_lag_since,
+                    ct_lag_paged,
+                    now,
+                    ct_lag_persist,
+                );
+                let lagging_for = ct_lag_since
+                    .map(|t| now.duration_since(t))
+                    .unwrap_or_default();
+
+                match action {
+                    CtLagAction::Quiet => {
+                        ct_lag_since = None;
+                    }
+                    CtLagAction::Building => {
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            threshold = ct_lag_thresholds.version_lag,
+                            lagging_secs = lagging_for.as_secs(),
+                            persist_secs = ct_lag_persist.as_secs(),
+                            "[watchdog] CT lag observed — holding the page until it \
+                             persists past the gate"
+                        );
+                    }
+                    CtLagAction::Holding => {
+                        // INFO, not WARN: the page already went out, and a
+                        // 60s cadence of WARN for the whole life of an open
+                        // episode is exactly the undifferentiated log noise
+                        // this audit exists to reduce.
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            lagging_secs = lagging_for.as_secs(),
+                            "[watchdog] CT lag still open — already paged this episode"
+                        );
+                    }
+                    CtLagAction::Page => {
+                        let claimed = claim_alert_slot(
+                            &pg,
+                            &site_id,
+                            CT_LAG_COOLDOWN_KEY,
+                            CT_LAG_ALERT_COOLDOWN_HOURS * 60,
+                            ClaimFallback::Suppress,
+                        )
+                        .await;
+                        if !claimed {
+                            // Deliberately do NOT latch `ct_lag_paged` here.
+                            // The usual reason we are here is a restart
+                            // inside an open episode (the pre-restart page's
+                            // 24h row is still held), and re-attempting the
+                            // claim each tick means (a) a transient PG error
+                            // self-heals within 60s instead of swallowing the
+                            // whole episode, and (b) an episode that outlives
+                            // the 24h window pages again, which is correct.
+                            // INFO, not WARN — this is the cooldown working.
+                            tracing::info!(
+                                site = %site_id,
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                lagging_secs = lagging_for.as_secs(),
+                                cooldown_hours = CT_LAG_ALERT_COOLDOWN_HOURS,
+                                "[watchdog] CT lag past the persistence gate but the \
+                                 durable cooldown slot is held — page suppressed"
+                            );
+                        } else {
+                            let table = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await
+                            .map(|ctx| ctx.table);
+                            let snap = CtLagSnapshot {
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                poll_age_seconds,
+                                table,
+                            };
+                            tracing::error!(
+                                site = %site_id,
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                poll_age_seconds,
+                                lagging_secs = lagging_for.as_secs(),
+                                threshold = ct_lag_thresholds.version_lag,
+                                "[watchdog] CT watcher lag sustained past the \
+                                 persistence gate — paging operator"
+                            );
+                            if let Some(s) = slack.as_ref() {
+                                let payload = SlackMessage::with_site_text_paged(
+                                    &site_id,
+                                    format_ct_lag_alert_message(
+                                        &snap,
+                                        ct_lag_thresholds,
+                                        lagging_for,
+                                        ct_lag_persist,
+                                    ),
+                                );
+                                let _ = s.send_message(&payload).await;
+                            }
+                            ct_lag_paged = true;
+                            ct_lag_paged_at = Some(now);
+                        }
+                    }
+                    CtLagAction::Recovered => {
+                        let lagged_for = ct_lag_paged_at
+                            .map(|t| now.duration_since(t))
+                            .unwrap_or_default();
+                        let snap = CtLagSnapshot {
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            poll_age_seconds,
+                            table: None,
+                        };
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            lagged_secs = lagged_for.as_secs(),
+                            "[watchdog] CT watcher lag recovered — firing all-clear"
+                        );
+                        if let Some(s) = slack.as_ref() {
+                            let payload = SlackMessage::with_site_text(
+                                &site_id,
+                                format_ct_lag_recovery_message(&snap, lagged_for),
+                            );
+                            let _ = s.send_message(&payload).await;
+                        }
+                        // Release the slot so a RECURRENCE pages on the next
+                        // breach instead of waiting out the 24h window.
+                        release_alert_slot(&pg, &site_id, CT_LAG_COOLDOWN_KEY).await;
+                        ct_lag_since = None;
+                        ct_lag_paged = false;
+                        ct_lag_paged_at = None;
+                    }
+                }
+            }
+        }
+
+        // Shadow-mode-too-long check. The clock is `legacy_ct_state`'s frozen
+        // `last_polled_at`, not process uptime — see
+        // `shadow_mode_pager_eligible` for why the old anchor could never
+        // reach the 36h ceiling. The cooldown is durable for the same reason.
+        if let Some(reason) =
+            shadow_mode_pager_eligible(shadow_mode, observation.last_polled_at, chrono::Utc::now())
+        {
+            let claimed = claim_alert_slot(
+                &pg,
+                &site_id,
+                SHADOW_CEILING_COOLDOWN_KEY,
+                (WATCHDOG_ALERT_COOLDOWN_SECS / 60) as i64,
+                ClaimFallback::Suppress,
+            )
+            .await;
+            if claimed {
                 tracing::error!(
                     site = %site_id,
                     reason,
@@ -2575,7 +4058,6 @@ async fn run_watermark_watchdog(
                     );
                     let _ = s.send_message(&payload).await;
                 }
-                last_shadow_alert = Some(now);
             }
         }
     }
@@ -2594,6 +4076,169 @@ async fn read_ct_state(pg: &PgPool) -> Result<WatermarkObservation, sqlx::Error>
         last_polled_at: row.1,
         observed_at: Instant::now(),
     })
+}
+
+/// One `legacy_ct_state_per_table` row as the watchdog reads it.
+///
+/// Deliberately a local mirror of `scheduler::sync::PerTableWatermark`
+/// (the two sit on opposite sides of the bin/lib split). The ranking in
+/// [`stalest_per_table_watermark`] MUST stay semantically identical to
+/// its sibling `scheduler::sync::stalest_per_table_watermark`, or the
+/// reconcile-tick health log and the watchdog page would name different
+/// tables for the same state.
+#[derive(Debug, Clone)]
+struct PerTableWatermarkRow {
+    table_name: String,
+    last_seen_version: i64,
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read every `legacy_ct_state_per_table` row. Dynamic `query_as` (not
+/// the `sqlx::query!` macro) so this needs no `.sqlx/` cache entry.
+async fn read_ct_state_per_table(pg: &PgPool) -> Result<Vec<PerTableWatermarkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT table_name, last_seen_version, last_polled_at \
+           FROM legacy_ct_state_per_table",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(table_name, last_seen_version, last_polled_at)| PerTableWatermarkRow {
+                table_name,
+                last_seen_version,
+                last_polled_at,
+            },
+        )
+        .collect())
+}
+
+/// Pure picker: given every per-table watermark row, the legacy CT
+/// current version and `now`, return the STALEST table with its
+/// `(version_lag, poll_age_seconds)`.
+///
+/// Ranking, in order: largest `version_lag` (i.e. smallest
+/// `last_seen_version` — the table holding the global floor down), then
+/// largest poll age (oldest `last_polled_at`), then `table_name` so the
+/// pick is deterministic on a full tie. A NULL `last_polled_at` counts as
+/// infinitely old (`i64::MAX`), matching the never-polled handling in the
+/// global path.
+///
+/// The `.max(0)` clamp is load-bearing: `saturating_sub` on a SIGNED i64
+/// saturates at `i64::MIN`, not at zero, so a watermark AHEAD of
+/// `current_version` (a CT anomaly — the version is monotonic) would
+/// otherwise be reported as a nonsensical negative lag AND win the
+/// ranking. Mirrors `scheduler::sync::stalest_per_table_watermark`.
+fn stalest_per_table_watermark(
+    rows: &[PerTableWatermarkRow],
+    current_version: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(&PerTableWatermarkRow, i64, i64)> {
+    rows.iter()
+        .map(|w| {
+            let version_lag = current_version.saturating_sub(w.last_seen_version).max(0);
+            let poll_age_seconds = w
+                .last_polled_at
+                .map(|polled| now.signed_duration_since(polled).num_seconds().max(0))
+                .unwrap_or(i64::MAX);
+            (w, version_lag, poll_age_seconds)
+        })
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                // `max_by` keeps the LAST maximum, so invert the name
+                // comparison to land on the alphabetically-first table.
+                .then_with(|| b.0.table_name.cmp(&a.0.table_name))
+        })
+}
+
+/// Per-table context attached to a watchdog stall page (issue #259).
+/// Built ONLY when `SYNC_PER_TABLE_WATERMARK=true` — in global mode the
+/// page must stay byte-identical to its pre-#259 wording.
+struct StalestTableContext {
+    table: String,
+    last_seen_version: i64,
+    version_lag: i64,
+    poll_age_seconds: i64,
+    tables_tracked: usize,
+}
+
+/// Resolve the table holding the global floor down, for the page about
+/// to fire. Returns `None` in global mode (no query issued at all), when
+/// the per-table rows can't be read, and when they haven't been seeded —
+/// in every one of those cases the page still goes out, just without the
+/// extra line.
+async fn stalest_table_context(
+    per_table_watermark: bool,
+    pg: &PgPool,
+    ct_current: i64,
+    site_id: &str,
+) -> Option<StalestTableContext> {
+    if !per_table_watermark {
+        return None;
+    }
+    let rows = match read_ct_state_per_table(pg).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %err,
+                "[watchdog] Failed to read legacy_ct_state_per_table — \
+                 paging without per-table context"
+            );
+            return None;
+        }
+    };
+    let (stalest, version_lag, poll_age_seconds) =
+        stalest_per_table_watermark(&rows, ct_current, chrono::Utc::now())?;
+    Some(StalestTableContext {
+        table: stalest.table_name.clone(),
+        last_seen_version: stalest.last_seen_version,
+        version_lag,
+        poll_age_seconds,
+        tables_tracked: rows.len(),
+    })
+}
+
+/// Structured log companion to [`format_stalest_table_note`]. A SEPARATE
+/// line rather than extra fields on the existing page log, so global-mode
+/// log output stays byte-identical (`ctx` is always `None` there).
+fn log_stalest_table(ctx: Option<&StalestTableContext>, site_id: &str) {
+    if let Some(ctx) = ctx {
+        tracing::error!(
+            site = %site_id,
+            table = %ctx.table,
+            table_version = ctx.last_seen_version,
+            version_lag = ctx.version_lag,
+            poll_age_seconds = ctx.poll_age_seconds,
+            tables_tracked = ctx.tables_tracked,
+            "[watchdog] Stalest per-table watermark is holding the GLOBAL floor down"
+        );
+    }
+}
+
+/// Extra Slack line naming the table that is holding the global floor
+/// down. Appended to [`format_stall_alert_message`]'s output; global
+/// mode appends the empty string instead, so its page is unchanged.
+fn format_stalest_table_note(ctx: &StalestTableContext) -> String {
+    let StalestTableContext {
+        table,
+        last_seen_version,
+        version_lag,
+        poll_age_seconds,
+        tables_tracked,
+    } = ctx;
+    let polled = if *poll_age_seconds == i64::MAX {
+        "never polled".to_string()
+    } else {
+        format!("last polled {poll_age_seconds}s ago")
+    };
+    format!(
+        "\nPer-table mode: stalest table is `{table}` at v{last_seen_version} \
+         ({version_lag} versions behind, {polled}; {tables_tracked} tables tracked). \
+         The global row is the MIN across tables, so this table is what is holding it down."
+    )
 }
 
 /// Operator-facing refusal message for the N1 live-bootstrap guard.
@@ -2694,6 +4339,27 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
 /// `legacy_ct_state_per_table` (true, Resilience PR R3). Per-table
 /// mode lets a row-lock wedge on one table freeze only that row
 /// rather than gating every CT-enabled table's advance.
+///
+/// ## Global-mode watermark: SETTLED ceiling, written once, here
+///
+/// The GLOBAL watermark advance belongs to the TICK, not to a table.
+/// This fn samples `CHANGE_TRACKING_CURRENT_VERSION()` ONCE before the
+/// mapper loop and — only if no table errored — writes a ceiling after
+/// the loop. `poll_table` no longer touches the global row.
+///
+/// Letting a late table (`HT_Book_Pro`, index 18) advance the shared
+/// watermark to its own `max_version` is exactly how customer C2413 /
+/// booking R002066 were lost on HF Ville 2026-07-11 — polled-first
+/// `HT_Customers` (index 0) had already run when they were written, and
+/// the 30788 → 30801 advance meant nothing ever re-read v30789.
+///
+/// The ceiling written is NOT this tick's sample. Issue #283 proved that
+/// "sampled before the loop, therefore already read through by every
+/// table" is FALSE outside a snapshot transaction — see
+/// [`DEFAULT_CT_CEILING_SETTLE_MS`]. The sample is parked in
+/// [`CeilingGate`] and only becomes an advance target on a LATER tick,
+/// once every `CHANGETABLE` read provably post-dates it by the settle
+/// window.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pg: &PgPool,
@@ -2704,6 +4370,8 @@ async fn run_one_tick(
     per_table_watermark: bool,
     retention_last_checked: &mut HashMap<String, Instant>,
     retention_check_interval: Duration,
+    ceiling_gate: &mut CeilingGate,
+    ceiling_settle: Duration,
     site_id: &str,
 ) {
     // Two paths converge on a `HashMap<&str, i64>` of per-table
@@ -2756,7 +4424,38 @@ async fn run_one_tick(
         return;
     }
 
+    // Release a ceiling sampled on an EARLIER tick, if it has settled.
+    // This MUST happen before the mapper loop: the whole guarantee is
+    // "every `CHANGETABLE` read below happened at least `ceiling_settle`
+    // after this value was sampled", which is only true if we decide it
+    // here (issue #283 — see `DEFAULT_CT_CEILING_SETTLE_MS`).
     let now = Instant::now();
+    let settled_ct_ceiling: Option<i64> = ceiling_gate.take_settled(now, ceiling_settle);
+
+    // Sample THIS tick's CT ceiling BEFORE any mapper runs. It is parked
+    // in the gate, not used now. A probe failure is NOT fatal to the
+    // tick: every mapper still polls and applies, we just have no fresh
+    // value to park; a previously-parked one is unaffected and the next
+    // tick re-samples. The cost is one repeated read of the same CT
+    // range (idempotent).
+    match read_change_tracking_current_version(mssql).await {
+        Ok(v) => ceiling_gate.record(v, Instant::now()),
+        Err(err) => {
+            tracing::warn!(
+                event_name = EV_CT_CEILING_PROBE_FAIL,
+                site = %site_id,
+                error = %err,
+                "CHANGE_TRACKING_CURRENT_VERSION() probe failed; \
+                 running mappers but parking no fresh ceiling this tick"
+            );
+        }
+    }
+
+    // Any table failing anywhere in the tick holds the ENTIRE global
+    // advance (see `global_watermark_target`). Per-table mode is
+    // unaffected — each table owns its own row.
+    let mut any_table_errored = false;
+
     for mapper in mappers {
         let table = mapper.table();
         let pk_cols = mapper.primary_key_cols();
@@ -2786,7 +4485,7 @@ async fn run_one_tick(
 
         // Run each table inside its own future; panics are isolated
         // via `tokio::spawn` further down for the per-row dispatch.
-        if let Err(err) = poll_table(
+        match poll_table(
             pg,
             mssql,
             slack,
@@ -2795,6 +4494,7 @@ async fn run_one_tick(
             pk_cols,
             select_sql,
             table_last_seen,
+            settled_ct_ceiling,
             shadow_mode,
             per_table_watermark,
             should_check_retention,
@@ -2802,30 +4502,151 @@ async fn run_one_tick(
         )
         .await
         {
-            // Top-level fallback — `poll_table` already records granular
-            // event_names for failures it can attribute to a specific
-            // stage. A bubble-up to here is rare (only the panic-free
-            // `Result` shape escaped the inner fn) but we still attach
-            // an event_name so log filters never see a "naked" error.
-            tracing::error!(
-                event_name = EV_MAPPER_APPLY_FAIL,
+            Ok(outcome) => {
+                any_table_errored |= outcome.errored;
+            }
+            Err(err) => {
+                // Top-level fallback — `poll_table` already records granular
+                // event_names for failures it can attribute to a specific
+                // stage. A bubble-up to here is rare (only the panic-free
+                // `Result` shape escaped the inner fn) but we still attach
+                // an event_name so log filters never see a "naked" error.
+                // It counts as an errored table for the global hold: we
+                // cannot prove this table read through the ceiling.
+                any_table_errored = true;
+                tracing::error!(
+                    event_name = EV_MAPPER_APPLY_FAIL,
+                    site = %site_id,
+                    table,
+                    error = %err,
+                    "poll_table failed"
+                );
+                let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
+                if per_table_watermark {
+                    // R3 mirror: keep the per-table sibling row in sync so a
+                    // per-table watchdog can age the `last_polled_at` on
+                    // this specific table. Prefix with the R1 event_name so
+                    // operators grepping per-table errors get the same
+                    // taxonomy as `legacy_sync_status.last_error`.
+                    let payload = format!("[{EV_MAPPER_APPLY_FAIL}] {err}");
+                    let _ = hotel_backend::sync::watermark::record_per_table_error(
+                        pg, table, &payload,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    // THE once-per-tick global advance. Per-table mode advanced each row
+    // inside `poll_table` and deliberately leaves `legacy_ct_state`
+    // alone (pre-R3 behaviour preserved on the global path only).
+    //
+    // Shadow mode is excluded: every mapper TX was rolled back, so
+    // advancing would march the watermark past changes that were never
+    // applied. That's unchanged from the pre-fix code (`poll_table`
+    // returned before its advance in shadow mode) and is why a long
+    // shadow soak still hits the documented 2-day retention trap.
+    if !per_table_watermark && !shadow_mode {
+        if let Some(target) =
+            global_watermark_target(settled_ct_ceiling, global_last_seen, any_table_errored)
+        {
+            match hotel_backend::sync::watermark::advance(pg, target).await {
+                Ok(()) => {
+                    tracing::info!(
+                        site = %site_id,
+                        from = global_last_seen,
+                        to = target,
+                        tables = mappers.len(),
+                        "Advanced GLOBAL CT watermark to this tick's sampled ceiling"
+                    );
+                }
+                Err(err) => {
+                    // No table-level attribution exists for a tick-level
+                    // write, so this is log-only — `record_table_error`
+                    // needs a `legacy_sync_status.table_name` row. The
+                    // next tick retries from the unchanged watermark.
+                    tracing::error!(
+                        event_name = EV_WATERMARK_ADVANCE_FAIL,
+                        site = %site_id,
+                        new_version = target,
+                        error = %err,
+                        "Failed to advance GLOBAL CT watermark"
+                    );
+                }
+            }
+        } else if any_table_errored {
+            tracing::warn!(
                 site = %site_id,
-                table,
-                error = %err,
-                "poll_table failed"
+                last_seen = global_last_seen,
+                ceiling = ?settled_ct_ceiling,
+                "[CT] Tick had table failures — holding GLOBAL watermark for retry next tick"
             );
-            let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
-            if per_table_watermark {
-                // R3 mirror: keep the per-table sibling row in sync so a
-                // per-table watchdog can age the `last_polled_at` on
-                // this specific table. Prefix with the R1 event_name so
-                // operators grepping per-table errors get the same
-                // taxonomy as `legacy_sync_status.last_error`.
-                let payload = format!("[{EV_MAPPER_APPLY_FAIL}] {err}");
-                let _ = hotel_backend::sync::watermark::record_per_table_error(
-                    pg, table, &payload,
-                )
-                .await;
+        }
+    }
+
+    // THE once-per-tick GLOBAL FLOOR write (issue #259). Per-table mode
+    // advances each table's own row inside `poll_table`; before this it
+    // left `legacy_ct_state` FROZEN forever, which blinded everything that
+    // reads that row — `run_watermark_watchdog` (paged `CT watermark STUCK`
+    // every 30min with no possible all-clear), `routes/health.rs` and
+    // `scripts/sync-status.sh` — and made a rollback to global mode
+    // hard-fail once the frozen version aged past
+    // CHANGE_TRACKING_MIN_VALID_VERSION (~2 days).
+    //
+    // What we write is deliberately NOT this tick's ceiling but the MINIMUM
+    // per-table watermark across the tables THIS process polls — a true
+    // conservative floor. It can never exceed any table's real progress, so
+    // resuming from it can only ever RE-READ (idempotent across the mapper
+    // stack), never skip. A table that errored this tick held its own row
+    // back, so the post-loop re-read picks that up for free: no separate
+    // `any_table_errored` gate is needed here, unlike the shared-row global
+    // path above.
+    //
+    // Shadow mode is excluded exactly as on the global path: every mapper TX
+    // was rolled back, so no watermark of any kind may move.
+    if per_table_watermark && !shadow_mode {
+        match hotel_backend::sync::watermark::read_per_table(pg).await {
+            Ok(after_tick) => {
+                let polled: Vec<&str> = mappers.iter().map(|m| m.table()).collect();
+                if let Some(floor) = global_floor_from_per_table(&after_tick, &polled) {
+                    // `advance` is monotonic (`WHERE last_seen_version <= $1`),
+                    // so a floor below the row's current value is a harmless
+                    // no-op rather than a regression.
+                    match hotel_backend::sync::watermark::advance(pg, floor).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                site = %site_id,
+                                from = global_last_seen,
+                                floor,
+                                tables = polled.len(),
+                                "Wrote GLOBAL CT watermark FLOOR from the per-table minimum"
+                            );
+                        }
+                        Err(err) => {
+                            // Log-only, same as the global path: a tick-level
+                            // write has no `legacy_sync_status.table_name` to
+                            // attribute to. The next tick recomputes the floor.
+                            tracing::error!(
+                                event_name = EV_WATERMARK_ADVANCE_FAIL,
+                                site = %site_id,
+                                new_version = floor,
+                                error = %err,
+                                "Failed to write GLOBAL CT watermark floor"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                // The per-table rows — the real watermarks — are already
+                // committed; only the derived floor is missing this tick.
+                tracing::warn!(
+                    site = %site_id,
+                    error = %err,
+                    "Failed to re-read per-table CT watermarks for the GLOBAL floor \
+                     — global row not written this tick"
+                );
             }
         }
     }
@@ -2871,9 +4692,45 @@ async fn run_one_tick(
     sync_sticky_notes(pg, mssql, shadow_mode, site_id).await;
 }
 
+/// What one table's poll told the tick. Currently just the error flag,
+/// which `run_one_tick` folds across every table to decide whether the
+/// GLOBAL watermark may advance — a table that failed cannot be proven
+/// to have read through the tick ceiling, so ONE failure holds the whole
+/// advance. Kept as a struct (not a bare `bool`) so a future signal
+/// (rows applied, ceiling overshoot) doesn't churn the signature again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollOutcome {
+    errored: bool,
+}
+
+impl PollOutcome {
+    /// Table polled to completion with nothing failing.
+    const fn clean() -> Self {
+        Self { errored: false }
+    }
+
+    /// Table did not complete a full, trustworthy read of its CT range.
+    const fn failed() -> Self {
+        Self { errored: true }
+    }
+}
+
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
 /// retention check → SELECT CT changes → for each row, dispatch to
-/// mapper → INSERT event_log → bump counters → advance watermark.
+/// mapper → INSERT event_log → bump counters → advance the PER-TABLE
+/// watermark.
+///
+/// Deliberately does NOT advance the GLOBAL watermark — that is a
+/// once-per-tick write owned by `run_one_tick` (see its doc comment for
+/// the 2026-07-11 HF Ville loss caused by advancing the shared row from
+/// here, per table, to that table's own `max_version`).
+///
+/// `settled_ct_ceiling` is a `CHANGE_TRACKING_CURRENT_VERSION()` sample
+/// taken on an EARLIER tick and held until it settled (`None` when
+/// nothing has settled yet). Used only on the per-table path, and it is
+/// the ONLY value a per-table watermark may advance to — see
+/// `settled_ceiling_target` and issue #283 for why this table's own
+/// `max_version` is not a safe target either.
 ///
 /// `should_check_retention` is throttled by the caller to
 /// `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` (default 300s) per
@@ -2891,11 +4748,12 @@ async fn poll_table(
     pk_cols: &[&str],
     select_sql: &str,
     last_seen: i64,
+    settled_ct_ceiling: Option<i64>,
     shadow_mode: bool,
     per_table_watermark: bool,
     should_check_retention: bool,
     site_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PollOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // 1. Retention guard (throttled — see fn doc comment).
     if should_check_retention {
         if let Err(err) = check_retention(mssql, table, last_seen).await {
@@ -2918,7 +4776,21 @@ async fn poll_table(
             );
             let _ = record_table_error(pg, table, event_name, &err).await;
             if let Some(s) = slack {
-                if err.contains("retention") {
+                // Cooldown is REQUIRED here, not a nicety. Retention overflow
+                // is not self-healing — it persists until an operator runs
+                // `--bootstrap` — and it hits every CT table at once, since
+                // they share a watermark. Uncooled, that is one page per
+                // table per retention-check window: ~19 messages every 5
+                // minutes, forever, across both sites. The single loudest
+                // burst in this binary, arriving exactly when the operator
+                // most needs a readable channel.
+                //
+                // Persisted (not process-local) because the container
+                // restarts on failure, which would reset an in-memory
+                // cooldown and reinstate the storm.
+                if err.contains("retention")
+                    && claim_retention_alert_slot(pg, site_id, table).await
+                {
                     let msg = SlackMessage::with_site_text(
                         site_id,
                         format!(
@@ -2926,13 +4798,20 @@ async fn poll_table(
                              Table: `{table}`\n\
                              Watermark fell behind CT retention; \
                              row history beyond `MIN_VALID_VERSION` is gone.\n\
-                             _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
+                             _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_.\n\
+                             _This will NOT self-heal, and further overflow pages for \
+                             this table are suppressed for \
+                             {RETENTION_ALERT_COOLDOWN_HOURS}h — the condition persists \
+                             until you bootstrap._"
                         ),
                     );
                     let _ = s.send_message(&msg).await;
                 }
             }
-            return Ok(()); // intentional skip — retention can't be repaired by retry
+            // Intentional skip — retention can't be repaired by retry.
+            // Still `failed()`: we did not read this table's CT range, so
+            // the tick must not advance the global watermark past it.
+            return Ok(PollOutcome::failed());
         }
     }
 
@@ -2949,7 +4828,7 @@ async fn poll_table(
                     "CT count query failed"
                 );
                 let _ = record_table_error(pg, table, EV_CT_COUNT_FAIL, &err).await;
-                return Ok(());
+                return Ok(PollOutcome::failed());
             }
         };
         if let Err(err) = bump_skipped(pg, table, row_count, false).await {
@@ -2966,7 +4845,10 @@ async fn poll_table(
                 "CT rows observed (NoopMapper — skipped, awaiting real mapper)"
             );
         }
-        return Ok(());
+        // No watermark movement of any kind on the noop path: the rows
+        // were counted, never applied, and per-table mode deliberately
+        // keeps them replayable for the day a real mapper ships.
+        return Ok(PollOutcome::clean());
     }
 
     // 3. Real-mapper path: fetch CT rows joined with the table.
@@ -2980,7 +4862,7 @@ async fn poll_table(
                 "CT fetch failed"
             );
             let _ = record_table_error(pg, table, EV_CT_FETCH_FAIL, &err).await;
-            return Ok(());
+            return Ok(PollOutcome::failed());
         }
     };
 
@@ -3001,12 +4883,30 @@ async fn poll_table(
         // (v2.58.3, fix/hfville-stuck-ct-tables).
         let _ = bump_skipped(pg, table, 0, false).await;
         if per_table_watermark {
-            // R3 — touch `last_polled_at` so the per-table watchdog
-            // can distinguish "healthy but quiet" from "wedged" by
-            // comparing now() - last_polled_at across rows.
-            let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+            // R3 — this row must move forward, not just get touched.
+            // A permanently-quiet table (HF Ville's HT_Cupon,
+            // HT_Deposit, HT_Bill_Debt_*, HT_CheckIn_Product,
+            // HT_Receipt_H — all 0 rows ingested) that only ever
+            // touches `last_polled_at` keeps `last_seen_version`
+            // frozen while MSSQL's MIN_VALID_VERSION marches forward,
+            // so it eventually trips the retention-overflow refusal for
+            // no reason. Having polled and found nothing, it HAS read
+            // through the tick ceiling — advance it there. Falls back
+            // to a plain touch when there's no ceiling to advance to.
+            match settled_ceiling_target(settled_ct_ceiling, last_seen, shadow_mode) {
+                Some(target) => {
+                    let _ =
+                        hotel_backend::sync::watermark::advance_per_table(pg, table, target).await;
+                }
+                None => {
+                    // Touch only: the per-table watchdog still needs to
+                    // distinguish "healthy but quiet" from "wedged" by
+                    // comparing now() - last_polled_at across rows.
+                    let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+                }
+            }
         }
-        return Ok(());
+        return Ok(PollOutcome::clean());
     }
 
     let row_count = rows.len() as i64;
@@ -3033,7 +4933,7 @@ async fn poll_table(
                 "Failed to begin PG TX"
             );
             let _ = record_table_error(pg, table, EV_PG_TX_BEGIN_FAIL, &err.to_string()).await;
-            return Ok(());
+            return Ok(PollOutcome::failed());
         }
     };
 
@@ -3071,13 +4971,21 @@ async fn poll_table(
             // path — the parent re-load supersedes per-row I/U/D
             // semantics.
             if let Err(err) = ChangeOp::try_from(op_char.as_str()) {
+                // Issue #283 audit: an op code we cannot parse means the
+                // change was NOT applied. Treating it as a plain skip let
+                // the watermark march past it — the silent-drop class the
+                // per-key `errored` gating exists to prevent. CT only ever
+                // emits I/U/D, so this is unreachable in practice; if it
+                // ever fires it is a driver/projection bug worth wedging
+                // the watermark until the stall watchdog pages.
                 tracing::warn!(
                     event_name = EV_UNKNOWN_CT_OP,
                     table,
                     sys_change_operation = %op_char,
                     error = %err,
-                    "Unknown CT operation code — skipping row"
+                    "Unknown CT operation code — holding watermark for retry"
                 );
+                errored = true;
                 skipped += 1;
                 continue;
             }
@@ -3245,12 +5153,21 @@ async fn poll_table(
                 }
                 "HT_CheckIn_Pay" => apply_payment_aggregate(&mut tx, mssql, key).await,
                 other => {
+                    // Issue #283 audit: a mapper that opted into
+                    // coalescing but has no applier wired here means the
+                    // key's change was never applied. Holding is the only
+                    // correct answer — the alternative advanced past it
+                    // and lost it to CT retention. This is a wiring bug
+                    // (new coalescing mapper, missing `match` arm), so it
+                    // will not self-heal; the watermark-stall watchdog is
+                    // the intended escalation.
                     tracing::warn!(
                         event_name = EV_AGGREGATE_APPLY_FAIL,
                         table = other,
                         reason = "unknown_aggregate_table",
-                        "Unknown coalesced aggregate table — skipping"
+                        "Unknown coalesced aggregate table — holding watermark for retry"
                     );
+                    errored = true;
                     skipped += 1;
                     continue;
                 }
@@ -3322,13 +5239,17 @@ async fn poll_table(
             let op = match ChangeOp::try_from(op_char.as_str()) {
                 Ok(o) => o,
                 Err(err) => {
+                    // See the sibling aggregate-path branch: an
+                    // undispatchable row is an UNAPPLIED change and must
+                    // hold the watermark (issue #283 audit).
                     tracing::warn!(
                         event_name = EV_UNKNOWN_CT_OP,
                         table,
                         sys_change_operation = %op_char,
                         error = %err,
-                        "Unknown CT operation code — skipping row"
+                        "Unknown CT operation code — holding watermark for retry"
                     );
+                    errored = true;
                     skipped += 1;
                     continue;
                 }
@@ -3337,7 +5258,10 @@ async fn poll_table(
             // For Delete, the joined row is NULL but the PK columns are
             // still in the projection (CT carries them). Pass `Some(&row)`
             // either way and let the mapper decide.
-            let result = mapper.apply(&mut tx, op, Some(row)).await;
+            // `apply_with_legacy`: identical to `apply` for every mapper
+            // except CheckinProductMirrorMapper, whose override uses the
+            // pool for the #263 eager product mirror (read-only).
+            let result = mapper.apply_with_legacy(&mut tx, mssql, op, Some(row)).await;
 
             match result {
                 Ok(Some(event)) => {
@@ -3414,7 +5338,10 @@ async fn poll_table(
         }
         // Bump skipped counter to mirror the noop path's behavior.
         let _ = bump_skipped(pg, table, row_count, errored).await;
-        return Ok(());
+        // Shadow mode applied nothing, so nothing advances anywhere —
+        // `run_one_tick` skips the global advance wholesale in shadow
+        // mode; report the raw per-key result for the tick's tally.
+        return Ok(PollOutcome { errored });
     }
 
     if let Err(err) = tx.commit().await {
@@ -3425,7 +5352,7 @@ async fn poll_table(
             "PG TX commit failed"
         );
         let _ = record_table_error(pg, table, EV_PG_TX_COMMIT_FAIL, &err.to_string()).await;
-        return Ok(());
+        return Ok(PollOutcome::failed());
     }
 
     // 6. Counters + watermark advance (live mode only).
@@ -3445,6 +5372,9 @@ async fn poll_table(
     // silent-drop bug where a transient per-key failure (deploy
     // mid-tick, MSSQL hiccup) advanced the watermark past the failed
     // key's CT version, losing the event after CT's 2-day retention.
+    //
+    // GLOBAL mode does nothing here beyond logging: `run_one_tick` owns
+    // that write and gets `errored` back via `PollOutcome`.
     if errored {
         tracing::warn!(
             table,
@@ -3460,18 +5390,41 @@ async fn poll_table(
         if per_table_watermark {
             let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
         }
-    } else if let Some(target_version) = next_watermark_after_tick(max_version, last_seen, errored)
-    {
-        // R3 — feature-flagged dual-write contract. Per-table mode
-        // advances ONLY the per-table row so a stuck sibling
-        // doesn't pin the global down; global mode advances ONLY
-        // the single-row state, preserving the pre-R3 behaviour.
-        let advance_result = if per_table_watermark {
-            hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await
-        } else {
-            hotel_backend::sync::watermark::advance(pg, target_version).await
-        };
-        match advance_result {
+        return Ok(PollOutcome::failed());
+    }
+
+    if !per_table_watermark {
+        // Global mode: observability only. Keeps the per-table
+        // from/to breadcrumb operators grep for, minus the write.
+        if let Some(applied_through) = next_watermark_after_tick(max_version, last_seen, errored) {
+            tracing::info!(
+                table,
+                from = last_seen,
+                applied_through,
+                ingested,
+                skipped,
+                "CT rows applied (global watermark advances once per tick in run_one_tick)"
+            );
+        }
+        return Ok(PollOutcome::clean());
+    }
+
+    // Per-table mode. The ONLY safe target is the settled ceiling —
+    // identical rule to the empty-fetch branch above.
+    //
+    // Issue #283: this used to prefer this table's own `max_version`.
+    // That is the same unsound assumption as the old global ceiling,
+    // one level down: `max_version` is the highest version this read
+    // HAPPENED to see, and outside a snapshot transaction a lower
+    // version whose commit was still in flight can be invisible to the
+    // very same read (commit_ts is assigned in commit order; visibility
+    // to a READ COMMITTED `CHANGETABLE` reader is not). Advancing to
+    // `max_version` therefore strands the in-flight one exactly as
+    // v41511..41516 was stranded on HF Ville. `errored` is already
+    // handled by the early return above, so this is on the clean path.
+    let per_table_target = settled_ceiling_target(settled_ct_ceiling, last_seen, shadow_mode);
+    if let Some(target_version) = per_table_target {
+        match hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await {
             Err(err) => {
                 // R1: structured event + persisted failure mode so the
                 // 2026-05-14 symptom (UPDATE failure post-commit, no
@@ -3480,7 +5433,7 @@ async fn poll_table(
                     event_name = EV_WATERMARK_ADVANCE_FAIL,
                     table,
                     new_version = target_version,
-                    per_table = per_table_watermark,
+                    per_table = true,
                     error = %err,
                     "Failed to advance CT watermark"
                 );
@@ -3494,16 +5447,14 @@ async fn poll_table(
                     &err.to_string(),
                 )
                 .await;
-                // R3 mirror: when per-table mode is active, also persist
-                // into the per-table row so a per-table watchdog can
-                // attribute the wedge to this specific table.
-                if per_table_watermark {
-                    let payload = format!("[{EV_WATERMARK_ADVANCE_FAIL}] {err}");
-                    let _ = hotel_backend::sync::watermark::record_per_table_error(
-                        pg, table, &payload,
-                    )
-                    .await;
-                }
+                // R3 mirror: also persist into the per-table row so a
+                // per-table watchdog can attribute the wedge to this
+                // specific table.
+                let payload = format!("[{EV_WATERMARK_ADVANCE_FAIL}] {err}");
+                let _ = hotel_backend::sync::watermark::record_per_table_error(
+                    pg, table, &payload,
+                )
+                .await;
             }
             Ok(()) => {
                 tracing::info!(
@@ -3512,19 +5463,19 @@ async fn poll_table(
                     to = target_version,
                     ingested,
                     skipped,
-                    per_table = per_table_watermark,
+                    per_table = true,
                     "Advanced CT watermark"
                 );
             }
         }
-    } else if per_table_watermark {
-        // Live tick with no new CT version (rows were all stale /
-        // coalesced away). Still touch `last_polled_at` so the
+    } else {
+        // Live tick with no new CT version AND no usable tick ceiling
+        // (the pre-loop probe failed). Touch `last_polled_at` so the
         // per-table watchdog doesn't flag the row as wedged.
         let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
     }
 
-    Ok(())
+    Ok(PollOutcome::clean())
 }
 
 /// One CT row returned by [`fetch_ct_rows`]: the version, the
@@ -3639,12 +5590,21 @@ async fn fetch_ct_rows(
 
     let mut out: Vec<CtRow> = Vec::with_capacity(rows.len());
     for r in rows {
-        let version: i64 = r.get("sys_change_version").unwrap_or(0);
+        // Issue #283 audit: the two CT control columns used to be read
+        // with `.unwrap_or(0)` / `.unwrap_or("?")`. Both defaults are
+        // silent corruption — a 0 version drops the row out of
+        // `max_version`, and a "?" op falls through to the unknown-op
+        // branch. Neither is a state we can apply, and a batch we cannot
+        // fully trust must fail the whole fetch so `poll_table` returns
+        // `PollOutcome::failed()` and the watermark holds.
+        let version: i64 = tiberius::Row::try_get::<i64, _>(&r, "sys_change_version")
+            .map_err(|e| format!("{table}: unreadable SYS_CHANGE_VERSION: {e}"))?
+            .ok_or_else(|| format!("{table}: NULL SYS_CHANGE_VERSION in CT projection"))?;
         // SYS_CHANGE_OPERATION is always one of 'I' / 'U' / 'D' (single
         // char); tiberius surfaces it as `&str`.
-        let op_char: String = r
-            .get::<&str, _>("sys_change_operation")
-            .unwrap_or("?")
+        let op_char: String = tiberius::Row::try_get::<&str, _>(&r, "sys_change_operation")
+            .map_err(|e| format!("{table}: unreadable SYS_CHANGE_OPERATION: {e}"))?
+            .ok_or_else(|| format!("{table}: NULL SYS_CHANGE_OPERATION in CT projection"))?
             .to_string();
         out.push((version, op_char, materialise_row(&r, pk_cols, select_sql)));
     }
@@ -4330,6 +6290,88 @@ async fn mark_backfill_skipped(
 /// just wider because cash entries can be back-dated a little).
 const CASH_WINDOW_DAYS: i64 = 120;
 
+/// The `sync_cash_history` per-row UPSERT into canonical `ht_cash_ledger`.
+/// Hoisted to a const (mirrors `sync/mappers/payment.rs::RECEIPT_UPSERT_UPDATE_SQL`)
+/// so a DB-independent shape-guard test can pin the echo-safety property
+/// without needing a live database — see `cash_sync_tests` below.
+///
+/// Conflict target is the `ht_cash_ledger_legacy_id_key` UNIQUE constraint on
+/// `cash_legacy_id` (migration 059) — `TB_Pay_History.id`.
+///
+/// TWO columns in the `DO UPDATE` are provenance-conditional; the rest are
+/// plain `EXCLUDED.*` on purpose. The shared premise: once a future writeback
+/// back-populates `cash_legacy_id` onto an app-originated row, the very next
+/// re-import lands on THAT row, so anything the app knows better than legacy
+/// must survive it — while a genuinely legacy-originated row must still take
+/// every edit iHOTEL makes. Hence `CASE WHEN ht_cash_ledger.cash_source =
+/// 'app'` (the pre-UPDATE value of the existing row) rather than a blanket
+/// `COALESCE`, which would also freeze legacy-originated rows.
+///
+/// 1. **`cash_source`** — never flips `'app'` → `'legacy'`. Losing it would
+///    silently rewrite the row's provenance on every tick. Same class as
+///    `sync/mappers/payment.rs`'s `pay_voided` guard: a legacy re-import must
+///    not undo a canonical-only fact.
+/// 2. **`cash_entry_date`** — an app row keeps its own instant (filled only
+///    when NULL, exactly as `payment.rs` does with
+///    `pay_date = COALESCE(pay_date, $2)`). `POST /api/cash/{income,expense}`
+///    stores a full instant (`routes/new_cash.rs` — `body.entry_date`, or
+///    `Utc::now()` when the client omits it), but the writeback recipe emits a
+///    **date-only** OADate (`writeback/recipes/cash_entry.rs` —
+///    `date_to_ole_serial(bangkok_date(..))`), which `ole_serial_to_utc` below
+///    reads back as naive **midnight Bangkok**. So an unguarded re-import
+///    replaces e.g. 14:32 Bangkok with 00:00 Bangkok: time-of-day is gone and
+///    `ORDER BY cash_entry_date DESC` (the list endpoint) collapses every
+///    re-imported app row into a midnight tie. The Bangkok *calendar day*
+///    survives — `/v2/cash` sends Bangkok-day bounds, so its own buckets do
+///    not move — but the UTC instant shifts 7h+ earlier, into the previous UTC
+///    day, which any UTC-day-bucketed reader of `ix_ht_cash_ledger_entry_date`
+///    would misfile.
+///
+/// Deliberately NOT guarded — a legacy edit must still land, and there is no
+/// better app-side fact to protect:
+/// * `cash_kind` / `cash_legacy_type` / `cash_amount` round-trip faithfully
+///   (Thai `Pay_Type` marker verbatim, 2dp money both sides).
+/// * `cash_bill_no` / `cash_payee` / `cash_note` / `cash_group` /
+///   `cash_account` round-trip a canonical NULL as `''` (the recipe's
+///   `sql_quote_or_empty` — the legacy blank convention, spike §3k). Accepted:
+///   NULL and `''` are both "blank" to every reader (`routes/new_cash.rs`
+///   passes them straight through to the DTO; nothing filters on `IS NULL`),
+///   and a guard here would block a receptionist's genuine iHOTEL edit that
+///   *clears* one of these fields.
+/// * `cash_program_date` round-trips a canonical NULL as the entry date's
+///   midnight (the recipe defaults `Pay_Program` to `Pay_Date`). Accepted: the
+///   app cannot author this column at all — it is absent from the create
+///   INSERT in `routes/new_cash.rs`, so it is always NULL on an app row and
+///   there is no app-authored value to lose. The column's contract is "mirror
+///   of `Pay_Program`", and post-writeback legacy really does hold that value.
+/// * `cash_created_by` needs no guard: it is deliberately absent from the SET
+///   list, so it is already preserved as-is.
+/// * There is no voided / deleted column on `ht_cash_ledger` (migration 059),
+///   so the `pay_voided` monotonicity half of the `payment.rs` precedent has
+///   no analogue here.
+const CASH_HISTORY_UPSERT_SQL: &str = "INSERT INTO ht_cash_ledger ( \
+         cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \
+         cash_bill_no, cash_payee, cash_amount, cash_note, \
+         cash_program_date, cash_group, cash_account, cash_source \
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, 'legacy') \
+     ON CONFLICT (cash_legacy_id) DO UPDATE SET \
+         cash_kind         = EXCLUDED.cash_kind, \
+         cash_legacy_type  = EXCLUDED.cash_legacy_type, \
+         cash_entry_date   = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN COALESCE(ht_cash_ledger.cash_entry_date, \
+                                                 EXCLUDED.cash_entry_date) \
+                                   ELSE EXCLUDED.cash_entry_date END, \
+         cash_bill_no      = EXCLUDED.cash_bill_no, \
+         cash_payee        = EXCLUDED.cash_payee, \
+         cash_amount       = EXCLUDED.cash_amount, \
+         cash_note         = EXCLUDED.cash_note, \
+         cash_program_date = EXCLUDED.cash_program_date, \
+         cash_group        = EXCLUDED.cash_group, \
+         cash_account      = EXCLUDED.cash_account, \
+         cash_source       = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN 'app' ELSE 'legacy' END, \
+         cash_synced_at    = NOW()";
+
 /// Convert a legacy OLE-Automation date serial (`TB_Pay_History.Pay_Date` /
 /// `Pay_Program` are `float` OADates — `DateTime.ToOADate()`, days since
 /// 1899-12-30 with the fractional part = fraction of a 24h day) into a true UTC
@@ -4496,6 +6538,52 @@ async fn sync_cash_categories(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
 ///
 /// **Resilience**: identical to `sync_round_bills` — every error path logs at
 /// WARN and returns/continues; shadow mode skips the canonical write.
+///
+/// ## ECHO-SAFETY (issue #202) — verified alignment + the provenance-clobber fix
+///
+/// This UPSERT dedups `ON CONFLICT (cash_legacy_id)`, i.e. on
+/// `TB_Pay_History.id`. That is ALREADY the same column
+/// `writeback/recipes/cash_entry.rs::build_statements`'s `legacy_id` parameter
+/// writes into `TB_Pay_History.id` (see that module's doc comment) — so once a
+/// future `WritebackIntent::CreateCashEntry` back-populates the allocated id
+/// onto this row's `cash_legacy_id` (mirroring `back_populate_legacy_ids` →
+/// `legacy_receipt_no` for payments), a re-import of that same legacy row
+/// UPDATEs the matched app row instead of inserting a second one. No column
+/// rename was needed here — unlike the payment bug (which read the WRONG
+/// column, `pay_reference`, for app-originated rows), this importer already
+/// targeted the right one.
+///
+/// What WAS wrong, and is fixed below — TWO instances of the same "legacy
+/// re-import clobbers an app-authoritative fact" class that
+/// `sync/mappers/payment.rs` guards against (`pay_voided` and `pay_date`
+/// respectively):
+///
+/// 1. the `DO UPDATE` unconditionally set `cash_source = 'legacy'`, silently
+///    stripping an app-originated row's `'app'` provenance on every
+///    re-import;
+/// 2. it also unconditionally set `cash_entry_date = EXCLUDED.cash_entry_date`,
+///    replacing the app's full instant with the **midnight-Bangkok** value the
+///    date-only writeback OADate round-trips back as.
+///
+/// Both are now provenance-conditional in [`CASH_HISTORY_UPSERT_SQL`]; that
+/// const's doc comment is the authoritative per-column ledger of what is
+/// guarded, what is deliberately left on `EXCLUDED.*`, and why (the string
+/// columns' NULL → `''` and `cash_program_date`'s NULL → entry-date round
+/// trips are named there as accepted). A legacy-originated row still takes
+/// every column from `EXCLUDED`, unchanged.
+///
+/// **Still open** (out of scope here — requires `dispatcher.rs` /
+/// `bin/writeback.rs`, not owned by this fix): `ht_cash_ledger` has no
+/// `aggregate_id` column and there is no `WritebackIntent::CreateCashEntry` /
+/// `back_populate_legacy_ids` arm at all, so nothing actually stamps
+/// `cash_legacy_id` onto an app row today. Cash-outbound writeback MUST NOT
+/// be enabled until that back-population step exists — without it, an
+/// app-originated entry's `cash_legacy_id` stays NULL forever, this UPSERT's
+/// `ON CONFLICT` never fires for it, and every re-import tick inserts a
+/// genuine duplicate row (the scenario
+/// [`cash_sync_tests::reimport_without_backpopulation_still_duplicates`]
+/// pins as a known, accepted gap — not something this importer can close
+/// alone).
 async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
     // Pre-compute the OADate cutoff serial for (today − CASH_WINDOW_DAYS) in
     // Bangkok local time, so the legacy comparison stays a cheap float >=.
@@ -4612,43 +6700,11 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
         }
 
         // Runtime `sqlx::query` (NOT the `query!` macro) so this adds nothing
-        // to the `.sqlx/` offline cache. `$6::numeric` mirrors the f64→NUMERIC
+        // to the `.sqlx/` offline cache. `$7::numeric` mirrors the f64→NUMERIC
         // convention used by sync_round_bills. Idempotent UPSERT keyed on
-        // cash_legacy_id; cash_source is forced to 'legacy' (this is the
-        // legacy mirror path).
-        //
-        // ECHO-SAFETY (issue #202): this UPSERT dedups on `cash_legacy_id`, so it
-        // is echo-safe ONLY if an app-originated cash entry already carries its
-        // allocated legacy id in `cash_legacy_id` by the time this mirror re-reads
-        // it. Cash-OUTBOUND writeback (`writeback/recipes/cash_entry.rs`) is
-        // currently DARK, so no echo occurs today. BEFORE enabling it, the worker
-        // MUST back-populate `cash_legacy_id` onto the canonical row after the
-        // writeback allocates the legacy id (the same pattern payments use:
-        // `back_populate_legacy_ids` → `legacy_receipt_no`, which the HT_Receipt_H
-        // importer then dedups on — see `sync/mappers/payment.rs`). Without that
-        // back-population, our own cash write re-imports here as a phantom
-        // duplicate (`cash_source='legacy'`, app's original keeps `cash_legacy_id`
-        // NULL). Verify before flipping cash-outbound writeback.
-        let res = sqlx::query(
-            "INSERT INTO ht_cash_ledger ( \
-                 cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \
-                 cash_bill_no, cash_payee, cash_amount, cash_note, \
-                 cash_program_date, cash_group, cash_account, cash_source \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, 'legacy') \
-             ON CONFLICT (cash_legacy_id) DO UPDATE SET \
-                 cash_kind         = EXCLUDED.cash_kind, \
-                 cash_legacy_type  = EXCLUDED.cash_legacy_type, \
-                 cash_entry_date   = EXCLUDED.cash_entry_date, \
-                 cash_bill_no      = EXCLUDED.cash_bill_no, \
-                 cash_payee        = EXCLUDED.cash_payee, \
-                 cash_amount       = EXCLUDED.cash_amount, \
-                 cash_note         = EXCLUDED.cash_note, \
-                 cash_program_date = EXCLUDED.cash_program_date, \
-                 cash_group        = EXCLUDED.cash_group, \
-                 cash_account      = EXCLUDED.cash_account, \
-                 cash_source       = 'legacy', \
-                 cash_synced_at    = NOW()",
-        )
+        // cash_legacy_id — see [`CASH_HISTORY_UPSERT_SQL`] and this function's
+        // doc comment for the echo-safety analysis (issue #202).
+        let res = sqlx::query(CASH_HISTORY_UPSERT_SQL)
         .bind(legacy_id)
         .bind(kind)
         .bind(&pay_type)
@@ -4688,7 +6744,8 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
 }
 
 /// Normalize the legacy `SMS_Readed` varchar marker ('yes' / 'no', lowercase
-/// per `docs/legacy-app/COMPAT_CHEATSHEET.md:98`) into the canonical
+/// per `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.5 Boolean conventions"
+/// "`SMS_Readed` (HT_Room_SMS, HT_EMP_SMS) → `'yes'` / `'no'`") into the canonical
 /// `note_is_read` bool. Anything other than a case-insensitive "yes" is treated
 /// as unread (the legacy default on insert is 'no'). PURE.
 fn sms_readed_to_bool(readed: &str) -> bool {
@@ -4865,7 +6922,7 @@ mod sticky_note_sync_tests {
 
 #[cfg(test)]
 mod cash_sync_tests {
-    use super::{cash_kind_from_pay_type, ole_serial_to_utc};
+    use super::{cash_kind_from_pay_type, ole_serial_to_utc, CASH_HISTORY_UPSERT_SQL};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -4901,6 +6958,473 @@ mod cash_sync_tests {
         assert_eq!(cash_kind_from_pay_type("จ่ายค่าน้ำ"), "expense");
         assert_eq!(cash_kind_from_pay_type(""), "unknown");
         assert_eq!(cash_kind_from_pay_type("misc"), "unknown");
+    }
+
+    // -----------------------------------------------------------------
+    // Echo-safety (issue #202) — dedup column alignment + the
+    // provenance-clobber fix. See `sync_cash_history`'s doc comment for
+    // the full analysis.
+    // -----------------------------------------------------------------
+
+    /// Shape guard — runs with NO database, so the invariant is pinned even
+    /// on a machine where the behavioural tests below skip. Locks both
+    /// halves: the conflict target is `cash_legacy_id` (the column
+    /// `writeback/recipes/cash_entry.rs` documents it will stamp the
+    /// legacy id into), and `cash_source` must fold in the existing value
+    /// rather than being assigned unconditionally.
+    #[test]
+    fn cash_history_upsert_dedups_on_legacy_id_and_preserves_app_source() {
+        let sql = CASH_HISTORY_UPSERT_SQL;
+        assert!(
+            sql.contains("ON CONFLICT (cash_legacy_id) DO UPDATE"),
+            "conflict target must be cash_legacy_id — the column the (dark) \
+             cash-outbound writeback documents it will stamp TB_Pay_History.id \
+             into; got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "cash_source       = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN 'app' ELSE 'legacy' END"
+            ),
+            "cash_source must fold in the existing value — a bare \
+             `cash_source = 'legacy'` lets a legacy re-import silently strip an \
+             app-originated row's provenance the moment cash_legacy_id is ever \
+             back-populated; got: {sql}"
+        );
+        assert!(
+            !sql.contains("cash_source       = 'legacy',"),
+            "cash_source must never be assigned unconditionally in the DO \
+             UPDATE branch; got: {sql}"
+        );
+    }
+
+    /// Shape guard for the SECOND provenance-conditional column, `cash_entry_date`
+    /// — the analogue of `sync/mappers/payment.rs`'s
+    /// `pay_date = COALESCE(pay_date, $2)`. Also DB-independent. The `CASE`
+    /// (not a bare `COALESCE`) is load-bearing in BOTH directions: it keeps an
+    /// app row's precise instant, and it leaves a legacy-originated row free
+    /// to take an iHOTEL date edit.
+    #[test]
+    fn cash_history_upsert_never_downgrades_an_app_entry_date() {
+        let sql = CASH_HISTORY_UPSERT_SQL;
+        assert!(
+            sql.contains(
+                "cash_entry_date   = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN COALESCE(ht_cash_ledger.cash_entry_date, \
+                                                 EXCLUDED.cash_entry_date) \
+                                   ELSE EXCLUDED.cash_entry_date END"
+            ),
+            "cash_entry_date must keep an app row's own instant (fill-when-NULL \
+             only) while still letting a legacy-originated row take an iHOTEL \
+             edit — the writeback emits a DATE-ONLY OADate, so a bare \
+             `EXCLUDED.cash_entry_date` re-import truncates the app's \
+             timestamp to midnight Bangkok; got: {sql}"
+        );
+        assert!(
+            !sql.contains("cash_entry_date   = EXCLUDED.cash_entry_date,"),
+            "cash_entry_date must never be assigned unconditionally in the DO \
+             UPDATE branch; got: {sql}"
+        );
+    }
+
+    /// Column subset the behavioural tests need — mirrors migration 059
+    /// closely enough to satisfy [`CASH_HISTORY_UPSERT_SQL`]. `ON COMMIT
+    /// DROP` plus the enclosing rollback means no real row is ever touched,
+    /// even when `DATABASE_URL` points at a populated database (CI does).
+    const CASH_PROBE_DDL: &str = "CREATE TEMP TABLE ht_cash_ledger ( \
+             cash_id           BIGSERIAL PRIMARY KEY, \
+             cash_legacy_id    INTEGER, \
+             cash_kind         VARCHAR(20)  NOT NULL DEFAULT 'unknown', \
+             cash_legacy_type  VARCHAR(50), \
+             cash_entry_date   TIMESTAMPTZ, \
+             cash_bill_no      VARCHAR(255), \
+             cash_payee        VARCHAR(500), \
+             cash_amount       NUMERIC(14,2) NOT NULL DEFAULT 0, \
+             cash_note         VARCHAR(500), \
+             cash_program_date TIMESTAMPTZ, \
+             cash_group        VARCHAR(50), \
+             cash_account      VARCHAR(50), \
+             cash_source       VARCHAR(20)  NOT NULL DEFAULT 'legacy', \
+             cash_created_by   VARCHAR(100), \
+             cash_synced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(), \
+             CONSTRAINT ht_cash_ledger_legacy_id_key UNIQUE (cash_legacy_id) \
+         ) ON COMMIT DROP";
+
+    /// Open a live PG connection for the behavioural tests, or `None` when
+    /// none is configured — `cargo test --lib` (and `--bins`) must stay
+    /// green on a machine with no database. CI sets `DATABASE_URL`
+    /// (`.github/workflows/docker-build.yml`), so these run for real there.
+    /// Mirrors `sync::mappers::payment::tests::void_probe_conn`.
+    async fn cash_probe_conn() -> Option<sqlx::PgConnection> {
+        use sqlx::Connection;
+        let url = std::env::var("SYNC_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        match sqlx::PgConnection::connect(&url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("cash echo-safety probe SKIPPED — cannot connect to PG: {e}");
+                None
+            }
+        }
+    }
+
+    async fn cash_probe_tx(conn: &mut sqlx::PgConnection) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        use sqlx::Connection;
+        let mut tx = conn.begin().await.expect("begin");
+        sqlx::query(CASH_PROBE_DDL)
+            .execute(&mut *tx)
+            .await
+            .expect("create temp ht_cash_ledger");
+        // `pg_temp` is searched first for relations anyway; pin it
+        // explicitly so the shadow is not implementation-dependent.
+        sqlx::query("SET LOCAL search_path = pg_temp, public")
+            .execute(&mut *tx)
+            .await
+            .expect("set search_path");
+        tx
+    }
+
+    /// Run the EXACT importer UPSERT for a re-import of `legacy_id` with a
+    /// fixed, arbitrary payload (content doesn't matter for these tests —
+    /// only the conflict/no-conflict behaviour does).
+    async fn run_cash_upsert(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, legacy_id: i32) {
+        let entry_date = Utc.with_ymd_and_hms(2026, 7, 31, 7, 0, 0).unwrap();
+        run_cash_upsert_at(tx, legacy_id, entry_date).await;
+    }
+
+    /// [`run_cash_upsert`] with the incoming `cash_entry_date` under the
+    /// caller's control — the date-guard tests need to feed the
+    /// **midnight-Bangkok** instant a date-only legacy OADate round-trips
+    /// back as (`ole_serial_to_utc` of `date_to_ole_serial(bangkok_date(..))`).
+    async fn run_cash_upsert_at(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        legacy_id: i32,
+        entry_date: chrono::DateTime<Utc>,
+    ) {
+        sqlx::query(CASH_HISTORY_UPSERT_SQL)
+            .bind(legacy_id)
+            .bind("income")
+            .bind("รายรับ")
+            .bind(entry_date)
+            .bind("B-100")
+            .bind("ลูกค้า")
+            .bind(500.0_f64)
+            .bind("re-imported")
+            .bind(None::<chrono::DateTime<Utc>>)
+            .bind(None::<String>)
+            .bind(None::<String>)
+            .execute(&mut **tx)
+            .await
+            .expect("cash UPSERT must execute");
+    }
+
+    /// The exact instant a date-only writeback OADate round-trips back as for
+    /// a 2026-04-24 Bangkok entry: `bangkok_date` → 2026-04-24,
+    /// `date_to_ole_serial` → a whole-day serial (no time fraction),
+    /// `ole_serial_to_utc` → 2026-04-24 00:00 **Bangkok** = 17:00Z the day
+    /// before. Sanity-checked against the real converter in
+    /// [`midnight_bangkok_fixture_matches_ole_round_trip`].
+    fn midnight_bkk_2026_04_24() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 23, 17, 0, 0).unwrap()
+    }
+
+    /// The app-authored instant that must survive: 2026-04-24 14:32 Bangkok.
+    fn app_instant_2026_04_24_1432() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 24, 7, 32, 0).unwrap()
+    }
+
+    /// Pins the premise of the date guard with the REAL converter rather than
+    /// a hand-computed constant: the writeback recipe's date-only OADate for
+    /// 2026-04-24 Bangkok (46136 — the same serial
+    /// `writeback::recipes::cash_entry`'s own tests assert) reads back through
+    /// [`ole_serial_to_utc`] as midnight Bangkok, i.e. 14h32m EARLIER than the
+    /// app instant and on the previous UTC day. If this ever goes green-by-
+    /// accident (e.g. the recipe starts emitting a time fraction), the guard
+    /// below can be revisited. No DB needed.
+    #[test]
+    fn midnight_bangkok_fixture_matches_ole_round_trip() {
+        let round_tripped = ole_serial_to_utc(46136.0).expect("46136 is a valid OADate");
+        assert_eq!(round_tripped, midnight_bkk_2026_04_24());
+        let app = app_instant_2026_04_24_1432();
+        assert!(
+            round_tripped < app,
+            "the round trip must move the instant BACKWARDS ({round_tripped} vs {app})"
+        );
+        assert_eq!(
+            (app - round_tripped).num_minutes(),
+            14 * 60 + 32,
+            "date-only round trip loses exactly the app entry's time-of-day"
+        );
+        assert_ne!(
+            round_tripped.date_naive(),
+            app.date_naive(),
+            "…and lands on the previous UTC day"
+        );
+    }
+
+    /// THE BUG this fix closes: once `cash_legacy_id` is back-populated onto
+    /// an app-originated row (the precondition `writeback/recipes/cash_entry.rs`
+    /// documents), the poll's next re-import of that same legacy row must
+    /// UPDATE it in place — WITHOUT silently downgrading `cash_source` from
+    /// `'app'` to `'legacy'`. Red on the pre-fix SQL (`cash_source` was
+    /// assigned unconditionally); green once the `CASE` folds in the
+    /// existing value.
+    #[tokio::test]
+    async fn reimporting_a_backpopulated_app_row_preserves_app_provenance() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_amount, cash_source, cash_created_by) \
+             VALUES (500, 'income', 500.00, 'app', 'reception_alice')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed app-originated row");
+
+        run_cash_upsert(&mut tx, 500).await;
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT cash_source, cash_created_by FROM ht_cash_ledger WHERE cash_legacy_id = 500",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-importing a back-populated row must UPDATE it, not insert a \
+             second row: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "app",
+            "cash_source must stay 'app' — a legacy re-import must never \
+             strip an app-originated row's provenance"
+        );
+        assert_eq!(
+            rows[0].1,
+            Some("reception_alice".to_string()),
+            "cash_created_by must be untouched by a re-import"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction that must keep working unchanged: a legacy-originated
+    /// row (never touched by our app) re-imports normally — content
+    /// refreshes, `cash_source` stays `'legacy'`. Regression guard for the
+    /// `CASE` added above.
+    #[tokio::test]
+    async fn legacy_originated_reimport_still_updates_and_stays_legacy() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES (600, 'expense', 100.00, 'legacy')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed legacy-originated row");
+
+        run_cash_upsert(&mut tx, 600).await;
+
+        let rows: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT cash_source, cash_amount::float8 FROM ht_cash_ledger WHERE cash_legacy_id = 600",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "legacy");
+        assert_eq!(
+            rows[0].1, 500.0,
+            "a legacy-originated row must still pick up refreshed content"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// THE SECOND HALF of the same bug class (the one the const's doc comment
+    /// used to claim was covered): a back-populated app row's PRECISE
+    /// `cash_entry_date` must survive a re-import that carries the
+    /// midnight-truncated date the date-only writeback OADate round-trips
+    /// back as. Also asserts the guard is SURGICAL — the unguarded columns
+    /// (`cash_amount`, `cash_note`) still refresh from `EXCLUDED`, so this is
+    /// not a blanket freeze of the app row.
+    #[tokio::test]
+    async fn reimporting_a_backpopulated_app_row_preserves_its_precise_entry_date() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        let app_instant = app_instant_2026_04_24_1432();
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_note, cash_source) \
+             VALUES (700, 'income', $1, 111.00, 'app note', 'app')",
+        )
+        .bind(app_instant)
+        .execute(&mut *tx)
+        .await
+        .expect("seed app-originated row with a precise instant");
+
+        // The legacy mirror of our own write: Pay_Date is a whole-day OADate,
+        // so it reads back as midnight Bangkok (17:00Z the previous day).
+        run_cash_upsert_at(&mut tx, 700, midnight_bkk_2026_04_24()).await;
+
+        let rows: Vec<(chrono::DateTime<Utc>, f64, Option<String>)> = sqlx::query_as(
+            "SELECT cash_entry_date, cash_amount::float8, cash_note \
+               FROM ht_cash_ledger WHERE cash_legacy_id = 700",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(rows.len(), 1, "must UPDATE in place, not insert: {rows:?}");
+        assert_eq!(
+            rows[0].0, app_instant,
+            "cash_entry_date must keep the app's 14:32 Bangkok instant — a \
+             date-only legacy re-import must not truncate it to midnight"
+        );
+        assert_eq!(
+            rows[0].1, 500.0,
+            "the guard is scoped to cash_entry_date: cash_amount must still \
+             refresh from the legacy row"
+        );
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some("re-imported"),
+            "the guard is scoped to cash_entry_date: cash_note must still \
+             refresh from the legacy row"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction that must keep working: a legacy-originated entry keeps
+    /// tracking the legacy row's `Pay_Date` on every re-import. This is why
+    /// the guard is a provenance `CASE` rather than the bare
+    /// `COALESCE(cash_entry_date, $2)` `sync/mappers/payment.rs` uses — the
+    /// `CASE` is a strict superset of it: same fill-when-absent behaviour on
+    /// app rows, but legacy rows stay legacy-authoritative.
+    ///
+    /// That matters because `TB_Pay_History.Pay_Date` is not derived from the
+    /// insert; it is whatever the operator picked in the entry form
+    /// (`DateTimePicker1.Value.ToOADate()` —
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §"1.4 Date/time handling"
+    /// "DateTimePicker1.Value.ToOADate()"), so we hold nothing that
+    /// could reconstruct it. Combined with the importer's 120-day rescan
+    /// window ([`CASH_WINDOW_DAYS`]), a blanket COALESCE would permanently
+    /// freeze whatever value the FIRST poll to see the row happened to
+    /// observe, for every row, forever.
+    #[tokio::test]
+    async fn legacy_originated_reimport_still_updates_its_entry_date() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_source) \
+             VALUES (800, 'expense', $1, 100.00, 'legacy')",
+        )
+        .bind(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("seed legacy-originated row");
+
+        run_cash_upsert_at(&mut tx, 800, midnight_bkk_2026_04_24()).await;
+
+        let date: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT cash_entry_date FROM ht_cash_ledger WHERE cash_legacy_id = 800",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            date,
+            midnight_bkk_2026_04_24(),
+            "a legacy-originated row's date must stay legacy-authoritative"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The `COALESCE` half of the guard: an app row with NO date yet (the
+    /// column is nullable) must still be FILLED by the re-import rather than
+    /// left blank — same fill-when-absent semantics as
+    /// `sync/mappers/payment.rs`'s `pay_date = COALESCE(pay_date, $2)`.
+    #[tokio::test]
+    async fn reimport_fills_a_null_entry_date_on_an_app_row() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_source) \
+             VALUES (900, 'income', NULL, 100.00, 'app')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed app row with no date");
+
+        run_cash_upsert_at(&mut tx, 900, midnight_bkk_2026_04_24()).await;
+
+        let date: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT cash_entry_date FROM ht_cash_ledger WHERE cash_legacy_id = 900",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            date,
+            Some(midnight_bkk_2026_04_24()),
+            "guarding must not mean 'never write' — a NULL app date is filled"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// PINS THE KNOWN, ACCEPTED GAP (issue #202, "still open" in
+    /// `sync_cash_history`'s doc comment) — NOT something this importer can
+    /// fix alone. An app row whose `cash_legacy_id` was never back-populated
+    /// (because no `WritebackIntent::CreateCashEntry` /
+    /// `back_populate_legacy_ids` arm exists yet) has no way to be found by
+    /// `ON CONFLICT (cash_legacy_id)`, so the "same" transaction re-imported
+    /// under a legacy id lands as a genuine second row. This test exists so
+    /// nobody mistakes the provenance fix above for having closed this —
+    /// closing it requires wiring back-population (`dispatcher.rs` /
+    /// `bin/writeback.rs`, out of scope for this importer).
+    #[tokio::test]
+    async fn reimport_without_backpopulation_still_duplicates() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES (NULL, 'income', 500.00, 'app')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed un-backpopulated app row");
+
+        // The legacy mirror of that same transaction arrives as a NEW
+        // legacy id (500) because nothing stamped it onto the app row above.
+        run_cash_upsert(&mut tx, 500).await;
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ht_cash_ledger")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
+        assert_eq!(
+            total, 2,
+            "documented gap: without back-population this importer cannot \
+             avoid a duplicate — if this now reads 1, back-population has \
+             been wired and this test (and the doc comment pointing at it) \
+             should be updated, not deleted"
+        );
+        tx.rollback().await.expect("rollback");
     }
 }
 
@@ -5061,8 +7585,16 @@ async fn bump_counters(
     Ok(())
 }
 
-/// Decide whether (and to what version) the CT watermark should advance
-/// at the end of a per-table tick.
+/// How far this table's CT read reached, for OBSERVABILITY only.
+///
+/// Issue #283 removed its last decision-making call site: `max_version`
+/// is the highest version a read HAPPENED to return and is NOT a safe
+/// watermark target (a lower version whose commit was in flight can be
+/// invisible to that same read). Watermark advances — global and
+/// per-table — now come exclusively from [`settled_ceiling_target`] /
+/// [`global_watermark_target`]. What remains here is the `from → applied_through`
+/// breadcrumb operators grep for, plus the `errored` short-circuit that
+/// suppresses it on a held tick.
 ///
 /// Returns `Some(target_version)` when the caller should advance, or
 /// `None` when the watermark must stay pinned at `last_seen` so the
@@ -5099,6 +7631,162 @@ fn next_watermark_after_tick(
     } else {
         None
     }
+}
+
+/// Global-mode watermark target for one completed tick.
+///
+/// `tick_ct_ceiling` is `CHANGE_TRACKING_CURRENT_VERSION()` sampled
+/// BEFORE the mapper loop (`None` when that probe failed). Returns
+/// `None` when any table errored (hold for retry) or when there is no
+/// forward progress.
+///
+/// ## Why the ceiling and not `max(SYS_CHANGE_VERSION)`
+///
+/// The global row is SHARED by all 18 CT tables, and `advance` is
+/// monotonic-max. Advancing it per table, to that table's own
+/// `max_version`, therefore ends every tick at the MAX across tables —
+/// so a table polled EARLY gets its resume point dragged past rows it
+/// never read. One iHOTEL save writes many CT tables in a single
+/// transaction, and `build_mappers` preserves `CT_ENABLED_TABLES` order
+/// with `HT_Customers` first and `HT_Book_Pro` last, which is precisely
+/// the window that lost customer C2413 + booking R002066 on HF Ville
+/// 2026-07-11: the save landed at v30789 after `HT_Customers` had
+/// already polled, `HT_Book_Pro` then advanced the shared watermark
+/// 30788 → 30801, and nothing ever re-read v30789. CT's 2-day retention
+/// aged it out. Nothing failed, so nothing was logged.
+///
+/// ## The ceiling must be SETTLED, not merely sampled-first (issue #283)
+///
+/// This fn's contract changed on 2026-08-10. It used to claim the
+/// sampled ceiling was "immune by construction: every table is polled at
+/// or after the sample instant, so it has read through at least that
+/// version". That is FALSE outside a snapshot transaction and HF Ville
+/// proved it: tick `2026-08-05T07:20:06Z` sampled v41516, read
+/// `HT_Room_Status` 40ms later and saw nothing above v41510, and
+/// advanced 41503 → 41516 — permanently stranding `HT_Room_Status.id
+/// =4799`, whose commit was in flight across that window. `commit_ts` is
+/// assigned in commit order; visibility to a READ COMMITTED
+/// `CHANGETABLE` reader is not, so "polled later" implies nothing about
+/// "saw everything at or below".
+///
+/// `settled_ct_ceiling` is therefore NOT this tick's sample. It is one
+/// parked by [`CeilingGate`] on an earlier tick and released only after
+/// [`DEFAULT_CT_CEILING_SETTLE_MS`], so every read in this tick provably
+/// post-dates it by that margin. It stays deliberately conservative — a
+/// tick may re-read rows it already applied, which is safe because
+/// re-applying a CT row is idempotent across the mapper stack (the same
+/// assumption the per-table `errored` hold has always relied on).
+fn global_watermark_target(
+    settled_ct_ceiling: Option<i64>,
+    last_seen: i64,
+    any_table_errored: bool,
+) -> Option<i64> {
+    if any_table_errored {
+        return None;
+    }
+    match settled_ct_ceiling {
+        Some(ceiling) if ceiling > last_seen => Some(ceiling),
+        _ => None,
+    }
+}
+
+/// The ONLY watermark target a per-table advance may use: a ceiling that
+/// has settled (see [`CeilingGate`]). Both call sites — the empty-fetch
+/// branch and the end-of-poll advance — are structurally on the
+/// non-errored path.
+///
+/// Renamed from `quiet_table_watermark_target` by issue #283. It used to
+/// serve only the "polled and found nothing" case, with a table that DID
+/// see rows advancing to its own `max_version` instead. That second path
+/// is gone: `max_version` is the highest version a read HAPPENED to
+/// return, which says nothing about a lower version whose commit was
+/// still in flight during that same read — the exact skew that stranded
+/// four HF Ville calendar nights. See [`global_watermark_target`].
+///
+/// It also remains the anti-freeze rule it always was: without it a
+/// permanently-quiet table only ever gets its `last_polled_at` touched,
+/// `last_seen_version` freezes while MSSQL's
+/// `CHANGE_TRACKING_MIN_VALID_VERSION` marches forward, and it
+/// eventually trips the retention-overflow refusal having done nothing
+/// wrong. On HF Ville that is `HT_Cupon`, `HT_Deposit`,
+/// `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`, `HT_CheckIn_Product` and
+/// `HT_Receipt_H` — all 0 rows ingested since CT was enabled.
+///
+/// Shadow mode never advances (nothing was applied), and no settled
+/// ceiling yet (`None`) simply defers to the next tick.
+fn settled_ceiling_target(
+    settled_ct_ceiling: Option<i64>,
+    last_seen: i64,
+    shadow_mode: bool,
+) -> Option<i64> {
+    if shadow_mode {
+        return None;
+    }
+    match settled_ct_ceiling {
+        Some(ceiling) if ceiling > last_seen => Some(ceiling),
+        _ => None,
+    }
+}
+
+/// Conservative global floor for per-table mode: the minimum watermark
+/// across the tables this process polls. `None` when there is nothing
+/// safe to write (an empty table list — e.g. an allowlist that matched
+/// no mapper — must not turn an empty `min()` into a fabricated 0).
+///
+/// This is what keeps `legacy_ct_state` moving while
+/// `SYNC_PER_TABLE_WATERMARK=true` (issue #259). The MINIMUM is the only
+/// safe choice: it can never exceed any table's real progress, so a
+/// process resuming from the global row — the watchdog reading it, a
+/// rollback to global mode, `/health`, `scripts/sync-status.sh` — can
+/// only ever re-read CT rows that were already applied (idempotent
+/// across the mapper stack), never skip one. Writing the MAX, or this
+/// tick's ceiling, would recreate the mid-loop-arrival silent-drop class
+/// documented on [`global_watermark_target`].
+///
+/// A table with no row yet counts as `0` — same resume semantics as
+/// `run_one_tick`'s `unwrap_or(0)` and `preflight_watermark` — which
+/// drags the floor to 0. That is correct and harmless: [`advance`]'s
+/// monotonic `WHERE last_seen_version <= $1` turns a 0 floor into a
+/// no-op on an already-advanced row.
+///
+/// [`advance`]: hotel_backend::sync::watermark::advance
+fn global_floor_from_per_table(per_table: &HashMap<String, i64>, tables: &[&str]) -> Option<i64> {
+    tables
+        .iter()
+        .map(|t| per_table.get(*t).copied().unwrap_or(0))
+        .min()
+}
+
+/// The watermark the STARTUP gates (cold-replay refusal,
+/// retention-overflow refusal) must reason about.
+///
+/// Global mode: the single `legacy_ct_state` row, unchanged.
+///
+/// Per-table mode: the MINIMUM `last_seen_version` across the tables
+/// this process will actually poll — the true floor of the replay. The
+/// global row is a derived, allowlist-blind echo of that minimum once
+/// `SYNC_PER_TABLE_WATERMARK=true` (see [`global_floor_from_per_table`]),
+/// so pre-flighting on it would hide exactly the failure the per-table
+/// split exists to expose: one table wedged at an ancient version while
+/// the global row looks current. A table with NO row yet defaults to `0`
+/// (matching `run_one_tick`'s `unwrap_or(0)` resume semantics), which
+/// drags the floor to 0 and correctly trips the cold-replay refusal —
+/// the fix is to seed its row, the way migration 056 did for
+/// `HT_Book_Pro`.
+fn preflight_watermark(
+    per_table: bool,
+    global: i64,
+    per_table_map: &std::collections::HashMap<String, i64>,
+    tables: &[&str],
+) -> i64 {
+    if !per_table {
+        return global;
+    }
+    tables
+        .iter()
+        .map(|t| per_table_map.get(*t).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(global)
 }
 
 /// Persist a per-table failure mode to `legacy_sync_status` for
@@ -5537,6 +8225,712 @@ mod tests {
     #[test]
     fn next_watermark_after_tick_holds_on_error_with_no_progress() {
         assert_eq!(next_watermark_after_tick(90, 90, true), None);
+    }
+
+    // ========================================================================
+    // Mid-loop-arrival silent-drop fix — the GLOBAL watermark is the TICK's,
+    // written once from a ceiling sampled BEFORE the mapper loop.
+    //
+    // HF Ville 2026-07-11: the tick read global watermark 30788.
+    // `HT_Customers` (CT_ENABLED_TABLES index 0, polled FIRST) found
+    // nothing. iHOTEL then wrote customer C2413 + booking R002066 at
+    // v≈30789 while the loop was still running. `HT_Book_Pro` (index 18,
+    // polled LAST at 03:50:53) found its own rows and advanced the SHARED
+    // watermark 30788 → 30801. Every table resumed at 30801 next tick, so
+    // C2413's v30789 was never fetched and aged out of CT's 2-day
+    // retention. Nothing errored, so nothing was logged.
+    // ========================================================================
+
+    /// Happy path: no table errored and the pre-loop ceiling is ahead of
+    /// the watermark we resumed from — advance to the ceiling.
+    #[test]
+    fn global_watermark_target_advances_to_sampled_ceiling() {
+        assert_eq!(
+            global_watermark_target(Some(30801), 30788, false),
+            Some(30801),
+            "clean tick must advance the global watermark to the sampled CT ceiling"
+        );
+    }
+
+    /// THE regression test for the mid-loop-arrival class.
+    ///
+    /// Replays HF Ville 2026-07-11 with the fix in place: the ceiling is
+    /// sampled BEFORE the loop, when CT was still at 30788. Customer
+    /// C2413 / booking R002066 land at v30789 mid-loop and `HT_Book_Pro`
+    /// observes versions up to 30801 — but none of that can reach the
+    /// global advance any more, because the only input is the 30788
+    /// ceiling. No progress ⇒ no write ⇒ every table resumes at 30788
+    /// next tick and re-reads v30789. That is the whole fix.
+    #[test]
+    fn global_watermark_target_ignores_versions_that_landed_mid_loop() {
+        assert_eq!(
+            global_watermark_target(Some(30788), 30788, false),
+            None,
+            "ceiling sampled pre-loop equals last_seen ⇒ no advance, so C2413/R002066 \
+             at v30789 survive to the next tick instead of being skipped to 30801"
+        );
+    }
+
+    /// Any table failing anywhere in the tick holds the ENTIRE global
+    /// advance — we cannot prove that table read through the ceiling,
+    /// and a shared row has no way to hold just its slice.
+    #[test]
+    fn global_watermark_target_holds_when_any_table_errored() {
+        assert_eq!(
+            global_watermark_target(Some(30801), 30788, true),
+            None,
+            "one errored table MUST hold the whole global advance for retry next tick"
+        );
+    }
+
+    /// The pre-loop `CHANGE_TRACKING_CURRENT_VERSION()` probe failed, so
+    /// there is no version we can prove every table read through. Hold;
+    /// the mappers still ran and the next tick re-samples.
+    #[test]
+    fn global_watermark_target_holds_when_ceiling_probe_failed() {
+        assert_eq!(
+            global_watermark_target(None, 30788, false),
+            None,
+            "no ceiling ⇒ nothing safe to write ⇒ hold"
+        );
+    }
+
+    /// Defensive: a ceiling BELOW the watermark (clock/bootstrap skew,
+    /// or a re-pointed legacy server) must never roll the watermark
+    /// backward. `advance`'s SQL guard would reject it anyway; the
+    /// helper refuses first so the intent is explicit.
+    #[test]
+    fn global_watermark_target_never_regresses_the_watermark() {
+        assert_eq!(global_watermark_target(Some(30_000), 30_788, false), None);
+    }
+
+    // ========================================================================
+    // Quiet-table anti-freeze (per-table mode).
+    // ========================================================================
+
+    /// A permanently-quiet table (HF Ville's HT_Cupon, HT_Deposit,
+    /// HT_Bill_Debt_*, HT_CheckIn_Product, HT_Receipt_H — 0 rows
+    /// ingested since CT was enabled) polled and found nothing, so it
+    /// has read through the tick ceiling. It must MOVE there, not just
+    /// get its `last_polled_at` touched: a frozen `last_seen_version`
+    /// eventually falls below CHANGE_TRACKING_MIN_VALID_VERSION and
+    /// pages a retention overflow for a table that never had a row.
+    #[test]
+    fn quiet_table_advances_to_tick_ceiling() {
+        assert_eq!(
+            settled_ceiling_target(Some(30801), 30788, false),
+            Some(30801),
+            "a table that polled and found nothing must advance to the tick ceiling"
+        );
+    }
+
+    /// Ceiling already at the table's watermark — nothing to write.
+    #[test]
+    fn quiet_table_no_advance_without_progress() {
+        assert_eq!(
+            settled_ceiling_target(Some(30788), 30788, false),
+            None
+        );
+    }
+
+    /// Shadow mode applied nothing this tick, so no watermark of any
+    /// kind may move — otherwise a shadow soak would silently consume
+    /// the CT range it is supposed to be observing.
+    #[test]
+    fn quiet_table_never_advances_in_shadow_mode() {
+        assert_eq!(
+            settled_ceiling_target(Some(30801), 30788, true),
+            None,
+            "shadow mode rolls every TX back — advancing would consume unapplied changes"
+        );
+    }
+
+    /// Failed ceiling probe degrades to the old touch-only behaviour.
+    #[test]
+    fn quiet_table_holds_when_ceiling_probe_failed() {
+        assert_eq!(settled_ceiling_target(None, 30788, false), None);
+    }
+
+    // ========================================================================
+    // Issue #283 — CT ceiling settle gate.
+    //
+    // HF Ville lost four `HT_Room_Status` rows (ids 4692 / 4799 / 4815 /
+    // 4832, room 107) with the watermark CURRENT throughout and ZERO
+    // errors logged. The container logs rule out the connection-failure
+    // hypothesis outright: none of the six CT events for those rows is
+    // within 85 minutes of any `sync.ct_fetch_fail` /
+    // `sync.legacy_probe_fail` burst — during the real outages the
+    // `!errored` gating held the watermark exactly as designed and
+    // nothing was lost.
+    //
+    // What DID happen, from the tick at `2026-08-05T07:20:06Z`:
+    //
+    //   ceiling sampled  = 41516      (pre-loop, ~07:20:06.83)
+    //   HT_Room_Status   from=41503 applied_through=41510   (07:20:06.87)
+    //   watermark        41503 -> 41516                     (07:20:07.33)
+    //
+    // Legacy row 4798 (room 105) and 4799 (room 107) were written by ONE
+    // iHOTEL check-in save. 4798 reached canonical in that tick; 4799
+    // never did, and the range (41510, 41516] was never re-read, so it
+    // aged out of CT's 2-day retention. 4799's version therefore sat at
+    // or below the sampled ceiling while being INVISIBLE to a
+    // `CHANGETABLE` read taken 40ms later — the legacy DBs run
+    // `ALLOW_SNAPSHOT_ISOLATION OFF`, so nothing orders the version
+    // counter a probe reads against what a later READ COMMITTED reader
+    // can see.
+    //
+    // The gate makes the ceiling usable only after it has settled, so
+    // every read in the advancing tick provably post-dates it.
+    // ========================================================================
+
+    /// Baseline: a freshly-recorded ceiling is NOT an advance target.
+    /// This is the assertion that fails against the pre-fix code path,
+    /// where `run_one_tick` fed its own just-taken sample straight into
+    /// `global_watermark_target`.
+    #[test]
+    fn ceiling_gate_withholds_a_sample_younger_than_the_settle_window() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(40), settle),
+            None,
+            "a ceiling sampled 40ms ago cannot prove this tick's reads covered it"
+        );
+    }
+
+    /// Once the window has elapsed, the sample is released exactly once.
+    #[test]
+    fn ceiling_gate_releases_a_settled_sample_exactly_once() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(2000), settle),
+            Some(41516),
+            "settle window elapsed ⇒ every read in this tick post-dates the sample"
+        );
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(9000), settle),
+            None,
+            "a consumed sample must not be handed out twice"
+        );
+    }
+
+    /// Anti-starvation: with a 1s poll interval and a 2s window the gate
+    /// is asked for a ceiling more often than one can mature. Recording
+    /// must NOT replace the maturing sample, or the watermark would
+    /// freeze forever and page a false `CT watermark STUCK`.
+    #[test]
+    fn ceiling_gate_keeps_the_older_sample_when_ticks_outpace_the_window() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41500, t0);
+        for tick in 1..=3 {
+            let now = t0 + Duration::from_millis(500 * tick);
+            assert_eq!(gate.take_settled(now, settle), None);
+            gate.record(41500 + tick as i64, now);
+        }
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(2000), settle),
+            Some(41500),
+            "the ORIGINAL sample must survive three fresher ones and then mature"
+        );
+    }
+
+    /// A failed `CHANGE_TRACKING_CURRENT_VERSION()` probe records
+    /// nothing, which must not disturb a sample already maturing.
+    #[test]
+    fn ceiling_gate_probe_failure_leaves_the_pending_sample_intact() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        // (probe failure = no `record` call at all this tick)
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(3000), settle),
+            Some(41516)
+        );
+    }
+
+    /// A fresh process has no proof about anything a pre-restart read
+    /// covered, so the first tick must advance nothing.
+    #[test]
+    fn ceiling_gate_advances_nothing_on_the_first_tick_after_restart() {
+        let mut gate = CeilingGate::default();
+        assert_eq!(
+            gate.take_settled(Instant::now(), Duration::from_millis(2000)),
+            None
+        );
+    }
+
+    /// THE regression test for issue #283 — replays the HF Ville tick
+    /// that stranded `HT_Room_Status.id=4799` (room 107, night
+    /// 2026-08-05), with the real version numbers from the container
+    /// log.
+    ///
+    /// Pre-fix, `global_watermark_target` received the ceiling sampled
+    /// 40ms earlier in the SAME tick and advanced 41503 → 41516,
+    /// consuming a range no `HT_Room_Status` read had covered (that read
+    /// topped out at 41510). Post-fix the same tick can only offer an
+    /// unsettled sample, so nothing advances and the next tick re-reads
+    /// from 41503 — by which time 4799's commit is long visible.
+    #[test]
+    fn issue_283_unsettled_ceiling_cannot_strand_hfville_room_107() {
+        const LAST_SEEN: i64 = 41503;
+        const CEILING: i64 = 41516;
+        const ROOM_STATUS_READ_MAX: i64 = 41510;
+        let settle = Duration::from_millis(2000);
+        let t_sample = Instant::now();
+        // Read happened 40ms after the sample, per the log timestamps.
+        let t_read = t_sample + Duration::from_millis(40);
+
+        // Pre-fix semantics, stated explicitly so the bug is legible:
+        // the sample alone was enough to consume 41511..=41516.
+        assert_eq!(
+            global_watermark_target(Some(CEILING), LAST_SEEN, false),
+            Some(CEILING),
+            "documents the pre-fix behaviour this test exists to prevent"
+        );
+        assert!(
+            ROOM_STATUS_READ_MAX < CEILING,
+            "the stranded range is (41510, 41516] — everything id=4799 could have been"
+        );
+
+        // Post-fix: the tick that took the sample cannot use it.
+        let mut gate = CeilingGate::default();
+        gate.record(CEILING, t_sample);
+        let settled = gate.take_settled(t_read, settle);
+        assert_eq!(settled, None, "same-tick sample must never be an advance target");
+        assert_eq!(
+            global_watermark_target(settled, LAST_SEEN, false),
+            None,
+            "no settled ceiling ⇒ watermark holds at 41503 ⇒ next tick re-reads \
+             (41503, ∞) and picks up id=4799 once its commit is visible"
+        );
+
+        // And the per-table path must reach the same verdict — it used
+        // to advance to the table's own `max_version` (41510), which
+        // strands exactly the same range.
+        assert_eq!(
+            settled_ceiling_target(settled, LAST_SEEN, false),
+            None,
+            "per-table advance must also hold, not jump to max_version=41510"
+        );
+    }
+
+    /// The healthy steady state must still make progress: a ceiling
+    /// carried over from an earlier tick advances both watermark paths.
+    #[test]
+    fn issue_283_settled_ceiling_still_advances_a_healthy_tick() {
+        let settle = Duration::from_millis(2000);
+        let t_sample = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t_sample);
+        let settled = gate.take_settled(t_sample + Duration::from_millis(2500), settle);
+        assert_eq!(settled, Some(41516));
+        assert_eq!(
+            global_watermark_target(settled, 41503, false),
+            Some(41516),
+            "the fix must not wedge a healthy watcher — progress is still made, one \
+             settle window behind"
+        );
+        assert_eq!(settled_ceiling_target(settled, 41503, false), Some(41516));
+    }
+
+    /// The settle gate is orthogonal to the `errored` hold: a settled
+    /// ceiling still must not be written when a table failed.
+    #[test]
+    fn issue_283_settled_ceiling_is_still_subject_to_the_errored_hold() {
+        assert_eq!(
+            global_watermark_target(Some(41516), 41503, true),
+            None,
+            "settle gate must not weaken the 2026-05-18 per-key failure hold"
+        );
+    }
+
+    /// Every un-dispatchable CT row in the tick path must hold the
+    /// watermark. The three sites that used to `skipped += 1; continue;`
+    /// without setting `errored` (two unknown-CT-op branches and the
+    /// unknown-aggregate-table arm) are the audit findings from #283.
+    ///
+    /// Source-scan, in the same spirit as
+    /// `every_tick_path_tracing_error_references_an_event_name`: the
+    /// branches live inside `poll_table`'s row loops and have no pure
+    /// seam of their own, so the invariant is asserted against the text.
+    #[test]
+    fn undispatchable_ct_rows_set_errored_in_the_tick_path() {
+        let source = include_str!("sync.rs");
+        let start = source
+            .find("async fn poll_table(")
+            .expect("poll_table must exist");
+        let end = source[start..]
+            .find("/// Build the CT polling query.")
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        let region = &source[start..end];
+
+        for marker in [
+            "\"Unknown CT operation code — holding watermark for retry\"",
+            "\"Unknown coalesced aggregate table — holding watermark for retry\"",
+        ] {
+            let mut searched = region;
+            let mut seen = 0usize;
+            while let Some(idx) = searched.find(marker) {
+                seen += 1;
+                let tail = &searched[idx + marker.len()..];
+                let window_end = tail.len().min(200);
+                assert!(
+                    tail[..window_end].contains("errored = true"),
+                    "un-dispatchable CT row at {marker} must set `errored = true` \
+                     so the watermark holds (issue #283 audit)"
+                );
+                searched = &searched[idx + marker.len()..];
+            }
+            assert!(seen > 0, "expected at least one occurrence of {marker}");
+        }
+    }
+
+    // ========================================================================
+    // Startup gates must see the per-table floor, not the global row.
+    // ========================================================================
+
+    fn per_table_map(entries: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
+        entries
+            .iter()
+            .map(|(t, v)| ((*t).to_string(), *v))
+            .collect()
+    }
+
+    /// Global mode is untouched — the single row IS the watermark.
+    #[test]
+    fn preflight_watermark_uses_global_row_when_per_table_off() {
+        let map = per_table_map(&[("HT_Customers", 10), ("HT_Book_Pro", 20)]);
+        assert_eq!(
+            preflight_watermark(false, 30_788, &map, &["HT_Customers", "HT_Book_Pro"]),
+            30_788,
+            "global mode must ignore the per-table rows entirely"
+        );
+    }
+
+    /// Per-table mode pre-flights on the MINIMUM: one table wedged at an
+    /// ancient version is exactly what the gates exist to catch, and the
+    /// global row would have hidden it.
+    #[test]
+    fn preflight_watermark_uses_min_per_table_when_on() {
+        let map = per_table_map(&[
+            ("HT_Customers", 30_788),
+            ("HT_Book_H", 12_000),
+            ("HT_Book_Pro", 30_801),
+        ]);
+        assert_eq!(
+            preflight_watermark(
+                true,
+                30_801,
+                &map,
+                &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]
+            ),
+            12_000,
+            "a table stuck at 12000 is the real replay floor, not the current-looking global row"
+        );
+    }
+
+    /// A table with no row yet resumes from 0 in `run_one_tick`
+    /// (`unwrap_or(0)`), so the gates must see 0 too — that trips the
+    /// cold-replay refusal, whose remedy is seeding the row the way
+    /// migration 056 did for HT_Book_Pro.
+    #[test]
+    fn preflight_watermark_unseeded_table_drags_floor_to_zero() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_H", 30_788)]);
+        assert_eq!(
+            preflight_watermark(
+                true,
+                30_788,
+                &map,
+                &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]
+            ),
+            0,
+            "unseeded HT_Book_Pro resumes from 0, so the pre-flight floor is 0"
+        );
+    }
+
+    /// Allowlisted down to nothing (or an empty table list): fall back
+    /// to the global row rather than inventing a floor of 0 out of an
+    /// empty `min()`.
+    #[test]
+    fn preflight_watermark_empty_table_list_falls_back_to_global() {
+        let map = per_table_map(&[("HT_Customers", 30_788)]);
+        assert_eq!(preflight_watermark(true, 30_788, &map, &[]), 30_788);
+    }
+
+    // ========================================================================
+    // Issue #259 — per-table mode must keep the GLOBAL row moving, as a
+    // conservative floor.
+    //
+    // Before this, `run_one_tick`'s advance was gated on
+    // `!per_table_watermark`, so `legacy_ct_state` froze the moment the flag
+    // went on. `run_watermark_watchdog` reads only that row: it saw
+    // ct_current > watermark forever, paged `CT watermark STUCK` every 30min,
+    // and its recovery condition compared against the SAME frozen row so no
+    // all-clear could ever fire. After ~2 days the frozen value fell below
+    // CHANGE_TRACKING_MIN_VALID_VERSION and rollback to global mode
+    // hard-failed, needing --bootstrap.
+    // ========================================================================
+
+    /// Retention-overflow cooldown rows share `ht_level_drift_alert_cooldowns`
+    /// with the reconcile digest, which keys on canonical entity names
+    /// (`bookings`, `customers`, `rooms`, `checkins`) plus the
+    /// `stale_active_checkin` sentinel. A CT table name must never be able to
+    /// collide with one of those, or suppressing a retention page would also
+    /// suppress an unrelated sync-lag digest — silently.
+    #[test]
+    fn retention_cooldown_key_is_namespaced_away_from_entity_keys() {
+        for entity in ["bookings", "customers", "rooms", "checkins", "stale_active_checkin"] {
+            assert_ne!(retention_cooldown_key("HT_Book_H"), entity);
+            assert_ne!(retention_cooldown_key(entity), entity);
+        }
+        assert_eq!(
+            retention_cooldown_key("HT_Customers"),
+            "ct_retention_overflow:HT_Customers"
+        );
+        // Distinct tables must not share a slot, or one page would mute the rest.
+        assert_ne!(
+            retention_cooldown_key("HT_Customers"),
+            retention_cooldown_key("HT_Book_H")
+        );
+    }
+
+    /// THE defining property: the floor is the MIN, never the MAX. Writing
+    /// the max would let the global row claim progress `HT_Customers` never
+    /// made — the same shape as the 2026-07-11 mid-loop-arrival loss, just
+    /// via the rollback/watchdog path instead of the resume path.
+    #[test]
+    fn global_floor_from_per_table_takes_the_minimum_not_the_maximum() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_Pro", 30_801)]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_Pro"]),
+            Some(30_788),
+            "the floor must be the laggard's watermark, not the leader's"
+        );
+    }
+
+    /// A table with no row yet resumes from 0, so the floor is 0. Harmless:
+    /// `watermark::advance` is monotonic (`WHERE last_seen_version <= $1`),
+    /// so a 0 floor is a no-op against an already-advanced row — and it is
+    /// the honest answer, since that table genuinely has no proven progress.
+    #[test]
+    fn global_floor_from_per_table_unseeded_table_drags_floor_to_zero() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_H", 30_788)]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]),
+            Some(0),
+            "unseeded HT_Book_Pro has no proven progress, so the floor is 0"
+        );
+    }
+
+    /// Nothing polled ⇒ nothing safe to write. Must NOT fabricate `Some(0)`
+    /// out of an empty `min()`.
+    #[test]
+    fn global_floor_from_per_table_empty_table_list_is_none() {
+        let map = per_table_map(&[("HT_Customers", 30_788)]);
+        assert_eq!(global_floor_from_per_table(&map, &[]), None);
+    }
+
+    /// Only the tables THIS process polls count. Under
+    /// `LEGACY_SYNC_TABLE_ALLOWLIST` a stale row for a table nobody polls
+    /// (retired mapper, or a table owned by the other site's worker) must
+    /// not drag the floor down and re-freeze the global row.
+    #[test]
+    fn global_floor_from_per_table_ignores_tables_this_process_does_not_poll() {
+        let map = per_table_map(&[
+            ("HT_Customers", 30_788),
+            ("HT_Book_Pro", 30_801),
+            // Not in the allowlist below — wedged at an ancient version.
+            ("HT_Room_Status", 12_000),
+        ]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_Pro"]),
+            Some(30_788),
+            "an allowlisted-out table's stale row must not hold the floor down"
+        );
+    }
+
+    // ========================================================================
+    // Issue #259 (task 2) — when the watchdog DOES page under per-table
+    // mode, it must name the table holding the floor down. Semantics mirror
+    // `scheduler::sync::stalest_per_table_watermark` so the reconcile-tick
+    // health log and the watcher page never disagree.
+    // ========================================================================
+
+    fn watermark_row(
+        table: &str,
+        version: i64,
+        polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> PerTableWatermarkRow {
+        PerTableWatermarkRow {
+            table_name: table.to_string(),
+            last_seen_version: version,
+            last_polled_at: polled_at,
+        }
+    }
+
+    /// Lowest `last_seen_version` (largest lag) wins — that is the table
+    /// pinning the global floor.
+    #[test]
+    fn stalest_per_table_watermark_picks_the_lowest_version() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row("HT_Customers", 30_788, Some(now)),
+            watermark_row("HT_Book_Pro", 30_801, Some(now)),
+            watermark_row("HT_Book_H", 12_000, Some(now)),
+        ];
+        let (stalest, version_lag, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(version_lag, 18_801);
+    }
+
+    /// Equal versions ⇒ the table that hasn't been polled for longest is
+    /// the more suspicious one.
+    #[test]
+    fn stalest_per_table_watermark_breaks_version_tie_on_oldest_poll() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row(
+                "HT_Customers",
+                30_788,
+                Some(now - chrono::Duration::seconds(10)),
+            ),
+            watermark_row(
+                "HT_Book_H",
+                30_788,
+                Some(now - chrono::Duration::seconds(3_600)),
+            ),
+        ];
+        let (stalest, _, poll_age_seconds) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(poll_age_seconds, 3_600);
+    }
+
+    /// A row that has NEVER been polled is infinitely old — it must beat
+    /// any finite poll age, same as the global path's never-polled handling.
+    #[test]
+    fn stalest_per_table_watermark_treats_never_polled_as_oldest() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row(
+                "HT_Customers",
+                30_788,
+                Some(now - chrono::Duration::seconds(86_400)),
+            ),
+            watermark_row("HT_Book_H", 30_788, None),
+        ];
+        let (stalest, _, poll_age_seconds) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(
+            poll_age_seconds,
+            i64::MAX,
+            "NULL last_polled_at is treated as infinitely old"
+        );
+    }
+
+    /// Everything equal ⇒ the pick must not depend on row order (PG returns
+    /// `legacy_ct_state_per_table` unordered). Alphabetically first wins.
+    #[test]
+    fn stalest_per_table_watermark_is_deterministic_on_a_full_tie() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row("HT_Rooms", 30_788, Some(now)),
+            watermark_row("HT_Book_H", 30_788, Some(now)),
+            watermark_row("HT_Customers", 30_788, Some(now)),
+        ];
+        let (stalest, _, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+
+        let reversed: Vec<PerTableWatermarkRow> = rows.into_iter().rev().collect();
+        let (stalest_reversed, _, _) =
+            stalest_per_table_watermark(&reversed, 30_801, now).expect("non-empty input");
+        assert_eq!(
+            stalest_reversed.table_name, "HT_Book_H",
+            "the pick must not depend on the order PG returned the rows in"
+        );
+    }
+
+    /// Per-table rows not seeded yet (pre-migration-050 / pre-bootstrap):
+    /// no context, and the page still goes out without the extra line.
+    #[test]
+    fn stalest_per_table_watermark_is_none_for_no_rows() {
+        assert!(stalest_per_table_watermark(&[], 30_801, chrono::Utc::now()).is_none());
+    }
+
+    /// A watermark AHEAD of the CT current version is a CT anomaly. The lag
+    /// must clamp at 0 — `saturating_sub` on a SIGNED i64 saturates at
+    /// `i64::MIN`, which would both print nonsense and lose the ranking.
+    #[test]
+    fn stalest_per_table_watermark_clamps_negative_lag_to_zero() {
+        let now = chrono::Utc::now();
+        let rows = vec![watermark_row("HT_Customers", 30_900, Some(now))];
+        let (_, version_lag, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(version_lag, 0, "negative lag clamps to 0, not i64::MIN");
+    }
+
+    /// The note is a suffix: it must start with a newline so appending it
+    /// to `format_stall_alert_message` can't mangle that message's last
+    /// line, and it must name the table + its version.
+    #[test]
+    fn format_stalest_table_note_names_the_table_and_appends_cleanly() {
+        let note = format_stalest_table_note(&StalestTableContext {
+            table: "HT_Book_H".to_string(),
+            last_seen_version: 12_000,
+            version_lag: 18_801,
+            poll_age_seconds: 3_600,
+            tables_tracked: 19,
+        });
+        assert!(note.starts_with('\n'), "note must append as its own line");
+        assert!(note.contains("HT_Book_H"), "must name the table; got: {note}");
+        assert!(note.contains("v12000"), "must give its version; got: {note}");
+        assert!(note.contains("18801 versions behind"), "got: {note}");
+        assert!(note.contains("last polled 3600s ago"), "got: {note}");
+    }
+
+    /// `i64::MAX` is the never-polled sentinel, not a poll age — printing
+    /// "last polled 9223372036854775807s ago" would be operator-hostile.
+    #[test]
+    fn format_stalest_table_note_renders_never_polled_sentinel() {
+        let note = format_stalest_table_note(&StalestTableContext {
+            table: "HT_Book_Pro".to_string(),
+            last_seen_version: 0,
+            version_lag: 30_801,
+            poll_age_seconds: i64::MAX,
+            tables_tracked: 19,
+        });
+        assert!(note.contains("never polled"), "got: {note}");
+        assert!(!note.contains("9223372036854775807"), "got: {note}");
+    }
+
+    /// Global mode contributes NO note, so the page must be byte-identical
+    /// to the pre-#259 message. (`stalest_table_context` returns `None`
+    /// without touching PG when the flag is off; this pins the
+    /// concatenation half of that contract.)
+    #[test]
+    fn stall_page_is_byte_identical_when_per_table_note_is_absent() {
+        let base = format_stall_alert_message(
+            17_209,
+            Some(17_250),
+            Duration::from_secs(1_800),
+            Duration::from_secs(1_800),
+        );
+        let note = None::<&StalestTableContext>
+            .map(format_stalest_table_note)
+            .unwrap_or_default();
+        assert_eq!(format!("{base}{note}"), base);
     }
 
     #[test]
@@ -6732,12 +10126,19 @@ mod tests {
         assert!(result.is_none(), "below threshold must not alert");
     }
 
+    /// Wall-clock helper for the shadow-ceiling tests. The anchor is now
+    /// `legacy_ct_state.last_polled_at`, a PG `TIMESTAMPTZ`, not a
+    /// process-local `Instant` (S11 fix, 2026-07-28).
+    fn shadow_frozen(secs_ago: i64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::Utc::now();
+        (now - chrono::Duration::seconds(secs_ago), now)
+    }
+
     /// Track D / T7 CRIT-3 — shadow mode older than the ceiling fires.
     #[test]
     fn shadow_mode_pager_fires_past_ceiling() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 1);
-        let result = shadow_mode_pager_eligible(true, started_at, now);
+        let (frozen_since, now) = shadow_frozen(SHADOW_MODE_MAX_DURATION_SECS as i64 + 1);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
         assert!(result.is_some(), "shadow > ceiling must page");
     }
 
@@ -6745,9 +10146,8 @@ mod tests {
     /// not fire (12h is below the 36h threshold).
     #[test]
     fn shadow_mode_pager_silent_inside_ceiling() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(12 * 3600);
-        let result = shadow_mode_pager_eligible(true, started_at, now);
+        let (frozen_since, now) = shadow_frozen(12 * 3600);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
         assert!(result.is_none(), "12h shadow run must NOT page");
     }
 
@@ -6755,10 +10155,64 @@ mod tests {
     /// shadow-too-long alert regardless of elapsed time.
     #[test]
     fn shadow_mode_pager_silent_in_live_mode() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 10_000);
-        let result = shadow_mode_pager_eligible(false, started_at, now);
+        let (frozen_since, now) = shadow_frozen(SHADOW_MODE_MAX_DURATION_SECS as i64 + 10_000);
+        let result = shadow_mode_pager_eligible(false, Some(frozen_since), now);
         assert!(result.is_none(), "live mode must never fire the shadow pager");
+    }
+
+    // -------------------------------------------------------------------
+    // S11 (2026-07-28 alert audit) — the shadow ceiling is now reachable.
+    //
+    // The guard used to measure `now - Instant::now()@watchdog-spawn`, i.e.
+    // PROCESS UPTIME. Deploys restart these workers several times a day, so
+    // the clock reset long before 36h and the guard could never fire. These
+    // tests pin the durable replacement: the anchor is
+    // `legacy_ct_state.last_polled_at`, which shadow mode freezes (no
+    // watermark write happens at all in shadow mode) and which survives
+    // restarts because it lives in PG.
+    // -------------------------------------------------------------------
+
+    /// The regression that motivated S11: a worker that has been up for only
+    /// a few minutes must STILL page when PG says the watermark has been
+    /// frozen past the ceiling. Under the old process-uptime anchor this
+    /// case was silent forever.
+    #[test]
+    fn shadow_ceiling_fires_after_a_restart_when_pg_says_frozen_past_ceiling() {
+        let (frozen_since, now) = shadow_frozen(40 * 3600);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
+        assert!(
+            result.is_some(),
+            "a fresh process must still page on a 40h-old PG freeze — that is the \
+             whole point of moving the anchor off process uptime"
+        );
+        let msg = result.unwrap();
+        assert!(
+            msg.contains(&frozen_since.to_rfc3339()),
+            "the page must name the freeze instant so an operator can date the \
+             soak; got: {msg}"
+        );
+    }
+
+    /// A missing `legacy_ct_state` row (pre-bootstrap) is UNKNOWN, not
+    /// "frozen since the epoch". Stay silent.
+    #[test]
+    fn shadow_ceiling_silent_when_freeze_anchor_is_unknown() {
+        let now = chrono::Utc::now();
+        assert!(
+            shadow_mode_pager_eligible(true, None, now).is_none(),
+            "no watermark row yet must not be read as an infinite freeze"
+        );
+    }
+
+    /// Clock skew (`last_polled_at` in the future) must not fire, and must
+    /// not panic on the negative duration.
+    #[test]
+    fn shadow_ceiling_silent_on_clock_skew() {
+        let (frozen_since, now) = shadow_frozen(-600);
+        assert!(
+            shadow_mode_pager_eligible(true, Some(frozen_since), now).is_none(),
+            "a future-dated freeze anchor is skew, not a 36h soak"
+        );
     }
 
     /// Track D / T7 CRIT-3 — the ceiling sits below the 48h MSSQL CT
@@ -6776,6 +10230,738 @@ mod tests {
         assert!(
             CT_RETENTION_CLIFF_SECS - SHADOW_MODE_MAX_DURATION_SECS >= 12 * 3600,
             "must leave >=12h cushion before the cliff"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // CT-lag pager (2026-07-28 alert audit).
+    //
+    // `[Sync] CT watcher lag detected` fired ~170×/day at WARN with no
+    // Slack path, while being the second line of defence for the
+    // 2026-05-18 lost-UPDATE class. These tests pin the three properties
+    // that make a page out of an observation without making noise:
+    // persistence, a namespaced durable cooldown, and an all-clear.
+    // -------------------------------------------------------------------
+
+    /// Only the VERSION arm is page-worthy, and strictly-greater-than —
+    /// same comparison as `scheduler::sync::ct_lag_is_warning`.
+    #[test]
+    fn ct_lag_pages_on_the_version_arm_strictly_above_threshold() {
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        assert!(!ct_lag_is_pageable(100, t), "at threshold must not page");
+        assert!(ct_lag_is_pageable(101, t), "one past threshold must page");
+        assert!(!ct_lag_is_pageable(0, t));
+    }
+
+    /// The poll-age arm must NEVER page on its own.
+    ///
+    /// `legacy_ct_state.last_polled_at` is written only by
+    /// `sync::watermark::advance`, and `global_watermark_target` returns
+    /// `None` once the sampled ceiling equals the watermark — so a healthy,
+    /// caught-up watcher on a quiet legacy stops touching the row and its
+    /// poll age grows without bound overnight. Paging on that would
+    /// manufacture nightly noise; it is a large part of why the reconcile
+    /// tick's WARN fires ~170×/day.
+    #[test]
+    fn ct_lag_never_pages_on_poll_age_alone() {
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        // A full quiet night: nothing to sync, so nothing advanced.
+        assert!(
+            !ct_lag_is_pageable(0, t),
+            "a caught-up watermark must never page no matter how old the last write is"
+        );
+    }
+
+    /// First breach starts the timer; it must not page on the spot. A
+    /// single tick of >100 versions is routine (one iHOTEL batch save).
+    #[test]
+    fn ct_lag_first_breach_only_starts_the_timer() {
+        let now = Instant::now();
+        assert_eq!(
+            ct_lag_next_action(true, None, false, now, Duration::from_secs(1800)),
+            CtLagAction::Building
+        );
+    }
+
+    /// The core level-trigger contract: silent below the persistence
+    /// threshold, pages at or past it.
+    #[test]
+    fn ct_lag_pager_fires_only_past_the_persistence_threshold() {
+        let persist = Duration::from_secs(1800);
+        let anchor = Instant::now();
+
+        let just_under = anchor + Duration::from_secs(1799);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, just_under, persist),
+            CtLagAction::Building,
+            "29min59s of lag must stay silent"
+        );
+
+        let exactly = anchor + persist;
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, exactly, persist),
+            CtLagAction::Page,
+            "the gate is >=, so the threshold instant itself pages"
+        );
+
+        let well_past = anchor + Duration::from_secs(7200);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, well_past, persist),
+            CtLagAction::Page
+        );
+    }
+
+    /// Once paged, a still-open episode must not page again — the durable
+    /// cooldown is the cross-restart backstop, this latch is the
+    /// within-process one.
+    #[test]
+    fn ct_lag_pager_pages_once_per_episode() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(7200);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), true, now, Duration::from_secs(1800)),
+            CtLagAction::Holding
+        );
+    }
+
+    /// The all-clear fires exactly when a paged episode stops lagging.
+    #[test]
+    fn ct_lag_all_clear_fires_on_recovery() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(3600);
+        assert_eq!(
+            ct_lag_next_action(false, Some(anchor), true, now, Duration::from_secs(1800)),
+            CtLagAction::Recovered,
+            "recovery after a page must produce the paired all-clear"
+        );
+    }
+
+    /// No page, no all-clear. A lag episode that drained before crossing
+    /// the persistence gate must leave the channel completely silent —
+    /// that is the whole point of the gate.
+    #[test]
+    fn ct_lag_building_episode_that_drains_emits_nothing() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(600);
+        assert_eq!(
+            ct_lag_next_action(false, Some(anchor), false, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet,
+            "a sub-threshold episode must not announce its own recovery"
+        );
+        assert_eq!(
+            ct_lag_next_action(false, None, false, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-restart episode state (issue #265).
+    //
+    // The watchdog's episode latches were process-local, so a restart
+    // mid-episode kept the durable cooldown (no re-page) but lost the
+    // latch that owns the ALL-CLEAR: a page followed by eternal silence.
+    // These pin the rebuild — a live slot resumes the episode, a released
+    // slot must never resurrect one, and neither may invent a page.
+    // -------------------------------------------------------------------
+
+    /// A live slot IS the paged latch: rebuild the episode and take the
+    /// "raised N ago" figure from the wall clock the row carries.
+    #[test]
+    fn resume_episode_rebuilds_the_paged_latch_from_a_live_slot() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::seconds(900)),
+            now_utc,
+            now,
+        )
+        .expect("a live cooldown row means an episode nobody has all-cleared");
+        assert_eq!(resumed.paged_ago, Duration::from_secs(900));
+        assert!(
+            resumed.paged_at <= now,
+            "the reconstructed page instant can never be in the future"
+        );
+    }
+
+    /// The all-clear DELETES the row, so no row = no episode. Resurrecting
+    /// a latch here would make the next healthy tick announce a recovery
+    /// for something nobody was ever paged about.
+    #[test]
+    fn resume_episode_ignores_a_released_slot() {
+        assert_eq!(
+            resume_episode(None, chrono::Utc::now(), Instant::now()),
+            None
+        );
+    }
+
+    /// Restart inside an OPEN, still-lagging episode: the rebuilt latch
+    /// must answer `Holding`, not `Page`. (The durable cooldown would also
+    /// swallow the claim, but that path re-attempts a PG write every tick
+    /// and reads as a suppressed page in the logs.)
+    #[test]
+    fn restart_inside_an_open_ct_lag_episode_holds_instead_of_double_paging() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let persist = Duration::from_secs(1800);
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(45)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let since = backdated_instant(resumed.paged_at, persist);
+        assert_eq!(
+            ct_lag_next_action(true, Some(since), true, now, persist),
+            CtLagAction::Holding,
+            "a resumed episode must not page again while the lag persists"
+        );
+    }
+
+    /// THE issue #265 regression: the lag drained while we were down (or
+    /// right after the restart), and the episode's all-clear must still
+    /// fire. Pre-fix `paged` came back as `false`, so the state machine
+    /// said `Quiet` and the operator never heard anything again.
+    #[test]
+    fn restart_inside_an_open_ct_lag_episode_still_fires_the_all_clear() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let persist = Duration::from_secs(1800);
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(45)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let since = backdated_instant(resumed.paged_at, persist);
+        assert_eq!(
+            ct_lag_next_action(false, Some(since), true, now, persist),
+            CtLagAction::Recovered,
+            "the durable slot is what lets the lost all-clear fire after a restart"
+        );
+    }
+
+    /// The slot-released path is unchanged: a restart with no open episode
+    /// starts quiet and stays quiet on a healthy observation.
+    #[test]
+    fn restart_with_no_open_episode_stays_silent() {
+        let now = Instant::now();
+        let paged = resume_episode(None, chrono::Utc::now(), now).is_some();
+        assert!(!paged);
+        assert_eq!(
+            ct_lag_next_action(false, None, paged, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet,
+            "no episode was open, so there is nothing to all-clear"
+        );
+    }
+
+    /// The stall slot cannot carry `paged_version`, so the resume seeds it
+    /// with the boot watermark. That is deliberately conservative: recovery
+    /// still needs real evidence (an advance PAST it, or a probe confirming
+    /// legacy is idle at it), so the worst case is an all-clear one tick
+    /// late — never a false one while the stall is real.
+    #[test]
+    fn resumed_stall_episode_needs_evidence_before_the_all_clear() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(20)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let boot_watermark = 30_788;
+        let pending = Some((resumed.paged_at, boot_watermark));
+
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark, Some(31_200)),
+            None,
+            "legacy still ahead of us ⇒ the resumed episode stays open"
+        );
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark, Some(boot_watermark))
+                .map(|d| d.reason),
+            Some(RecoveryReason::ProbeConfirmsQuiet),
+            "probe proves there is no backlog ⇒ the lost all-clear fires"
+        );
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark + 1, None).map(|d| d.reason),
+            Some(RecoveryReason::WatermarkAdvanced),
+            "one fresh advance past the seeded version also closes it"
+        );
+    }
+
+    /// Clock skew between PG and the container must not backdate an
+    /// episode into the future (nor panic on the negative duration).
+    #[test]
+    fn durable_age_clamps_a_future_timestamp_to_zero() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            durable_age(now_utc + chrono::Duration::seconds(600), now_utc),
+            Duration::ZERO
+        );
+        assert_eq!(
+            durable_age(now_utc - chrono::Duration::seconds(600), now_utc),
+            Duration::from_secs(600)
+        );
+    }
+
+    /// The wall-clock → monotonic projection is exact, and degrades to
+    /// `now` rather than panicking when the monotonic clock is younger
+    /// than the age (fresh host boot).
+    #[test]
+    fn backdated_instant_is_exact_and_falls_back_on_underflow() {
+        let now = Instant::now();
+        assert_eq!(
+            now.duration_since(backdated_instant(now, Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            backdated_instant(now, Duration::MAX),
+            now,
+            "an unrepresentable backdate must degrade, not panic"
+        );
+    }
+
+    /// Global mode: `legacy_ct_state.last_polled_at` moves if and only if
+    /// the version moves, so it is a durable "frozen since" clock. The
+    /// first post-restart observation resumes that timer instead of
+    /// re-serving the full 30-min threshold from process start.
+    #[test]
+    fn stall_anchor_resumes_the_freeze_timer_in_global_mode() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            stall_anchor_age(
+                Some(now_utc - chrono::Duration::minutes(25)),
+                false,
+                now_utc
+            ),
+            Duration::from_secs(1500),
+            "a 25-min-old advance must page 5min after boot, not 31"
+        );
+    }
+
+    /// Per-table mode writes the global FLOOR row every tick regardless of
+    /// progress, so `last_polled_at` means "last tick" there and carries no
+    /// freeze information. Fall back to the process-anchored behaviour.
+    #[test]
+    fn stall_anchor_ignores_last_polled_at_in_per_table_mode() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            stall_anchor_age(Some(now_utc - chrono::Duration::hours(3)), true, now_utc),
+            Duration::ZERO,
+            "SYNC_PER_TABLE_WATERMARK=true ⇒ the column is not a freeze anchor"
+        );
+    }
+
+    /// Pre-bootstrap (no `legacy_ct_state` row) is unknown, not stale.
+    #[test]
+    fn stall_anchor_claims_nothing_without_a_watermark_row() {
+        assert_eq!(
+            stall_anchor_age(None, false, chrono::Utc::now()),
+            Duration::ZERO
+        );
+    }
+
+    /// Namespacing lock. `ht_level_drift_alert_cooldowns` is keyed
+    /// `(site_id, table_name)` and is SHARED with `scheduler::sync`, which
+    /// parks bare reconcile entity names (`bookings`, `customers`) and the
+    /// `stale_active_checkin` sentinel there. Every key this binary writes
+    /// must be namespaced, unique, and non-prefixing so no two tripwires
+    /// can ever steal each other's cooldown slot.
+    #[test]
+    fn cooldown_key_namespaces_cannot_collide() {
+        let mut keys: Vec<String> = vec![
+            retention_cooldown_key("HT_Customers"),
+            retention_cooldown_key("HT_Book_H"),
+            CT_LAG_COOLDOWN_KEY.to_string(),
+            CT_STALL_COOLDOWN_KEY.to_string(),
+            SHADOW_CEILING_COOLDOWN_KEY.to_string(),
+        ];
+        for reason in [
+            BootRefusal::LiveBootstrap,
+            BootRefusal::SchemaFingerprint,
+            BootRefusal::ColdReplay,
+            BootRefusal::RetentionOverflow,
+            BootRefusal::CtNotEnabled,
+        ] {
+            keys.push(reason.cooldown_key());
+        }
+
+        // 1. Every key is namespaced.
+        for k in &keys {
+            assert!(
+                k.contains(':'),
+                "`{k}` is not namespaced — it could collide with a reconcile entity name"
+            );
+        }
+
+        // 2. No key collides with a name the reconcile digest owns.
+        for reserved in [
+            "bookings",
+            "customers",
+            "checkins",
+            "rooms",
+            "stale_active_checkin",
+        ] {
+            assert!(
+                !keys.iter().any(|k| k == reserved),
+                "`{reserved}` is owned by scheduler::sync; a watcher key must never equal it"
+            );
+        }
+
+        // 3. Keys are pairwise distinct.
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "duplicate cooldown key — two tripwires would share one slot: {keys:?}"
+        );
+
+        // 4. Namespace prefixes are pairwise non-prefixing, so no key can
+        //    ever be mistaken for one in another namespace.
+        let prefixes = [
+            CT_RETENTION_KEY_PREFIX,
+            BOOT_REFUSAL_KEY_PREFIX,
+            CT_LAG_COOLDOWN_KEY,
+            CT_STALL_COOLDOWN_KEY,
+            SHADOW_CEILING_COOLDOWN_KEY,
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !a.starts_with(b),
+                        "namespace `{a}` starts with `{b}` — ambiguous key space"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The page body has to carry the diagnosis, because the operator's
+    /// next move differs from the STUCK page's.
+    #[test]
+    fn ct_lag_alert_message_names_the_gap_and_the_retention_hazard() {
+        let snap = CtLagSnapshot {
+            watermark: 30_700,
+            ct_current: 31_200,
+            version_lag: 500,
+            poll_age_seconds: 42,
+            table: None,
+        };
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        let msg = format_ct_lag_alert_message(
+            &snap,
+            t,
+            Duration::from_secs(2700),
+            Duration::from_secs(1800),
+        );
+        assert!(msg.contains("v30700"), "{msg}");
+        assert!(msg.contains("v31200"), "{msg}");
+        assert!(msg.contains("500 versions behind"), "{msg}");
+        assert!(msg.contains("45min"), "sustained duration must be stated: {msg}");
+        assert!(
+            msg.contains("retention"),
+            "the operator must be told why this is urgent: {msg}"
+        );
+        assert!(
+            msg.contains("CT watcher lag detected"),
+            "must point at the greppable per-tick log line: {msg}"
+        );
+        assert!(
+            !msg.contains("Per-table mode"),
+            "global mode must not claim a stalest table: {msg}"
+        );
+    }
+
+    /// Per-table mode names the table holding the global floor down.
+    #[test]
+    fn ct_lag_alert_message_names_the_stalest_table_in_per_table_mode() {
+        let snap = CtLagSnapshot {
+            watermark: 10,
+            ct_current: 500,
+            version_lag: 490,
+            poll_age_seconds: i64::MAX,
+            table: Some("HT_CheckIn_Ds".to_string()),
+        };
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        let msg = format_ct_lag_alert_message(
+            &snap,
+            t,
+            Duration::from_secs(3600),
+            Duration::from_secs(1800),
+        );
+        assert!(msg.contains("HT_CheckIn_Ds"), "{msg}");
+        // The never-polled sentinel must not leak as a raw i64::MAX.
+        assert!(msg.contains("never"), "{msg}");
+        assert!(!msg.contains(&i64::MAX.to_string()), "{msg}");
+    }
+
+    /// The all-clear must read as a resolution and must say the cooldown
+    /// was released, so an operator knows a recurrence will page again.
+    #[test]
+    fn ct_lag_recovery_message_is_an_all_clear() {
+        let snap = CtLagSnapshot {
+            watermark: 31_200,
+            ct_current: 31_205,
+            version_lag: 5,
+            poll_age_seconds: 3,
+            table: None,
+        };
+        let msg = format_ct_lag_recovery_message(&snap, Duration::from_secs(5400));
+        assert!(msg.contains(":white_check_mark:"), "{msg}");
+        assert!(msg.contains("RECOVERED"), "{msg}");
+        assert!(msg.contains("1h30min ago"), "{msg}");
+        assert!(msg.contains("released"), "{msg}");
+    }
+
+    // --- Issue #261 (re-scoped 2026-07-29) — pager-tier `<!channel>` mention ---
+    //
+    // No second webhook: on the shared Slack webhook, ONLY the pager tier
+    // (>72h escalated digest, sync-lag burst, CT-lag pager, boot-refusal)
+    // leads with `<!channel> `. These pin the ACTUAL composition each real
+    // call site produces — same `format_*` + `with_site_text[_paged]` pairing
+    // as `main`'s CT-lag watchdog loop and `send_boot_refusal_alert`.
+
+    /// The CT-lag pager page — named explicitly in the re-scope — must
+    /// lead with the exact mention.
+    #[test]
+    fn ct_lag_pager_composition_leads_with_channel_mention() {
+        let snap = CtLagSnapshot {
+            watermark: 30_700,
+            ct_current: 31_200,
+            version_lag: 500,
+            poll_age_seconds: 42,
+            table: None,
+        };
+        let t = CtLagThresholds { version_lag: 100, poll_age_seconds: 300 };
+        let body = format_ct_lag_alert_message(&snap, t, Duration::from_secs(2700), Duration::from_secs(1800));
+        let payload = SlackMessage::with_site_text_paged("hfhotel", body);
+        assert!(
+            payload.text.starts_with("<!channel> "),
+            "CT-lag pager must lead with `<!channel> `; got {:?}",
+            payload.text
+        );
+    }
+
+    /// The paired CT-lag all-clear must stay unmentioned — all-clears are
+    /// explicitly excluded from the re-scope.
+    #[test]
+    fn ct_lag_recovery_composition_has_no_channel_mention() {
+        let snap = CtLagSnapshot {
+            watermark: 31_200,
+            ct_current: 31_205,
+            version_lag: 5,
+            poll_age_seconds: 3,
+            table: None,
+        };
+        let body = format_ct_lag_recovery_message(&snap, Duration::from_secs(5400));
+        let payload = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !payload.text.contains("<!channel>"),
+            "CT-lag all-clear must stay unmentioned; got {:?}",
+            payload.text
+        );
+    }
+
+    /// Boot-refusal warnings — named explicitly in the re-scope — must
+    /// lead with the exact mention. All five refuse-to-start reasons route
+    /// through this one composer, so a single test covers all of them.
+    #[test]
+    fn boot_refusal_composition_leads_with_channel_mention() {
+        let body = format_boot_refusal_message(
+            ":warning: *CT watcher REFUSED TO START — schema drift* :warning:",
+            "Legacy MSSQL columns drifted from the captured baseline.",
+            30,
+        );
+        let payload = SlackMessage::with_site_text_paged("hfville", body);
+        assert!(
+            payload.text.starts_with("<!channel> "),
+            "boot-refusal page must lead with `<!channel> `; got {:?}",
+            payload.text
+        );
+        assert!(payload.text.contains("does NOT mean recovered"));
+    }
+
+    /// The pager must resolve its thresholds from the SAME env contract as
+    /// the reconcile-tick observation, and default to the SAME numbers.
+    /// Source-text assertion (the file's existing idiom) so it stays
+    /// non-flaky under parallel tests that would otherwise race on env.
+    #[test]
+    fn ct_lag_env_contract_matches_the_reconcile_observation() {
+        let source = include_str!("sync.rs");
+        for var in [
+            "LEGACY_CT_LAG_WARN_VERSIONS_{site_upper}",
+            "LEGACY_CT_LAG_WARN_SECONDS_{site_upper}",
+            "\"LEGACY_CT_LAG_WARN_VERSIONS\"",
+            "\"LEGACY_CT_LAG_WARN_SECONDS\"",
+        ] {
+            assert!(
+                source.contains(var),
+                "the pager must read `{var}` exactly as scheduler::sync does — \
+                 divergent thresholds would page on a condition the logs call healthy"
+            );
+        }
+        // The default NUMBERS are imported, never re-declared, so they can
+        // never drift from the observation's.
+        assert!(
+            source.contains("hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_VERSIONS")
+                && source.contains("hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_SECONDS"),
+            "CT-lag defaults must be imported from scheduler::sync, not copied"
+        );
+    }
+
+    /// The persistence gate must leave meaningful room before the 2-day CT
+    /// retention cliff — a pager that only fires with an hour to spare is
+    /// not a pager.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn ct_lag_persistence_gate_leaves_retention_headroom() {
+        const CT_RETENTION_CLIFF_SECS: u64 = 48 * 3600;
+        assert!(
+            DEFAULT_CT_LAG_PERSIST_SECS < CT_RETENTION_CLIFF_SECS / 24,
+            "the gate must burn well under an hour of the 48h retention window"
+        );
+        assert!(
+            DEFAULT_CT_LAG_PERSIST_SECS >= 10 * WATERMARK_WATCHDOG_POLL_INTERVAL_SECS,
+            "the gate must span enough watchdog ticks to be a real persistence test"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Refuse-to-start pages — per-reason durable dedup (2026-07-28).
+    //
+    // Five guards each fired a bare Slack POST with no dedup. With
+    // `restart: on-failure:5` and a 60s pre-exit sleep, one failed deploy
+    // produced up to six identical pages per service per site — and then
+    // the container gave up with NO message at all.
+    // -------------------------------------------------------------------
+
+    /// First page of a reason always goes out.
+    #[test]
+    fn boot_refusal_first_page_always_sends() {
+        assert!(
+            boot_refusal_should_send(true, true),
+            "a claimed slot is the first page in the window and must send"
+        );
+    }
+
+    /// Repeats inside the window are the Docker restart loop, not new
+    /// information. Suppress them.
+    #[test]
+    fn boot_refusal_repeat_inside_window_is_suppressed() {
+        assert!(
+            !boot_refusal_should_send(true, false),
+            "an unclaimed slot means we already paged this reason — stay quiet"
+        );
+    }
+
+    /// With no dedup backend (PG down, or the live-bootstrap guard running
+    /// before any pool exists) we FAIL OPEN. The failure mode of these
+    /// guards is silence about a process that will not run; a duplicate
+    /// page is strictly better than none.
+    #[test]
+    fn boot_refusal_falls_open_without_a_dedup_backend() {
+        assert!(
+            boot_refusal_should_send(false, false),
+            "no PG must never be allowed to silence a refuse-to-start page"
+        );
+        assert!(boot_refusal_should_send(false, true));
+    }
+
+    /// Each reason owns its own slot, so a deploy that fixes the
+    /// fingerprint but then trips the CT gate still pages immediately.
+    #[test]
+    fn boot_refusal_reasons_have_distinct_namespaced_keys() {
+        let reasons = [
+            BootRefusal::LiveBootstrap,
+            BootRefusal::SchemaFingerprint,
+            BootRefusal::ColdReplay,
+            BootRefusal::RetentionOverflow,
+            BootRefusal::CtNotEnabled,
+        ];
+        let keys: Vec<String> = reasons.iter().map(|r| r.cooldown_key()).collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two refusal reasons share a dedup slot: {keys:?}"
+        );
+        for k in &keys {
+            assert!(
+                k.starts_with(BOOT_REFUSAL_KEY_PREFIX),
+                "`{k}` escapes the boot-refusal namespace"
+            );
+        }
+    }
+
+    /// The default window has to outlast the whole restart burst, or the
+    /// dedup buys nothing: 5 attempts × (60s guard sleep + startup).
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn boot_refusal_window_outlasts_the_restart_burst() {
+        let burst_secs = COMPOSE_RESTART_CAP as i64 * (60 + 60);
+        assert!(
+            DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS * 60 > burst_secs,
+            "a {DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS}min window does not cover a \
+             {burst_secs}s restart burst"
+        );
+    }
+
+    /// The half of the fix that dedup alone cannot buy: because this
+    /// process cannot page after Docker gives up on it, the last message it
+    /// CAN send must warn that the following silence may mean "dead", not
+    /// "recovered".
+    #[test]
+    fn restart_cap_note_states_the_give_up_contract() {
+        let note = format_restart_cap_note(30);
+        assert!(
+            note.contains(&COMPOSE_RESTART_CAP.to_string()),
+            "the restart cap must be stated: {note}"
+        );
+        assert!(
+            note.contains("does NOT mean recovered"),
+            "silence-is-not-recovery is the load-bearing sentence: {note}"
+        );
+        assert!(note.contains("30min"), "{note}");
+    }
+
+    /// Regression lock: no refuse-to-start guard may go back to a bare
+    /// Slack POST. Scoped to `main`, which is where all five live.
+    #[test]
+    fn every_refuse_to_start_guard_routes_through_the_dedup_helper() {
+        let source = include_str!("sync.rs");
+        let start = source
+            .find("async fn main(")
+            .expect("main must exist");
+        let end = source[start..]
+            .find("async fn run_bootstrap(")
+            .map(|i| start + i)
+            .expect("run_bootstrap must follow main");
+        let region = &source[start..end];
+
+        assert_eq!(
+            region.matches("send_boot_refusal_alert(").count(),
+            5,
+            "all five refuse-to-start guards must page through the dedup helper"
+        );
+        assert_eq!(
+            region.matches("send_message(").count(),
+            0,
+            "a bare Slack POST in a startup guard reintroduces the restart-loop \
+             page storm this dedup exists to stop"
         );
     }
 

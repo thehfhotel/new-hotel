@@ -25,6 +25,11 @@ import PrintButton from '@/components/ui/PrintButton'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
+import BookingChannelChip from '@/components/v2/BookingChannelChip'
+import AppDepositNotice, { appDepositNoticeView } from '@/components/v2/AppDepositNotice'
+import AppDepositNote from '@/components/documents/AppDepositNote'
+import BookingCheckInAction from '@/components/v2/BookingCheckInAction'
+import type { BookingCheckInState } from '@/lib/v2/checkin-from-booking'
 
 /** A pre-ordered product line attached to a booking (task #52 — the canonical
  *  analog of iHOTEL's FrmAddBook2 / `HT_Book_Pro`). `name`/`unitPrice` are
@@ -48,6 +53,11 @@ export interface BookingFormState {
   children: number
   status: string
   source: string | null
+  /** `ht_bookings.book_channel` — READ-ONLY provenance, shown as a chip in the
+   *  header. Never submitted: the update payload does not carry it, and the
+   *  channel is only ever set by the create path. Optional so classic callers
+   *  (app/bookings) that don't fetch it still type-check. */
+  bookChannel?: string | null
   depositAmount: number | null
   notes: string | null
   rooms: { roomId: number; pricePerNight: number | null }[]
@@ -77,6 +87,17 @@ interface BookingFormProps {
   mode: 'create' | 'edit'
   /** Optional create-mode prefill (e.g. reserve-from-cell on the room board). */
   prefill?: { room?: RoomOption; checkIn?: string; checkOut?: string }
+  /**
+   * Task B7a — the check-in control for THIS reservation, resolved by the
+   * caller (`lib/v2/checkin-from-booking`). Optional so the classic
+   * `app/bookings` mount, which has no check-in wiring, is untouched:
+   * omit it and no control renders.
+   */
+  checkInState?: BookingCheckInState
+  /** Fires when the desk starts a from-reservation check-in. */
+  onCheckIn?: () => void
+  /** The caller's resolve is in flight. */
+  checkInBusy?: boolean
 }
 
 const sourceOptions = [
@@ -149,6 +170,9 @@ export default function BookingForm({
   initialData,
   mode,
   prefill,
+  checkInState,
+  onCheckIn,
+  checkInBusy = false,
 }: BookingFormProps) {
   const branchFetch = useBranchFetch()
   // Spike Phase 3 (ship-dark): when BOOKING_VALIDATION_ENABLED is on the form
@@ -484,18 +508,78 @@ export default function BookingForm({
                   {mode === 'create' ? 'สร้างการจองใหม่' : 'แก้ไขการจอง'}
                 </h2>
                 {initialData?.bookNo && (
-                  <p className="text-sm text-gray-500">เลขที่จอง: {initialData.bookNo}</p>
+                  <p className="text-sm text-gray-500 flex items-center gap-2">
+                    <span>เลขที่จอง: {initialData.bookNo}</span>
+                    {/* Read-only origin chip — tells the desk an app booking
+                        from a walk-in without opening anything else. */}
+                    <BookingChannelChip
+                      bookChannel={initialData.bookChannel}
+                      bookSource={initialData.source}
+                    />
+                  </p>
                 )}
               </div>
             </div>
-            <button
-              onClick={onClose}
-              className="p-2 hover:bg-gray-100 rounded-full transition-colors"
-              aria-label="ปิด"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2">
+              {/* Task B7a — start the check-in from the reservation itself, so
+                  the stay is created with `bookingId` instead of as an
+                  unlinked walk-in. Renders nothing when the caller passes no
+                  state (the classic app/bookings mount) or when the booking is
+                  cancelled / completed / an unpaid hold. */}
+              {mode === 'edit' && checkInState && onCheckIn && (
+                <BookingCheckInAction
+                  state={checkInState}
+                  busy={checkInBusy}
+                  onCheckIn={onCheckIn}
+                />
+              )}
+              <button
+                onClick={onClose}
+                className="p-2 hover:bg-gray-100 rounded-full transition-colors"
+                aria-label="ปิด"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
+
+          {/* Task B7 — app-deposit signpost. The saved `initialData` values are
+              used (not the editable `formData`) because this states what the
+              loyalty app already collected, not what a receptionist is halfway
+              through typing. Renders nothing unless this is a loyalty booking
+              with a deposit recorded. */}
+          {appDepositNoticeView(initialData?.bookChannel, initialData?.depositAmount ?? null) && (
+            <div className="px-4 pt-4 space-y-2">
+              <AppDepositNotice
+                bookChannel={initialData?.bookChannel}
+                depositAmount={initialData?.depositAmount ?? null}
+              />
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-100"
+                >
+                  พิมพ์ใบแจ้งมัดจำ A6
+                </button>
+              </div>
+              {/* Print-only portal — nothing on screen, one A6 note on paper. */}
+              <AppDepositNote
+                bookChannel={initialData?.bookChannel}
+                depositAmount={initialData?.depositAmount ?? null}
+                bookingNo={initialData?.bookNo}
+                guestName={
+                  selectedCustomer
+                    ? `${selectedCustomer.firstName || ''} ${selectedCustomer.lastName || ''}`.trim()
+                    : initialData?.customerName
+                }
+                roomNo={selectedRooms.map((r) => r.roomNo).join(', ') || null}
+                checkIn={formData.checkIn}
+                checkOut={formData.checkOut}
+                hotelName={hotelInfoForBranch(branch).name}
+              />
+            </div>
+          )}
 
           {/* Success → booking-confirmation print panel */}
           {created ? (

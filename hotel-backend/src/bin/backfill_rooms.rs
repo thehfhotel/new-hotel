@@ -73,8 +73,7 @@ use std::collections::HashMap;
 use std::env;
 use hotel_backend::service::ids::{aggregate_uuid, AggregateKind};
 
-use bb8::Pool;
-use bb8_tiberius::ConnectionManager;
+use hotel_backend::db::DbPool;
 use sqlx::PgPool;
 
 /// Connection-pool size for the one-shot bin — small on purpose: we issue
@@ -148,7 +147,7 @@ struct UpsertCounts {
 const STANDARD_PRICE_TIER: &str = "ราคาปกติ";
 
 async fn load_default_prices(
-    legacy: &Pool<ConnectionManager>,
+    legacy: &DbPool,
 ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = legacy.get().await?;
     let rows = conn
@@ -186,7 +185,7 @@ async fn load_default_prices(
 // =============================================================================
 
 async fn backfill_room_types(
-    legacy: &Pool<ConnectionManager>,
+    legacy: &DbPool,
     pg: &PgPool,
     default_prices: &HashMap<String, f64>,
 ) -> Result<UpsertCounts, Box<dyn std::error::Error + Send + Sync>> {
@@ -273,7 +272,7 @@ async fn backfill_room_types(
 // =============================================================================
 
 async fn backfill_rooms(
-    legacy: &Pool<ConnectionManager>,
+    legacy: &DbPool,
     pg: &PgPool,
     default_prices: &HashMap<String, f64>,
 ) -> Result<UpsertCounts, Box<dyn std::error::Error + Send + Sync>> {
@@ -488,7 +487,7 @@ async fn bump_sequence_to_max(
 // Connection helpers
 // =============================================================================
 
-async fn connect_legacy() -> Result<Pool<ConnectionManager>, Box<dyn std::error::Error + Send + Sync>>
+async fn connect_legacy() -> Result<DbPool, Box<dyn std::error::Error + Send + Sync>>
 {
     // Use the centralised DbConfig + create_pool so this binary inherits the
     // MSSQL_PORT env handling (HF Ville on 1436), the require_secret check

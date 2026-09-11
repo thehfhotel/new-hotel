@@ -69,7 +69,32 @@ impl SlackMessage {
             blocks: None,
         }
     }
+
+    /// Like [`Self::with_site_text`], but for the pager tier only (issue
+    /// #261, re-scoped 2026-07-29): leads the message with
+    /// [`PAGER_MENTION`] so it breaks through Slack's "mentions only"
+    /// notification preference on the single shared webhook. No second
+    /// webhook/channel — this is deliberately just text.
+    ///
+    /// Reserved for: the >72h escalated reconcile digest (`:bangbang:`),
+    /// sync-lag burst pages (`:rotating_light:`), the CT-lag pager, and
+    /// boot-refusal warnings. Routine digests, all-clears, and every
+    /// other send must keep using [`Self::with_site_text`] — do not widen
+    /// this without updating the pager-tier list in the issue.
+    pub fn with_site_text_paged(site_id: &str, text: impl Into<String>) -> Self {
+        Self {
+            text: format!("{PAGER_MENTION}{}", format_site_prefixed(site_id, &text.into())),
+            blocks: None,
+        }
+    }
 }
+
+/// Slack's channel-mention markup (mrkdwn). Renders as `@channel` in the
+/// client and — unlike a plain-text mention — breaks through Slack's
+/// "mentions only" per-user notification preference, which is what makes
+/// it worth reserving for the pager tier. Prepended verbatim, including
+/// the trailing space, by [`SlackMessage::with_site_text_paged`].
+pub const PAGER_MENTION: &str = "<!channel> ";
 
 /// Prepend the site-id prefix to a Slack message body. Pulled out as a
 /// pure helper so the prefix shape (`[site=<id>] ...`) is unit-testable
@@ -88,10 +113,26 @@ pub fn format_site_prefixed(site_id: &str, text: &str) -> String {
 pub struct SlackClient {
     config: SlackConfig,
     agent: ureq::Agent,
+    /// Consecutive fully-failed sends (all retries exhausted). Reset to 0
+    /// on the next success. See [`EV_SLACK_DELIVERY_FAILED`].
+    consecutive_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Maximum number of retry attempts for a Slack webhook POST.
 const SLACK_MAX_RETRIES: u32 = 3;
+
+/// A message was DROPPED after exhausting every retry — i.e. an alert
+/// nobody will ever see. Greppable because Slack is itself the alerting
+/// channel, so a dead webhook cannot be announced via Slack; the only
+/// signal available is a distinctive, counted log line.
+pub const EV_SLACK_DELIVERY_FAILED: &str = "slack.delivery_failed";
+
+/// Deliveries resumed after ≥1 consecutive total failure.
+pub const EV_SLACK_DELIVERY_RECOVERED: &str = "slack.delivery_recovered";
+
+/// How much of the dropped message to echo into the failure log. Enough
+/// to identify WHICH alert was lost without dumping a whole payload.
+const DROPPED_MESSAGE_PREVIEW_CHARS: usize = 160;
 
 impl SlackClient {
     /// Create a new Slack client
@@ -100,7 +141,23 @@ impl SlackClient {
             .timeout_connect(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build();
-        Self { config, agent }
+        Self {
+            config,
+            agent,
+            consecutive_failures: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// First line of a message, truncated on a char boundary — the alert's
+    /// identity for the drop log. Thai text is common in these payloads, so
+    /// slicing by byte index would panic.
+    fn preview(text: &str) -> String {
+        let first_line = text.lines().next().unwrap_or("").trim();
+        if first_line.chars().count() <= DROPPED_MESSAGE_PREVIEW_CHARS {
+            return first_line.to_string();
+        }
+        let truncated: String = first_line.chars().take(DROPPED_MESSAGE_PREVIEW_CHARS).collect();
+        format!("{truncated}…")
     }
 
     /// Send a message to Slack via webhook.
@@ -148,6 +205,20 @@ impl SlackClient {
                     let status = response.status();
                     if (200..300).contains(&status) {
                         tracing::info!("[Slack] Message sent successfully");
+                        // Announce recovery so a resolved outage is visible
+                        // in logs — the failures below are only interpretable
+                        // if you can also see when they stopped.
+                        let prior = self
+                            .consecutive_failures
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        if prior > 0 {
+                            tracing::warn!(
+                                event_name = EV_SLACK_DELIVERY_RECOVERED,
+                                dropped_while_down = prior,
+                                "[Slack] Delivery recovered — {prior} message(s) were dropped \
+                                 while the webhook was failing and are NOT retried"
+                            );
+                        }
                         return true;
                     }
 
@@ -194,7 +265,21 @@ impl SlackClient {
             }
         }
 
-        tracing::error!("[Slack] All retry attempts failed");
+        // Every retry exhausted: this alert is GONE. Nothing re-queues it.
+        // Callers all discard the returned bool (by design — notifications
+        // are best-effort and must never break the caller), so this line is
+        // the only record that a page was lost, and the only way to tell a
+        // dead webhook from a genuinely quiet system.
+        let consecutive = self
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        tracing::error!(
+            event_name = EV_SLACK_DELIVERY_FAILED,
+            consecutive_failures = consecutive,
+            dropped_alert = %Self::preview(&message.text),
+            "[Slack] All retry attempts failed — message DROPPED, not retried"
+        );
         false
     }
 }
@@ -419,6 +504,33 @@ pub fn build_new_booking_alert_message(
 mod tests {
     use super::*;
 
+    /// The drop log must name WHICH alert was lost — "all retries failed"
+    /// alone tells an operator nothing about what they missed.
+    #[test]
+    fn preview_takes_the_first_line_only() {
+        let msg = ":rotating_light: *Writeback EXHAUSTED retries*\nbody line\nmore body";
+        assert_eq!(
+            SlackClient::preview(msg),
+            ":rotating_light: *Writeback EXHAUSTED retries*"
+        );
+    }
+
+    /// These payloads routinely carry Thai guest names, so truncation MUST
+    /// be char-wise — a byte-index slice would panic mid-codepoint.
+    #[test]
+    fn preview_truncates_multibyte_text_without_panicking() {
+        let thai = "สุภาวดี เมียนเมือง ".repeat(40);
+        let out = SlackClient::preview(&thai);
+        assert!(out.chars().count() <= DROPPED_MESSAGE_PREVIEW_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_leaves_short_lines_untouched() {
+        assert_eq!(SlackClient::preview("short"), "short");
+        assert_eq!(SlackClient::preview("  padded  \nrest"), "padded");
+    }
+
     /// Task #69 contract: the site prefix must show up at the START of
     /// the Slack message text so an operator sees `[site=hfvilel]` in
     /// the notification preview before any context.
@@ -438,5 +550,36 @@ mod tests {
         );
         assert!(msg.text.contains("schema fingerprint mismatch"));
         assert!(msg.blocks.is_none());
+    }
+
+    /// Issue #261 (re-scoped 2026-07-29): the pager-tier constructor must
+    /// lead the message with the exact `<!channel> ` mention — Slack's
+    /// channel-mention markup, not a plain-text lookalike — so it renders
+    /// as `@channel` and breaks through mentions-only notification prefs.
+    #[test]
+    fn with_site_text_paged_leads_with_the_exact_channel_mention() {
+        let msg = SlackMessage::with_site_text_paged("hfville", ":bangbang: STUCK :bangbang:");
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "pager tier must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert_eq!(
+            msg.text,
+            "<!channel> [site=hfville] :bangbang: STUCK :bangbang:"
+        );
+        assert!(msg.blocks.is_none());
+    }
+
+    /// Routine sends must never pick up the mention — the whole point of
+    /// the re-scope is that MOST sends stay quiet on mentions-only prefs.
+    #[test]
+    fn with_site_text_never_carries_the_channel_mention() {
+        let msg = SlackMessage::with_site_text("hfhotel", "Reconcile rows unconverged >4h");
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "routine constructor must never emit the pager mention; got {:?}",
+            msg.text
+        );
     }
 }

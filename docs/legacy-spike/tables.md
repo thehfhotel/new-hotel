@@ -25,7 +25,7 @@ Columns marked **observed** were seen written to in our 2026-04-24 capture.
 | `HT_Rooms` | 58 | Room master. PK `id` (identity int). App-key `room_no` (varchar). Status fields: `room_use`, `Room_Clean`, `Room_Use_Count`, `room_book_*`. | walk-in, check-in-to-booking, extend, check-out |
 | `HT_Room_Status` | 4,449 | One row per (room, date). **Current state, not history.** Overwritten on new check-in for same room+date. PK `id` (app-allocated). | walk-in, check-in-to-booking, extend, check-out |
 | `HT_POWER_LOG` | 29,755 | IoT relay log (lights on/off per occupancy). One INSERT on check-in (start), one UPDATE on check-out (end). Filter `WHERE ROOM_POWER_END_BY=''` for in-progress. | walk-in, check-in-to-booking, check-out |
-| `HT_Housewife` | 30,210 | Housekeeping work items. App-INSERTed when room marked dirty. | check-out (after) |
+| `HT_Housewife` | 30,210 | Housekeeping work items. App-INSERTed when room marked CLEAN (§3j) or sent to repair — NOT on the dirty flip itself (corrected 2026-07-31, #276; findings.md §3e/§3i show check-out/cancel-check-in raise `Room_Clean='yes'` with zero `HT_Housewife` touches). | check-out (after) |
 | `HT_Cupon` | 17,894 | Pre-allocated coupons; `cupon_print` flag flipped on check-in. Purpose unclear. | walk-in, check-in-to-booking |
 | `Tb_Save_Image` | 9,688 | ID card / customer photo storage. Pre-staged with `tmp_no`, claimed by `cin_no`/`cust_no` on check-in completion. | walk-in (no-op if no photo), check-in-to-booking |
 
