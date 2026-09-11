@@ -21,7 +21,8 @@ because the two per-site databases have overlapping SERIAL sequences.
 |---|---|---|
 | `LOYALTY_CHANNEL_ENABLED` | Master switch for the inbound `/api/channel/*` surface | **off** — all channel requests answer 503 |
 | `LOYALTY_CHANNEL_TOKEN` | Shared bearer the loyalty app presents (`Authorization: Bearer …`) | unset — fail closed even when the flag is on |
-| `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` | B8e/L2 — sellable rooms each property keeps for the **front desk**; a hold is refused while the channel's surplus is at or below it | **1** — guard ON; `0` disables. A garbled value reads as 1, not as off |
+| `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` | B8e/L2 — sellable rooms each property keeps for the **front desk**; a hold is refused while the channel's surplus is at or below it | compose ships **0** (dark — see Rollout below); Rust default is 1, so a garbled value reads as 1, never as off |
+| `BOOKING_INVENTORY_LOCK_ENABLED` | B8e/L3 — kill switch for the pick→create advisory lock | **true** (on). Only an explicit `false`/`0` disables it, which re-opens the double-sell |
 | `LOYALTY_APP_URL` | Loyalty app base URL for the checkout stay hook | unset — hook off |
 | `LOYALTY_SERVICE_TOKEN` | Bearer for the outbound stay hook | unset — hook off |
 
@@ -384,7 +385,9 @@ its whole pick→insert span (`repository::inventory_lock`):
 | Scope | **One lock per property.** NOT per (type, date) — see below. |
 | Who takes it | `service::channel::create_hold` across floor-check → pick → `BookingService::create`; and `BookingService::create` itself whenever `CreateBookingCommand::inventory_lock` is set, which `routes::new_bookings::create_booking` (the desk form / OTA bridge) always does. |
 | Lifetime | Transaction-scoped on a transaction the guard owns and never writes through, so an error path that skips `release()` still frees it — sqlx queues the `ROLLBACK` and flushes it when the connection returns to the pool. |
-| Waiting | `pg_try_advisory_xact_lock` in a 5 ms→50 ms backoff loop, 5 s deadline, **returning the pooled connection between attempts**. A blocking `pg_advisory_xact_lock` would pin one connection per waiter while the holder needs a second one — a pool-exhaustion deadlock waiting for a burst (`NEW_DB_POOL_MAX` defaults to 10). A timeout answers 409, never a booking. |
+| Waiting | `pg_try_advisory_xact_lock` in a 5 ms→50 ms backoff loop, 5 s deadline, **returning the pooled connection between attempts**. A blocking `pg_advisory_xact_lock` would pin one connection per waiter while the holder needs a second one — a pool-exhaustion deadlock waiting for a burst (`NEW_DB_POOL_MAX` defaults to 10). A pool timeout while trying counts as the same contention, not a 500. |
+| Giving up | **`503` + `Retry-After: 1`, on BOTH routers** — `reason: "inventory_lock_timeout"` on `/api/channel/*`, `ApiError::Busy` on the desk form and the OTA bridge. Never `409`, and above all never `400`: nothing was written and the condition clears in milliseconds, so a 4xx would tell a machine caller its request was wrong and an OTA booking would be dropped for a race we already know how to survive. |
+| Kill switch | `BOOKING_INVENTORY_LOCK_ENABLED`, compose-owned, **default on** (opposite polarity to the ship-dark flags — this one closes a window rather than opening a legacy write). Setting it false makes `acquire` return a no-op guard and re-opens the double-sell; an incident tool, not a knob. |
 
 *Why the key is not `(property, room type, check-in date)`:* two stays that
 overlap need not share a check-in date (Nov 1–5 vs Nov 2–3), so a date term
@@ -395,9 +398,34 @@ while the L2 floor is property-wide by definition, a type term cannot
 serialise either quantity. Booking creates at both properties are human-paced,
 so a correct coarse lock beats a fine-grained one that does not exclude.
 
-*Not covered:* the **edit** path (`PUT /api/new/bookings/{id}`, which can also
-assign a room) still runs unlocked. Same window, much smaller population;
-tracked as follow-up rather than widened here.
+**Exactly two paths take this lock.** Do not read it as "inventory is now
+serialised" — it is not. Everything else that moves inventory still races as
+it did before:
+
+| unlocked path | |
+|---|---|
+| walk-in check-in (`service::checkin::create`) | consumes a room directly |
+| room change (`service::checkin::change_room`) | moves an occupied stay |
+| stay extension (`service::checkin::extend_stay`) | lengthens a claim |
+| booking edit / parked promote (`service::booking::modify` via `PUT /api/new/bookings/{id}`) | assigns the FIRST room to a parked booking |
+| CT sync mappers (`bin/sync.rs`) | replay iHOTEL's own writes — iHOTEL cannot be asked to take our lock |
+
+What keeps the *channel* clear of those is **not** the lock, it is the L2 floor
+below: it holds back a buffer of sellable rooms, so an unlocked desk-side write
+landing a beat later still finds one. The lock removes the hold-vs-hold and
+hold-vs-desk-create races outright; the floor absorbs the rest. Widening the
+lock to those rows is a separate decision — they take real row locks inside
+their own transactions.
+
+**⚠️ The guard's transaction sits idle by design.** It holds
+`pg_advisory_xact_lock` open while the caller works on other connections, so a
+server-side `idle_in_transaction_session_timeout` would kill that backend
+mid-critical-section and **silently** release the lock — the pick and the
+insert would stop excluding with no error near the caller. PostgreSQL ships
+that setting disabled and this repo never sets it. Before enabling it, read
+`docs/adr/0009-booking-inventory-lock.md`, which also records the structural
+alternative (take the lock as the first statement of the INSERT's own
+transaction) and why it is not what shipped.
 
 **L2 — the last-room floor.** When the channel's property-wide surplus for the
 requested nights is `<= LOYALTY_CHANNEL_LAST_ROOM_FLOOR` (default **1**), the
@@ -410,11 +438,41 @@ hold is refused:
       "free_rooms": 1, "floor": 1 }
 ```
 
-`reason` is a **stable contract string** (`routes::channel::
-REASON_LAST_ROOM_HELD_FOR_DESK`) — the loyalty app branches on it to show
-call-the-desk copy rather than a generic sold-out message. `free_rooms` is the
-parked-claim-adjusted surplus (`inventory_snapshot().surplus`, the same number
-the counter and the picker are derived from), not a raw room count.
+`reason` is a **stable contract string** — the loyalty app branches on it to
+show call-the-desk copy rather than a generic sold-out message. `free_rooms` is
+the parked-claim-adjusted surplus (`inventory_snapshot().surplus`, the same
+number the counter and the picker are derived from), not a raw room count.
+
+### `reason` codes on `/api/channel/*` (the total mapping)
+
+**Every** error body this router returns carries `reason`, so loyalty-app's
+mapping has no "and otherwise?" hole. Defined in `routes::channel::reason`;
+renaming one is a contract change.
+
+| `reason` | status | meaning / guest copy |
+|---|---|---|
+| `sold_out` | 409 | no room of that type for those dates — offer other dates |
+| `last_room_held_for_desk` | 409 | B8e/L2 floor — **call the desk**, reception can still sell it |
+| `inventory_lock_timeout` | 503 + `Retry-After` | transient contention, nothing written — **retry the same request** |
+| `idempotency_key_mismatch` | 422 | the key is bound to a different request |
+| `bad_request` / `not_found` / `forbidden` / `conflict` / `unprocessable` / `unavailable` / `internal` | per status | status-derived fallback so the field is never absent |
+
+### Rollout: the floor ships at 0
+
+`docker-compose.yml` ships `LOYALTY_CHANNEL_LAST_ROOM_FLOOR=0` — the guard is
+**off in production on day one**, even though the Rust default is 1 (an unset
+or garbled env value must not silently remove an inventory guard).
+
+The reason is the contract above: a floored hold is only useful once
+loyalty-app renders call-the-desk copy for `last_room_held_for_desk`. Until it
+does, the refusal reaches the guest as an unexplained failure — worse than the
+race it prevents, because the race is rare and the bad copy is certain. That
+loyalty-app change is filed separately.
+
+**Flip to 1 when:** loyalty-app is live with copy for
+`reason: "last_room_held_for_desk"`, and a hold against a property drained to
+its last room has been observed returning it. The L3 lock needs no such wait —
+it ships on.
 
 Properties of the guard, all deliberate:
 

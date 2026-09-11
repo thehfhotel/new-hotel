@@ -662,15 +662,35 @@ services:
       - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
       # B8e / L2 — how many sellable rooms each property keeps for the FRONT
       # DESK. With the channel's surplus for the requested nights at or below
-      # this number, a hold is refused 409 `last_room_held_for_desk` and the
-      # loyalty app shows call-the-desk copy; reception is NOT gated and can
-      # still sell the room. Default 1 = guard ON, which is the direction that
-      # fails safe (the alternative failure is a guest turned away at 22:00).
-      # `0` disables it. NOT a legacy-write flag and NOT an allotment — it caps
-      # nothing while the property has slack (loyalty-app ADR-0003) — but it is
-      # compose-owned like its siblings above so a change is a reviewable diff.
-      # Deliberately absent from docker-build.yml for that reason.
-      - LOYALTY_CHANNEL_LAST_ROOM_FLOOR=${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-1}
+      # this number, a hold is refused 409 `reason: last_room_held_for_desk`;
+      # reception is NOT gated and can still sell the room. NOT a legacy-write
+      # flag and NOT an allotment — it caps nothing while the property has
+      # slack (loyalty-app ADR-0003) — but it is compose-owned like its
+      # siblings above so a change is a reviewable diff, and deliberately
+      # absent from docker-build.yml for that reason.
+      #
+      # SHIPS DARK AT 0. The refusal is only useful once loyalty-app renders
+      # call-the-desk copy for `reason: last_room_held_for_desk`; until then a
+      # floored hold reaches the guest as an unexplained failure, which is
+      # worse than the race it prevents. That loyalty-app change is filed
+      # separately — flip this to 1 AFTER it is live, and verify with a hold
+      # against a property drained to its last room.
+      #
+      # (The Rust default is 1, not 0: an unset or garbled value must not
+      # silently remove an inventory guard. The dark default is asserted HERE,
+      # once, where it can be reviewed and dated by `git log -S`.)
+      - LOYALTY_CHANNEL_LAST_ROOM_FLOOR=${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-0}
+      # B8e / L3 — kill switch for the per-property booking-inventory advisory
+      # lock that serialises pick -> create on the channel hold path and the
+      # desk/OTA create path.
+      #
+      # DEFAULT ON, which is the opposite polarity to every flag above: those
+      # ship dark because they OPEN a legacy write, this one CLOSES a
+      # double-sell window. Setting it false re-opens the race where two holds
+      # (or a hold and a desk booking) both take the property's last room.
+      # It exists so an operator can un-serialise booking creates during an
+      # incident without waiting for a rollback deploy — not a tuning knob.
+      - BOOKING_INVENTORY_LOCK_ENABLED=${BOOKING_INVENTORY_LOCK_ENABLED:-true}
       # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
       # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
       # secret file; with either missing, LoyaltyClient::from_config yields None

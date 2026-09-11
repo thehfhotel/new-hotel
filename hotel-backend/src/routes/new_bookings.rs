@@ -741,7 +741,7 @@ pub struct ValidateBookingResponse {
 ///
 /// Mirrors [`AppState::write_pool`]'s own branch mapping exactly: `All`
 /// resolves to the HF Hotel pool, so it must resolve to the HF Hotel lock.
-fn branch_property(branch: Option<Branch>) -> &'static str {
+pub(crate) fn branch_property(branch: Option<Branch>) -> &'static str {
     match branch.unwrap_or_default() {
         Branch::Hfville => "hfville",
         Branch::Hfhotel | Branch::All => "hf",
@@ -1182,5 +1182,43 @@ mod tests {
         let json = serde_json::to_value(&detail).expect("NewBookingDetail serialises");
 
         assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+    }
+}
+
+#[cfg(test)]
+mod inventory_lock_scope_tests {
+    use super::*;
+
+    /// B8e / L3 — the desk router and the channel router must derive the SAME
+    /// property label, or they take two different advisory locks and stop
+    /// excluding each other while every test still passes in isolation.
+    ///
+    /// This is the assertion that would have caught a `"hfhotel"` here against
+    /// the channel contract's `"hf"`: nothing else in the suite compares the
+    /// two routers' strings, and the failure mode is silent (both paths lock,
+    /// neither blocks the other, the double-sell returns).
+    #[test]
+    fn desk_and_channel_agree_on_the_property_lock_scope() {
+        let channel_hf = crate::routes::channel::parse_property("hf")
+            .map(|(_, property)| property)
+            .expect("'hf' is a valid contract property");
+        let channel_ville = crate::routes::channel::parse_property("hfville")
+            .map(|(_, property)| property)
+            .expect("'hfville' is a valid contract property");
+
+        assert_eq!(branch_property(Some(Branch::Hfhotel)), channel_hf);
+        assert_eq!(branch_property(Some(Branch::Hfville)), channel_ville);
+
+        // `write_pool` sends BOTH the default (no `?branch=`) and `All` to the
+        // HF Hotel pool, so both must lock on the HF Hotel key — a desk save
+        // with no branch parameter is the common case.
+        assert_eq!(branch_property(None), channel_hf);
+        assert_eq!(branch_property(Some(Branch::All)), channel_hf);
+
+        assert_ne!(
+            branch_property(Some(Branch::Hfhotel)),
+            branch_property(Some(Branch::Hfville)),
+            "the two properties must not share one inventory lock"
+        );
     }
 }

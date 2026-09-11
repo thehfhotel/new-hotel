@@ -361,8 +361,11 @@ async fn loyalty_channel_end_to_end() {
         ))
         .await
     {
-        Err(ServiceError::Conflict(_)) => {}
-        other => panic!("expected Conflict for sold-out window, got {other:?}"),
+        // B8e / M2: sold-out is an OUTCOME now, not an error — the route
+        // needs it separable from the last-room floor (same 409, different
+        // guest copy) and from a lock timeout (503).
+        Ok(HoldCreateOutcome::SoldOut { .. }) => {}
+        other => panic!("expected SoldOut for a sold-out window, got {other:?}"),
     }
 
     // Party larger than the type sleeps ⇒ refuse even with rooms free
@@ -370,8 +373,8 @@ async fn loyalty_channel_end_to_end() {
     let mut oversized = hold_cmd(&format!("{BOOK_NO_PREFIX}-X2"), type_id, w2.0, w2.1);
     oversized.guests = 3;
     match svc.create_hold(oversized).await {
-        Err(ServiceError::Conflict(_)) => {}
-        other => panic!("expected Conflict for oversized party, got {other:?}"),
+        Ok(HoldCreateOutcome::SoldOut { .. }) => {}
+        other => panic!("expected SoldOut for an oversized party, got {other:?}"),
     }
 
     // Free the seeded conflicts for the rest of the scenario.
@@ -873,6 +876,14 @@ async fn create_hold_with_key(
                         HoldCreateOutcome::LastRoomHeldForDesk { .. } => {
                             reservation.abandon().await;
                             panic!("the last-room floor is disabled in this file's fixtures");
+                        }
+                        // Likewise unreachable: these fixtures seed their own
+                        // free rooms. A sold-out answer here means the fixture
+                        // changed, and folding it into a key verdict would
+                        // report the wrong reason for the failure.
+                        HoldCreateOutcome::SoldOut { room_type } => {
+                            reservation.abandon().await;
+                            panic!("fixture room type '{room_type}' unexpectedly sold out");
                         }
                     };
                     // Stand-in for the real 201 payload; the point is that the

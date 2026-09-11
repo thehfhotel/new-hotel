@@ -14,10 +14,36 @@
 //! `room_id = NULL` on the loyalty side by design, so the loyalty app's own
 //! range constraint cannot cover them either).
 //!
-//! This module is the serializer: every writer that CONSUMES inventory takes
-//! the same advisory lock for the whole pick → insert span, so the second
-//! writer re-evaluates availability against the first writer's COMMITTED
-//! state instead of against the snapshot it read before the race started.
+//! ## EXACTLY which paths take this lock
+//!
+//! Two, and only two. Do not read this module as "inventory is now
+//! serialised"; it is not, and the list below is the whole of it:
+//!
+//! 1. **`service::channel::create_hold`** — holds it across last-room-floor
+//!    check → `pick_free_room` → `BookingService::create`.
+//! 2. **`service::booking::create`**, whenever
+//!    `CreateBookingCommand::inventory_lock` is `Some(property)` — which
+//!    `routes::new_bookings::create_booking` (the desk form and the OTA
+//!    bridge) always sets, roomless creates included.
+//!
+//! **Everything else that moves inventory still runs unlocked**, by design and
+//! for now:
+//!
+//! | path | why it is out of scope |
+//! |---|---|
+//! | walk-in check-in (`service::checkin::create`) | consumes a room directly; a desk-vs-desk race, unchanged from today |
+//! | room change (`service::checkin::change_room`) | moves an occupied stay between rooms |
+//! | stay extension (`service::checkin::extend_stay`) | lengthens an existing claim |
+//! | booking edit / parked promote (`service::booking::modify`, via `routes::new_bookings::update_booking`) | assigns the FIRST room to a parked booking |
+//! | CT sync mappers (`bin/sync.rs`) | replay iHOTEL's own writes; iHOTEL is the writer there and cannot be asked to take our lock |
+//!
+//! What protects the channel against those is **not** this lock — it is the
+//! **L2 last-room floor**, which keeps a buffer of sellable rooms the channel
+//! will not touch, so an unlocked desk-side write landing a beat later still
+//! finds a room. The lock removes the hold-vs-desk-create and hold-vs-hold
+//! races outright; the floor absorbs the rest. Widening the lock to the rows
+//! above is a separate, larger change (they take real row locks and sit inside
+//! their own transactions) and needs its own decision record.
 //!
 //! ## Why the key is per-PROPERTY, not per (type, date)
 //!
@@ -52,6 +78,30 @@
 //! waiting for a burst — `NEW_DB_POOL_MAX` defaults to 10. So we try, and on
 //! failure DROP the transaction (returning the connection to the pool) before
 //! sleeping. No connection is held while waiting.
+//!
+//! ## ⚠️ The guard depends on its transaction staying open
+//!
+//! The lock is `pg_advisory_xact_lock` inside a transaction this guard owns
+//! and then leaves IDLE while the caller does its work on OTHER connections.
+//! **A server-side `idle_in_transaction_session_timeout` would therefore kill
+//! that backend mid-critical-section and silently release the lock**, with no
+//! error anywhere near the caller — the pick and the insert would simply stop
+//! excluding, and the double-sell would come back looking like a heisenbug.
+//!
+//! PostgreSQL ships that setting as `0` (disabled) and this repo never sets
+//! it, on the server or per role. If it is ever turned on:
+//!
+//! * it must be larger than the whole create span (hundreds of ms), and
+//! * this module should move to the structural design instead — take
+//!   `pg_advisory_xact_lock` as the FIRST statement of the SAME transaction
+//!   that does the INSERT, threading `&mut Transaction` through
+//!   `pick_free_room` / `inventory_snapshot`.
+//!
+//! The structural version has no idle transaction at all and is strictly
+//! better; it is not what shipped because `BookingService::create` owns its
+//! transaction and giving every caller (desk form, OTA bridge, channel,
+//! scheduler) a way to pass one in is a refactor with a far wider blast radius
+//! than this fix. Recorded in `docs/adr/0009-booking-inventory-lock.md`.
 
 use std::time::{Duration, Instant};
 
@@ -73,16 +123,45 @@ const MAX_BACKOFF: Duration = Duration::from_millis(50);
 /// Why a lock could not be taken.
 #[derive(Debug, Error)]
 pub enum InventoryLockError {
+    /// A real database failure — not retryable, surfaces as a 500.
     #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
 
-    /// Nobody released the lock inside [`ACQUIRE_TIMEOUT`]. Callers surface
-    /// this as a retryable conflict, never as a successful booking.
+    /// Transient contention: either nobody released the lock inside
+    /// [`ACQUIRE_TIMEOUT`], or the connection pool had nothing to lend us
+    /// (`PoolTimedOut`) — indistinguishable to the caller and identical in
+    /// remedy, so they share one variant. Callers surface this as `503` +
+    /// `Retry-After`, never as a successful booking.
+    ///
+    /// This `Display` is the INTERNAL, logged form; the caller-facing message
+    /// is built in `From<InventoryLockError> for ServiceError` and names
+    /// neither the property nor this subsystem.
     #[error(
-        "timed out after {waited:?} waiting for the booking-inventory lock of property \
-         '{property}'; another booking write is still in progress"
+        "booking-inventory lock for property '{property}' unavailable after {waited:?} ({cause})"
     )]
-    Timeout { property: String, waited: Duration },
+    Busy {
+        property: String,
+        waited: Duration,
+        cause: BusyCause,
+    },
+}
+
+/// What stopped us from taking the lock — carried for the log line only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyCause {
+    /// Another writer held the lock for the whole acquire window.
+    LockHeld,
+    /// The PG connection pool could not lend a connection to even try.
+    PoolExhausted,
+}
+
+impl std::fmt::Display for BusyCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BusyCause::LockHeld => f.write_str("another booking write held it"),
+            BusyCause::PoolExhausted => f.write_str("no pooled connection available"),
+        }
+    }
 }
 
 /// The `(classid, objid)` pair `pg_advisory_xact_lock` is called with for
@@ -120,10 +199,16 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
 /// Prefer [`release`](Self::release) anyway: it frees the lock at a
 /// deterministic point (right after the caller's own commit) rather than
 /// whenever the pool gets round to the connection.
+///
+/// A guard with `tx == None` is a **bypass** — the kill switch
+/// (`BOOKING_INVENTORY_LOCK_ENABLED=false`) is off, so nothing is held and
+/// every method is a no-op. The type is still handed back so callers keep one
+/// code path.
 pub struct InventoryLock {
-    /// `None` only after [`release`](Self::release) has consumed it.
+    /// `None` after [`release`](Self::release), or when the lock is bypassed.
     tx: Option<Transaction<'static, Postgres>>,
     property: String,
+    bypassed: bool,
 }
 
 impl std::fmt::Debug for InventoryLock {
@@ -133,6 +218,7 @@ impl std::fmt::Debug for InventoryLock {
             .field("property", &self.property)
             .field("key", &(class, obj))
             .field("held", &self.tx.is_some())
+            .field("bypassed", &self.bypassed)
             .finish()
     }
 }
@@ -140,23 +226,69 @@ impl std::fmt::Debug for InventoryLock {
 impl InventoryLock {
     /// Take the booking-inventory lock for `property`, waiting up to
     /// [`ACQUIRE_TIMEOUT`].
+    ///
+    /// Returns a no-op bypass guard when `BOOKING_INVENTORY_LOCK_ENABLED` is
+    /// off — the kill switch exists so an operator can un-serialise booking
+    /// creates without a rollback deploy if this lock ever becomes the thing
+    /// that is wrong. It re-opens the B8 §2.1/§2.3 double-sell window, so it
+    /// is an incident tool, not a tuning knob.
     pub async fn acquire(pool: &PgPool, property: &str) -> Result<Self, InventoryLockError> {
+        if !crate::config::booking_inventory_lock_enabled() {
+            tracing::warn!(
+                property,
+                "BOOKING_INVENTORY_LOCK_ENABLED=false — booking creates are NOT serialised; \
+                 concurrent writers can take the same last room"
+            );
+            return Ok(Self {
+                tx: None,
+                property: property.to_string(),
+                bypassed: true,
+            });
+        }
+
         let (class, obj) = lock_key(property);
         let started = Instant::now();
         let mut backoff = FIRST_BACKOFF;
 
+        let busy = |waited: Duration, cause: BusyCause| InventoryLockError::Busy {
+            property: property.to_string(),
+            waited,
+            cause,
+        };
+
         loop {
-            let mut tx = pool.begin().await?;
+            // Deadline checked around the ACQUIRE as a whole, not only around
+            // the sleeps: `pool.begin()` below has its own multi-second
+            // acquire timeout, so without this a slow pool could stretch the
+            // effective wait well past ACQUIRE_TIMEOUT and hold the caller's
+            // request open for it.
+            if started.elapsed() >= ACQUIRE_TIMEOUT {
+                return Err(busy(started.elapsed(), BusyCause::LockHeld));
+            }
+
+            let mut tx = match pool.begin().await {
+                Ok(tx) => tx,
+                // A pool timeout is contention, not a fault: every connection
+                // is busy right now. Surfacing it as `Db` would render a raw
+                // 500 for a condition that clears by itself in milliseconds.
+                Err(sqlx::Error::PoolTimedOut) => {
+                    return Err(busy(started.elapsed(), BusyCause::PoolExhausted))
+                }
+                Err(err) => return Err(InventoryLockError::Db(err)),
+            };
+
             let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, $2)")
                 .bind(class)
                 .bind(obj)
                 .fetch_one(&mut *tx)
-                .await?;
+                .await
+                .map_err(InventoryLockError::Db)?;
 
             if acquired {
                 return Ok(Self {
                     tx: Some(tx),
                     property: property.to_string(),
+                    bypassed: false,
                 });
             }
 
@@ -166,10 +298,7 @@ impl InventoryLock {
 
             let waited = started.elapsed();
             if waited >= ACQUIRE_TIMEOUT {
-                return Err(InventoryLockError::Timeout {
-                    property: property.to_string(),
-                    waited,
-                });
+                return Err(busy(waited, BusyCause::LockHeld));
             }
             tokio::time::sleep(backoff).await;
             backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
@@ -181,8 +310,14 @@ impl InventoryLock {
         &self.property
     }
 
+    /// `true` when the kill switch is off and this guard holds nothing.
+    pub fn is_bypassed(&self) -> bool {
+        self.bypassed
+    }
+
     /// Release the lock now. Rolls back the guard's own transaction (which
-    /// wrote nothing) — that is what drops the advisory lock.
+    /// wrote nothing) — that is what drops the advisory lock. A no-op on a
+    /// bypass guard.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
         match self.tx.take() {
             Some(tx) => tx.rollback().await,

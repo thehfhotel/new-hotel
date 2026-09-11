@@ -68,7 +68,7 @@ use hotel_backend::repository::{CustomerRepository, PgBookingRepository, PgCusto
 use hotel_backend::service::{
     aggregate_uuid, AggregateKind, BookingRoomCommand, BookingService, BookingWritebackContext,
     ChannelService, CreateBookingCommand, CreateHoldCommand, CustomerService, HoldCreateOutcome,
-    PaymentPlan, ServiceError,
+    PaymentPlan,
 };
 
 /// Unique-to-this-file fixture markers (see tests/common/mod.rs cleanup rules).
@@ -430,15 +430,25 @@ async fn cleanup(pool: &PgPool) {
 // ── the lock key (no database needed) ───────────────────────────────────────
 
 /// The two properties must not share a lock, and a property's key must not
-/// move between releases — a key that drifts is a lock that stops excluding
-/// while still looking like it works.
+/// move between releases.
+///
+/// The literals are PINNED, not recomputed from `lock_key`, and that is the
+/// whole point: a self-referential assertion would pass through any change to
+/// the hash. A key that drifts is a lock that silently stops excluding — two
+/// backend versions mid-deploy would take different keys for one property and
+/// the double-sell would come back for the length of the rollout, with every
+/// test still green.
 #[test]
 fn lock_keys_are_stable_and_per_property() {
-    let hf = lock_key("hf");
-    let ville = lock_key("hfville");
-    assert_ne!(hf, ville, "each property needs its own lock");
-    assert_eq!(hf.0, ville.0, "both share the booking-inventory namespace");
-    assert_eq!(hf, lock_key("hf"), "the key must be deterministic");
+    // classid 1112230230 == i32::from_be_bytes(*b"BKIV"); objid == FNV-1a/32
+    // of the property label, as i32.
+    assert_eq!(lock_key("hf"), (1_112_230_230, 1_530_585_635));
+    assert_eq!(lock_key("hfville"), (1_112_230_230, -2_099_596_955));
+    assert_ne!(
+        lock_key("hf"),
+        lock_key("hfville"),
+        "each property needs its own lock"
+    );
 }
 
 // ── the tests ───────────────────────────────────────────────────────────────
@@ -475,18 +485,24 @@ async fn last_room_is_serialized_and_floored() {
     let ra = ta.await.expect("task a");
     let rb = tb.await.expect("task b");
 
+    // The loser must be SOLD OUT specifically — it re-picked after the winner
+    // committed and found nothing. Asserting a looser "it failed somehow"
+    // would also accept a lock TIMEOUT (503) or any repository error, which
+    // would mean the serialization never actually ran and the test was
+    // certifying a failure mode instead of the fix.
     let created = [&ra, &rb]
         .iter()
         .filter(|r| matches!(r, Ok(HoldCreateOutcome::Created(_))))
         .count();
     let refused = [&ra, &rb]
         .iter()
-        .filter(|r| matches!(r, Err(ServiceError::Conflict(_))))
+        .filter(|r| matches!(r, Ok(HoldCreateOutcome::SoldOut { .. })))
         .count();
     assert_eq!(
         (created, refused),
         (1, 1),
-        "exactly one of two concurrent holds may take the last room; got {ra:?} / {rb:?}"
+        "exactly one of two concurrent holds may take the last room, and the loser must be \
+         SoldOut (not a lock timeout); got {ra:?} / {rb:?}"
     );
     assert_eq!(
         live_claims_on(&pool, room_a, w1_in, w1_out).await,
@@ -537,14 +553,74 @@ async fn last_room_is_serialized_and_floored() {
     gate.release().await.expect("release the gate");
 
     let hold_result = hold_task.await.expect("hold task");
+    // Again SoldOut specifically: the hold waited out the gate, re-picked, and
+    // found the desk's room gone. A 503 here would mean it gave up on the lock
+    // without ever re-evaluating — a different (and much worse) outcome that
+    // an `is_err()` assertion would have happily accepted.
     assert!(
-        matches!(hold_result, Err(ServiceError::Conflict(_))),
-        "the hold must re-evaluate after the desk commits and refuse; got {hold_result:?}"
+        matches!(hold_result, Ok(HoldCreateOutcome::SoldOut { .. })),
+        "the hold must re-evaluate after the desk commits and report SoldOut; got {hold_result:?}"
     );
     assert_eq!(
         live_claims_on(&pool, room_a, w2_in, w2_out).await,
         1,
         "the desk booking must be the only live claim on the last room"
+    );
+
+    // ---------------------------------------------------------------------
+    // 2b. L3 — the DESK create takes the lock too.
+    //
+    // Scenario 2 proved the channel WAITS. This one proves the other half of
+    // the mutual exclusion, which nothing else covers: that
+    // `routes::new_bookings`' shape of the command (`inventory_lock:
+    // Some(property)`) actually blocks. Without it a reviewer could delete the
+    // field from the desk route and every remaining test would still pass.
+    //
+    // Shape: hold the gate, start the desk create, prove it has NOT finished
+    // while the gate is held, release, prove it then completes.
+    // ---------------------------------------------------------------------
+    let (w2b_in, w2b_out) = (d("2027-03-16"), d("2027-03-18"));
+
+    let gate = InventoryLock::acquire(&pool, PROPERTY)
+        .await
+        .expect("take the property lock");
+    assert!(
+        !gate.is_bypassed(),
+        "BOOKING_INVENTORY_LOCK_ENABLED must be on for this suite to mean anything"
+    );
+
+    let svc_desk = booking_service(&pool);
+    let desk_cmd_locked = desk_cmd(
+        &format!("{BOOK_NO_PREFIX}-0211"),
+        cust,
+        room_a,
+        ROOM_A,
+        w2b_in,
+        w2b_out,
+        Some(PROPERTY.to_string()),
+    );
+    let desk_task = tokio::spawn(async move { svc_desk.create(desk_cmd_locked).await });
+
+    // Comfortably longer than an uncontended desk create (a handful of
+    // statements, low single-digit ms) and far inside the lock's 5 s acquire
+    // deadline, so a finished task here can only mean it never waited.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !desk_task.is_finished(),
+        "the desk create must BLOCK on the property's inventory lock while it is held"
+    );
+
+    gate.release().await.expect("release the gate");
+
+    let desk_done = desk_task
+        .await
+        .expect("desk task")
+        .expect("the desk create must proceed once the lock is free");
+    assert!(desk_done.book_id > 0);
+    assert_eq!(
+        live_claims_on(&pool, room_a, w2b_in, w2b_out).await,
+        1,
+        "the desk booking landed exactly once"
     );
 
     // ---------------------------------------------------------------------

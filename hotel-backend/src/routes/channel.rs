@@ -76,7 +76,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -103,7 +103,7 @@ use crate::service::{
 /// deliberate on this machine surface (exact status codes are part of the
 /// contract), so the `clippy::result_large_err` size lint is waived.
 #[allow(clippy::result_large_err)]
-fn parse_property(property: &str) -> Result<(Branch, &'static str), Response> {
+pub(crate) fn parse_property(property: &str) -> Result<(Branch, &'static str), Response> {
     match property.trim() {
         "hf" => Ok((Branch::Hfhotel, "hf")),
         "hfville" => Ok((Branch::Hfville, "hfville")),
@@ -186,10 +186,58 @@ fn channel_service_for(
 // the app-wide `From<ServiceError> for ApiError` flattens it to 400)
 // ---------------------------------------------------------------------------
 
+/// Stable machine `reason` codes on `/api/channel/*` refusals (B8e / M2).
+///
+/// **Every** error body this router emits carries a `reason`, so loyalty-app's
+/// mapping can be total — a `match` with no "and otherwise?" hole. The three
+/// that matter to a guest are the first three: they are the ones whose copy
+/// differs even though two of them share a status code.
+///
+/// Renaming any of these is a CONTRACT change, not a refactor.
+pub mod reason {
+    /// 409 — no room of the requested type is sellable for those dates.
+    /// Guest copy: try other dates.
+    pub const SOLD_OUT: &str = "sold_out";
+    /// 409 — the property is at its last-room floor (B8e / L2). Guest copy:
+    /// call the desk; reception can still sell this room.
+    pub const LAST_ROOM_HELD_FOR_DESK: &str = "last_room_held_for_desk";
+    /// 503 — a concurrent booking write held the inventory lock (B8e / L3).
+    /// **Retryable**, and the response carries `Retry-After`. Nothing was
+    /// written; the same request replayed will normally succeed.
+    pub const INVENTORY_LOCK_TIMEOUT: &str = "inventory_lock_timeout";
+    /// 422 — this `Idempotency-Key` is bound to a different request.
+    pub const IDEMPOTENCY_KEY_MISMATCH: &str = "idempotency_key_mismatch";
+
+    /// Fallback for a refusal with no more specific code, derived from the
+    /// status. Present so the field is never absent — a client that reads
+    /// `reason` must never have to handle `undefined`.
+    pub fn for_status(status: u16) -> &'static str {
+        match status {
+            400 => "bad_request",
+            401 => "unauthorized",
+            403 => "forbidden",
+            404 => "not_found",
+            409 => "conflict",
+            422 => "unprocessable",
+            503 => "unavailable",
+            _ => "internal",
+        }
+    }
+}
+
 fn error_response(status: StatusCode, message: String) -> Response {
+    error_response_with_reason(status, reason::for_status(status.as_u16()), message)
+}
+
+/// An error body with an explicit machine `reason` (see [`reason`]).
+fn error_response_with_reason(status: StatusCode, reason: &str, message: String) -> Response {
     (
         status,
-        Json(serde_json::json!({ "success": false, "error": message })),
+        Json(serde_json::json!({
+            "success": false,
+            "reason": reason,
+            "error": message,
+        })),
     )
         .into_response()
 }
@@ -203,9 +251,36 @@ fn service_error_response(err: ServiceError) -> Response {
         ServiceError::Validation(msg) => error_response(StatusCode::BAD_REQUEST, msg),
         ServiceError::NotFound(msg) => error_response(StatusCode::NOT_FOUND, msg),
         ServiceError::Conflict(msg) => error_response(StatusCode::CONFLICT, msg),
+        // B8e / L3. **503 + Retry-After, never 409 and never 400**: nothing
+        // was written and the condition clears in milliseconds, so the only
+        // correct instruction to a machine caller is "send it again". A 4xx
+        // here would tell loyalty-app the request itself was wrong and the
+        // guest would lose a booking to a race we already know how to survive.
+        ServiceError::Busy(msg) => busy_response(msg),
         other => api_error_response(ApiError::from(other)),
     }
 }
+
+/// 503 + `Retry-After` for transient booking-write contention. Mirrors the
+/// desk/OTA router's `ApiError::Busy` rendering, header included, so the two
+/// surfaces answer a lock wait identically (`docs/loyalty-channel.md`).
+fn busy_response(message: String) -> Response {
+    let mut response = error_response_with_reason(
+        StatusCode::SERVICE_UNAVAILABLE,
+        reason::INVENTORY_LOCK_TIMEOUT,
+        message,
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_static(BUSY_RETRY_AFTER_HEADER),
+    );
+    response
+}
+
+/// `Retry-After` seconds, as a literal so it can be a `HeaderValue::from_static`.
+/// Kept equal to `crate::error::BUSY_RETRY_AFTER_SECONDS` by the unit test at
+/// the bottom of this file.
+const BUSY_RETRY_AFTER_HEADER: &str = "1";
 
 /// Render a pre-serialized JSON payload with an explicit status, optionally
 /// marking it as an idempotent replay.
@@ -241,20 +316,15 @@ fn replay_response(stored: StoredResponse) -> Response {
 /// request is well-formed and the server is in no conflicting state — the
 /// entity is unprocessable because it contradicts what this key already means.
 fn mismatch_response(key: &str) -> Response {
-    error_response(
+    error_response_with_reason(
         StatusCode::UNPROCESSABLE_ENTITY,
+        reason::IDEMPOTENCY_KEY_MISMATCH,
         format!(
             "Idempotency-Key '{key}' was already used for a different booking request; \
              retry the original request unchanged, or use a new key"
         ),
     )
 }
-
-/// B8e / L2 — the machine-readable reason the last-room floor refused a hold.
-/// Stable: the loyalty app branches on this string to show its call-the-desk
-/// copy instead of a generic sold-out message, so renaming it is a contract
-/// change, not a refactor.
-pub const REASON_LAST_ROOM_HELD_FOR_DESK: &str = "last_room_held_for_desk";
 
 /// The property is at its last-room floor. **409**, with `reason` alongside
 /// the human `error` string.
@@ -276,7 +346,7 @@ fn last_room_response(free_rooms: i64, floor: i64) -> Response {
         StatusCode::CONFLICT,
         Json(serde_json::json!({
             "success": false,
-            "reason": REASON_LAST_ROOM_HELD_FOR_DESK,
+            "reason": reason::LAST_ROOM_HELD_FOR_DESK,
             "error": "the last rooms for these dates are held for the front desk — \
                       please call the hotel to book",
             "free_rooms": free_rooms,
@@ -284,6 +354,22 @@ fn last_room_response(free_rooms: i64, floor: i64) -> Response {
         })),
     )
         .into_response()
+}
+
+/// No room of the requested type is sellable for the window. **409**,
+/// `reason: "sold_out"` — the message is byte-identical to the one this
+/// refusal carried before it gained a reason code.
+fn sold_out_response(
+    room_type: &str,
+    guests: i32,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+) -> Response {
+    error_response_with_reason(
+        StatusCode::CONFLICT,
+        reason::SOLD_OUT,
+        format!("no {room_type} room available for {guests} guest(s), {check_in} to {check_out}"),
+    )
 }
 
 /// The bearer this request presented, for `caller_identity`.
@@ -568,6 +654,17 @@ async fn perform_create_hold(
         // free to make the hold it was minted for.
         HoldCreateOutcome::LastRoomHeldForDesk { free_rooms, floor } => {
             return Err(last_room_response(free_rooms, floor))
+        }
+        // Same `Err` treatment, same reasoning: a sold-out answer must not be
+        // cached against the key either — the room frees up when a hold
+        // expires or a stay is cancelled.
+        HoldCreateOutcome::SoldOut { room_type } => {
+            return Err(sold_out_response(
+                &room_type,
+                body.guests,
+                check_in,
+                check_out,
+            ))
         }
     };
 
@@ -1066,5 +1163,36 @@ mod tests {
         assert_eq!(v["total"], 2400.0);
         assert_eq!(v["amount_due_now"], 1200.0);
         assert!(v["hold_expires_at"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    /// The literal `Retry-After` this router sends must equal the number the
+    /// desk/OTA router's `ApiError::Busy` sends. They are declared separately
+    /// only because `HeaderValue::from_static` needs a literal; if they ever
+    /// diverge the two surfaces would tell a client to retry at different
+    /// times for the identical condition.
+    #[test]
+    fn both_routers_agree_on_retry_after() {
+        assert_eq!(
+            BUSY_RETRY_AFTER_HEADER,
+            crate::error::BUSY_RETRY_AFTER_SECONDS.to_string(),
+            "channel Retry-After literal drifted from crate::error::BUSY_RETRY_AFTER_SECONDS"
+        );
+    }
+
+    /// Every refusal carries a `reason`, and the fallback never returns an
+    /// empty string — loyalty-app's mapping must never see `undefined`.
+    #[test]
+    fn every_status_maps_to_a_non_empty_reason() {
+        for status in [400u16, 401, 403, 404, 409, 422, 500, 503, 418] {
+            assert!(
+                !reason::for_status(status).is_empty(),
+                "status {status} produced an empty reason"
+            );
+        }
     }
 }

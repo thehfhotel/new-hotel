@@ -576,6 +576,31 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// `BOOKING_INVENTORY_LOCK_ENABLED` (B8e / L3) — kill switch for the
+/// per-property booking-inventory advisory lock that serialises
+/// pick → create (`repository::inventory_lock`).
+///
+/// **Default ON**, unlike every other flag in this file: the flags below ship
+/// dark because they OPEN a legacy write, whereas this one CLOSES a
+/// double-sell window and turning it off re-opens the B8 §2.1/§2.3 race
+/// (two holds, or a hold and a desk booking, both taking the last room).
+/// It exists so an operator can un-serialise booking creates without a
+/// rollback deploy if the lock itself ever becomes the problem — an incident
+/// tool, not a tuning knob.
+///
+/// Only an explicit `false` / `0` disables it; unset, blank and garbage all
+/// keep the guard on, which is the same "a deploy typo must not silently
+/// remove a guard" rule as [`loyalty_last_room_floor`].
+pub fn booking_inventory_lock_enabled() -> bool {
+    match std::env::var("BOOKING_INVENTORY_LOCK_ENABLED") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "false" || normalized == "0")
+        }
+        Err(_) => true,
+    }
+}
+
 /// `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` (B8e / L2) — how many sellable rooms the
 /// property keeps back for the FRONT DESK.
 ///
@@ -585,13 +610,17 @@ fn optional_env(var_name: &str) -> Option<String> {
 /// 409 reason and the loyalty app shows call-the-desk copy. Reception is not
 /// gated: the desk can still book the room the channel just declined.
 ///
-/// Default **1** — the guard is ON out of the box, which is the safe
-/// direction: the failure it prevents is a guest turned away at 22:00, and
-/// the failure it causes is a direct booking that becomes a phone call.
-/// `0` disables it. A non-numeric or negative value also reads as the
-/// default rather than as "off": a typo in the deploy env must not silently
-/// remove a guard (contrast [`flag_enabled`], where an unparseable value
+/// The CODE default is **1** (guard on) so an unset or garbled value can
+/// never silently remove an inventory guard — a typo in the deploy env must
+/// not disable it (contrast [`flag_enabled`], where an unparseable value
 /// reads as off because there the closed state IS off).
+///
+/// The DEPLOYED default is **0** (guard off) — `docker-compose.yml` ships
+/// `${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-0}` deliberately, because the refusal
+/// is only useful once loyalty-app renders call-the-desk copy for
+/// `reason: "last_room_held_for_desk"`; until it does, a floored hold reaches
+/// the guest as an unexplained failure. Flip the compose default to 1 after
+/// that lands — see `docs/loyalty-channel.md`. `0` disables the guard.
 ///
 /// Not an allotment — loyalty-app ADR-0003 rejects those and this is not one:
 /// it caps nothing while the property has slack, it only reserves the tail.
@@ -1447,6 +1476,41 @@ mod tests {
     ///   including empty values.
     ///
     /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// B8e / L3 — the inventory-lock kill switch is DEFAULT ON, and only an
+    /// explicit false/0 turns it off.
+    ///
+    /// The polarity is the opposite of every ship-dark flag in this file and
+    /// that is the point: those gate a legacy WRITE (closed = off), this one
+    /// gates a double-sell GUARD (closed = on). A future refactor that routes
+    /// it through `flag_enabled` for consistency would silently un-serialise
+    /// every booking create, so the asymmetry is pinned here.
+    #[test]
+    fn inventory_lock_is_on_unless_explicitly_disabled() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["BOOKING_INVENTORY_LOCK_ENABLED"]);
+
+        assert!(
+            booking_inventory_lock_enabled(),
+            "unset must keep the lock on"
+        );
+
+        for on in ["true", "1", "", "   ", "yes", "garbage"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", on);
+            assert!(
+                booking_inventory_lock_enabled(),
+                "'{on}' must not disable the serialisation guard"
+            );
+        }
+
+        for off in ["false", "0", " FALSE ", "False"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", off);
+            assert!(
+                !booking_inventory_lock_enabled(),
+                "'{off}' is the explicit kill switch"
+            );
+        }
+    }
+
     /// B8e / L2 — the last-room floor defaults to ON, and only an explicit,
     /// parseable, non-negative number moves it.
     ///

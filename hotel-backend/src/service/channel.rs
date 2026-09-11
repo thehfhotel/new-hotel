@@ -171,6 +171,17 @@ pub enum HoldCreateOutcome {
     /// ADR-0003): it only bites on the last `floor` rooms, so a property with
     /// slack sells through the channel exactly as it did before.
     LastRoomHeldForDesk { free_rooms: i64, floor: i64 },
+    /// No room of the requested type is sellable for the window. **409**.
+    ///
+    /// An outcome rather than a `ServiceError::Conflict` so the route can give
+    /// it a stable `reason` of its own: `sold_out` and
+    /// `last_room_held_for_desk` share a status code and mean genuinely
+    /// different things to the guest ("try other dates" vs "call the desk"),
+    /// and a client cannot tell them apart by matching on English prose. It is
+    /// also what keeps a LOSER of the L3 race distinguishable from a lock
+    /// TIMEOUT, which is now a 503 — the two used to collapse onto one
+    /// `Conflict` and a test could not tell which it had caught.
+    SoldOut { room_type: String },
 }
 
 /// Outcome of `confirm_payment` (payment-verified). `already_confirmed` is
@@ -188,6 +199,17 @@ pub struct ConfirmOutcome {
 pub struct ReleaseOutcome {
     pub book_id: i32,
     pub already_released: bool,
+}
+
+/// The guest fields of a hold, validated BEFORE the booking-inventory lock is
+/// taken and handed to the locked half as owned strings.
+///
+/// A struct rather than three positional `String`s so a future reorder cannot
+/// silently swap the phone and the surname.
+struct HoldGuest {
+    first_name: String,
+    last_name: Option<String>,
+    phone: String,
 }
 
 /// Per-request/per-site service handle (cheap: Arc clones + pool handle).
@@ -395,6 +417,35 @@ impl ChannelService {
                 );
             }
         }
+        // Everything that can REFUSE this request without reading inventory
+        // runs before the lock is taken: a malformed guest name, a blank
+        // phone, an unknown room type. Holding the property's lock while
+        // rejecting a typo would make a real booking wait on a request that
+        // was never going to consume a room.
+        let (first_name, last_name) = split_guest_name(&cmd.guest_name)?;
+        let (first_name, last_name) = (
+            first_name.to_string(),
+            last_name.map(|last| last.to_string()),
+        );
+        let phone = cmd.guest_phone.trim().to_string();
+        if phone.is_empty() {
+            return Err(ServiceError::validation("guest.phone must not be empty"));
+        }
+
+        // Room type + quote. The nightly price the guest saw in availability
+        // is the price the hold is written with (type_base_price). A plain
+        // read of a near-static table — no inventory, so it stays outside the
+        // lock too.
+        let (type_name, nightly_baht) =
+            channel_repo::type_nightly_price(&self.pg, cmd.room_type_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found(format!(
+                        "room type {} does not exist or is inactive",
+                        cmd.room_type_id
+                    ))
+                })?;
+
         // B8e / L3 — everything past this point CONSUMES inventory: the
         // last-room floor reads it, the picker claims a room from it, and
         // `BookingService::create` commits that claim. Hold the property's
@@ -404,7 +455,18 @@ impl ChannelService {
         // guard is released right after the create commits; dropping it on an
         // error path frees the lock too (see `repository::inventory_lock`).
         let lock = InventoryLock::acquire(&self.pg, &cmd.property).await?;
-        let result = self.create_hold_locked(cmd).await;
+        let result = self
+            .create_hold_locked(
+                &cmd,
+                HoldGuest {
+                    first_name,
+                    last_name,
+                    phone,
+                },
+                &type_name,
+                nightly_baht,
+            )
+            .await;
         if let Err(err) = lock.release().await {
             tracing::warn!(
                 error = %err,
@@ -420,28 +482,20 @@ impl ChannelService {
     /// Split out purely so the lock guard lives in a scope that cannot
     /// accidentally skip its release: every `?` in here returns into
     /// `create_hold`, which releases and only then propagates.
-    ///
-    /// Validation that cannot touch inventory (stay range, guest count, the
-    /// crash-recovery replay) stays in the caller and runs UNLOCKED — a
-    /// malformed request must never make a real booking wait.
-    async fn create_hold_locked(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldCreateOutcome> {
-        let (first_name, last_name) = split_guest_name(&cmd.guest_name)?;
-        let phone = cmd.guest_phone.trim();
-        if phone.is_empty() {
-            return Err(ServiceError::validation("guest.phone must not be empty"));
-        }
-
-        // Room type + quote. The nightly price the guest saw in availability
-        // is the price the hold is written with (type_base_price).
-        let (type_name, nightly_baht) =
-            channel_repo::type_nightly_price(&self.pg, cmd.room_type_id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found(format!(
-                        "room type {} does not exist or is inactive",
-                        cmd.room_type_id
-                    ))
-                })?;
+    async fn create_hold_locked(
+        &self,
+        cmd: &CreateHoldCommand,
+        guest: HoldGuest,
+        type_name: &str,
+        nightly_baht: f64,
+    ) -> ServiceResult<HoldCreateOutcome> {
+        let HoldGuest {
+            first_name,
+            last_name,
+            phone,
+        } = guest;
+        let (first_name, last_name, phone) =
+            (first_name.as_str(), last_name.as_deref(), phone.as_str());
 
         // B8e / L2 — property-wide last-room floor. `surplus` is the shared
         // inventory CTE's own answer to "what may the channel still sell
@@ -485,13 +539,23 @@ impl ChannelService {
             cmd.check_out,
             cmd.guests,
         )
-        .await?
-        .ok_or_else(|| {
-            ServiceError::conflict(format!(
-                "no {type_name} room available for {} guest(s), {} to {}",
-                cmd.guests, cmd.check_in, cmd.check_out
-            ))
-        })?;
+        .await?;
+        // Sold out for this type/window. An OUTCOME, not an error, so the
+        // route can stamp `reason: "sold_out"` — see `HoldCreateOutcome
+        // ::SoldOut`. This is also the arm a LOSER of the serialized race
+        // lands on: it re-picked after the winner committed and found nothing.
+        let Some(room) = room else {
+            tracing::info!(
+                property = %cmd.property,
+                room_type = %type_name,
+                check_in = %cmd.check_in,
+                check_out = %cmd.check_out,
+                "loyalty hold refused: no room of the requested type is sellable"
+            );
+            return Ok(HoldCreateOutcome::SoldOut {
+                room_type: type_name.to_string(),
+            });
+        };
 
         // Guest: match (exact phone + case-insensitive name) or create.
         let customer_id = match self
@@ -599,7 +663,7 @@ impl ChannelService {
                 // request instead of replaying an unrelated stay.
                 book_ext_ref_fingerprint: cmd.ext_ref_fingerprint.clone(),
                 hold_expires_at: Some(hold_expires_at),
-                source: cmd.source,
+                source: cmd.source.clone(),
             })
             .await?;
 
@@ -642,7 +706,7 @@ impl ChannelService {
 
         Ok(HoldCreateOutcome::Created(HoldOutcome {
             book_id: outcome.book_id,
-            book_no: outcome.book_no.unwrap_or(cmd.book_no),
+            book_no: outcome.book_no.unwrap_or_else(|| cmd.book_no.clone()),
             total_baht: total.as_satang() as f64 / 100.0,
             amount_due_baht: due.as_satang() as f64 / 100.0,
             hold_expires_at,
