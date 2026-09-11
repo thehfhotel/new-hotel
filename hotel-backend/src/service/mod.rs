@@ -37,6 +37,7 @@
 pub mod auth;
 pub mod booking;
 pub mod channel;
+pub mod channel_idempotency;
 pub mod checkin;
 pub mod coupon;
 pub mod customer;
@@ -56,10 +57,16 @@ pub use auth::{AuthError, AuthService, DEFAULT_SESSION_TTL};
 pub use booking::{
     BookingOutcome, BookingProductCommand, BookingRoomCommand, BookingService,
     BookingSnapshotInputs, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
-    ModifyBookingCommand,
+    ModifyBookingCommand, RoomTypeEdit,
 };
 pub use channel::{
-    ChannelService, ConfirmOutcome, CreateHoldCommand, HoldOutcome, PaymentPlan, ReleaseOutcome,
+    hold_ext_ref, ChannelService, ConfirmOutcome, CreateHoldCommand, HoldCreateOutcome,
+    HoldOutcome, PaymentPlan, ReleaseOutcome,
+};
+pub use channel_idempotency::{
+    caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, Reservation, Reserved,
+    StoredResponse, ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
+    IDEMPOTENCY_TTL_HOURS, MAX_IDEMPOTENCY_KEY_LEN,
 };
 pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
@@ -79,8 +86,8 @@ pub use hk_reports::{
     StoredPhotoId, SubmitReportCommand, VerifyReportCommand,
 };
 pub use hk_signals::{
-    ActOnSignalCommand, AnswerOutcome, AnswerRoomCheckCommand, HkSignalService,
-    RaiseSignalCommand, SignalOutcome,
+    ActOnSignalCommand, AnswerOutcome, AnswerRoomCheckCommand, HkSignalService, RaiseSignalCommand,
+    SignalOutcome,
 };
 pub use housekeeping::{
     HousekeepingOutcome, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,

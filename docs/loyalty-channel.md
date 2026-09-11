@@ -183,7 +183,9 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   `room_type_id` is the `type_id` SERIAL as a string (stable per property).
 
 * `POST /api/channel/bookings` → **201**
-  `{pms_booking_id, total, amount_due_now, hold_expires_at}`.
+  `{pms_booking_id, total, amount_due_now, hold_expires_at}`. Accepts an
+  OPTIONAL **`Idempotency-Key`** header so a client retry replays the first
+  response instead of creating a second hold — see §Idempotency below.
   Creates a **TENTATIVE HOLD** that consumes availability immediately:
   - match-or-create guest (exact phone + case-insensitive name; else create
     via `CustomerService::create`), attach `membership_id` when supplied
@@ -202,9 +204,16 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   body `{"amount": <THB received>}` → flips `pending → confirmed`, records
   `book_deposit_amount` + `book_deposit_date`; response carries
   `deposit_recorded` + `balance_due`. **Idempotent** — replay against an
-  already-confirmed booking succeeds (`already_confirmed: true`) without
-  writing. Refuses released/expired holds with 409. `FOR UPDATE` serializes
-  against the sweep/release.
+  already-settled booking succeeds (`already_confirmed: true`) without writing.
+  The settled set accepts **both spellings of each state**
+  (`service::channel::is_settled_status`): this app writes `'checkedin'` while
+  the CT sync mapper writes `'checked_in'` for iHOTEL's `เข้าพัก`, and the
+  underscored spelling is the steady state — so a late payment-verified retry
+  for a guest the desk has since checked in through iHOTEL replays instead of
+  answering 409. `'checkedout'` / `'checked_out'` / `'completed'` (legacy
+  `ออกแล้ว`) are settled for the same reason. **What the mapper writes is
+  unchanged** — only what we accept. Refuses released/expired holds with 409.
+  `FOR UPDATE` serializes against the sweep/release.
 
 * `POST /api/channel/bookings/{pms_booking_id}/release` → cancels the hold.
   **Idempotent** (`already_released: true` on replay). Guarded on
@@ -217,6 +226,137 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   load-bearing. Registered unconditionally: it filters
   `book_channel='loyalty' AND book_status='pending'` via the partial index
   `ix_ht_bookings_hold_expiry`, a no-op while the channel is dark.
+
+### Idempotency on the hold create (`Idempotency-Key`)
+
+**Header name: `Idempotency-Key`. Response marker: `Idempotency-Replayed: true`.**
+Optional — a request without the header behaves exactly as it always has.
+
+`payment-verified` and `release` are naturally replay-tolerant (they converge on
+a state). `POST /api/channel/bookings` is not: it mints a NEW hold every time it
+runs. A loyalty-app client whose request hung and was retried therefore ended up
+with **two** holds → two `ht_bookings` rows → **two real iHOTEL `จอง` bookings**,
+one of which nobody releases before its 2h deadline. The loyalty app worked
+around this with a 20 s Redis lock — a timing heuristic, not a guarantee.
+
+Migration **093** (`ht_channel_idempotency`) closes it properly. Migration 076's
+`(book_channel, book_ext_ref)` natural key does NOT apply here: a loyalty hold
+has no channel-native booking id at request time — the id the app knows is the
+one we mint. What the app CAN supply is a client-generated key.
+
+**It is a HEADER, not a body field.** The request body is a locked snake_case
+contract the two systems agree on field by field, and a `idempotencyKey` member
+would both break that shape and put transport policy inside booking data. It is
+also where every client library already looks, including the loyalty app's own
+backend (`services/idempotency.rs`).
+
+| case | response |
+|---|---|
+| no `Idempotency-Key` | unchanged behaviour; no row is written |
+| first request with key K | **201**, the hold is created, K records the response |
+| retry of the SAME request with K | the stored response, **verbatim** — same status, same body, same `pms_booking_id` — plus `Idempotency-Replayed: true`. No second hold. |
+| a DIFFERENT request with K | **422** `{"success": false, "error": "Idempotency-Key '…' was already used for a different booking request; …"}` |
+| two identical requests at once | serialised — exactly one hold; the loser replays the winner's response |
+| key present but blank / with spaces / > 255 chars | **400** (a broken key is loud, never a silent opt-out) |
+| retry more than 24 h later | **for hold-create: still NOT a first-time request.** The `ht_channel_idempotency` row is gone (TTL), but the booking itself still carries the key as `book_ext_ref` and the request fingerprint as `book_ext_ref_fingerprint`, so the key is answered from the booking: a replay if the hold is still live, **409** if it is not, **422** if the request differs. See "The gap between the two writes" below. |
+
+Key facts a caller needs:
+
+* **Any printable-ASCII string, 1..=255 characters**; a UUID v4 per booking
+  attempt is the intended usage. Keep the key across retries of the SAME
+  attempt; mint a new one for a new booking.
+* **The key space is per caller and per property.** `idem_caller` is the
+  SHA-256 of the presented bearer, so rotating `LOYALTY_CHANNEL_TOKEN` starts a
+  fresh key space (a rotated token is a different client), and the row lives in
+  the property's own database — which is correct, because a retry always targets
+  the property the original request did. The booking-side copy carries the same
+  scoping inside `book_ext_ref` (`idem:{caller-digest}:{key}`).
+* **A key is one-shot for the LIFE OF THE BOOKING it created, not for 24 h.**
+  The 24 h TTL belongs to `ht_channel_idempotency`, which is now a cache in
+  front of a durable record rather than the record itself. Mint a new key per
+  booking attempt and never recycle one.
+* **"Different request" is judged on a canonicalised fingerprint**, not raw
+  bytes: property, room type, both dates, guests, trimmed guest name and phone,
+  trimmed membership id, payment plan. Re-serialising the JSON with different
+  whitespace or key order, or sending `" 3 "` where the first attempt sent
+  `"3"`, still REPLAYS. Changing anything that changes what gets booked is 422.
+* **Errors are never cached.** A request that failed (no room available, bad
+  dates, HF Ville writes disabled) frees its key immediately, so the client may
+  retry the same key once the cause is fixed.
+
+How the concurrent case is actually safe, since it is the part that is easy to
+get wrong: the reserving `INSERT` runs inside a transaction that is held open
+across the whole create. A simultaneous duplicate blocks on the uncommitted
+unique-index entry (PostgreSQL speculative insertion) until the winner commits,
+then finds nothing to insert and reads a COMPLETE row. There is no advisory
+lock and no Redis, and the stored response commits in the same transaction that
+reserved the key — so a rollback loses both, never one without the other.
+
+**The gap between the two writes — CLOSED (B8d / issue #305).** The hold and
+the idempotency record are, and must remain, two transactions: the hold rides
+`BookingService::create`, which owns its own, while the reservation stays open
+across it. A process that died in between left the hold COMMITTED and the key
+GONE, so the retry re-entered as a fresh request and created a second hold.
+
+The key is now threaded through `create_hold` as the hold's own
+`ht_bookings.book_ext_ref` — `idem:{caller-digest}:{key}`, alongside
+`book_channel = 'loyalty'` — so migration **076**'s partial UNIQUE index
+`(book_channel, book_ext_ref)` dedupes INSIDE the booking's transaction, the
+one place a crash cannot separate from the booking itself. (That index was
+ruled out for the general case above because a loyalty hold has no
+channel-native id; it applies perfectly once the KEY plays that role.) The
+caller digest is in the value because `book_ext_ref` is unique only within
+`book_channel`, which is the constant `'loyalty'` for every hold — without it
+two callers, or one caller either side of a token rotation, could collide on a
+key as ordinary as `"1"` and the second would replay the first's booking.
+
+A retry after the crash therefore answers with the SURVIVING hold: same
+**201**, `Idempotency-Replayed: true`, and the payload rendered from the stored
+row — its total, and its ORIGINAL 2 h deadline, never a re-quote of the retry.
+The same path catches two retries racing each other (`BookingService::create`
+rolls its half-built row back on the unique violation and re-selects the
+winner **by the key**, so that arm runs the identical gates below).
+
+In the **crash arm** the lookup runs BEFORE the guest match-or-create, so that
+replay also leaves no duplicate `ht_customers` row behind. (The race arm cannot
+make that claim: it is reached only after `create` has already run, so the
+guest row exists either way — the losing attempt's booking is rolled back, not
+its customer. Matching an existing guest by phone + name keeps this from
+accumulating rows in practice.)
+
+Two gates run before anything is replayed, in this order, because "you reused
+someone else's key" is a different mistake from "the hold this key made is
+gone" and must not be reported as the latter:
+
+1. **Identity — `book_ext_ref_fingerprint` (migration 095).** The booking
+   stores the SHA-256 of the canonicalised request that minted its key, written
+   in the SAME statement as the key itself. A retry whose fingerprint differs
+   is **422**, byte-identical to the 422 the key store gives for the same
+   mistake. Without this the booking held only half of what `ht_channel_idempotency`
+   holds, and a reused key with a different body replayed an unrelated stay as
+   a fresh 201.
+2. **Liveness.** A hold that is cancelled, released, swept, already paid, or
+   simply past its deadline is **409**, naming the booking and its stored
+   status. The 201 contract has no status field, so returning such a booking as
+   a fresh hold would hand the client a `hold_expires_at` in the past with no
+   way to notice. 409 tells them to look it up or mint a new key.
+
+`amount_due_now` on a replay is recomputed rather than read back — it is not a
+stored column (a pending hold has received no money). That is sound *because*
+gate 1 ran first: the payment plan is part of the fingerprint, so a replay's
+plan is provably the one the original attempt quoted.
+
+Unkeyed requests stamp no `book_ext_ref` and are completely unchanged: every
+call mints a new hold. Covered by
+`tests/test_channel.rs::hold_retry_after_a_crash_between_the_two_writes_replays_the_same_hold`,
+which reproduces the crash deterministically by abandoning the reservation
+after the hold commits.
+
+Implementation: `service::channel_idempotency` (policy, fingerprinting, the
+reservation guard) + `repository::channel_idempotency` (SQL) + the keyed branch
+of `routes::channel::create_booking`. Integration tests:
+`hotel-backend/tests/test_channel.rs::hold_create_is_idempotent_per_key` and
+`::concurrent_identical_hold_creates_produce_one_hold`.
 
 ### Dual-write policy for holds (the load-bearing decision)
 
@@ -237,6 +377,56 @@ Consequences:
   the room.
 * an abandoned hold therefore appears-and-disappears in iHOTEL within ≤2h —
   churn reception should be told about at go-live.
+
+### Checking an app booking in — which app the desk uses
+
+A booking made in the guest app exists in BOTH systems from the moment the hold
+is created (previous subsection), so the desk can check the arriving guest in
+from either one. The two paths are not equivalent, and the difference is
+invisible at the counter — which is why it is written down here.
+
+| | iHOTEL (`FormCheckIn`) | our app (Task B7a: reservations list / reservation detail / room board `จองแล้ว` → **เช็คอิน**) |
+|---|---|---|
+| creates | `HT_CheckIn_H` + `HT_CheckIn_Ds` directly | `ht_checkins` with `cin_book_id` set, then the `create_check_in` writeback mirrors it |
+| booking link | `HT_CheckIn_H.Cin_Book_ID`, arrives canonical via the CT sync mapper | written in the same PG transaction as the stay |
+| `ht_bookings.book_status` | `เข้าพัก` → mapped to `checked_in` by the sync | `checkedin`, written by `set_booking_checkedin` |
+| app-deposit signposts | appear once the sync round-trip completes | appear immediately |
+
+**Both are supported and neither is being removed** (ADR 0002 — iHOTEL is not
+being decommissioned, and per ADR 0003 no capability reception has today may
+become unreachable). The channel API already tolerates both spellings of the
+checked-in state for exactly this reason, so a late `payment_verified` retry for
+a guest the desk checked in through iHOTEL replays instead of answering 409.
+
+**Which one the desk should use for an app booking: ours.** Not because iHOTEL
+is wrong, but because the link is immediate there and the deposit signpost is
+the whole point:
+
+* An app guest's deposit is **not mirrored** (previous subsection), so iHOTEL's
+  own check-in screen shows `0` with nothing to explain it. Our from-reservation
+  check-in carries the `AppDepositNotice` into the check-in modal, the printed
+  registration slip, the folio, the payment dialog and the checkout modal.
+* The link is what every one of those signposts resolves through
+  (`GET /api/checkins/:id/deposits` joins `ht_bookings` via `ci.cin_book_id`).
+  Checking the same guest in as a **walk-in** from our room board leaves
+  `cin_book_id` NULL, and then the notice never appears at all — which is the
+  gap B7a closed.
+* An iHOTEL check-in still ends up correct; the signposts simply lag by the
+  sync round-trip, and the booking-linked state is only as good as what the CT
+  mapper carried back.
+
+Two consequences worth saying out loud at go-live:
+
+* **The desk deposit field is not the booking deposit.** Our check-in modal
+  leaves `เงินมัดจำที่รับที่เคาน์เตอร์` BLANK for a from-reservation check-in,
+  deliberately: `ht_bookings.book_deposit_amount` is money in the bank,
+  `ht_checkin_rooms.cr_dep_amount` (→ legacy `HT_CheckIn_Ds.Cin_Room_Dep`) is
+  money in the drawer, and pre-filling one from the other would refund the
+  guest in cash at checkout for a transfer they made in the app.
+* **Multi-room app bookings still go through iHOTEL.** The single-room guard in
+  `CheckInService::check_in_to_booking` rejects them with a Thai-facing message
+  saying so; the loyalty channel creates single-room holds, so this only bites a
+  desk-grown booking.
 
 ## Piece 2 — membership link on the guest profile
 

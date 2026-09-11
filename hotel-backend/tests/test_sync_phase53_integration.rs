@@ -142,14 +142,13 @@ async fn seed_room(pool: &sqlx::PgPool, room_no: &str) -> i32 {
 
 async fn cleanup(pool: &sqlx::PgPool, book_id: &str, cust_no: &str, room_no: &str) {
     // Delete event_log rows tagged with the booking's aggregate uuid.
-    let agg: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT aggregate_id FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(book_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let agg: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT aggregate_id FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(book_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     if let Some(a) = agg {
         sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
             .bind(a)
@@ -157,12 +156,14 @@ async fn cleanup(pool: &sqlx::PgPool, book_id: &str, cust_no: &str, room_no: &st
             .await
             .ok();
     }
-    sqlx::query("DELETE FROM ht_booking_rooms WHERE br_book_id IN \
-                 (SELECT book_id FROM ht_bookings WHERE legacy_book_id = $1)")
-        .bind(book_id)
-        .execute(pool)
-        .await
-        .ok();
+    sqlx::query(
+        "DELETE FROM ht_booking_rooms WHERE br_book_id IN \
+                 (SELECT book_id FROM ht_bookings WHERE legacy_book_id = $1)",
+    )
+    .bind(book_id)
+    .execute(pool)
+    .await
+    .ok();
     sqlx::query("DELETE FROM ht_bookings WHERE legacy_book_id = $1")
         .bind(book_id)
         .execute(pool)
@@ -210,32 +211,27 @@ async fn booking_insert_upserts_pg_row_and_writes_event_log() {
     tx.commit().await.expect("commit");
 
     // Canonical row landed.
-    let (book_pg_id, agg_id, status, total): (
-        i32,
-        Option<uuid::Uuid>,
-        String,
-        Option<f64>,
-    ) = sqlx::query_as(
-        "SELECT book_id, aggregate_id, book_status, book_total_amount::float8 \
+    let (book_pg_id, agg_id, status, total): (i32, Option<uuid::Uuid>, String, Option<f64>) =
+        sqlx::query_as(
+            "SELECT book_id, aggregate_id, book_status, book_total_amount::float8 \
            FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(&book_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+        )
+        .bind(&book_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(agg_id.is_some());
     assert_eq!(status, "confirmed");
     assert_eq!(total, Some(890.0));
     let _ = cust_pg_id; // silence unused
 
     // ht_booking_rooms wired.
-    let room_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
-    )
-    .bind(book_pg_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let room_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1")
+            .bind(book_pg_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(room_count, 1);
 
     // event_log carries exactly one BookingCreated row.
@@ -370,13 +366,12 @@ async fn booking_delete_marks_status_cancelled_and_emits_booking_cancelled() {
     let event = event.expect("cancel must emit");
     assert_eq!(event.type_name(), "BookingCancelled");
 
-    let status: String = sqlx::query_scalar(
-        "SELECT book_status FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(&book_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT book_status FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(status, "cancelled");
 
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
@@ -417,28 +412,266 @@ async fn header_only_booking_creates_canonical_row_with_zero_booking_rooms() {
         .expect("publish");
     tx.commit().await.expect("commit");
 
-    let (book_pg_id, status): (i32, String) = sqlx::query_as(
-        "SELECT book_id, book_status FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(&book_id)
-    .fetch_one(&pool)
-    .await
-    .expect("canonical row must land for header-only booking");
+    let (book_pg_id, status): (i32, String) =
+        sqlx::query_as("SELECT book_id, book_status FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .expect("canonical row must land for header-only booking");
     assert_eq!(status, "confirmed");
 
-    let room_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
-    )
-    .bind(book_pg_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let room_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1")
+            .bind(book_pg_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         room_count, 0,
         "header-only booking must have zero ht_booking_rooms rows"
     );
 
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
+}
+
+/// B8c / issue #304 / migration 094 — the CT mapper must record the room type
+/// a PARKED (roomless) legacy booking claims.
+///
+/// iHOTEL's "ระบุประเภทห้อง" form (`FrmAddBook`, cheatsheet §3.3) writes
+/// `HT_Book_H.Book_room_type = 1` and puts a room-TYPE code — not a room
+/// number — in every `HT_Book_Ds.Book_Room_Type`. The mapper has projected
+/// those bookings as header-only since 2026-06-11 (a type code can never
+/// resolve against `ht_rooms_new.room_no`), which was right for
+/// `ht_booking_rooms` but left canonical with a parked claim of UNKNOWN type —
+/// so `repository::channel` could only cap it property-wide.
+///
+/// Three shapes in one body (shared fixtures, and `--test-threads=1` in CI):
+///   (a) mode 1 + a code that maps      → book_room_type_id = that type
+///   (b) mode 1 + a code that does NOT  → NULL (never an error: a data-quality
+///                                        value must not hold the watermark)
+///   (c) mode 2 (rooms named)           → DERIVED from the assigned room
+#[tokio::test]
+async fn mapper_records_the_room_type_of_a_parked_legacy_booking() {
+    let pool = common::create_test_pool().await;
+    let cust_no = unique_cust_no();
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+
+    // A room type whose legacy code is what the Ds lines will carry.
+    let type_code = format!("TP{:04}", unique_residue() % 10_000);
+    let type_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ($1, $1, 1000.00, 2) RETURNING type_id",
+    )
+    .bind(&type_code)
+    .fetch_one(&pool)
+    .await
+    .expect("seed room type");
+
+    async fn apply(pool: &sqlx::PgPool, agg: &BookingAggregate, book_id: &str) {
+        let mut tx = pool.begin().await.expect("begin");
+        let event = apply_booking_aggregate(&mut tx, None, agg, book_id)
+            .await
+            .expect("apply must succeed");
+        if let Some(event) = event {
+            hotel_backend::outbox::bus::EventBus::publish(&mut tx, &event)
+                .await
+                .expect("publish");
+        }
+        tx.commit().await.expect("commit");
+    }
+
+    async fn read_type(pool: &sqlx::PgPool, book_id: &str) -> (i32, Option<i32>, i64) {
+        let (pg_id, type_id): (i32, Option<i32>) = sqlx::query_as(
+            "SELECT book_id, book_room_type_id FROM ht_bookings WHERE legacy_book_id = $1",
+        )
+        .bind(book_id)
+        .fetch_one(pool)
+        .await
+        .expect("canonical row");
+        let rooms: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+        )
+        .bind(pg_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (pg_id, type_id, rooms)
+    }
+
+    // --- (a) mode 1, code maps -------------------------------------------
+    let mapped_book = unique_book_id();
+    let mut header = header_row(&mapped_book, &cust_no, "จอง", 2000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(1));
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&mapped_book, &type_code, 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &aggregate, &mapped_book).await;
+
+    let (_, recorded, rooms) = read_type(&pool, &mapped_book).await;
+    assert_eq!(
+        recorded,
+        Some(type_id),
+        "a Book_room_type=1 booking must record the type its Ds line names"
+    );
+    assert_eq!(
+        rooms, 0,
+        "it stays header-only — a type code is not a room assignment"
+    );
+
+    // Re-applying the identical aggregate must be an idempotent skip: the new
+    // gate term has to COMPARE the resolved id, not just write it.
+    let mut tx = pool.begin().await.expect("begin");
+    let again = apply_booking_aggregate(&mut tx, None, &aggregate, &mapped_book)
+        .await
+        .expect("re-apply");
+    tx.commit().await.expect("commit");
+    assert!(
+        again.is_none(),
+        "an unchanged aggregate must still skip — a type term that never \
+         converged would re-emit BookingModified on every CT tick"
+    );
+
+    // A type CHANGE must re-apply (the shape no other gate term can see: this
+    // booking has no ht_booking_rooms rows for the room stage to compare).
+    let other_code = format!("TQ{:04}", unique_residue() % 10_000);
+    let other_type_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ($1, $1, 1000.00, 2) RETURNING type_id",
+    )
+    .bind(&other_code)
+    .fetch_one(&pool)
+    .await
+    .expect("seed second room type");
+    let mut header = header_row(&mapped_book, &cust_no, "จอง", 2000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(1));
+    let changed = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&mapped_book, &other_code, 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &changed, &mapped_book).await;
+    let (_, recorded, _) = read_type(&pool, &mapped_book).await;
+    assert_eq!(
+        recorded,
+        Some(other_type_id),
+        "a room-TYPE change on a parked booking must converge"
+    );
+
+    // --- (b) mode 1, code does NOT map -----------------------------------
+    let unknown_book = unique_book_id();
+    let mut header = header_row(&unknown_book, &cust_no, "จอง", 2000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(1));
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&unknown_book, "TEST_no_such_room_type", 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &aggregate, &unknown_book).await;
+    let (_, recorded, rooms) = read_type(&pool, &unknown_book).await;
+    assert_eq!(
+        recorded, None,
+        "an unmappable code leaves NULL — the property-wide cap still applies"
+    );
+    assert_eq!(rooms, 0);
+
+    // --- (b2) mode 1, the line holds a ROOM NUMBER (observed R014814) ----
+    //
+    // The pre-merge verification (PENDING-VERIFICATIONS V17, 2026-09-11) found
+    // one of HF Hotel's four live mode-1 Ds rows carrying `402` — a room
+    // number — where the decompile said a type code would be. The resolver
+    // falls back to `ht_rooms_new.room_no` and borrows that room's type; the
+    // booking still projects header-only (a mode-1 line is never a room
+    // assignment).
+    let numbered_room = unique_room_no();
+    sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_type_id, room_clean, room_notes) \
+         VALUES ($1, $2, true, 'TEST_phase53_room') \
+         ON CONFLICT (room_no) DO UPDATE SET room_type_id = EXCLUDED.room_type_id",
+    )
+    .bind(&numbered_room)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed the numbered room");
+
+    let numbered_book = unique_book_id();
+    let mut header = header_row(&numbered_book, &cust_no, "จอง", 2000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(1));
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&numbered_book, &numbered_room, 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &aggregate, &numbered_book).await;
+    let (_, recorded, rooms) = read_type(&pool, &numbered_book).await;
+    assert_eq!(
+        recorded,
+        Some(type_id),
+        "a mode-1 line holding a ROOM NUMBER must still attribute a type, via \
+         that room (the R014814 shape)"
+    );
+    assert_eq!(
+        rooms, 0,
+        "...but it is still NOT a room assignment — mode 1 stays header-only, \
+         which is what keeps the 2026-06-11 re-emit loop closed"
+    );
+
+    // --- (c) mode 2, type DERIVED from the assigned room -----------------
+    let roomed_book = unique_book_id();
+    let room_no = unique_room_no();
+    sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_type_id, room_clean, room_notes) \
+         VALUES ($1, $2, true, 'TEST_phase53_room') \
+         ON CONFLICT (room_no) DO UPDATE SET room_type_id = EXCLUDED.room_type_id",
+    )
+    .bind(&room_no)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed typed room");
+
+    let mut header = header_row(&roomed_book, &cust_no, "จอง", 1000.0);
+    header
+        .cells
+        .insert("Book_room_type".into(), MockValue::I32(2));
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&roomed_book, &room_no, 1000.0)],
+        nights: vec![],
+    };
+    apply(&pool, &aggregate, &roomed_book).await;
+    let (_, recorded, rooms) = read_type(&pool, &roomed_book).await;
+    assert_eq!(
+        recorded,
+        Some(type_id),
+        "a roomed booking derives its type from the assigned room, which is \
+         what makes our own write-back echo converge instead of flapping"
+    );
+    assert_eq!(rooms, 1);
+
+    for book in [&mapped_book, &unknown_book, &roomed_book, &numbered_book] {
+        cleanup(&pool, book, &cust_no, &room_no).await;
+    }
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&numbered_room)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code = ANY($1)")
+        .bind(vec![type_code, other_code])
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 /// Regression: an edit that drops every room from a booking (the legacy app's
@@ -475,13 +708,12 @@ async fn re_apply_with_zero_rooms_clears_stale_booking_rooms() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    let seeded_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
-    )
-    .bind(book_pg_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let seeded_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1")
+            .bind(book_pg_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(seeded_count, 1, "seed should land one booking_rooms row");
 
     // Re-apply with empty rooms (header-only transient state).
@@ -496,13 +728,12 @@ async fn re_apply_with_zero_rooms_clears_stale_booking_rooms() {
         .expect("header-only re-apply");
     tx2.commit().await.unwrap();
 
-    let after_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
-    )
-    .bind(book_pg_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let after_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1")
+            .bind(book_pg_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         after_count, 0,
         "header-only re-apply must drop stale booking_rooms rows"
@@ -564,13 +795,12 @@ async fn coalescing_yields_exactly_one_event_per_aggregate_per_tick() {
 
     // Two events total in event_log: the original Created + the
     // Modified from the second apply. NOT one-per-child-row.
-    let agg_id: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT aggregate_id FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(&book_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let agg_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT aggregate_id FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let modified_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM event_log \
           WHERE aggregate_id = $1 AND event_type = 'BookingModified'",
@@ -632,13 +862,12 @@ async fn booking_apply_errors_when_customer_unresolvable() {
         "error must name the unresolvable FK: {err}"
     );
 
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM ht_bookings WHERE legacy_book_id = $1",
-    )
-    .bind(&book_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 0, "no row must be inserted on the error path");
 
     sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
@@ -706,13 +935,12 @@ async fn booking_reapply_after_c0000_cascade_repoints_to_sentinel() {
         Some("C0000"),
         "denormalised pointer must mirror the cascade sentinel"
     );
-    let sentinel_no: Option<String> = sqlx::query_scalar(
-        "SELECT legacy_cust_no FROM ht_customers WHERE cust_id = $1",
-    )
-    .bind(book_cust_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let sentinel_no: Option<String> =
+        sqlx::query_scalar("SELECT legacy_cust_no FROM ht_customers WHERE cust_id = $1")
+            .bind(book_cust_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         sentinel_no.as_deref(),
         Some("C0000"),
@@ -741,8 +969,8 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
 
     let _cust_id = seed_customer(&pool, &cust_no).await;
 
-    let header = header_row(&book_id, &cust_no, "จอง", 890.0)
-        .with("Book_room_type", MockValue::I32(1));
+    let header =
+        header_row(&book_id, &cust_no, "จอง", 890.0).with("Book_room_type", MockValue::I32(1));
     // Ds line carries a room-TYPE code, not a room number.
     let aggregate = BookingAggregate {
         header: Some(header),
@@ -857,7 +1085,10 @@ async fn booking_blank_room_line_is_skipped_not_errored() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(junction, 1, "only the resolvable line lands in the junction");
+    assert_eq!(
+        junction, 1,
+        "only the resolvable line lands in the junction"
+    );
 
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
 }
