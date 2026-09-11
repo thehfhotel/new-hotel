@@ -97,7 +97,9 @@ use crate::sync::mapper::MssqlChangeMapper;
 // the reconcile arm and the mapper cannot disagree about what a folio is,
 // and the canonical name re-concatenation is the SAME bytes the mapper's
 // echo-adoption match uses.
-use crate::sync::mappers::guest_registry::{RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL};
+use crate::sync::mappers::guest_registry::{
+    RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL,
+};
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
 
@@ -412,8 +414,11 @@ pub async fn run_sync(
     // `consecutive_failures` and stamps `last_sync_at` (`last_error`/
     // `last_error_at` keep the most recent failure).
     if reconcile_payment_ledger_probe_enabled() {
-        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(legacy_pool, pg_pool)
-            .await
+        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(
+            legacy_pool,
+            pg_pool,
+        )
+        .await
         {
             Ok(outcome) => {
                 // added=0 (the probe writes no canonical rows),
@@ -1194,11 +1199,7 @@ fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> 
 /// Slack body for the level-drift all-clear. Pure — unit-testable
 /// without a PG pool. All-clear tier (issue #261) — stays on
 /// `with_site_text`, never the pager mention.
-fn format_level_drift_all_clear_message(
-    stale_hours: i64,
-    body: &str,
-    cooldown_hours: i64,
-) -> String {
+fn format_level_drift_all_clear_message(stale_hours: i64, body: &str, cooldown_hours: i64) -> String {
     format!(
         ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
          Every `ht_reconcile_log` row older than \
@@ -1426,8 +1427,14 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     // early return below, because "no table has stale rows any more" is
     // exactly the everything-recovered case an operator needs to hear about.
     let still_stale_tables: Vec<String> = counts.iter().map(|r| r.table.clone()).collect();
-    check_level_drift_recovery_and_notify(pg_pool, slack, site_id, &still_stale_tables, thresholds)
-        .await;
+    check_level_drift_recovery_and_notify(
+        pg_pool,
+        slack,
+        site_id,
+        &still_stale_tables,
+        thresholds,
+    )
+    .await;
 
     if counts.is_empty() {
         tracing::debug!(
@@ -1922,6 +1929,7 @@ async fn notify_stale_checkin_all_clear(
         );
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Track F5 — loyalty-channel writeback-leg stall detector
@@ -4101,8 +4109,8 @@ async fn compute_current_pg_hash(
         // an ABSENT key hashes to `mirror_absent_hash` so a row deleted on
         // both sides converges instead of sitting open forever.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
-            let probe =
-                crate::scheduler::mirror_probe::probe_for_table(t).expect("guard just matched");
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
             crate::scheduler::mirror_probe::resolve_pg_hash(pg_pool, probe, legacy_pk).await
         }
         // Phase 6-D. `legacy_pk` is either a `Cin_No` or the `<aggregate>`
@@ -4189,8 +4197,8 @@ async fn compute_current_legacy_hash(
         // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
         // arm; same absent-is-a-real-hash contract.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
-            let probe =
-                crate::scheduler::mirror_probe::probe_for_table(t).expect("guard just matched");
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
             crate::scheduler::mirror_probe::resolve_legacy_hash(
                 legacy_pool,
                 pg_pool,
@@ -4633,8 +4641,7 @@ const ROOM_CALENDAR_ERA_FLOOR_SQL: &str =
 ///
 /// The floor is a BOUND parameter and `NULL` means "no mirrored coverage at
 /// all" — then every tile is in scope, matching the unfloored legacy scan.
-const ROOM_CALENDAR_PAIRS_PG_SQL: &str =
-    "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
+const ROOM_CALENDAR_PAIRS_PG_SQL: &str = "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
        FROM ht_room_calendar c \
        JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
       WHERE $1::date IS NULL OR c.rcal_date >= $1::date";
@@ -4951,11 +4958,10 @@ async fn fetch_room_calendar_pairs_pg(
     pg_pool: &PgPool,
     floor: Option<NaiveDate>,
 ) -> Result<BTreeMap<RoomCalendarPair, CanonicalCalendarTile>, sqlx::Error> {
-    let rows =
-        sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
-            .bind(floor)
-            .fetch_all(pg_pool)
-            .await?;
+    let rows = sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
+        .bind(floor)
+        .fetch_all(pg_pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|(room_no, night, rcal_id, legacy_id)| {
@@ -6210,27 +6216,21 @@ async fn auto_resolve_reconcile_log(
 
     let mut resolved = 0usize;
     for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
-        let current_legacy_hash = match compute_current_legacy_hash(
-            legacy_pool,
-            pg_pool,
-            &table_name,
-            &legacy_pk,
-        )
-        .await
-        {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!(
-                    site = %site_id,
-                    id,
-                    table_name = %table_name,
-                    legacy_pk = %legacy_pk,
-                    error = %e,
-                    "[Sync] Auto-resolve sweep: failed to re-fetch legacy hash, skipping row"
-                );
-                continue;
-            }
-        };
+        let current_legacy_hash =
+            match compute_current_legacy_hash(legacy_pool, pg_pool, &table_name, &legacy_pk).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        site = %site_id,
+                        id,
+                        table_name = %table_name,
+                        legacy_pk = %legacy_pk,
+                        error = %e,
+                        "[Sync] Auto-resolve sweep: failed to re-fetch legacy hash, skipping row"
+                    );
+                    continue;
+                }
+            };
 
         let current_pg_hash = match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await
         {
@@ -8464,8 +8464,12 @@ async fn upsert_checkin_mirror(
 /// excluded from the hash. (`Receipt_Date` IS used in the scan's WHERE
 /// clause as the canonical-era floor — see [`PAYMENTS_ERA_FLOOR_SQL`] —
 /// which is a scope filter, not a hash input.)
-const PAYMENTS_RECONCILE_PROJECTION: &[&str] =
-    &["Receipt_no", "Receipt_Total", "Receipt_ref", "status_name"];
+const PAYMENTS_RECONCILE_PROJECTION: &[&str] = &[
+    "Receipt_no",
+    "Receipt_Total",
+    "Receipt_ref",
+    "status_name",
+];
 
 /// The scan filter for the bulk payments sweep.
 ///
@@ -8694,15 +8698,15 @@ async fn fetch_canonical_payment(
 ) -> Result<Option<CanonicalPaymentRow>, sqlx::Error> {
     sqlx::query_as::<_, (f64, Option<bool>, Option<String>)>(CANONICAL_PAYMENT_PROBE_SQL)
         .bind(receipt_no)
-        .fetch_optional(pg_pool)
-        .await
-        .map(|opt| {
-            opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
-                pay_amount: amount,
-                pay_voided: voided,
-                legacy_cin_no: cin_no,
-            })
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
+            pay_amount: amount,
+            pay_voided: voided,
+            legacy_cin_no: cin_no,
         })
+    })
 }
 
 /// Best-effort ack: record the `mssql_hash` we last reconciled for this
@@ -9156,7 +9160,9 @@ pub(crate) fn clamped_era_floor<T: Ord>(persisted: Option<T>, derived: Option<T>
     }
 }
 
-async fn guest_registry_era_floor(pg_pool: &PgPool) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+async fn guest_registry_era_floor(
+    pg_pool: &PgPool,
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
     // `AssertSqlSafe`: the statement is assembled from compile-time consts
     // only (no runtime value reaches it) — same audit note as the sibling
     // canonical-folio statements below.
@@ -9174,17 +9180,21 @@ async fn guest_registry_era_floor(pg_pool: &PgPool) -> Result<Option<NaiveDateTi
     // fails the whole guest-registry tick. A NULL reads as "nothing
     // persisted", which is exactly what `clamped_era_floor` already handles.
     let persisted = match derived {
-        Some(d) => sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
-            .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
-            .bind(d)
-            .fetch_optional(pg_pool)
-            .await?
-            .flatten(),
-        None => sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
-            .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
-            .fetch_optional(pg_pool)
-            .await?
-            .flatten(),
+        Some(d) => {
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .bind(d)
+                .fetch_optional(pg_pool)
+                .await?
+                .flatten()
+        }
+        None => {
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .fetch_optional(pg_pool)
+                .await?
+                .flatten()
+        }
     };
 
     let effective = clamped_era_floor(persisted, derived);
@@ -10522,8 +10532,7 @@ mod tests {
     #[test]
     fn room_clean_projections_agree_across_detection_and_auto_resolve() {
         // A dirty room: legacy says "needs cleaning", canonical says not clean.
-        let legacy_dirty =
-            room_canonical_hash("512", legacy_yesno_canonical(Some("yes")), "no", None);
+        let legacy_dirty = room_canonical_hash("512", legacy_yesno_canonical(Some("yes")), "no", None);
         let canonical_dirty =
             room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(false)), "no", None);
         assert_eq!(
@@ -10532,8 +10541,7 @@ mod tests {
         );
 
         // A clean room: legacy "no cleaning needed", canonical clean.
-        let legacy_clean =
-            room_canonical_hash("512", legacy_yesno_canonical(Some("no")), "no", None);
+        let legacy_clean = room_canonical_hash("512", legacy_yesno_canonical(Some("no")), "no", None);
         let canonical_clean =
             room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(true)), "no", None);
         assert_eq!(
@@ -11909,9 +11917,10 @@ mod tests {
         ));
         for sloppy in ["TRUE", "1", "yes", " true", "True"] {
             assert!(
-                !with_env_vars(&[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))], || {
-                    reconcile_payments_arm_enabled()
-                }),
+                !with_env_vars(
+                    &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))],
+                    || { reconcile_payments_arm_enabled() }
+                ),
                 "`{sloppy}` must NOT enable the arm"
             );
         }
@@ -12235,7 +12244,9 @@ mod tests {
     /// check-ins BEFORE it (the CT mapper ERRORS on an unresolvable parent).
     #[test]
     fn guest_registry_ranks_after_its_parent_checkin() {
-        assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry"));
+        assert!(
+            reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry")
+        );
         assert!(
             reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank("something_new"),
             "the wildcard must stay strictly after every ranked entity"
@@ -12323,27 +12334,20 @@ mod tests {
             "a registered PRIMARY guest is not a companion: {folios}"
         );
         assert_eq!(
-            CANONICAL_COMPANION_PRIMARY_FILTER, "COALESCE(guest_is_primary, false) = false",
+            CANONICAL_COMPANION_PRIMARY_FILTER,
+            "COALESCE(guest_is_primary, false) = false",
             "the column is nullable; a bare `= false` drops NULL rows out of \
              the canonical folio and reports them as legacy-only forever"
         );
         assert!(
-            folios.contains(
-                "JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"
-            ),
+            folios.contains("JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"),
             "join companion → check-in, never the reverse: a duplicate \
              legacy_cin_no would otherwise duplicate companion lines: {folios}"
         );
-        assert!(
-            folios.contains("ht_checkins.cin_checkin_time >= $1"),
-            "{folios}"
-        );
+        assert!(folios.contains("ht_checkins.cin_checkin_time >= $1"), "{folios}");
 
         let floor = guest_registry_era_floor_sql();
-        assert!(
-            floor.contains("MIN(ht_checkins.cin_checkin_time)"),
-            "{floor}"
-        );
+        assert!(floor.contains("MIN(ht_checkins.cin_checkin_time)"), "{floor}");
         assert!(floor.contains("FROM ht_guest_registry"), "{floor}");
         assert!(
             floor.contains("date_trunc('day'"),
@@ -12427,8 +12431,9 @@ mod tests {
     #[test]
     fn era_floor_watermark_sql_is_monotonic_and_single_round_trip() {
         assert!(
-            RECONCILE_ERA_FLOOR_UPSERT_SQL
-                .contains("GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"),
+            RECONCILE_ERA_FLOOR_UPSERT_SQL.contains(
+                "GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"
+            ),
             "without GREATEST the upsert would happily write a LOWER floor: \
              {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
         );
@@ -12636,10 +12641,8 @@ mod tests {
         assert!(body.contains("40470"), "effective floor missing: {body:?}");
         assert!(body.contains("hfhotel"), "site missing: {body:?}");
         assert!(
-            body.contains(
-                "DELETE FROM ht_reconcile_era_floor WHERE table_name = \
-                           'payment_ledger_probe';"
-            ),
+            body.contains("DELETE FROM ht_reconcile_era_floor WHERE table_name = \
+                           'payment_ledger_probe';"),
             "the delete-row escape hatch must be spelled out: {body:?}"
         );
         assert!(
@@ -12730,14 +12733,8 @@ mod tests {
         let probe = &NULL_SENTINEL_PROBES[0];
         assert_eq!(probe.table_name, "bookings");
         let body = format_null_sentinel_message(probe, 3, 24);
-        assert!(
-            body.contains("HT_Book_H"),
-            "must name the legacy table: {body:?}"
-        );
-        assert!(
-            body.contains("Book_Cust_ID"),
-            "must name the legacy column: {body:?}"
-        );
+        assert!(body.contains("HT_Book_H"), "must name the legacy table: {body:?}");
+        assert!(body.contains("Book_Cust_ID"), "must name the legacy column: {body:?}");
         assert!(body.contains("*3*"), "must state the count: {body:?}");
         assert!(
             body.to_lowercase().contains("cannot"),
@@ -13284,7 +13281,10 @@ mod tests {
 
         // PRE-FIX: the canonical side counted `rcal_legacy_id IS NOT NULL`
         // only — 3 legacy nights vs 0 mirrored — and fabricated a deficit.
-        let bound_only = canonical.values().filter(|t| t.legacy_id.is_some()).count();
+        let bound_only = canonical
+            .values()
+            .filter(|t| t.legacy_id.is_some())
+            .count();
         assert_eq!(bound_only, 0);
         assert!(
             legacy.len() > bound_only,
@@ -13383,10 +13383,7 @@ mod tests {
             (
                 "deficit alongside both surplus classes",
                 classify_room_calendar_pairs(
-                    &legacy_pairs(&[
-                        ("107", "2026-08-05", 4799, 1),
-                        ("405", "2026-05-11", 50980, 1),
-                    ]),
+                    &legacy_pairs(&[("107", "2026-08-05", 4799, 1), ("405", "2026-05-11", 50980, 1)]),
                     &canonical_pairs(&[
                         ("405", "2026-05-11", 48, None),
                         ("303", "2026-05-14", 87, None),
@@ -13459,10 +13456,7 @@ mod tests {
     #[test]
     fn room_calendar_divergence_is_missing_pg_or_nothing() {
         for c in [
-            classify_room_calendar_pairs(
-                &legacy_pairs(&ville_dropped_nights()),
-                &canonical_pairs(&[]),
-            ),
+            classify_room_calendar_pairs(&legacy_pairs(&ville_dropped_nights()), &canonical_pairs(&[])),
             classify_room_calendar_pairs(
                 &legacy_pairs(&[]),
                 &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
@@ -13592,9 +13586,7 @@ mod tests {
              stamped in the meantime: {sql}"
         );
         assert!(
-            sql.contains(
-                "NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"
-            ),
+            sql.contains("NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"),
             "the id must not already be bound to another row — the partial \
              unique index would raise: {sql}"
         );
@@ -13639,9 +13631,7 @@ mod tests {
             "async fn compute_room_calendar_deficit_hash(",
             "pub(crate) async fn probe_room_calendar_business_key(",
         ] {
-            let start = src
-                .find(func)
-                .unwrap_or_else(|| panic!("{func} must exist"));
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
             let rest = &src[start..];
             let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
             assert!(
@@ -13681,9 +13671,7 @@ mod tests {
             "async fn compute_current_pg_hash(",
             "async fn compute_current_legacy_hash(",
         ] {
-            let start = src
-                .find(func)
-                .unwrap_or_else(|| panic!("{func} must exist"));
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
             let rest = &src[start..];
             let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
 
@@ -13851,8 +13839,7 @@ mod tests {
              {all} — the region may have been refactored away"
         );
         assert_eq!(
-            all,
-            via_const,
+            all, via_const,
             "{} emission site(s) name their event with a raw string literal \
              instead of a registered EV_ constant. A typo or rename there is \
              invisible to the registry and silently breaks the \
@@ -14093,10 +14080,7 @@ mod tests {
     /// namesake in the issue — must lead with the exact mention.
     #[test]
     fn escalated_level_digest_composition_leads_with_channel_mention() {
-        let body = format_escalated_level_digest_message(
-            72,
-            "• `bookings`: 3 unresolved row(s), oldest *388h*",
-        );
+        let body = format_escalated_level_digest_message(72, "• `bookings`: 3 unresolved row(s), oldest *388h*");
         let msg = SlackMessage::with_site_text_paged("hfhotel", body);
         assert!(
             msg.text.starts_with("<!channel> "),
@@ -14112,12 +14096,7 @@ mod tests {
     /// breaks.
     #[test]
     fn stale_level_digest_composition_has_no_channel_mention() {
-        let body = format_stale_level_digest_message(
-            4,
-            "• `customers`: 1 unresolved row(s), oldest 6h",
-            24,
-            72,
-        );
+        let body = format_stale_level_digest_message(4, "• `customers`: 1 unresolved row(s), oldest 6h", 24, 72);
         let msg = SlackMessage::with_site_text("hfhotel", body);
         assert!(
             !msg.text.contains("<!channel>"),
@@ -14141,8 +14120,7 @@ mod tests {
     /// the re-scope.
     #[test]
     fn burst_alert_composition_leads_with_channel_mention() {
-        let body =
-            format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
+        let body = format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
         let msg = SlackMessage::with_site_text_paged("hfville", body);
         assert!(
             msg.text.starts_with("<!channel> "),
@@ -14174,13 +14152,7 @@ mod tests {
         // `guest_registry` (Phase 6-B) is the first entity name carrying an
         // underscore — it must still read as a bare reconcile table key
         // (no `:`), and must not collide with any namespaced family.
-        for table in [
-            "bookings",
-            "customers",
-            "checkins",
-            "rooms",
-            "guest_registry",
-        ] {
+        for table in ["bookings", "customers", "checkins", "rooms", "guest_registry"] {
             let key = escalated_cooldown_key(table);
             assert_ne!(key, table, "escalation key must not equal the entity name");
             assert!(
@@ -14305,10 +14277,7 @@ mod tests {
             ],
             || level_drift_thresholds_from_env("hfhotel"),
         );
-        assert_eq!(
-            (t.stale_hours, t.cooldown_hours, t.escalate_hours),
-            (8, 12, 96)
-        );
+        assert_eq!((t.stale_hours, t.cooldown_hours, t.escalate_hours), (8, 12, 96));
     }
 
     /// Per-site override wins over the global, and does not leak to the
@@ -14565,7 +14534,6 @@ mod tests {
         let (first, _, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
         assert_eq!(first.table_name, "HT_Customers");
     }
-
     // -------------------------------------------------------------------
     // Track F5 — loyalty-channel writeback-leg stall tripwire
     // -------------------------------------------------------------------

@@ -11,8 +11,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
-use super::notification_state::{load_watermark, now_thai_local, save_watermark, NotificationType};
-use super::sync;
 use crate::config::{SiteConfig, SlackConfig};
 use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::{DbPool, PgPool};
@@ -21,8 +19,14 @@ use crate::notifications::slack::{
     build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
 use crate::outbox::{EventBus, OutboxRepository};
-use crate::repository::{CustomerRepository, PgBookingRepository, PgCustomerRepository};
+use crate::repository::{
+    CustomerRepository, PgBookingRepository, PgCustomerRepository,
+};
 use crate::service::{BookingService, ChannelService, CustomerService};
+use super::notification_state::{
+    load_watermark, now_thai_local, save_watermark, NotificationType,
+};
+use super::sync;
 
 /// Scheduler state for tracking last polled timestamps in-process.
 ///
@@ -233,11 +237,7 @@ pub async fn init_scheduler(
                             .sweep_expired_holds("hfville")
                             .await;
                         if released > 0 {
-                            tracing::info!(
-                                site = "hfville",
-                                released,
-                                "[Scheduler] loyalty hold sweep released expired holds"
-                            );
+                            tracing::info!(site = "hfville", released, "[Scheduler] loyalty hold sweep released expired holds");
                         }
                     }
                 }
@@ -310,6 +310,7 @@ pub async fn init_scheduler(
             "[Scheduler] - Loyalty writeback-leg stall tripwire: every 2 minutes (pure-PG; \
              survives a writeback-worker outage)"
         );
+
 
         // Room-signal escalation valve (ADR 0008). Every 30 seconds: a
         // ขอเช็คห้อง still unacked after 2 minutes is POSTed to HF ID, which
@@ -424,7 +425,9 @@ pub async fn init_scheduler(
         })?;
         scheduler.add(hourly_job).await?;
     } else {
-        tracing::info!("[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED != true)");
+        tracing::info!(
+            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED != true)"
+        );
     }
 
     // Poll for check-ins every 2 minutes.
@@ -445,7 +448,8 @@ pub async fn init_scheduler(
             let site_id = checkin_site.clone();
             let pg = pg_checkins.clone();
             Box::pin(async move {
-                if let Err(e) = poll_checkins(&pool, pg.as_ref(), &slack, &state, &site_id).await {
+                if let Err(e) = poll_checkins(&pool, pg.as_ref(), &slack, &state, &site_id).await
+                {
                     tracing::error!(site = %site_id, "[Scheduler] Error polling check-ins: {}", e);
                 }
             })
@@ -474,7 +478,8 @@ pub async fn init_scheduler(
             let site_id = checkout_site.clone();
             let pg = pg_checkouts.clone();
             Box::pin(async move {
-                if let Err(e) = poll_checkouts(&pool, pg.as_ref(), &slack, &state, &site_id).await {
+                if let Err(e) = poll_checkouts(&pool, pg.as_ref(), &slack, &state, &site_id).await
+                {
                     tracing::error!(site = %site_id, "[Scheduler] Error polling checkouts: {}", e);
                 }
             })
@@ -648,8 +653,13 @@ async fn poll_checkins(
     // an event we MUST resume past it, otherwise we re-emit (the bug
     // this whole subsystem exists to fix).
     if state.last_checkin_timestamp.is_none() {
-        let initial =
-            hydrate_or_seed_watermark(pg, site_id, NotificationType::Checkin, "check-in").await;
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Checkin,
+            "check-in",
+        )
+        .await;
         state.last_checkin_timestamp = Some(initial);
         return Ok(());
     }
@@ -726,8 +736,13 @@ async fn poll_checkouts(
     // an event we MUST resume past it, otherwise we re-emit ~45
     // historical events (the production-verified bug 2026-05-13).
     if state.last_checkout_timestamp.is_none() {
-        let initial =
-            hydrate_or_seed_watermark(pg, site_id, NotificationType::Checkout, "checkout").await;
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Checkout,
+            "checkout",
+        )
+        .await;
         state.last_checkout_timestamp = Some(initial);
         return Ok(());
     }
@@ -802,8 +817,13 @@ async fn poll_new_bookings(
     // Hydrate the watermark on first poll after process start. PG is
     // authoritative — see poll_checkouts for the full rationale.
     if state.last_booking_timestamp.is_none() {
-        let initial =
-            hydrate_or_seed_watermark(pg, site_id, NotificationType::Booking, "booking").await;
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Booking,
+            "booking",
+        )
+        .await;
         state.last_booking_timestamp = Some(initial);
         return Ok(());
     }
@@ -843,8 +863,7 @@ async fn poll_new_bookings(
             let booking_time = row.get::<NaiveDateTime, _>("Book_Date");
 
             if let (Some(cin), Some(cout)) = (check_in_date, check_out_date) {
-                let mut message =
-                    build_new_booking_alert_message(&guest_name, &room_type, cin, cout);
+                let mut message = build_new_booking_alert_message(&guest_name, &room_type, cin, cout);
                 prefix_message_with_site(&mut message, site_id);
                 slack.send_message(&message).await;
 
