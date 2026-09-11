@@ -20,6 +20,30 @@
 //! Wire shapes are snake_case verbatim from the contract — this file
 //! deliberately does NOT use `rename_all = "camelCase"`.
 //!
+//! ## `Idempotency-Key` on the hold create
+//!
+//! `POST /api/channel/bookings` is the one call here that is not naturally
+//! replay-tolerant — payment-verified and release converge on a state, but a
+//! create mints a new booking every time. A client retry after a hung request
+//! therefore used to produce TWO holds (two real iHOTEL `จอง` rows, one of
+//! which nobody releases before its 2h deadline).
+//!
+//! Callers may now send **`Idempotency-Key: <client-generated string>`**
+//! (OPTIONAL — a request without it behaves exactly as it always has). The key
+//! is a HEADER and deliberately NOT a body field: the request body is a locked
+//! snake_case contract that the loyalty app and this file agree on field by
+//! field, and idempotency is transport concern, not booking data. It is also
+//! where every client library already looks for it, including the loyalty
+//! app's own backend.
+//!
+//! * same key + same request → the FIRST response is replayed verbatim (same
+//!   status, same body, no second hold), stamped `Idempotency-Replayed: true`;
+//! * same key + a materially different request → **422**;
+//! * two identical requests at once → serialised; exactly one hold is created
+//!   and the loser replays the winner's response.
+//!
+//! Mechanism and TTL live in `service::channel_idempotency` (migration 093).
+//!
 //! ## Property ↔ branch mapping
 //!
 //! The contract identifies properties as `"hf"` (The Harbour Front Hotel)
@@ -34,8 +58,9 @@
 //! keys on `?branch=` — so the same policy is enforced here explicitly).
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -46,7 +71,11 @@ use uuid::Uuid;
 use super::mode::{AppState, Branch};
 use crate::error::ApiError;
 use crate::outbox::event::EventSource;
-use crate::service::{ChannelService, CreateHoldCommand, PaymentPlan, ServiceError};
+use crate::service::{
+    caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, ChannelService,
+    CreateHoldCommand, PaymentPlan, Reserved, ServiceError, StoredResponse,
+    ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
+};
 
 // ---------------------------------------------------------------------------
 // Property ↔ branch mapping + pms_booking_id codec (pure, unit-tested)
@@ -155,6 +184,85 @@ fn service_error_response(err: ServiceError) -> Response {
         ServiceError::Conflict(msg) => error_response(StatusCode::CONFLICT, msg),
         other => api_error_response(ApiError::from(other)),
     }
+}
+
+/// Render a pre-serialized JSON payload with an explicit status, optionally
+/// marking it as an idempotent replay.
+///
+/// Built by hand rather than through `Json(...)` because a replay must return
+/// the stored body BYTE FOR BYTE — re-parsing and re-serializing it would hand
+/// the retrying client a different document than the original request got.
+fn json_response(status: StatusCode, body: String, replayed: bool) -> Response {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if replayed {
+        builder = builder.header(IDEMPOTENCY_REPLAYED_HEADER, "true");
+    }
+    builder.body(Body::from(body)).unwrap_or_else(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build channel response: {err}"),
+        )
+    })
+}
+
+/// Replay a stored response, stamped so the client can tell it from a fresh
+/// one. A stored status that is no longer a valid HTTP code cannot happen (we
+/// wrote it) — fall back to the status the create path uses rather than 500 on
+/// our own record.
+fn replay_response(stored: StoredResponse) -> Response {
+    let status = StatusCode::from_u16(stored.status).unwrap_or(StatusCode::CREATED);
+    json_response(status, stored.body, true)
+}
+
+/// A key that was already spent on a different request. **422**, not 409: the
+/// request is well-formed and the server is in no conflicting state — the
+/// entity is unprocessable because it contradicts what this key already means.
+fn mismatch_response(key: &str) -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "Idempotency-Key '{key}' was already used for a different booking request; \
+             retry the original request unchanged, or use a new key"
+        ),
+    )
+}
+
+/// The bearer this request presented, for `caller_identity`.
+///
+/// A local re-read of the `Authorization` header rather than plumbing it out of
+/// `middleware::channel_token`: that module's job is to decide 401 vs 503 and
+/// it deliberately exposes no token accessor. Behind it a valid bearer is
+/// guaranteed, so this is a total function over an already-verified header.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, rest) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Read + validate the optional `Idempotency-Key` header.
+///
+/// `Ok(None)` = the caller opted out and gets exactly today's behaviour. A
+/// header that IS present but unusable is a 400, not a silent opt-out —
+/// dropping idempotency protection quietly is the failure this feature exists
+/// to remove.
+#[allow(clippy::result_large_err)] // see parse_property
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let Some(raw) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key must be printable ASCII without spaces (a UUID is ideal)".to_string(),
+        )
+    })?;
+    normalize_key(raw).map(Some).map_err(service_error_response)
 }
 
 fn channel_event_source() -> EventSource {
@@ -267,6 +375,18 @@ impl From<ChannelPayment> for PaymentPlan {
     }
 }
 
+impl ChannelPayment {
+    /// The contract literal, for the idempotency fingerprint. Deliberately not
+    /// `Serialize`: this enum is request-only and the literals are already
+    /// pinned by `payment_plan_wire_literals`.
+    fn wire_value(self) -> &'static str {
+        match self {
+            ChannelPayment::Deposit50 => "deposit50",
+            ChannelPayment::Full => "full",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateChannelBookingRequest {
     pub property: String,
@@ -291,8 +411,91 @@ pub struct CreateChannelBookingResponse {
     pub hold_expires_at: String,
 }
 
+/// Canonical fingerprint of a hold-create request, for the `Idempotency-Key`
+/// mismatch check.
+///
+/// Hashes NORMALISED fields in a fixed order, not the raw bytes: a retry that
+/// re-serialises its JSON with different key order or whitespace, or sends
+/// `" 3 "` where the first attempt sent `"3"`, is the SAME request and must
+/// replay rather than 422. Everything that changes what gets booked is in
+/// here; nothing else is.
+fn create_booking_fingerprint(
+    property: &str,
+    room_type_id: i32,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+    body: &CreateChannelBookingRequest,
+) -> String {
+    fingerprint_of(&[
+        property,
+        &room_type_id.to_string(),
+        &check_in.format("%Y-%m-%d").to_string(),
+        &check_out.format("%Y-%m-%d").to_string(),
+        &body.guests.to_string(),
+        body.guest.name.trim(),
+        body.guest.phone.trim(),
+        body.membership_id.as_deref().unwrap_or("").trim(),
+        body.payment.wire_value(),
+    ])
+}
+
+/// Create the hold and render the 201 payload as a STRING — the exact bytes
+/// that get sent and, on a keyed request, stored for replay.
+///
+/// Returns the rendered body plus the created `book_id`, or a ready-to-send
+/// error `Response`.
+#[allow(clippy::result_large_err)] // see parse_property
+async fn perform_create_hold(
+    state: &AppState,
+    service: &ChannelService,
+    branch: Branch,
+    property: &'static str,
+    room_type_id: i32,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+    body: &CreateChannelBookingRequest,
+) -> Result<(String, i32), Response> {
+    // Same daily allocator as the booking form (per-branch pool).
+    let pool = state.write_pool(Some(branch)).map_err(api_error_response)?;
+    let book_no = super::new_bookings::generate_book_no(state, pool)
+        .await
+        .map_err(api_error_response)?;
+
+    let outcome = service
+        .create_hold(CreateHoldCommand {
+            book_no,
+            room_type_id,
+            check_in,
+            check_out,
+            guests: body.guests,
+            guest_name: body.guest.name.clone(),
+            guest_phone: body.guest.phone.clone(),
+            membership_id: body.membership_id.clone(),
+            payment: body.payment.into(),
+            source: channel_event_source(),
+        })
+        .await
+        .map_err(service_error_response)?;
+
+    let payload = CreateChannelBookingResponse {
+        pms_booking_id: format_pms_booking_id(property, outcome.book_id),
+        total: outcome.total_baht,
+        amount_due_now: outcome.amount_due_baht,
+        hold_expires_at: outcome.hold_expires_at.to_rfc3339(),
+    };
+    let body = serde_json::to_string(&payload).map_err(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to render channel booking response: {err}"),
+        )
+    })?;
+
+    Ok((body, outcome.book_id))
+}
+
 pub async fn create_booking(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateChannelBookingRequest>,
 ) -> Response {
     let (branch, property) = match parse_property(&body.property) {
@@ -319,47 +522,103 @@ pub async fn create_booking(
             )
         }
     };
+    // Validated (and the HF Ville write gate applied) BEFORE the key is
+    // reserved: a request that could never have created a hold must not spend
+    // one.
     let service = match channel_service_for(&state, branch, true) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-
-    // Same daily allocator as the booking form (per-branch pool).
-    let pool = match state.write_pool(Some(branch)) {
-        Ok(p) => p,
-        Err(e) => return api_error_response(e),
-    };
-    let book_no = match super::new_bookings::generate_book_no(&state, pool).await {
-        Ok(n) => n,
-        Err(e) => return api_error_response(e),
+    let key = match idempotency_key(&headers) {
+        Ok(k) => k,
+        Err(resp) => return resp,
     };
 
-    match service
-        .create_hold(CreateHoldCommand {
-            book_no,
+    // No key — exactly the pre-existing behaviour, no row written.
+    let Some(key) = key else {
+        return match perform_create_hold(
+            &state,
+            &service,
+            branch,
+            property,
             room_type_id,
             check_in,
             check_out,
-            guests: body.guests,
-            guest_name: body.guest.name.clone(),
-            guest_phone: body.guest.phone.clone(),
-            membership_id: body.membership_id.clone(),
-            payment: body.payment.into(),
-            source: channel_event_source(),
-        })
+            &body,
+        )
+        .await
+        {
+            Ok((rendered, _)) => json_response(StatusCode::CREATED, rendered, false),
+            Err(resp) => resp,
+        };
+    };
+
+    // Keyed: the reservation lives in the same per-branch database as the
+    // booking it protects, so the key and the hold commit or roll back together.
+    let pool = match state.write_pool(Some(branch)) {
+        Ok(p) => p.clone(),
+        Err(e) => return api_error_response(e),
+    };
+    let idempotency = ChannelIdempotency::new(pool);
+    let caller = caller_identity(bearer_token(&headers));
+    let fingerprint =
+        create_booking_fingerprint(property, room_type_id, check_in, check_out, &body);
+
+    let reservation = match idempotency
+        .reserve(&caller, &key, ENDPOINT_CREATE_BOOKING, &fingerprint)
         .await
     {
-        Ok(outcome) => (
-            StatusCode::CREATED,
-            Json(CreateChannelBookingResponse {
-                pms_booking_id: format_pms_booking_id(property, outcome.book_id),
-                total: outcome.total_baht,
-                amount_due_now: outcome.amount_due_baht,
-                hold_expires_at: outcome.hold_expires_at.to_rfc3339(),
-            }),
-        )
-            .into_response(),
-        Err(err) => service_error_response(err),
+        Ok(Reserved::Fresh(reservation)) => reservation,
+        Ok(Reserved::Replay(stored)) => {
+            tracing::info!(
+                idempotency_key = %key,
+                book_id = ?stored.book_id,
+                "loyalty channel hold create replayed from a stored response"
+            );
+            return replay_response(stored);
+        }
+        Ok(Reserved::Mismatch) => return mismatch_response(&key),
+        Err(err) => return service_error_response(err),
+    };
+
+    match perform_create_hold(
+        &state,
+        &service,
+        branch,
+        property,
+        room_type_id,
+        check_in,
+        check_out,
+        &body,
+    )
+    .await
+    {
+        Ok((rendered, book_id)) => {
+            if let Err(err) = reservation
+                .complete(StatusCode::CREATED.as_u16(), &rendered, Some(book_id))
+                .await
+            {
+                // The hold IS committed (its own transaction); only the record
+                // of the key failed. Report the created booking — refusing it
+                // would tell the client nothing happened when a real iHOTEL
+                // `จอง` exists. A retry of this key re-enters as a fresh
+                // request, which is the pre-existing behaviour, not a
+                // regression.
+                tracing::error!(
+                    error = %err,
+                    idempotency_key = %key,
+                    book_id,
+                    "hold created but its idempotency key could not be recorded; a retry of this \
+                     key would create a second hold"
+                );
+            }
+            json_response(StatusCode::CREATED, rendered, false)
+        }
+        Err(resp) => {
+            // Errors are never cached: free the key so the client may retry it.
+            reservation.abandon().await;
+            resp
+        }
     }
 }
 
@@ -473,8 +732,14 @@ mod tests {
             parse_property("hfville"),
             Ok((Branch::Hfville, "hfville"))
         ));
-        assert!(matches!(parse_property(" hf "), Ok((Branch::Hfhotel, "hf"))));
-        assert!(parse_property("hfhotel").is_err(), "internal site ids are NOT wire values");
+        assert!(matches!(
+            parse_property(" hf "),
+            Ok((Branch::Hfhotel, "hf"))
+        ));
+        assert!(
+            parse_property("hfhotel").is_err(),
+            "internal site ids are NOT wire values"
+        );
         assert!(parse_property("").is_err());
     }
 
@@ -529,6 +794,151 @@ mod tests {
         assert_eq!(v["room_types"][0]["nightly_price"], 1200.0);
         assert_eq!(v["room_types"][0]["available_count"], 4);
         assert!(v["room_types"][0].get("roomTypeId").is_none());
+    }
+
+    fn sample_request() -> CreateChannelBookingRequest {
+        serde_json::from_value(serde_json::json!({
+            "property": "hf",
+            "room_type_id": "3",
+            "check_in": "2026-09-20",
+            "check_out": "2026-09-22",
+            "guests": 2,
+            "guest": { "name": "Somchai Jaidee", "phone": "0812345678" },
+            "payment": "deposit50"
+        }))
+        .expect("sample request parses")
+    }
+
+    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, value.parse().expect("header value"));
+        headers
+    }
+
+    #[test]
+    fn idempotency_key_is_optional_and_validated() {
+        // Absent → opt out, today's behaviour.
+        assert!(idempotency_key(&HeaderMap::new()).unwrap().is_none());
+        // Present → trimmed. Header name lookup is case-insensitive.
+        assert_eq!(
+            idempotency_key(&headers_with("Idempotency-Key", " abc-123 "))
+                .unwrap()
+                .as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(
+            idempotency_key(&headers_with("idempotency-key", "abc-123"))
+                .unwrap()
+                .as_deref(),
+            Some("abc-123")
+        );
+        // Present but unusable is a 400, NOT a silent opt-out.
+        assert!(idempotency_key(&headers_with("Idempotency-Key", "   ")).is_err());
+        assert!(idempotency_key(&headers_with("Idempotency-Key", "has space")).is_err());
+        assert!(idempotency_key(&headers_with("Idempotency-Key", &"a".repeat(256))).is_err());
+    }
+
+    #[test]
+    fn bearer_token_is_read_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let headers = headers_with("authorization", &format!("{scheme} tok-123"));
+            assert_eq!(bearer_token(&headers), Some("tok-123"), "scheme {scheme}");
+        }
+        assert_eq!(
+            bearer_token(&headers_with("authorization", "Basic tok-123")),
+            None
+        );
+        assert_eq!(
+            bearer_token(&headers_with("authorization", "Bearer  ")),
+            None
+        );
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn fingerprint_ignores_formatting_but_not_content() {
+        let base = sample_request();
+        let baseline = create_booking_fingerprint("hf", 3, d("2026-09-20"), d("2026-09-22"), &base);
+
+        // Same booking, sloppier client: padded name/phone, no membership vs
+        // an empty one. Must REPLAY, not 422.
+        let mut sloppy = sample_request();
+        sloppy.guest.name = "  Somchai Jaidee  ".into();
+        sloppy.guest.phone = " 0812345678 ".into();
+        sloppy.membership_id = Some("   ".into());
+        assert_eq!(
+            baseline,
+            create_booking_fingerprint("hf", 3, d("2026-09-20"), d("2026-09-22"), &sloppy)
+        );
+
+        // Anything that changes what gets booked must differ.
+        let mut other_guests = sample_request();
+        other_guests.guests = 3;
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hf", 3, d("2026-09-20"), d("2026-09-22"), &other_guests)
+        );
+        let mut other_payment = sample_request();
+        other_payment.payment = ChannelPayment::Full;
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hf", 3, d("2026-09-20"), d("2026-09-22"), &other_payment)
+        );
+        let mut member = sample_request();
+        member.membership_id = Some("HF-0001".into());
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hf", 3, d("2026-09-20"), d("2026-09-22"), &member)
+        );
+        // Property, room type and dates are the caller's normalised values.
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hfville", 3, d("2026-09-20"), d("2026-09-22"), &base)
+        );
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hf", 4, d("2026-09-20"), d("2026-09-22"), &base)
+        );
+        assert_ne!(
+            baseline,
+            create_booking_fingerprint("hf", 3, d("2026-09-21"), d("2026-09-22"), &base)
+        );
+    }
+
+    #[test]
+    fn a_reused_key_with_a_different_body_is_422() {
+        let resp = mismatch_response("abc-123");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "422 — well-formed request, but it contradicts what the key already means"
+        );
+    }
+
+    #[test]
+    fn only_a_replay_carries_the_replay_header() {
+        let fresh = json_response(StatusCode::CREATED, "{\"a\":1}".to_string(), false);
+        assert_eq!(fresh.status(), StatusCode::CREATED);
+        assert_eq!(
+            fresh.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert!(fresh.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none());
+
+        let replay = replay_response(StoredResponse {
+            status: 201,
+            body: "{\"a\":1}".to_string(),
+            book_id: Some(7),
+        });
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay.headers().get(IDEMPOTENCY_REPLAYED_HEADER).unwrap(),
+            "true"
+        );
+    }
+
+    fn d(raw: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(raw, "%Y-%m-%d").expect("test date")
     }
 
     #[test]

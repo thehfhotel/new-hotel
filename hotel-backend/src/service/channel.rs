@@ -302,7 +302,9 @@ impl ChannelService {
         amount_baht: f64,
     ) -> ServiceResult<ConfirmOutcome> {
         if !(amount_baht.is_finite() && amount_baht >= 0.0) {
-            return Err(ServiceError::validation("amount must be a non-negative number"));
+            return Err(ServiceError::validation(
+                "amount must be a non-negative number",
+            ));
         }
 
         let mut tx = self.pg.begin().await?;
@@ -318,7 +320,7 @@ impl ChannelService {
         match row.status.as_str() {
             "pending" => {}
             // Idempotent replay — report the stored numbers, write nothing.
-            "confirmed" | "checkedin" | "completed" => {
+            s if is_settled_status(s) => {
                 if (row.deposit_amount - amount_baht).abs() > 0.01 {
                     tracing::warn!(
                         book_id,
@@ -473,7 +475,10 @@ impl ChannelService {
 
         let mut released = 0usize;
         for book_id in ids {
-            match self.release(book_id, "loyalty hold expired (auto-release)").await {
+            match self
+                .release(book_id, "loyalty hold expired (auto-release)")
+                .await
+            {
                 Ok(outcome) if !outcome.already_released => {
                     tracing::info!(site = %site_id, book_id, "loyalty hold sweep: released expired hold");
                     released += 1;
@@ -521,6 +526,44 @@ fn split_guest_name(name: &str) -> ServiceResult<(&str, Option<&str>)> {
     }
 }
 
+/// `book_status` values that mean "this hold is already past the payment step",
+/// i.e. a `payment-verified` call for it is an idempotent REPLAY rather than a
+/// state change.
+///
+/// **Both spellings of each state are accepted, deliberately.** One canonical
+/// booking row can be written by two engines that spell the same state
+/// differently, and neither spelling is wrong:
+///
+/// * our own app writes `'checkedin'` (`repository::checkin`, one word);
+/// * the CT sync mapper writes `'checked_in'` when iHOTEL's `เข้าพัก` arrives
+///   (`sync::mappers::booking::legacy_status_to_pg`), and that is the STEADY
+///   state — a hold the desk later checks in through iHOTEL converges on the
+///   underscored spelling.
+///
+/// Matching only `'checkedin'` meant a payment-verified retry landing after the
+/// guest had been checked in through iHOTEL fell through to the catch-all and
+/// answered **409 "booking is in state 'checked_in' and cannot be confirmed"** —
+/// a hard error for what is simply a late replay. `'completed'` (legacy
+/// `ออกแล้ว`) was already here; `'checkedout'`/`'checked_out'` join it for the
+/// same reason, and the `-` spellings mirror the tolerant list
+/// `service::booking::parse_booking_state` already keeps.
+///
+/// This changes only what we ACCEPT. It does not change what any writer
+/// produces — the mapper's literals are untouched.
+fn is_settled_status(status: &str) -> bool {
+    matches!(
+        status,
+        "confirmed"
+            | "checkedin"
+            | "checked_in"
+            | "checked-in"
+            | "checkedout"
+            | "checked_out"
+            | "checked-out"
+            | "completed"
+    )
+}
+
 fn validate_stay(check_in: NaiveDate, check_out: NaiveDate) -> ServiceResult<()> {
     if check_out <= check_in {
         return Err(ServiceError::validation(format!(
@@ -557,6 +600,49 @@ mod tests {
         assert_eq!(amount_due_satang(240_000, PaymentPlan::Full), 240_000);
     }
 
+    // ----- is_settled_status: both spellings of every post-payment state -----
+
+    #[test]
+    fn settled_set_accepts_both_spellings_of_checked_in() {
+        // `checkedin` is what THIS app writes; `checked_in` is what the CT sync
+        // mapper writes for iHOTEL's `เข้าพัก`, and it is the steady state.
+        for status in [
+            "confirmed",
+            "checkedin",
+            "checked_in",
+            "checked-in",
+            "checkedout",
+            "checked_out",
+            "checked-out",
+            "completed",
+        ] {
+            assert!(
+                is_settled_status(status),
+                "{status} must replay, not 409 — a payment-verified retry for a settled hold \
+                 is not an error"
+            );
+        }
+    }
+
+    #[test]
+    fn settled_set_excludes_states_that_are_not_a_replay() {
+        // `pending` is the real work; `cancelled` is its own 409 with a
+        // different, actionable message; unknown states must not be swallowed.
+        for status in [
+            "pending",
+            "cancelled",
+            "",
+            "no_show",
+            "confirmed_",
+            "CHECKEDIN",
+        ] {
+            assert!(
+                !is_settled_status(status),
+                "{status} must NOT be treated as an already-confirmed replay"
+            );
+        }
+    }
+
     #[test]
     fn deposit_plus_balance_never_exceeds_total() {
         for total in [0i64, 1, 99_999, 100_000, 123_457] {
@@ -571,7 +657,10 @@ mod tests {
 
     #[test]
     fn split_name_first_last() {
-        assert_eq!(split_guest_name("Somchai Jaidee").unwrap(), ("Somchai", Some("Jaidee")));
+        assert_eq!(
+            split_guest_name("Somchai Jaidee").unwrap(),
+            ("Somchai", Some("Jaidee"))
+        );
     }
 
     #[test]
