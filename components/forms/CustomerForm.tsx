@@ -16,6 +16,7 @@ import {
   Tag,
 } from 'lucide-react'
 import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
+import MembershipEditor from '@/components/customers/MembershipEditor'
 
 export interface CustomerFormData {
   id?: number
@@ -28,6 +29,12 @@ export interface CustomerFormData {
   /** Customer category / price tier — stored verbatim in `ht_customers.cust_type`. */
   customerType: string
   notes: string
+  /**
+   * Loyalty membership link (migration 086; PG-canonical only). READ-ONLY in
+   * this form's main save — edited via the dedicated MembershipEditor, which
+   * PUTs `/api/customers/{id}/membership` through `onSaveMembership`.
+   */
+  membershipId?: string | null
   // --- Extended registration fields (optional; from card reader / passport
   // scanner or manual entry). Persisted via the backend COALESCE enrichment,
   // so a blank value never clobbers an existing one. ---
@@ -72,6 +79,15 @@ interface CustomerFormProps {
   onClose: () => void
   onSave: (data: CustomerFormData) => Promise<void>
   onDelete?: (id: number) => Promise<void>
+  /**
+   * Persist the loyalty membership link (edit mode only). Optional so
+   * embedding contexts without the desk flow are unchanged; when absent the
+   * membership editor is not rendered.
+   */
+  onSaveMembership?: (
+    customerId: number,
+    membershipId: string | null
+  ) => Promise<void>
   initialData?: CustomerFormData | null
   mode: 'create' | 'edit'
 }
@@ -92,6 +108,7 @@ export default function CustomerForm({
   onClose,
   onSave,
   onDelete,
+  onSaveMembership,
   initialData,
   mode,
 }: CustomerFormProps) {
@@ -462,6 +479,16 @@ export default function CustomerForm({
                   className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors resize-none"
                 />
               </div>
+
+              {/* Loyalty membership link (edit mode; own save — see
+                  MembershipEditor). Not part of the main form submit. */}
+              {mode === 'edit' && onSaveMembership && initialData?.id != null && (
+                <MembershipEditor
+                  customerId={initialData.id}
+                  membershipId={initialData.membershipId ?? null}
+                  onSave={onSaveMembership}
+                />
+              )}
             </div>
 
             {/* Footer */}

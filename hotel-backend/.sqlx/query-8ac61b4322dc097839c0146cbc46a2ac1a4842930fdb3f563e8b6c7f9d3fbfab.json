@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT type_name,\n               COALESCE(type_base_price, 0)::float8 AS \"nightly_price!\"\n          FROM ht_room_types\n         WHERE type_id = $1 AND COALESCE(type_active, true) = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "type_name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ht_room_types",
+            "name": "type_name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "nightly_price!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "8ac61b4322dc097839c0146cbc46a2ac1a4842930fdb3f563e8b6c7f9d3fbfab"
+}

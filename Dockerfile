@@ -37,6 +37,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ARG NEXT_PUBLIC_CARD_READER_URL
 ENV NEXT_PUBLIC_CARD_READER_URL=$NEXT_PUBLIC_CARD_READER_URL
+ARG NEXT_PUBLIC_HOUSEKEEPING_URL
+ENV NEXT_PUBLIC_HOUSEKEEPING_URL=$NEXT_PUBLIC_HOUSEKEEPING_URL
 # AuthGuard runtime gate (Phase 4 cutover). When `'true'` the frontend
 # enforces the /login redirect on any unauthenticated page navigation.
 # When unset/anything-else: AuthGuard is a no-op (auth-off escape hatch

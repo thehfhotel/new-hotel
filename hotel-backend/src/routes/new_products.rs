@@ -284,7 +284,9 @@ pub async fn get_product(
 /// Product CREATE is **canonical-only**. Mirroring an INSERT into legacy
 /// `HT_Products` would have to allocate the row's `id`/`Pro_no` app-side, but
 /// iHOTEL allocates those MAX+1 app-side itself and edits the table with a
-/// destructive delete-then-reinsert (cheatsheet §`HT_Products`, §1471) — a
+/// destructive delete-then-reinsert (cheatsheet §"Table: `HT_Products` (A)",
+/// §3.25 "On master-data edit: HT_Rooms, HT_Products" — was: cheatsheet 1471,
+/// which is the §3.21 Close Round-Bill heading) — a
 /// blind INSERT risks a duplicate-key race with a concurrent iHOTEL save and
 /// has no back-population anchor. Stock changes (the high-frequency mutation)
 /// DO mirror, via the additive `/stock-adjust` → `AdjustProductStock`

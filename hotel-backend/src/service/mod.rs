@@ -36,12 +36,17 @@
 
 pub mod auth;
 pub mod booking;
+pub mod channel;
+pub mod channel_idempotency;
 pub mod checkin;
 pub mod coupon;
 pub mod customer;
 pub mod error;
+pub mod hk_reports;
+pub mod hk_signals;
 pub mod housekeeping;
 pub mod ids;
+pub mod loyalty;
 pub mod payment;
 pub mod pos;
 pub mod reader;
@@ -52,7 +57,16 @@ pub use auth::{AuthError, AuthService, DEFAULT_SESSION_TTL};
 pub use booking::{
     BookingOutcome, BookingProductCommand, BookingRoomCommand, BookingService,
     BookingSnapshotInputs, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
-    ModifyBookingCommand,
+    ModifyBookingCommand, RoomTypeEdit,
+};
+pub use channel::{
+    hold_ext_ref, ChannelService, ConfirmOutcome, CreateHoldCommand, HoldCreateOutcome,
+    HoldOutcome, PaymentPlan, ReleaseOutcome,
+};
+pub use channel_idempotency::{
+    caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, Reservation, Reserved,
+    StoredResponse, ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
+    IDEMPOTENCY_TTL_HOURS, MAX_IDEMPOTENCY_KEY_LEN,
 };
 pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
@@ -67,11 +81,20 @@ pub use customer::{
     UpdateCustomerCommand,
 };
 pub use error::{ServiceError, ServiceResult};
+pub use hk_reports::{
+    HkReportService, ReportTickInput, ReturnReportCommand, StorePhotoCommand, StoredPhoto,
+    StoredPhotoId, SubmitReportCommand, VerifyReportCommand,
+};
+pub use hk_signals::{
+    ActOnSignalCommand, AnswerOutcome, AnswerRoomCheckCommand, HkSignalService, RaiseSignalCommand,
+    SignalOutcome,
+};
 pub use housekeeping::{
     HousekeepingOutcome, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,
     MarkMaintenanceCommand,
 };
 pub use ids::{aggregate_uuid, AggregateKind};
+pub use loyalty::{LoyaltyClient, LoyaltyStayPayload};
 pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
     RecordPaymentOutcome, RefundPaymentCommand, RefundPaymentOutcome,
