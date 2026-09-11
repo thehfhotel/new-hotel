@@ -4,12 +4,23 @@
 //! Targeted UPDATEs — we **skip the legacy app's destructive Phase B**
 //! (DELETE+REINSERT) per spike §3f recommendation.
 //!
-//! Reference SQL (verbatim from `extend-20260424-101350/writes.txt`,
-//! findings.md §3f Phase A — 7 statements):
+//! Reference SQL (from `docs/legacy-spike/raw/extend-20260424-101350/writes.txt`,
+//! findings.md §3f "Extend stay", Phase A). Statements 1-7 are that capture's
+//! `10:15:26` save burst; statement 0 is a separate folio-LOAD event four
+//! seconds earlier, listed here because we replay it deliberately (see its
+//! note):
 //!
 //! ```text
 //! 0. UPDATE HT_CheckIn_H SET Cin_Work_number=539215 WHERE Cin_No='CH26-005230'
-//!    -- ONE leading TM.30 touch (findings.md:276)
+//!    -- Folio lock token: take iHOTEL's per-folio optimistic lock
+//!    -- (`Module1.GET_WORK_NUMBER`, Module1.cs:1662-1669, called from each
+//!    -- form's `LoadBill()`). NOTE: this statement is NOT part of the
+//!    -- capture's save burst — in
+//!    -- `raw/extend-20260424-101350/writes.txt` it fired at `10:15:22`,
+//!    -- 4 s before the `10:15:26` burst, and three more like it sit at
+//!    -- `10:14:12` / `10:16:30` / `10:16:36`; the save burst contains none
+//!    -- of them (findings.md §3f, "the form-open lock take").
+//!    -- We emit it deliberately, for concurrency safety, not for parity.
 //!
 //! 1. update HT_Rooms set room_use='no'
 //!    where room_no in (select Cin_Room_No from HT_CheckIn_Ds
@@ -18,10 +29,15 @@
 //! 2. delete from HT_Room_Status where room_CheckIn_No='CH26-005230'
 //!
 //! 3. UPDATE [HT_CheckIn_H] SET
-//!      [Total_Price_Room]=1780, [Total_Price_Net]=1780, [Total_Price_Balance]=1780
+//!      [Total_Price_Room]=1780.00, [Total_Price_Product]=0.00,
+//!      [Total_Price_Net]=1780.00, [Total_Price_Pay]=0.00,
+//!      [Total_Price_Balance]=1780.00
 //!    where [Cin_no]='CH26-005230'
-//!    -- ONLY Room / Net / Balance (findings.md:279-281). The capture does
-//!    -- NOT touch Total_Price_Product or Total_Price_Pay.
+//!    -- The capture sets ALL FIVE totals: the `10:15:26` totals line of
+//!    -- `raw/extend-20260424-101350/writes.txt` is reproduced verbatim
+//!    -- above, and `FrmEditDate.SAVE_EDIT` (FrmEditDate.cs:4880-4887)
+//!    -- concatenates all five from its in-form labels. We deliberately
+//!    -- write only Room / Net / Balance — see "Deliberate departures".
 //!
 //! 4. update [HT_CheckIn_Ds] SET
 //!      [Cin_Room_night]=2, [Cin_Room_PriceTotal]=1780, [Cin_note]='',
@@ -29,6 +45,10 @@
 //!    where id=25009
 //!
 //! 5. update HT_Rooms set room_use='yes' where room_no='508'   -- revert
+//!    -- Captured shape only. iHOTEL emits one of these per grid row
+//!    -- (FrmEditDate.cs:4909), which on this single-room folio is one
+//!    -- statement; WE emit step-1's subquery instead (Wave 5b item 2 —
+//!    -- see the step-5 comment in `build_statements`).
 //!
 //! 6+7. INSERT INTO [HT_Room_Status] (id, room_no, room_date, room_status,
 //!        room_Details, room_CheckIn_No, room_date_oa)
@@ -41,18 +61,23 @@
 //! Spike §3f notes:
 //! - Old `HT_Room_Status` rows are deleted entirely, then re-INSERTed for the
 //!   full new date range. (Cleaner than diffing — and matches the legacy app.)
-//! - `room_use='no'` then `'yes'` flicker is intentional in the capture but
-//!   functionally a no-op. We preserve it for parity.
+//! - `room_use='no'` then `'yes'` flicker is coded into
+//!   `FrmEditDate.SAVE_EDIT` itself (clear at FrmEditDate.cs:4877, re-set at
+//!   :4909), so it is not a capture artefact — but its net effect is a no-op
+//!   and why iHOTEL bothers is not recorded anywhere we can check. We
+//!   preserve it for parity.
 //! - `Cin_Room_Out` is the canonical departure time the user picked. Format
 //!   matches the legacy app's `12:00:00 PM` convention.
 //!
 //! ## Deliberate departures (2026-06-11 coexistence audit, P0-3)
 //!
-//! - **`Total_Price_Product` and `Total_Price_Pay` are NOT written.** An
-//!   earlier revision set both — with `product_total` hardcoded `0.0` —
-//!   which zeroed iHOTEL-entered product revenue on every extend and raced
-//!   concurrent payment writebacks on `Total_Price_Pay`. The §3f capture
-//!   never touches those columns; neither do we.
+//! - **`Total_Price_Product` and `Total_Price_Pay` are NOT written.** The
+//!   §3f capture DOES set all five totals (its `10:15:26` totals line) —
+//!   this is a deliberate departure, not parity. An earlier revision
+//!   mirrored the capture, with
+//!   `product_total` hardcoded `0.0`, which zeroed iHOTEL-entered product
+//!   revenue on every extend and raced concurrent payment writebacks on
+//!   `Total_Price_Pay`.
 //! - **`Total_Price_Balance` is re-aggregated live**, not taken from the
 //!   intent payload: `Balance = Net - SUM(active HT_CheckIn_Pay tender)`
 //!   under UPDLOCK+HOLDLOCK held through COMMIT — the same discipline
@@ -96,23 +121,21 @@ pub struct ExtendStayInputs<'a> {
     /// First `HT_Room_Status.id` to use. Recipe assigns
     /// `room_status_id_base + i` for the i-th night.
     pub room_status_id_base: i32,
-    /// Random TM.30 batch number — spike §3a + §3f capture line 1
-    /// (`findings.md:276`). The .NET app emits ONE
-    /// `UPDATE HT_CheckIn_H SET Cin_Work_number=<rand>` at the start of the
-    /// extend flow. It is a non-sequential i32; the caller generates it via
-    /// `rand::random::<i32>()` so `build_statements` stays pure. `None`
-    /// emits no touch (useful for tests that focus on the downstream
-    /// statements).
-    pub tm30_touch_id: Option<i32>,
+    /// Fresh folio lock token for `HT_CheckIn_H.Cin_Work_number` — iHOTEL's
+    /// per-folio optimistic-lock token (COMPAT_CHEATSHEET §7.4). Emitted as
+    /// statement 0. A non-sequential i32; the caller generates it via
+    /// `new_folio_lock_token()` so `build_statements` stays pure. `None`
+    /// emits no token statement (useful for tests that focus on the
+    /// downstream statements).
+    pub folio_lock_token: Option<i32>,
 }
 
 /// Build all statements for an extend-stay. PURE — no I/O.
 ///
-/// `tm30_touch_id` injects the single leading TM.30 touch (spike §3a + §3f
-/// `extend/writes.txt:1`, findings.md:276 — the capture shows exactly ONE).
-/// It is a random `i32` per spike §3a — the caller (`execute()`) generates
-/// it via `rand::random()` so this function stays pure and trivially
-/// unit-testable.
+/// `folio_lock_token` injects the single leading folio-lock bump (statement
+/// 0 — see COMPAT_CHEATSHEET §7.4). It is a random `i32`; the caller
+/// (`execute()`) generates it via `new_folio_lock_token()` so this function
+/// stays pure and trivially unit-testable.
 pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     let cin_no_q = sql_quote(inputs.cin_no);
     let room_no_q = sql_quote(inputs.room_no);
@@ -123,14 +146,42 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
 
     let mut statements: Vec<String> = Vec::new();
 
-    // 0. TM.30 touch — spike §3a (`Cin_Work_number` is random + async) and
-    //    §3f extend capture line 1 (findings.md:276): the .NET app fires
-    //    exactly ONE such UPDATE at the start of the extend flow. Random
-    //    i32, supplied by caller. (An earlier revision emitted two —
-    //    corrected per the 2026-06-11 coexistence audit.)
-    if let Some(tm30_id) = inputs.tm30_touch_id {
+    // 0. Folio lock token. `HT_CheckIn_H.Cin_Work_number` is iHOTEL's
+    //    per-folio optimistic-lock token. `Module1.GET_WORK_NUMBER`
+    //    (Module1.cs:1662-1669) writes a fresh `Random.Next(100000, 999999)`
+    //    — .NET's upper bound is EXCLUSIVE, so iHOTEL only ever emits
+    //    100000..=999998 — from the `LoadBill()` of five forms:
+    //    FrmEditDate, FrmPayAdd, FrmPayAddPro, FrmCheckIn, FrmCheckOut. Each
+    //    of those five re-reads the column as the first DB access of its
+    //    `SAVE_EDIT()`; on mismatch it shows
+    //    `มีการแก้ไข ... จากเครื่องอื่น`, calls `Close()`, and issues none
+    //    of the save's writes — the receptionist's typed edit is discarded.
+    //
+    //    We bump it because we ARE another machine editing this folio: one of
+    //    those five forms, loaded before this extend, would otherwise
+    //    overwrite our totals with its stale in-form literals, and the CT
+    //    sync would carry that reversion into canonical
+    //    (`sync/mappers/checkin.rs::update_existing` writes
+    //    cin_total/room/paid_amount plain, no COALESCE).
+    //
+    //    The guard is ADVISORY, not sound — do not treat this bump as mutual
+    //    exclusion: iHOTEL runs no transactions, `new Random()` is
+    //    clock-seeded, and `FrmCheckIn_EditOnly` neither takes nor checks the
+    //    token. COMPAT_CHEATSHEET §7.4 ("Caveats") lists all three.
+    //
+    //    Not an immigration-reporting batch number: grepping the whole
+    //    decompile for `Cin_Work_number` returns only `GET_WORK_NUMBER`, the
+    //    five `SAVE_EDIT()` guards, and the `ALTER TABLE ... ADD
+    //    [Cin_Work_number]` at frmMain1.cs:6815; the shipped Crystal reports
+    //    (`report/`, `reports00/`, top-level `*.rpt`) never mention it
+    //    either. Nothing outside the lock itself consumes the value.
+    //    The 2026-04 spike misread a folio-load side effect as an async batch
+    //    assignment. Exactly ONE bump per extend (an earlier revision emitted
+    //    two — corrected per the 2026-06-11 coexistence audit). See
+    //    COMPAT_CHEATSHEET §7.4.
+    if let Some(token) = inputs.folio_lock_token {
         statements.push(format!(
-            "update HT_CheckIn_H set Cin_Work_number={tm30_id} where Cin_No={cin_no_q}"
+            "update HT_CheckIn_H set Cin_Work_number={token} where Cin_No={cin_no_q}"
         ));
     }
 
@@ -142,9 +193,11 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     statements.push(format!(
         "delete from HT_Room_Status where room_CheckIn_No={cin_no_q}"
     ));
-    // 3. Update HT_CheckIn_H totals — ONLY Room / Net / Balance, matching
-    //    the §3f capture (findings.md:279-281). Total_Price_Product and
-    //    Total_Price_Pay are deliberately untouched (see module docs —
+    // 3. Update HT_CheckIn_H totals — ONLY Room / Net / Balance. The §3f
+    //    capture sets all five (findings.md §3f "Extend stay", Phase A; the
+    //    `10:15:26` totals line of
+    //    `raw/extend-20260424-101350/writes.txt`); Total_Price_Product and
+    //    Total_Price_Pay are a deliberate departure (see module docs —
     //    2026-06-11 audit P0-3).
     //
     //    Balance is `Net - SUM(active tender rows)` re-aggregated live from
@@ -210,12 +263,12 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
 ///
 /// `new_pay_total` / `new_balance_total` are still accepted (older queued
 /// intents carry them, and we validate finiteness) but are NOT written to
-/// MSSQL — the §3f capture never touches `Total_Price_Pay`, and Balance is
-/// re-aggregated live inside the UPDATE (2026-06-11 audit P0-3).
+/// MSSQL — we deliberately leave `Total_Price_Pay` to the payment path, and
+/// Balance is re-aggregated live inside the UPDATE (2026-06-11 audit P0-3).
 ///
-/// The single leading TM.30 touch (capture line 1, findings.md:276) is
-/// generated via `rand::random::<i32>()` per spike §3a — `Cin_Work_number`
-/// is a non-sequential random i32 the .NET app assigns after each save.
+/// The single leading folio-lock bump (statement 0) is generated here via
+/// `new_folio_lock_token()`, so `build_statements` stays pure. See
+/// COMPAT_CHEATSHEET §7.4 for why an extend takes iHOTEL's folio lock.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
@@ -258,14 +311,20 @@ pub async fn execute(
         guest_label,
         nights,
         room_status_id_base: id_base,
-        // Spike §3a: TM.30 batch numbers are non-sequential random i32
-        // assigned by the .NET app's async post-save job. We mirror ONE
-        // touch per the extend capture (line 1, findings.md:276). MED-3:
-        // clamp to the positive i32 range — the .NET app's Cin_Work_number
-        // column is signed but no spike capture has ever observed a
-        // negative value, and a negative number may trip the WinForms grid
-        // control.
-        tm30_touch_id: Some(positive_i32()),
+        // Fresh folio lock token: bumping `Cin_Work_number` makes any of
+        // the five token-checking iHOTEL forms already open on this
+        // `Cin_no` fail closed on save, instead of silently reverting our
+        // totals. Advisory only — `FrmCheckIn_EditOnly` never takes or
+        // checks the token, so it is not covered (COMPAT_CHEATSHEET §7.4
+        // "Caveats"). MED-3: any i32 compares safely — the value's only
+        // consumer is the equality guard in each form's `SAVE_EDIT()`. We
+        // keep the positive clamp because it costs nothing and,
+        // incidentally, iHOTEL's own generator can only produce
+        // 100000..=999998 (`Random.Next(100000, 999999)`, exclusive upper
+        // bound), so a token outside that window is very likely ours — a
+        // weak forensic hint, not a guarantee, since our 1..=i32::MAX draw
+        // can land inside iHOTEL's window too.
+        folio_lock_token: Some(new_folio_lock_token()),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -276,9 +335,10 @@ fn money_to_baht_f64(m: Money) -> f64 {
     (m.as_satang() as f64) / 100.0
 }
 
-/// Random positive i32 (1..=i32::MAX) for TM.30 `Cin_Work_number`. See MED-3
-/// in the call site.
-fn positive_i32() -> i32 {
+/// Fresh folio lock token for `HT_CheckIn_H.Cin_Work_number` (1..=i32::MAX).
+/// Generated in `execute()` so `build_statements` stays pure. See
+/// COMPAT_CHEATSHEET §7.4.
+fn new_folio_lock_token() -> i32 {
     (rand::random::<u32>() & 0x7FFF_FFFF).max(1) as i32
 }
 
@@ -305,7 +365,7 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
             ],
             room_status_id_base: 50235,
-            tm30_touch_id: None,
+            folio_lock_token: None,
         };
         let statements = build_statements(&inputs);
         // 5 fixed + 2 night rows
@@ -345,10 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn single_tm30_touch_leads_when_provided() {
-        // Spike §3f capture line 1 (findings.md:276): exactly ONE leading
-        // TM.30 UPDATE before any other statement. (An earlier revision
-        // emitted two — corrected per the 2026-06-11 coexistence audit.)
+    fn folio_lock_token_leads_and_is_emitted_once() {
+        // The byte-pin below is the SHAPE `Module1.GET_WORK_NUMBER` emits
+        // (Module1.cs:1667), NOT a replay of the §3f save burst — that
+        // burst contains no token write (in
+        // `raw/extend-20260424-101350/writes.txt` the token UPDATEs sit at
+        // `10:14:12` / `10:15:22` / `10:16:30` / `10:16:36`, all folio-LOAD
+        // events, while the save burst is `10:15:26`; findings.md §3f,
+        // "the form-open lock take"). Exactly ONE bump per extend, leading,
+        // and never without a real folio mutation beside it.
         let inputs = ExtendStayInputs {
             cin_no: "CH26-005230",
             room_no: "508",
@@ -360,27 +425,45 @@ mod tests {
             guest_label: "SPIKE TEST WALKIN 3",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_id: Some(539215),
+            folio_lock_token: Some(539215),
         };
         let statements = build_statements(&inputs);
-        // First statement is the TM.30 touch — byte-pinned to the capture
-        // shape (modulo the random batch number).
+        // Position pin: the bump leads the recipe, so a later refactor
+        // can't quietly move it.
         assert_eq!(
             statements[0],
             "update HT_CheckIn_H set Cin_Work_number=539215 where Cin_No='CH26-005230'"
         );
-        // And exactly one touch in the whole recipe.
+        // And exactly one bump in the whole recipe.
         let touches = statements
             .iter()
             .filter(|s| s.contains("Cin_Work_number="))
             .count();
-        assert_eq!(touches, 1, "extend must emit exactly one TM.30 touch");
+        assert_eq!(touches, 1, "extend must emit exactly one folio lock bump");
+        // We never invalidate a receptionist's open form without actually
+        // mutating the folio — the bump only ships alongside the totals
+        // UPDATE.
+        assert!(
+            statements.iter().any(|s| s.contains("[Total_Price_Room]")),
+            "folio lock bump must accompany the real folio mutation"
+        );
+        // With no token supplied nothing touches the column at all.
+        let untouched = build_statements(&ExtendStayInputs {
+            folio_lock_token: None,
+            ..inputs
+        });
+        assert!(
+            untouched.iter().all(|s| !s.contains("Cin_Work_number")),
+            "no statement may touch Cin_Work_number without a token"
+        );
     }
 
     /// 2026-06-11 audit P0-3 — byte-pin the HT_CheckIn_H totals UPDATE:
-    /// only Room / Net / Balance (the §3f capture's column set,
-    /// findings.md:279-281); Balance is the live re-aggregate; Product and
-    /// Pay are never written.
+    /// only Room / Net / Balance, a deliberate departure from the §3f
+    /// capture's five-column set (findings.md §3f "Extend stay", Phase A;
+    /// the `10:15:26` totals line of
+    /// `raw/extend-20260424-101350/writes.txt`); Balance is the live
+    /// re-aggregate; Product and Pay are never written.
     #[test]
     fn totals_update_matches_capture_columns_with_live_balance() {
         let inputs = ExtendStayInputs {
@@ -394,7 +477,7 @@ mod tests {
             guest_label: "SPIKE TEST WALKIN 3",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_id: None,
+            folio_lock_token: None,
         };
         let statements = build_statements(&inputs);
         let totals = statements
@@ -412,7 +495,7 @@ mod tests {
              WHERE Cin_No='CH26-005230' AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
              where [Cin_no]='CH26-005230'"
         );
-        // The two columns the capture never touches must NOT appear.
+        // The two columns we deliberately leave alone must NOT appear.
         assert!(
             !totals.contains("[Total_Price_Product]"),
             "extend must not clobber Total_Price_Product: {totals}"
@@ -462,7 +545,7 @@ mod tests {
             guest_label: "MULTI",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_id: None,
+            folio_lock_token: None,
         };
         let statements = build_statements(&inputs);
         let step5 = statements
@@ -497,7 +580,7 @@ mod tests {
             guest_label: "SOLO",
             nights: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             room_status_id_base: 50235,
-            tm30_touch_id: None,
+            folio_lock_token: None,
         };
         let statements = build_statements(&inputs);
         // Step-1 and step-5 must share the EXACT same subquery / WHERE shape
@@ -534,7 +617,7 @@ mod tests {
             guest_label: "",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_id: None,
+            folio_lock_token: None,
         };
         let statements = build_statements(&inputs);
         for s in &statements {

@@ -52,11 +52,23 @@ pub struct Pagination {
 
 impl Pagination {
     pub fn new(page: i32, limit: i32, total: i32) -> Self {
+        // `limit <= 0` short-circuits: `total / 0.0` is `inf`, and `inf as i32`
+        // saturates, so `?limit=0` used to report `"totalPages": 2147483647`.
+        // No page can be served at all in that case, so 0 is the honest answer.
+        // Fixed here rather than per-caller because all eleven `Pagination::new`
+        // call sites take `limit` straight from the query string, none can be
+        // relying on the saturated value, and the arithmetic for `limit > 0` is
+        // untouched.
+        let total_pages = if limit > 0 {
+            (total as f64 / limit as f64).ceil() as i32
+        } else {
+            0
+        };
         Self {
             page,
             limit,
             total,
-            total_pages: (total as f64 / limit as f64).ceil() as i32,
+            total_pages,
         }
     }
 }
@@ -76,5 +88,26 @@ impl<T: Serialize> PaginatedResponse<T> {
             data,
             pagination: Pagination::new(page, limit, total),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_pages_rounds_up_for_a_positive_limit() {
+        assert_eq!(Pagination::new(1, 50, 0).total_pages, 0);
+        assert_eq!(Pagination::new(1, 50, 50).total_pages, 1);
+        assert_eq!(Pagination::new(1, 50, 51).total_pages, 2);
+    }
+
+    /// `?limit=0` divided by zero, and `inf as i32` saturates — the payload
+    /// claimed `"totalPages": 2147483647`. A non-positive limit serves no
+    /// pages at all, so it must report none.
+    #[test]
+    fn non_positive_limit_reports_zero_total_pages() {
+        assert_eq!(Pagination::new(1, 0, 120).total_pages, 0);
+        assert_eq!(Pagination::new(1, -20, 120).total_pages, 0);
     }
 }

@@ -163,12 +163,19 @@ async fn fetch_legacy_sync_status(
 /// jobs are stuck pending" without touching the DB shell. Empty
 /// vector when the queue is empty (steady state — successful jobs
 /// flip to `done` and are kept indefinitely as an audit log).
+///
+/// `'skipped'` (housekeeping-ops 2026-08-11) is included so jobs the HF Ville
+/// `HFVILLE_WRITEBACK_INTENTS` allowlist parked are VISIBLE here — without it
+/// an operator has no way to see what the allowlist is holding back short of a
+/// DB shell. It is deliberately terminal and never retried, so treat it as
+/// informational: it must NOT be added into any "queue depth" alarm
+/// arithmetic, or a working allowlist would page someone forever.
 async fn fetch_writeback_queue_depth(pool: &sqlx::PgPool) -> Vec<WritebackQueueRow> {
     let rows = sqlx::query_as::<_, (String, String, i64)>(
         r#"
         SELECT intent, status, count(*)::bigint AS depth
           FROM writeback_jobs
-         WHERE status IN ('pending', 'in_progress', 'failed', 'exhausted')
+         WHERE status IN ('pending', 'in_progress', 'failed', 'exhausted', 'skipped')
          GROUP BY intent, status
          ORDER BY intent, status
         "#,

@@ -58,6 +58,9 @@ pub struct NewCustomer {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
+    /// Loyalty membership id (migration 086; PG-canonical only). Set/cleared
+    /// via `PUT /api/customers/{id}/membership` — NOT the general update.
+    pub membership_id: Option<String>,
     pub active: bool,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
@@ -75,6 +78,7 @@ impl NewCustomer {
             address: row.cust_address,
             customer_type: row.cust_type,
             notes: row.cust_notes,
+            membership_id: row.cust_membership_id,
             active: row.cust_active.unwrap_or(true),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -374,6 +378,80 @@ pub async fn update_customer(
     Ok(Json(MutationResponse {
         success: true,
         message: "Customer updated successfully".to_string(),
+        id: Some(outcome.customer_id),
+    }))
+}
+
+/// Request body for `PUT /api/customers/{id}/membership`.
+///
+/// `membershipId: null` (or blank / omitted) CLEARS the link — the desk flow
+/// is "type/scan the id from the guest's member QR", and clearing must be a
+/// first-class action (wrong guest linked, membership revoked).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetMembershipRequest {
+    #[serde(default)]
+    pub membership_id: Option<String>,
+}
+
+/// Longest membership id we accept — matches `cust_membership_id VARCHAR(64)`.
+const MEMBERSHIP_ID_MAX_LEN: usize = 64;
+
+/// PUT /api/customers/{id}/membership — set or clear the guest's loyalty
+/// membership link (desk flow; loyalty-channel bookings attach it
+/// server-side). Branch-aware via `?branch=`.
+///
+/// PG-CANONICAL ONLY — deliberately no legacy writeback (legacy
+/// `HT_Customers` has no membership column); see
+/// `CustomerService::set_membership`. A dedicated endpoint (not a field on
+/// the general update) because the general PUT round-trips the full record —
+/// a stale form would silently clobber a link set at the desk moments
+/// earlier, and COALESCE-enrichment semantics can't express "clear".
+pub async fn set_membership(
+    State(state): State<AppState>,
+    Path(path_id): Path<String>,
+    Query(query): Query<CustomerMutationQuery>,
+    Json(body): Json<SetMembershipRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    let pool = customer_pool_for(&state, query.branch)?;
+    let cust_id = resolve_customer_id_int(&pool, &path_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    // Blank / whitespace-only ⇒ clear (same "blank is absent" policy as the
+    // enrichment fields). Guard the column width up front for a clear 400
+    // instead of a driver error.
+    let membership_id = body
+        .membership_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(ref id) = membership_id {
+        if id.len() > MEMBERSHIP_ID_MAX_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "membershipId exceeds {MEMBERSHIP_ID_MAX_LEN} characters"
+            )));
+        }
+    }
+
+    let cleared = membership_id.is_none();
+    let outcome = customer_service_for(&state, pool)
+        .set_membership(
+            cust_id,
+            membership_id,
+            // TODO: wire user_id from auth middleware
+            EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        )
+        .await?;
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: if cleared {
+            "Membership link cleared".to_string()
+        } else {
+            "Membership link saved".to_string()
+        },
         id: Some(outcome.customer_id),
     }))
 }

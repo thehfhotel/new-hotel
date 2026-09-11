@@ -60,6 +60,23 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 const PUBLIC_PATHS = new Set<string>(['/login'])
 
 /**
+ * The /hk maid surface carries its OWN identity: the Cloudflare Access
+ * assertion (HF ID, grant `housekeeping`) verified server-side by the
+ * backend's hk_access middleware. Maids have no PMS user account, so the
+ * cookie-session AuthGuard must never bounce /hk to /login — in production
+ * that bounce lands on the Google-gated root Access app and renders as a
+ * white blank (the maid can never satisfy it). Prefix-matched because
+ * PUBLIC_PATHS is exact-match and /hk has subroutes — same shape as the
+ * chromeless check in components/AppShell.tsx.
+ *
+ * Because /hk does not use the PMS session, this also gates the provider's
+ * mount-time session probe: no /api/auth/* request is made from /hk at all.
+ */
+function isHkSurface(pathname: string | null): boolean {
+  return pathname === '/hk' || (pathname?.startsWith('/hk/') ?? false)
+}
+
+/**
  * Read-once flag: when `false` (the default in dev / pre-cutover) the
  * AuthGuard does NOT enforce a logged-in user. This avoids an infinite
  * /login redirect loop while the backend still ships AUTH_ENABLED=false
@@ -154,7 +171,8 @@ interface MeResponse {
 }
 
 /**
- * AuthProvider: hydrates the current user from /api/auth/me on mount and
+ * AuthProvider: hydrates the current user from /api/auth/me on mount (never
+ * on /hk — that surface has no PMS session; see the mount effect below) and
  * exposes login/logout/refresh actions. Wraps children in <AuthGuard> so
  * that — when NEXT_PUBLIC_AUTH_REQUIRED=true — protected pages redirect
  * unauthenticated users to /login.
@@ -164,6 +182,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [permissions, setPermissions] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const pathname = usePathname()
 
   /**
    * One-shot guard for the Cloudflare Access auto-login attempt. The
@@ -254,9 +273,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [permissions],
   )
 
+  // Initial session hydration — EXCEPT on /hk, which does not use the PMS
+  // session at all (see isHkSurface). The probe there was not merely useless:
+  // in production it rides the ROOT Access app's `aud`, so the edge answers
+  // with a redirect to a login host that connect-src does not allow, and every
+  // maid pageload printed a red CSP violation. Removing the call is deliberate
+  // over exempting it at the edge — an exemption would make a dead request
+  // WORK, inviting the next reader to assume /hk depends on the PMS session.
+  //
+  // `loading` still has to settle so the provider's state is coherent for any
+  // consumer; the /hk pages read no session state, and AuthGuard already
+  // exempts /hk from the loading blank.
+  const isHk = isHkSurface(pathname)
   useEffect(() => {
+    if (isHk) {
+      setLoading(false)
+      return
+    }
     refresh()
-  }, [refresh])
+  }, [isHk, refresh])
 
   const value: AuthContextValue = {
     user,
@@ -314,14 +349,16 @@ function IdleLogout() {
  *  - when AUTH_REQUIRED is false (dev / pre-cutover), pass-through —
  *    every page renders regardless of user state
  *  - when AUTH_REQUIRED is true and user is null and we're not already on
- *    /login, redirect to /login?redirect=<current> and render nothing
+ *    /login (or the self-authenticating /hk surface), redirect to
+ *    /login?redirect=<current> and render nothing
  */
 function AuthGuard({ children }: { children: ReactNode }) {
   const { user, loading } = useContext(AuthContext) as AuthContextValue
   const pathname = usePathname()
   const router = useRouter()
 
-  const isPublicPath = pathname ? PUBLIC_PATHS.has(pathname) : false
+  const isHk = isHkSurface(pathname)
+  const isPublicPath = isHk || (pathname ? PUBLIC_PATHS.has(pathname) : false)
   const shouldRedirect =
     AUTH_REQUIRED && !loading && user === null && !isPublicPath
 
@@ -333,7 +370,13 @@ function AuthGuard({ children }: { children: ReactNode }) {
 
   // Hydration shim: while the initial /me check is pending OR a redirect
   // is queued, render an empty fragment so we don't flash protected UI.
-  if (loading || shouldRedirect) {
+  //
+  // /hk opts out of the pending-check blank. The provider no longer probes at
+  // all there, so `loading` should already be false — this is kept as the
+  // guard's own contract: /hk renders no session-dependent UI, and gating its
+  // paint on a session probe is exactly how this surface went white in the
+  // first place. It must not go white again if a probe ever returns.
+  if ((loading && !isHk) || shouldRedirect) {
     return null
   }
 
