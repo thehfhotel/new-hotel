@@ -2404,7 +2404,10 @@ mod extend_tests {
         match err {
             ServiceError::Validation(msg) => {
                 assert!(msg.contains("nothing to change"), "got: {msg}");
-                assert!(msg.contains("2026-08-21"), "message must name the date: {msg}");
+                assert!(
+                    msg.contains("2026-08-21"),
+                    "message must name the date: {msg}"
+                );
             }
             other => panic!("expected Validation, got {other:?}"),
         }
@@ -2430,7 +2433,9 @@ mod extend_tests {
     #[tokio::test]
     async fn extend_rejects_no_op_same_date_and_enqueues_nothing() {
         let Some(pool) = try_pool().await else {
-            eprintln!("skipping extend_rejects_no_op_same_date_and_enqueues_nothing — PG not reachable");
+            eprintln!(
+                "skipping extend_rejects_no_op_same_date_and_enqueues_nothing — PG not reachable"
+            );
             return;
         };
         let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "noop").await else {
@@ -2481,7 +2486,9 @@ mod extend_tests {
     #[tokio::test]
     async fn extend_still_lands_real_changes_in_both_directions() {
         let Some(pool) = try_pool().await else {
-            eprintln!("skipping extend_still_lands_real_changes_in_both_directions — PG not reachable");
+            eprintln!(
+                "skipping extend_still_lands_real_changes_in_both_directions — PG not reachable"
+            );
             return;
         };
         let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "real").await else {
@@ -2498,7 +2505,9 @@ mod extend_tests {
 
         // Earlier: the shorten / re-date edit.
         let earlier = expected_checkout;
-        let shorten_result = svc.extend(sample_extend(cin_id, checkin_date, earlier)).await;
+        let shorten_result = svc
+            .extend(sample_extend(cin_id, checkin_date, earlier))
+            .await;
         let after_shorten = checkout_and_updated_at(&pool, cin_id).await.0;
         let jobs_after_shorten = writeback_job_count(&pool, cin_id).await;
 
@@ -2532,7 +2541,11 @@ mod extend_tests {
     /// Same shape `routes::new_checkins::build_extend_stay_command` produces:
     /// UTC-midnight boundaries, one-room folio, totals that the recipe
     /// re-aggregates anyway.
-    fn sample_extend(cin_id: i32, checkin_date: NaiveDate, new_checkout: NaiveDate) -> ExtendStayCommand {
+    fn sample_extend(
+        cin_id: i32,
+        checkin_date: NaiveDate,
+        new_checkout: NaiveDate,
+    ) -> ExtendStayCommand {
         ExtendStayCommand {
             check_in_id: cin_id,
             new_end: utc_midnight(new_checkout),
@@ -2669,5 +2682,341 @@ mod extend_tests {
                 .execute(pool)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod checkin_to_booking_tests {
+    //! Task B7a — the booking LINK a from-reservation check-in must create.
+    //!
+    //! `CreateCheckInRequest.booking_id` has been accepted by the route since
+    //! the spike, but until B7a no frontend call site sent it: every POST
+    //! /api/checkins was room-only, so a stay created in our app had
+    //! `cin_book_id` NULL. That link is what the B7 app-deposit signposts
+    //! resolve through (`GET /api/checkins/:id/deposits` joins
+    //! `ht_bookings` via `ci.cin_book_id`), and it is what flips the booking
+    //! out of the arrivals list — so a silent NULL there means reception reads
+    //! "unpaid" on a guest who already paid, and the reservation still looks
+    //! like it is arriving.
+    //!
+    //! Same layout as `change_room_tests` / `extend_tests`: integration-style
+    //! against the PG test database, skipped at runtime when PG is unreachable
+    //! so the suite still passes without a DB.
+
+    use super::*;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::{EventBus, OutboxRepository};
+    use crate::repository::checkin::PgCheckInRepository;
+    use chrono::{NaiveTime, TimeZone};
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    fn build_service(pool: PgPool) -> CheckInService {
+        let repo: Arc<dyn crate::repository::checkin::CheckInRepository> =
+            Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        CheckInService::new(repo, outbox, events, pool)
+    }
+
+    fn utc_midnight(day: NaiveDate) -> DateTime<Utc> {
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+        Utc.from_utc_datetime(&day.and_time(midnight))
+    }
+
+    /// Same shape `routes::new_checkins::build_check_in_writeback_context`
+    /// produces for a from-reservation check-in with NO desk deposit — which is
+    /// the normal case for an app booking, whose money is already in the bank
+    /// (`ht_bookings.book_deposit_amount`) rather than in the drawer.
+    fn sample_context(
+        room_no: &str,
+        stay_start: NaiveDate,
+        stay_end: NaiveDate,
+    ) -> CheckInWritebackContext {
+        CheckInWritebackContext {
+            legacy_cust_no: None,
+            linked_legacy_book_id: None,
+            room_no: room_no.to_string(),
+            room_type: "Standard".to_string(),
+            stay: DateRange::new(utc_midnight(stay_start), utc_midnight(stay_end)),
+            price_per_night: Money::from_baht(900),
+            nights: 2,
+            price_total: Money::from_baht(1800),
+            created_by: String::new(),
+            guest_name_for_registry: "B7a Tester".to_string(),
+            guest_country: "ไทย".to_string(),
+            customer_phone: None,
+            deposit: Money::ZERO,
+            photo_tmp_no: None,
+        }
+    }
+
+    struct Seed {
+        cust_id: i32,
+        room_id: i32,
+        book_id: i32,
+        room_no: String,
+    }
+
+    /// Seed `(customer, room, booking, ht_booking_rooms)` for one single-room
+    /// reservation arriving today. Returns `None` if any step fails.
+    async fn seed_booking(pool: &PgPool, marker: &str) -> Option<Seed> {
+        // Clear anything an aborted earlier run left behind — a poisoned seed
+        // makes the test SKIP, and a test that quietly stops testing is worse
+        // than one that fails.
+        if let Ok(Some(stale)) =
+            sqlx::query_scalar::<_, i32>("SELECT book_id FROM ht_bookings WHERE book_no = $1")
+                .bind(format!("BK-B7A-{marker}"))
+                .fetch_optional(pool)
+                .await
+        {
+            cleanup(pool, stale).await;
+        }
+
+        let cust_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_customers (cust_firstname, cust_lastname) \
+             VALUES ($1, 'TestB7a') RETURNING cust_id",
+        )
+        .bind(format!("Guest_{marker}"))
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        let room_no = format!("B7A{marker}");
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'available') RETURNING room_id",
+        )
+        .bind(&room_no)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        // `confirmed` + a recorded deposit = exactly what the UI rule
+        // (`lib/v2/checkin-from-booking`) calls ready to check in.
+        let book_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_bookings (\
+                book_no, book_cust_id, book_checkin, book_checkout, book_status, \
+                book_channel, book_deposit_amount\
+             ) VALUES ($1, $2, CURRENT_DATE, CURRENT_DATE + 2, 'confirmed', 'loyalty', 600) \
+             RETURNING book_id",
+        )
+        .bind(format!("BK-B7A-{marker}"))
+        .bind(cust_id)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        sqlx::query(
+            "INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night) \
+             VALUES ($1, $2, 900)",
+        )
+        .bind(book_id)
+        .bind(room_id)
+        .execute(pool)
+        .await
+        .ok()?;
+
+        Some(Seed {
+            cust_id,
+            room_id,
+            book_id,
+            room_no,
+        })
+    }
+
+    /// Best-effort teardown of everything [`seed_booking`] planted, plus any
+    /// check-in the test created against it. Ordered so FKs are satisfied.
+    async fn cleanup(pool: &PgPool, book_id: i32) {
+        let cin_ids: Vec<i32> =
+            sqlx::query_scalar("SELECT cin_id FROM ht_checkins WHERE cin_book_id = $1")
+                .bind(book_id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        for cin_id in &cin_ids {
+            let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+                .bind(aggregate_uuid(AggregateKind::CheckIn, *cin_id))
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+                .bind(cin_id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_book_id = $1")
+            .bind(book_id)
+            .execute(pool)
+            .await;
+
+        let ids: Option<(i32,)> =
+            sqlx::query_as("SELECT book_cust_id FROM ht_bookings WHERE book_id = $1")
+                .bind(book_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let room_ids: Vec<i32> =
+            sqlx::query_scalar("SELECT br_room_id FROM ht_booking_rooms WHERE br_book_id = $1")
+                .bind(book_id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        // ht_booking_rooms cascades from the booking.
+        let _ = sqlx::query("DELETE FROM ht_bookings WHERE book_id = $1")
+            .bind(book_id)
+            .execute(pool)
+            .await;
+        for room_id in room_ids {
+            let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+                .bind(room_id)
+                .execute(pool)
+                .await;
+        }
+        if let Some((cust_id,)) = ids {
+            let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
+                .bind(cust_id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    /// The B7a contract in one test: a check-in created WITH `booking_id`
+    /// (1) stores the link in `ht_checkins.cin_book_id`,
+    /// (2) resolves the customer from the booking rather than the caller,
+    /// (3) flips the booking to `checkedin` so it leaves the arrivals list, and
+    /// (4) enqueues the `create_check_in` writeback carrying the linked booking.
+    #[tokio::test]
+    async fn check_in_to_booking_links_the_stay() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping check_in_to_booking_links_the_stay — PG not reachable");
+            return;
+        };
+        let Some(seed) = seed_booking(&pool, "link").await else {
+            eprintln!("skipping check_in_to_booking_links_the_stay — seed failed");
+            return;
+        };
+
+        let today = Utc::now().date_naive();
+        let svc = build_service(pool.clone());
+        let outcome = svc
+            .check_in_to_booking(CheckInToBookingCommand {
+                cin_no: "CIN-B7A-link".to_string(),
+                booking_id: seed.book_id,
+                room_id: seed.room_id,
+                check_in_time: None,
+                expected_checkout: today + chrono::Duration::days(2),
+                adults: 2,
+                children: 1,
+                rate_per_night: Some(900.0),
+                notes: None,
+                writeback_context: sample_context(
+                    &seed.room_no,
+                    today,
+                    today + chrono::Duration::days(2),
+                ),
+                source: EventSource::System {
+                    reason: "b7a_link_test".into(),
+                },
+            })
+            .await;
+
+        let result = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                cleanup(&pool, seed.book_id).await;
+                panic!("from-reservation check-in must succeed: {e:?}");
+            }
+        };
+
+        // 1. The link itself — the whole point of B7a.
+        let linked: (Option<i32>, i32) =
+            sqlx::query_as("SELECT cin_book_id, cin_cust_id FROM ht_checkins WHERE cin_id = $1")
+                .bind(result.check_in_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the new check-in must be readable");
+        assert_eq!(
+            linked.0,
+            Some(seed.book_id),
+            "cin_book_id must carry the originating booking — a NULL here is the \
+             bug B7a closes: every B7 app-deposit signpost resolves through it"
+        );
+
+        // 2. The customer came from the booking, not from the request.
+        assert_eq!(
+            linked.1, seed.cust_id,
+            "the customer must be resolved from the booking"
+        );
+
+        // 3. The booking left the arrivals list.
+        let status: String =
+            sqlx::query_scalar("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+                .bind(seed.book_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the seeded booking must be readable");
+        assert_eq!(status, "checkedin", "check-in must flip the booking status");
+
+        // 4. The writeback intent is the booking-linked one, carrying the
+        //    booking's aggregate id — this is what makes the legacy mirror use
+        //    the `checkin_to_booking` recipe rather than the walk-in one.
+        let job: (String, serde_json::Value) = sqlx::query_as(
+            "SELECT intent, payload FROM writeback_jobs \
+              WHERE aggregate_id = $1 AND intent = 'create_check_in' \
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(aggregate_uuid(AggregateKind::CheckIn, result.check_in_id))
+        .fetch_one(&pool)
+        .await
+        .expect("a create_check_in outbox row must be enqueued");
+        assert_eq!(job.0, "create_check_in");
+        let linked_booking = job.1["payload"]["linked_booking_id"].as_str();
+        assert_eq!(
+            linked_booking,
+            Some(aggregate_uuid(AggregateKind::Booking, seed.book_id).to_string()).as_deref(),
+            "the writeback payload must name the linked booking"
+        );
+
+        cleanup(&pool, seed.book_id).await;
+    }
+
+    /// A booking that does not exist must surface as NotFound, not as a
+    /// silently unlinked walk-in stay.
+    #[tokio::test]
+    async fn check_in_to_booking_rejects_a_missing_booking() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping check_in_to_booking_rejects_a_missing_booking — PG not reachable");
+            return;
+        };
+        let svc = build_service(pool);
+        let err = svc
+            .check_in_to_booking(CheckInToBookingCommand {
+                cin_no: "CIN-B7A-missing".to_string(),
+                booking_id: -1,
+                room_id: 1,
+                check_in_time: None,
+                expected_checkout: Utc::now().date_naive() + chrono::Duration::days(1),
+                adults: 1,
+                children: 0,
+                rate_per_night: None,
+                notes: None,
+                writeback_context: sample_context(
+                    "000",
+                    Utc::now().date_naive(),
+                    Utc::now().date_naive() + chrono::Duration::days(1),
+                ),
+                source: EventSource::System {
+                    reason: "b7a_missing".into(),
+                },
+            })
+            .await
+            .expect_err("a non-existent booking must reject");
+        assert!(matches!(err, ServiceError::NotFound(_)), "got {err:?}");
     }
 }

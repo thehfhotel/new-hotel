@@ -322,6 +322,56 @@ Consequences:
 * an abandoned hold therefore appears-and-disappears in iHOTEL within ≤2h —
   churn reception should be told about at go-live.
 
+### Checking an app booking in — which app the desk uses
+
+A booking made in the guest app exists in BOTH systems from the moment the hold
+is created (previous subsection), so the desk can check the arriving guest in
+from either one. The two paths are not equivalent, and the difference is
+invisible at the counter — which is why it is written down here.
+
+| | iHOTEL (`FormCheckIn`) | our app (Task B7a: reservations list / reservation detail / room board `จองแล้ว` → **เช็คอิน**) |
+|---|---|---|
+| creates | `HT_CheckIn_H` + `HT_CheckIn_Ds` directly | `ht_checkins` with `cin_book_id` set, then the `create_check_in` writeback mirrors it |
+| booking link | `HT_CheckIn_H.Cin_Book_ID`, arrives canonical via the CT sync mapper | written in the same PG transaction as the stay |
+| `ht_bookings.book_status` | `เข้าพัก` → mapped to `checked_in` by the sync | `checkedin`, written by `set_booking_checkedin` |
+| app-deposit signposts | appear once the sync round-trip completes | appear immediately |
+
+**Both are supported and neither is being removed** (ADR 0002 — iHOTEL is not
+being decommissioned, and per ADR 0003 no capability reception has today may
+become unreachable). The channel API already tolerates both spellings of the
+checked-in state for exactly this reason, so a late `payment_verified` retry for
+a guest the desk checked in through iHOTEL replays instead of answering 409.
+
+**Which one the desk should use for an app booking: ours.** Not because iHOTEL
+is wrong, but because the link is immediate there and the deposit signpost is
+the whole point:
+
+* An app guest's deposit is **not mirrored** (previous subsection), so iHOTEL's
+  own check-in screen shows `0` with nothing to explain it. Our from-reservation
+  check-in carries the `AppDepositNotice` into the check-in modal, the printed
+  registration slip, the folio, the payment dialog and the checkout modal.
+* The link is what every one of those signposts resolves through
+  (`GET /api/checkins/:id/deposits` joins `ht_bookings` via `ci.cin_book_id`).
+  Checking the same guest in as a **walk-in** from our room board leaves
+  `cin_book_id` NULL, and then the notice never appears at all — which is the
+  gap B7a closed.
+* An iHOTEL check-in still ends up correct; the signposts simply lag by the
+  sync round-trip, and the booking-linked state is only as good as what the CT
+  mapper carried back.
+
+Two consequences worth saying out loud at go-live:
+
+* **The desk deposit field is not the booking deposit.** Our check-in modal
+  leaves `เงินมัดจำที่รับที่เคาน์เตอร์` BLANK for a from-reservation check-in,
+  deliberately: `ht_bookings.book_deposit_amount` is money in the bank,
+  `ht_checkin_rooms.cr_dep_amount` (→ legacy `HT_CheckIn_Ds.Cin_Room_Dep`) is
+  money in the drawer, and pre-filling one from the other would refund the
+  guest in cash at checkout for a transfer they made in the app.
+* **Multi-room app bookings still go through iHOTEL.** The single-room guard in
+  `CheckInService::check_in_to_booking` rejects them with a Thai-facing message
+  saying so; the loyalty channel creates single-room holds, so this only bites a
+  desk-grown booking.
+
 ## Piece 2 — membership link on the guest profile
 
 * Migration **086**: `ht_customers.cust_membership_id VARCHAR(64)`

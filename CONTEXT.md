@@ -44,6 +44,26 @@ booking create/convert, round open/close, POS-to-room. Back-office surfaces (rep
 admin, sync monitor, verification hub) stay v2-native.
 _Avoid_: "the whole app" (back-office is deliberately unbound)
 
+**From-reservation check-in**:
+Starting a check-in from an existing booking rather than as a walk-in, so the stay is created
+with `ht_checkins.cin_book_id` set (`POST /api/checkins` with `bookingId` →
+`CheckInService::check_in_to_booking`). Reachable from the reservations list row, the
+reservation detail header, and the room board's action sheet for a `จองแล้ว` room. The link is
+what the app-deposit signposts resolve through, so a walk-in check-in on a booked room is a
+silent data loss, not a shortcut. Single-room only; multi-room bookings are checked in via
+iHOTEL. See `docs/loyalty-channel.md` §"Checking an app booking in".
+_Avoid_: "converting the booking" (nothing is consumed — the booking stays and flips to
+`checkedin`)
+
+**Booking deposit vs. desk deposit**:
+Two pots that share the Thai word มัดจำ and must never be conflated. BOOKING deposit =
+`ht_bookings.book_deposit_amount`, money already transferred (in the bank; for a
+`book_channel='loyalty'` booking it is what the app collected, and iHOTEL shows it as 0 until
+checkout). DESK deposit = `ht_checkin_rooms.cr_dep_amount` → legacy `HT_CheckIn_Ds.Cin_Room_Dep`,
+cash taken at the counter and returned at checkout via คืนเงินมัดจำ. A from-reservation check-in
+never pre-fills the second from the first.
+_Avoid_: "the deposit" unqualified on any check-in or folio surface
+
 **Verified unused**:
 A legacy feature with zero (or long-dead) rows in BOTH sites' live legacy DBs, reclassified out
 of the build scope with the evidence dated in the gap matrix. Current members (2026-07-09):

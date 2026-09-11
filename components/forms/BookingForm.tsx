@@ -28,6 +28,8 @@ import { useBranch } from '@/contexts/BranchContext'
 import BookingChannelChip from '@/components/v2/BookingChannelChip'
 import AppDepositNotice, { appDepositNoticeView } from '@/components/v2/AppDepositNotice'
 import AppDepositNote from '@/components/documents/AppDepositNote'
+import BookingCheckInAction from '@/components/v2/BookingCheckInAction'
+import type { BookingCheckInState } from '@/lib/v2/checkin-from-booking'
 
 /** A pre-ordered product line attached to a booking (task #52 — the canonical
  *  analog of iHOTEL's FrmAddBook2 / `HT_Book_Pro`). `name`/`unitPrice` are
@@ -85,6 +87,17 @@ interface BookingFormProps {
   mode: 'create' | 'edit'
   /** Optional create-mode prefill (e.g. reserve-from-cell on the room board). */
   prefill?: { room?: RoomOption; checkIn?: string; checkOut?: string }
+  /**
+   * Task B7a — the check-in control for THIS reservation, resolved by the
+   * caller (`lib/v2/checkin-from-booking`). Optional so the classic
+   * `app/bookings` mount, which has no check-in wiring, is untouched:
+   * omit it and no control renders.
+   */
+  checkInState?: BookingCheckInState
+  /** Fires when the desk starts a from-reservation check-in. */
+  onCheckIn?: () => void
+  /** The caller's resolve is in flight. */
+  checkInBusy?: boolean
 }
 
 const sourceOptions = [
@@ -157,6 +170,9 @@ export default function BookingForm({
   initialData,
   mode,
   prefill,
+  checkInState,
+  onCheckIn,
+  checkInBusy = false,
 }: BookingFormProps) {
   const branchFetch = useBranchFetch()
   // Spike Phase 3 (ship-dark): when BOOKING_VALIDATION_ENABLED is on the form
@@ -504,13 +520,27 @@ export default function BookingForm({
                 )}
               </div>
             </div>
-            <button
-              onClick={onClose}
-              className="p-2 hover:bg-gray-100 rounded-full transition-colors"
-              aria-label="ปิด"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2">
+              {/* Task B7a — start the check-in from the reservation itself, so
+                  the stay is created with `bookingId` instead of as an
+                  unlinked walk-in. Renders nothing when the caller passes no
+                  state (the classic app/bookings mount) or when the booking is
+                  cancelled / completed / an unpaid hold. */}
+              {mode === 'edit' && checkInState && onCheckIn && (
+                <BookingCheckInAction
+                  state={checkInState}
+                  busy={checkInBusy}
+                  onCheckIn={onCheckIn}
+                />
+              )}
+              <button
+                onClick={onClose}
+                className="p-2 hover:bg-gray-100 rounded-full transition-colors"
+                aria-label="ปิด"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
 
           {/* Task B7 — app-deposit signpost. The saved `initialData` values are
