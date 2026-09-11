@@ -6,12 +6,14 @@ import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { roomStatusView } from '@/lib/v2/status'
-import { deriveBoardPixels, type SpatialRoom } from '@/lib/v2/spatial-grid'
+import { buildLayoutMoves, type SpatialRoom } from '@/lib/v2/spatial-grid'
 import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
 import SpatialRoomGrid, { type LayoutDropTarget } from '@/components/v2/SpatialRoomGrid'
 import GuestMoveConfirmModal from '@/components/v2/GuestMoveConfirmModal'
-import CheckInModal from '@/components/CheckInModal'
+import CheckInModal, { type CheckInBookingContext } from '@/components/CheckInModal'
+import { pickTodaysBookingIdForRoom, todayYmd } from '@/lib/v2/checkin-from-booking'
+import type { BookingDetail } from '@/types/booking'
 import CheckOutModal from '@/components/CheckOutModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
@@ -27,6 +29,9 @@ const ROOM_EVENTS = [
   'BookingCreated',
   'BookingModified',
   'BookingCancelled',
+  // #236: a จัดผัง drop on ANY terminal — the board is shared, so the other
+  // tabs must pick up the rearrangement instead of sitting on a stale board.
+  'RoomLayoutChanged',
 ]
 
 type ModalKind = 'checkin' | 'checkout' | 'extend' | 'change' | 'pos' | 'walkup'
@@ -73,6 +78,12 @@ export default function V2Rooms() {
   // a canonical-only rearrange would fork the two boards.
   const [layoutMode, setLayoutMode] = useState(false)
   const [layoutError, setLayoutError] = useState<string | null>(null)
+  // Task B7a — the reservation a `booked` room's check-in is being started
+  // from, resolved on click. `null` = walk-in (the `available` path, unchanged).
+  const [checkInBooking, setCheckInBooking] = useState<CheckInBookingContext | null>(null)
+  // Inline message shown in the action sheet when a booked room's reservation
+  // cannot be resolved — better than a button that appears to do nothing.
+  const [sheetNotice, setSheetNotice] = useState<string | null>(null)
 
   useEffect(() => {
     try {
@@ -96,6 +107,8 @@ export default function V2Rooms() {
 
   // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
   const reqRef = useRef(0)
+  // How many จัดผัง drops this terminal currently has in flight (#236).
+  const layoutInFlightRef = useRef(0)
 
   const fetchRooms = useCallback(async () => {
     const token = ++reqRef.current
@@ -120,7 +133,17 @@ export default function V2Rooms() {
   }, [fetchRooms])
 
   // Live-refresh on iHOTEL/other-app changes mirrored through the event stream.
-  const live = useLiveRefresh(branch, ROOM_EVENTS, fetchRooms)
+  //
+  // `RoomLayoutChanged` also comes back to the terminal that caused it (the
+  // stream has no origin filter). Refetching then would race this tab's own
+  // optimistic coords during a rapid จัดผัง session, so a drop in flight
+  // suppresses the refetch — the optimistic state already IS what the server
+  // just persisted, and a failed drop resyncs explicitly in its catch.
+  const liveRefresh = useCallback(() => {
+    if (layoutInFlightRef.current > 0) return
+    fetchRooms()
+  }, [fetchRooms])
+  const live = useLiveRefresh(branch, ROOM_EVENTS, liveRefresh)
 
   const filtered = useMemo(() => {
     const f = FILTERS.find((x) => x.value === filter) || FILTERS[0]
@@ -154,11 +177,75 @@ export default function V2Rooms() {
     fetchRooms()
     setModal(null)
     setSelected(null)
+    setCheckInBooking(null)
   }
+
+  /**
+   * Task B7a — find the reservation that makes `room` read จองแล้ว today and
+   * load enough of it to pre-fill the check-in.
+   *
+   * Two reads, both existing endpoints: the calendar answers "which canonical
+   * booking sits on this room number today" (same predicate the room board is
+   * painted with), then the booking detail supplies guest / dates / pax /
+   * deposit / channel. Returns `null` when nothing matches — an iHOTEL-only
+   * booking, or a board that has drifted from the data behind it.
+   */
+  const resolveBookingForRoom = useCallback(
+    async (room: RoomItem): Promise<CheckInBookingContext | null> => {
+      const today = todayYmd()
+      const calRes = await branchFetch(`/api/calendar?startDate=${today}&endDate=${today}`)
+      if (!calRes.ok) return null
+      const cal = await calRes.json()
+      const bookingId = pickTodaysBookingIdForRoom(cal?.data?.bookings, room.roomNo, today)
+      if (bookingId == null) return null
+
+      const detRes = await branchFetch(`/api/bookings/${bookingId}`)
+      if (!detRes.ok) return null
+      const det = await detRes.json()
+      if (!det?.success || !det.booking) return null
+      const b = det.booking as BookingDetail
+      return {
+        id: b.id,
+        bookNo: b.bookNo,
+        customerName: b.customerName,
+        checkIn: b.checkIn,
+        checkOut: b.checkOut,
+        adults: b.adults,
+        children: b.children,
+        depositAmount: b.depositAmount,
+        bookChannel: b.bookChannel,
+      }
+    },
+    [branchFetch],
+  )
 
   const handleAction = async (a: RoomAction) => {
     if (!selected) return
+    setSheetNotice(null)
+    // Task B7a — a `booked` room checks in FROM its reservation, so the POST
+    // carries bookingId and the stay lands linked. `available` stays the
+    // walk-in path, byte-identical to before.
+    if (a === 'checkin' && selected.status === 'booked') {
+      setBusy(true)
+      try {
+        const resolved = await resolveBookingForRoom(selected)
+        if (!resolved) {
+          setSheetNotice(
+            'ไม่พบการจองของห้องนี้ในระบบใหม่สำหรับวันนี้ — ถ้าเป็นการจองที่ทำใน iHOTEL ให้เช็คอินที่ iHOTEL',
+          )
+          return
+        }
+        setCheckInBooking(resolved)
+        setModal('checkin')
+      } catch {
+        setSheetNotice('อ่านข้อมูลการจองไม่สำเร็จ กรุณาลองใหม่')
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
     if (MODAL_ACTIONS.includes(a)) {
+      setCheckInBooking(null)
       setModal(a as ModalKind)
       return // keep `selected`; sheet is replaced by the modal overlay
     }
@@ -198,19 +285,9 @@ export default function V2Rooms() {
    *  round-trip through computeSpatialLayout into the intended cell; a swap
    *  exchanges the two rooms' existing pairs verbatim (decision 2). */
   const handleLayoutDrop = async (source: SpatialRoom, target: LayoutDropTarget) => {
-    let moves: { id: number; roomX: number; roomY: number }[]
-    if (target.type === 'swap') {
-      const other = target.room
-      // Both sides are placed (the grid guarantees it); coords are present.
-      if (source.roomX == null || source.roomY == null || other.roomX == null || other.roomY == null) return
-      moves = [
-        { id: source.id, roomX: other.roomX, roomY: other.roomY },
-        { id: other.id, roomX: source.roomX, roomY: source.roomY },
-      ]
-    } else {
-      const { x, y } = deriveBoardPixels(rooms, { col: target.col, row: target.row })
-      moves = [{ id: source.id, roomX: x, roomY: y }]
-    }
+    // `rooms` (unfiltered) is deliberate — see buildLayoutMoves/deriveBoardPixels.
+    const moves = buildLayoutMoves(rooms, source, target)
+    if (!moves) return // swap partner has no coords, or self-drop — no-op
 
     // Optimistic apply; remember only the touched rooms' prior coords so a
     // revert can't clobber an interleaved drop on other tiles.
@@ -228,6 +305,7 @@ export default function V2Rooms() {
     )
     setLayoutError(null)
 
+    layoutInFlightRef.current += 1
     try {
       const res = await branchFetch('/api/rooms/layout', {
         method: 'PUT',
@@ -249,6 +327,8 @@ export default function V2Rooms() {
       )
       setLayoutError(err instanceof Error ? err.message : 'บันทึกผังห้องไม่สำเร็จ')
       fetchRooms() // resync with server truth
+    } finally {
+      layoutInFlightRef.current -= 1
     }
   }
 
@@ -425,19 +505,35 @@ export default function V2Rooms() {
 
       {/* Action sheet — hidden while a transactional modal is open */}
       {selected && !modal && (
-        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} readOnly={!canWrite} />
+        <RoomActionSheet
+          room={selected}
+          onClose={() => {
+            setSelected(null)
+            setSheetNotice(null)
+          }}
+          onAction={handleAction}
+          busy={busy}
+          readOnly={!canWrite}
+          notice={sheetNotice}
+        />
       )}
 
       {/* Transactional modals (reused from the classic app for contract safety) */}
       {modal === 'checkin' && selected && (
         <CheckInModal
           room={{ id: selected.id, roomNo: selected.roomNo, roomTypeName: selected.roomTypeName }}
-          onClose={() => setModal(null)}
+          booking={checkInBooking}
+          onClose={() => {
+            setModal(null)
+            setCheckInBooking(null)
+          }}
           onSuccess={refreshAfterModal}
         />
       )}
+      {/* `roomCheck` is the v2 desk opt-in for the ADR 0008 ขอเช็คห้อง panel;
+          the v1 mounts of this same modal deliberately do not pass it. */}
       {modal === 'checkout' && selected && (
-        <CheckOutModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} />
+        <CheckOutModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} roomCheck />
       )}
       {modal === 'extend' && selected && (
         <ExtendStayModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={refreshAfterModal} />

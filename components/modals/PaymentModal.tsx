@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, CreditCard, FileText, DollarSign, Banknote, QrCode } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import AppDepositNotice from '@/components/v2/AppDepositNotice'
 
 interface PaymentModalProps {
   isOpen: boolean
@@ -11,6 +12,15 @@ interface PaymentModalProps {
   totalAmount: number
   totalPaid: number
   onSuccess: () => void
+  /**
+   * Task B7 — `ht_bookings.book_channel` of the originating booking, and that
+   * booking's own deposit in baht. Optional so existing call sites are
+   * unaffected; when they say "loyalty" + a positive amount the dialog warns
+   * that the deposit is already collected even though iHOTEL shows 0 for it
+   * until checkout. Display-only: neither value touches the POST body.
+   */
+  bookChannel?: string | null
+  bookingDepositAmount?: number | null
 }
 
 type PaymentMethod = 'cash' | 'credit' | 'transfer' | 'qr'
@@ -38,6 +48,8 @@ export default function PaymentModal({
   totalAmount,
   totalPaid,
   onSuccess,
+  bookChannel,
+  bookingDepositAmount,
 }: PaymentModalProps) {
   const branchFetch = useBranchFetch()
 
@@ -165,6 +177,15 @@ export default function PaymentModal({
             </div>
           </div>
         </div>
+
+        {/* Task B7 — sits between the balance summary and the amount field, the
+            two things a receptionist reads before typing a number. Renders
+            nothing unless this stay's booking was paid in the guest app. */}
+        <AppDepositNotice
+          bookChannel={bookChannel}
+          depositAmount={bookingDepositAmount}
+          className="mx-4 mt-4"
+        />
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="p-4 space-y-4">

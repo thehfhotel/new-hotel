@@ -26,23 +26,23 @@
 //! | `extend_stay` | §3f | `ExtendStay` |
 //! | `checkout` | §3e Phase 2 ONLY | `CheckOut` |
 //! | `payment` | §3h | `RecordPayment` (+ receipt) |
-//! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
+//! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_CheckIn_Pay` (A)" "can be negative (refunds use negation)") | `RefundPayment` |
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `deposit_refund` | Task #49 — deposit refund (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds` "Refund deposit", FormShowDEPBack.cs:536) | `RefundDeposit` |
-//! | `mark_clean` | §3j | `MarkRoomClean` |
-//! | `mark_dirty` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13) | `MarkRoomDirty` |
+//! | `mark_clean` | spike §3j | `MarkRoomClean` |
+//! | `mark_dirty` | Audit 2026-06-11 P2; flag literal per `docs/legacy-spike/findings.md` §3e/§3i (`Room_Clean='yes'`) | `MarkRoomDirty` |
 //! | `set_maintenance` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16) | `SetRoomMaintenance` |
 //! | `update_room` | Admin room master-data edit — closes the `PUT /api/new/rooms/:id` writeback gap | `UpdateRoom` |
 //! | `move_room_tiles` | Issue #236 — จัดผัง layout-edit drop, FormRoomMain drag/drop shape (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Update grid layout"). **SHIPPED DARK** behind `LAYOUT_WRITEBACK_ENABLED` | `MoveRoomTiles` |
-//! | `update_customer` | Audit 2026-06-11 P2 — standalone customer-edit re-save (spike §3c line 28 shape) | `UpdateCustomer` |
-//! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
+//! | `update_customer` | Audit 2026-06-11 P2 — standalone customer-edit re-save (spike §3c "re-save customer") | `UpdateCustomer` |
+//! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §6.3 "HT_Products.Pro_Amt -= num") | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
 //! | `receipt` | Task #45 / POS walk-up (roomless) sale — `HT_Receipt_H` INSERT + N `HT_Receipt_Ds` + paired `HT_Products.Pro_Amt` decrement per line (NO `HT_CheckIn_Product`; `Receipt_ref=''`) | `RecordReceipt` |
 //! | `pos_void` | Task #45 / POS void — guarded `DELETE HT_CheckIn_Product` (by `sale_legacy_id`) + additive `Pro_Amt` restore | `VoidPosSale` |
-//! | `round_bill` | Track J6 (round coexistence step 2) — `HT_Round_Bill` open (`INSERT`) / close (`UPDATE`), `COMPAT_CHEATSHEET.md` §946-956 / §3.20-3.21 (`FrmDueBill.cs:1653/1670`) | `OpenRound` + `CloseRound` |
-//! | `sticky_note` | Task #47 — room/staff notes `HT_Room_SMS` / `HT_EMP_SMS` INSERT (`OUTPUT INSERTED.SMS_ID`) + mark-read UPDATE, `COMPAT_CHEATSHEET.md` §932-942 / §3.22. **SHIPPED DARK** behind `NOTES_WRITEBACK_ENABLED` | `CreateNote` + `MarkNoteRead` |
-//! | `cash_entry` | Migration 059 — petty-cash `TB_Pay_History` positional INSERT (`COMPAT_CHEATSHEET.md` §1051 / `FrmAddPay.cs:638`). **PURE-but-UNWIRED** — no intent/dispatcher arm yet; awaiting `Pay_Type`/`Pay_Group`/`Pay_Account`/`Pay_Program` byte-shape verification | _(none yet — TODO)_ |
+//! | `round_bill` | Track J6 (round coexistence step 2) — `HT_Round_Bill` open (`INSERT`) / close (`UPDATE`), `COMPAT_CHEATSHEET.md` §"Table: `HT_Round_Bill` (A)", §"3.20 Open Round-Bill", §"3.21 Close Round-Bill" (`FrmDueBill.cs:1653/1670`) | `OpenRound` + `CloseRound` |
+//! | `sticky_note` | Task #47 — room/staff notes `HT_Room_SMS` / `HT_EMP_SMS` INSERT (`OUTPUT INSERTED.SMS_ID`) + mark-read UPDATE, `COMPAT_CHEATSHEET.md` §"Table: `HT_Room_SMS` (A)", §"Table: `HT_EMP_SMS` (A)", §3.22. **SHIPPED DARK** behind `NOTES_WRITEBACK_ENABLED` | `CreateNote` + `MarkNoteRead` |
+//! | `cash_entry` | Migration 059 — petty-cash `TB_Pay_History` positional INSERT (`COMPAT_CHEATSHEET.md` §"Table: `TB_Pay_History` (A)" "`id int` (NOT IDENTITY) via `get_id`" / `FrmAddPay.cs:638`). Issue #202: intent/dispatcher/back-population WIRED (migration 085 adds `ht_cash_ledger.aggregate_id`); **still UNWIRED at the emission side** — no `POST /api/cash/*` call site enqueues it yet, pending `Pay_Type`/`Pay_Group`/`Pay_Account`/`Pay_Program` byte-shape verification | `CreateCashEntry` |
 //! | `rate_price` | Task #51 — `(Room_Type, Cust_Type)` pricing matrix UPSERT into `HT_Rooms_Price` (`docs/legacy-app/SCHEMA.sql` + `sync/mappers/rate_tiers.rs`). Idempotent `IF EXISTS … UPDATE … ELSE INSERT …` keyed on the composite natural key | `UpsertRatePrice` |
 
 pub mod adjust_product_stock;
@@ -199,6 +199,47 @@ mod tests {
             assert!(
                 s.to_ascii_uppercase().contains("OUTPUT INSERTED."),
                 "example {s:?} must satisfy the helper precondition"
+            );
+        }
+    }
+
+    /// Issue #274/#279 sibling, scoped to `save_image.rs`: it is the one
+    /// writeback RECIPE (not a scheduler poll) that reaches legacy MSSQL
+    /// through a bound `tiberius::Query` — its two Write call sites
+    /// (provisional INSERT, existing-row UPDATE) run inside the writeback
+    /// transaction, so an unbounded hang there holds a legacy row lock
+    /// against the live iHOTEL app, not just a read-only scheduler poll.
+    /// Neither `scheduler::mod::tests` (`SCHEDULER_SOURCES` is scoped to
+    /// `scheduler/*.rs`) nor `writeback::dispatcher`'s own `include_str!`
+    /// tests (pin unrelated invariants — ledger-write ordering,
+    /// `intent_facts` exhaustiveness) cover this file, so it gets its own
+    /// pin here rather than joining `SCHEDULER_SOURCES` — this file talks
+    /// to `&mut LegacyConn` directly (no pool), so it can't satisfy that
+    /// array's companion "must import `simple_query_with_timeout_pooled`"
+    /// test, and folding it in would misname a scheduler-scoped constant.
+    ///
+    /// Fails loudly if a future edit reverts either bound-Query site back
+    /// to a raw `Query::new(sql).execute(&mut **conn)` / `.query(&mut`
+    /// call, or reaches for `.simple_query(` directly, bypassing
+    /// `query_execute_with_timeout` / `simple_query_with_timeout`
+    /// (`db::mssql_timeout`). Scanning from here (not from inside
+    /// `save_image.rs` via `include_str!` of itself) sidesteps the
+    /// self-reference trap `scheduler::mod::tests` also avoids: this
+    /// assertion's own needle strings live in `recipes/mod.rs`, a
+    /// different file from the one being scanned, so they can't trip the
+    /// scan on themselves.
+    #[test]
+    fn save_image_recipe_has_no_raw_mssql_bypass_calls() {
+        let src = include_str!("save_image.rs");
+        for needle in [".simple_query(", ".query(&mut", ".execute(&mut"] {
+            assert!(
+                !src.contains(needle),
+                "writeback/recipes/save_image.rs calls `{needle}` directly — \
+                 route it through query_execute_with_timeout / \
+                 simple_query_with_timeout (db::mssql_timeout) so the \
+                 bound-parameter call gets a per-op timeout and poisons the \
+                 connection on timeout instead of hanging unbounded and \
+                 holding a legacy row lock against iHOTEL (issue #279 / #274)"
             );
         }
     }

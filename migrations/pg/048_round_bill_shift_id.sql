@@ -17,8 +17,8 @@
 -- `ht_shifts.shift_id` on the `ht_checkins` row so per-shift revenue
 -- attribution is possible from canonical PG (the legacy `HT_Receipt_H`
 -- and `HT_Round_Bill` have no column linking them — see
--- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: HT_Round_Bill" and
--- §"Table: HT_Receipt_H"). So the column is canonical-only; the
+-- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Round_Bill`" and
+-- `docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Receipt_H`"). So the column is canonical-only; the
 -- writeback recipe for check-out (`writeback/recipes/checkout.rs`) is
 -- unchanged — we don't invent legacy columns.
 --

@@ -9,6 +9,15 @@
 //!
 //! When SYSTEM_MODE=new, the app can run without the legacy database.
 //! Legacy routes will return 503 Service Unavailable when legacy DB is unavailable.
+//
+// Build-trigger note (2026-09-01): the room-signals push (0938e95) had its
+// backend image build CANCELED by the concurrency group when the env-plumbing
+// push (69ae588) superseded it — but its WEB image had already been pushed, so
+// the plumbing run (build jobs path-filtered out) deployed a new frontend over
+// a 3-hour-old backend. This comment exists to put hotel-backend/ in the push's
+// changed paths so test-backend + build-backend + deploy all run from the
+// current tree. See the workflow's force_deploy note for why an empty commit
+// cannot do this.
 
 // Modules live in `lib.rs` so they're reachable from integration tests under
 // `tests/`. The binary brings them into scope via `use hotel_backend::*`.
@@ -20,14 +29,17 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderValue, Method},
     middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
-    Router,
+    Extension, Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use hotel_backend::legacy_room_status::RoomFlagsReaders;
+
 use crate::config::{auth_enabled_from_env, AppConfig};
-use crate::db::{create_pg_pool, create_pool};
+use crate::db::{create_pg_pool, create_pool, pg_pool_options};
+use crate::routes::events::{spawn_domain_event_listener, EventSite};
 use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
 
@@ -130,8 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // _NAME / _USER / _PASSWORD env vars drive the connection.
     let ville_pool = if config.ville_db.enabled {
         let ville_conn = config.ville_db.connection_string();
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(config.ville_db.pool_max)
+        // `pg_pool_options` (not a bare `PgPoolOptions::new()`) so this pool
+        // carries the same explicit acquire bound as the HotelNew one — see
+        // `db::PG_ACQUIRE_TIMEOUT` and the 2026-07-29 SSE incident.
+        match pg_pool_options(config.ville_db.pool_max)
             .connect(&ville_conn)
             .await
         {
@@ -170,6 +184,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     tracing::info!("HF Ville writes: enabled={}", hfville_writes);
 
+    // `/hk` maid surface policy (wave-4 housekeeping stream). Read ONCE here so
+    // the startup log names the SAME values the router serves:
+    //
+    // - `HK_BRANCHES` (default `hfhotel`) — which properties a maid may file
+    //   against. HF Ville is NOT offered until `repair_room_legacy_keys --apply`
+    //   has fixed `hotelville.ht_rooms_new.legacy_room_id_int` and two clean
+    //   sync ticks confirm it; a Ville room writeback would otherwise flip the
+    //   WRONG iHOTEL room (no Ville room writeback has ever run).
+    // - `HK_MARK_DIRTY_ENABLED` (default OFF) — invariant #6. The MarkRoomDirty
+    //   write shape is live-verified, but a maid's phone as the TRIGGER is new,
+    //   so it needs its own reception-coordinated window before the flip.
+    // - `HK_LOCATION_ENFORCEMENT_ENABLED` (default OFF) — per-employee branch
+    //   enforcement against HF ID's `Employee.location`. `HK_BRANCHES` answers
+    //   "which properties does this deployment serve", never "which property
+    //   does THIS maid work at", so until this flips a Ville maid is still
+    //   offered HF Hotel. Flipping it needs `HFID_LOCATION_URL` +
+    //   `HFID_RESOLVE_SECRET` present FIRST (`location_lookup_configured`
+    //   below) — with the flag on and the lookup unconfigured, every /hk
+    //   request 503s. See PENDING-VERIFICATIONS.md V14.
+    let hk_policy = attach_hk_legacy_readers(routes::hk::HkPolicy::from_env(), &legacy_pool).await;
+    tracing::info!(
+        "/hk surface: branches={:?}, mark_dirty_enabled={}, \
+         location_enforcement_enabled={} (lookup configured: {}), \
+         ihotel_room_status={:?}",
+        hk_policy.branch_ids(),
+        hk_policy.mark_dirty_enabled,
+        hk_policy.location_enforcement_enabled,
+        hk_policy.location_lookup_configured(),
+        hk_policy.legacy_room_flags_branches()
+    );
+    if hk_policy.location_enforcement_enabled && !hk_policy.location_lookup_configured() {
+        tracing::error!(
+            "/hk location enforcement is ON but HFID_LOCATION_URL / HFID_RESOLVE_SECRET \
+             are not both set — every /hk request will answer 503. Set both (or flip \
+             HK_LOCATION_ENFORCEMENT_ENABLED back to false) and redeploy."
+        );
+    }
+
+    // Loyalty-app integration (docs/loyalty-channel.md). Inbound channel
+    // ships DARK (flag + token both required); outbound stay hook is off
+    // unless LOYALTY_APP_URL + LOYALTY_SERVICE_TOKEN are set.
+    let loyalty_config = config::LoyaltyConfig::from_env();
+    tracing::info!(
+        "Loyalty channel: enabled={} (token set: {}); stay hook configured: {}",
+        loyalty_config.channel_enabled,
+        loyalty_config.channel_token.is_some(),
+        loyalty_config.stay_hook_configured()
+    );
+
+    // OTA booking bridge (docs/ota-bridge.md). The machine surface `ota-desk`
+    // calls: five existing handlers re-mounted under `/api/ota/*` behind a
+    // shared bearer, plus the purpose-built reconciler read. Ships DARK
+    // (`OTA_BRIDGE_ENABLED` default off ⇒ every request 503).
+    //
+    // The token/previous fields render as `sha256(value)[0..6]`, NEVER the
+    // value — that fingerprint is how an operator confirms new-hotel's
+    // `OTA_BRIDGE_TOKEN` and ota-desk's `PMS_BRIDGE_TOKEN` hold the identical
+    // string without either side printing a secret.
+    let ota_config = config::OtaBridgeConfig::from_env();
+    let ota_line = format!(
+        "OTA bridge: enabled={} enforce={} token={} previous={}",
+        ota_config.enabled,
+        ota_config.enforce,
+        app_middleware::token_fingerprint(ota_config.token.as_deref()),
+        app_middleware::token_fingerprint(ota_config.previous_token.as_deref()),
+    );
+    if ota_config.enabled && !ota_config.enforce {
+        // Permissive: un-credentialed calls are being ACCEPTED. This is a
+        // deliberate migration window, but it must be loud — the operator
+        // flips OTA_BRIDGE_ENFORCE once the per-request WARNs stop.
+        tracing::warn!("{ota_line} — PERMISSIVE, unauthenticated calls are accepted");
+    } else {
+        tracing::info!("{ota_line}");
+    }
+
     // Create AppState — canonical PG only. As of the 2026-06-11 coexistence
     // audit AppState carries no MSSQL handle: routes/repositories never touch
     // the legacy DB (docs/architecture.md "critical rule"); MSSQL is reserved
@@ -196,6 +285,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("No database connections available".into());
         }
     };
+
+    // Shared `domain_events` LISTEN fan-out — ONE dedicated connection per
+    // canonical database, forwarding into the per-site broadcast channels the
+    // `/api/events` SSE handler subscribes to (`routes::events`).
+    //
+    // These are STANDALONE connections (`PgListener::connect(dsn)`), NOT pool
+    // checkouts: before 2026-07-29 the SSE handler opened a listener per
+    // client with `connect_with(pool)`, so every open /v2 tab held 1–2 real
+    // pool slots for its whole lifetime and tab churn exhausted the pool (30s
+    // acquire hangs → 500s on /api/stats|checkins|bookings, ~90s zero-byte SSE
+    // setup → Cloudflare 524 → EventSource reconnect spiral). Post-fix
+    // invariant: `pg_stat_activity` shows exactly two `LISTEN "domain_events"`
+    // connections total, no matter how many browser tabs are open.
+    //
+    // The DSNs are the same `connection_string()`s the pools above were built
+    // from, so the listener can never drift onto a different database.
+    if let Some(ref state) = final_app_state {
+        spawn_domain_event_listener(
+            config.new_db.connection_string(),
+            EventSite::Hfhotel,
+            state.event_fanout.hfhotel_sender(),
+        );
+        // `hfville_sender()` is Some exactly when `ville_pool` is (AppState::
+        // with_ville), so a disabled/unreachable Ville DB spawns no task and
+        // `branch=hfville|all` degrades to hfhotel-only as before.
+        match state.event_fanout.hfville_sender() {
+            Some(ville_tx) => {
+                spawn_domain_event_listener(
+                    config.ville_db.connection_string(),
+                    EventSite::Hfville,
+                    ville_tx,
+                );
+            }
+            None => tracing::info!(
+                "HF Ville domain-event listener not started (Ville pool unavailable)"
+            ),
+        }
+    }
 
     // Initialize scheduler for background jobs (only if legacy pool is available)
     // Pass PgPool if available for legacy-to-PG sync job
@@ -244,8 +371,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // are PG-only as of Phase 8 — they read from `ht_*_legacy` mirror tables
     // populated by the CT mappers + drift-reconcile job. MSSQL is write-only
     // (writeback worker) for the legacy .NET app.
+    //
+    // Reception's board reads the SAME iHOTEL readers the maid's `/hk` surface
+    // reads (wave-5 IF-1) — one truth, so the two screens cannot disagree about
+    // a room. `hk_policy` owns them; clone the map (Arc bumps only, no new
+    // legacy connection) before it is moved into the `/hk` router below.
+    let room_flags_readers = RoomFlagsReaders::new(hk_policy.legacy_room_flags.clone());
+    tracing::info!(
+        "reception housekeeping board: iHOTEL readers for {:?}",
+        room_flags_readers.branches()
+    );
+
     let new_routes = if let Some(ref app_state) = final_app_state {
-        build_new_routes(app_state.clone())
+        build_new_routes(app_state.clone(), room_flags_readers)
     } else {
         Router::new()
     };
@@ -345,37 +483,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `HkIdentity`. FAIL CLOSED — env unset ⇒ every request 401, so the
     // surface ships dark until the Access wiring lands. Mounted OUTSIDE
     // `require_auth` (maids have no PMS session) but WITH its own
-    // `ville_write_guard` layer so a `branch=hfville` mutation stays
-    // blocked until `HFVILLE_WRITES_ENABLED`, exactly like the main router.
-    // Body limit raised for the optional broken-item photo (base64 JSON,
-    // same transport as guest documents).
+    // `ville_write_guard` layer, exactly like the main router — with ONE
+    // exemption: `POST /api/hk/rooms/{id}/cleaning` is admitted for
+    // `branch=hfville` even while `HFVILLE_WRITES_ENABLED` is off, so the
+    // admitted set matches `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` and
+    // canonical PG cannot diverge from Ville's iHOTEL (see
+    // `middleware::ville_guard`).
+    //
+    // The whole stack is built by `routes::hk::router` so the integration
+    // tests mount the shipped wiring rather than a replica.
     let hk_routes = match &final_app_state {
+        Some(state) => routes::hk::router_with_policy(state.clone(), hk_policy),
+        None => Router::new(),
+    };
+
+    // Loyalty-app booking channel (`/api/channel/*` — docs/loyalty-channel.md).
+    // Machine-to-machine surface for the loyalty app: availability quote,
+    // tentative hold create, payment-verified confirm, release. Mounted
+    // OUTSIDE `require_auth` (the caller is a service, not a session user)
+    // behind its OWN shared-bearer gate, which fails closed: the whole
+    // surface answers 503 until `LOYALTY_CHANNEL_ENABLED=true` AND
+    // `LOYALTY_CHANNEL_TOKEN` are provisioned (ship-dark — a channel hold
+    // writes back to iHOTEL as `จอง` via the normal booking-create recipe, so
+    // the flag flip is a coordinated go-live step, invariant #6). HF Ville
+    // channel mutations are additionally rejected until
+    // `HFVILLE_WRITES_ENABLED` (enforced in `routes::channel` — this router
+    // sits outside the main router's `ville_write_guard`, which keys on the
+    // `?branch=` query param the channel API doesn't use).
+    let channel_routes = match &final_app_state {
         Some(state) => {
-            let hk_ville_guard =
-                axum_middleware::from_fn_with_state(state.clone(), ville_write_guard);
+            let channel_token_state = app_middleware::ChannelTokenState::new(&loyalty_config);
             Router::new()
-                .route("/api/hk/me", get(routes::hk::me))
-                .route("/api/hk/rooms", get(routes::hk::list_rooms))
-                .route("/api/hk/rooms/{room_id}", get(routes::hk::room_detail))
                 .route(
-                    "/api/hk/rooms/{room_id}/cleaning",
-                    post(routes::hk::report_cleaning),
+                    "/api/channel/availability",
+                    get(routes::channel::availability),
                 )
                 .route(
-                    "/api/hk/rooms/{room_id}/broken-items",
-                    post(routes::hk::report_broken_item),
+                    "/api/channel/bookings",
+                    post(routes::channel::create_booking),
                 )
                 .route(
-                    "/api/hk/broken-items/{report_id}/photo",
-                    get(routes::hk::broken_item_photo),
+                    "/api/channel/bookings/{pms_booking_id}/payment-verified",
+                    post(routes::channel::payment_verified),
                 )
-                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
-                .layer(axum_middleware::from_fn(
-                    app_middleware::hk_access::require_hk_access,
+                .route(
+                    "/api/channel/bookings/{pms_booking_id}/release",
+                    post(routes::channel::release),
+                )
+                .layer(axum_middleware::from_fn_with_state(
+                    channel_token_state,
+                    app_middleware::require_channel_token,
                 ))
-                .layer(hk_ville_guard)
                 .with_state(state.clone())
         }
+        None => Router::new(),
+    };
+
+    // OTA booking bridge (`/api/ota/*` — docs/ota-bridge.md). Re-mounts the
+    // FIVE EXISTING ota-desk handlers (customer search/create, room list,
+    // booking validate/create) unchanged behind a shared-bearer gate, plus the
+    // new `GET /api/ota/reconcile/bookings` read that replaces ota-desk's
+    // direct `mcp_ro` PostgreSQL query.
+    //
+    // Why a parallel prefix rather than gating `/api/*`: the PMS browser UI
+    // reaches those same routes through the Next.js rewrite, so requiring a
+    // bearer on them would break the desk. See `routes::ota` for the layering
+    // rationale — the whole stack (ota gate OUTSIDE ville_write_guard) is built
+    // by `routes::ota::router` so the integration tests mount the shipped
+    // wiring rather than a replica.
+    //
+    // Mounted OUTSIDE `require_auth` (the caller is a service, not a session
+    // user), exactly like `/api/channel/*`.
+    let ota_routes = match &final_app_state {
+        Some(state) => routes::ota::router_with_config(state.clone(), ota_config),
         None => Router::new(),
     };
 
@@ -405,11 +585,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(auth_routes)
         .merge(reader_routes)
         .merge(hk_routes)
+        .merge(channel_routes)
+        .merge(ota_routes)
         .merge(admin_routes)
         .merge(health_routes)
         .merge(downloads_routes)
         .layer(cors)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        // Outermost: measures the full round trip, including the layers above.
+        .layer(axum_middleware::from_fn(access_log));
 
     // Log database availability status
     match (legacy_available, new_available) {
@@ -428,6 +612,149 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Attach the per-branch iHOTEL room-status readers the `/hk` surface serves
+/// its room-clean values from (CR-1 — owner decision, see `routes::hk`).
+///
+/// ## HF Hotel reuses the pool that already exists
+///
+/// This binary has built a legacy MSSQL pool since long before `/hk` existed
+/// (the scheduler's reconcile backstop), and the API container is already
+/// given `DB_SERVER` / `DB_NAME` / `DB_USER` / `MSSQL_PORT` + the
+/// `db_password` secret to build it. So the shipping branch needs NO new
+/// connection, NO new env var, and NO deploy-payload entry — the reader
+/// borrows the existing pool, whose `PoisonAwareManager` already guarantees a
+/// timed-out read cannot hand a desynced connection back to the scheduler.
+///
+/// ## HF Ville is built only when it is actually served
+///
+/// Ville's legacy server is reached today only by the `sync-hfville` /
+/// `writeback-hfville` sidecars. Building its pool unconditionally would open
+/// a new connection to a shared production server for a branch `/hk` refuses
+/// to serve (`HK_BRANCHES` is `hfhotel` until V13), so it is built ONLY when
+/// the branch is admitted. The reader therefore arms itself exactly when
+/// Ville is admitted, and today's deploy touches Ville's legacy server zero
+/// times.
+///
+/// ## Every failure here is non-fatal
+///
+/// No reader for a branch means the maid sees the canonical PG mirror plus a
+/// visible Thai note — a supported, tested state
+/// (`routes::hk::merge_legacy_room_flags`). A legacy server that is down at
+/// boot must never stop the API from serving, so an unconfigured or
+/// unreachable target is a WARN and nothing more.
+async fn attach_hk_legacy_readers(
+    policy: routes::hk::HkPolicy,
+    legacy_pool: &Option<db::DbPool>,
+) -> routes::hk::HkPolicy {
+    use crate::routes::mode::Branch;
+    use hotel_backend::legacy_room_status::MssqlRoomFlagsSource;
+    use std::sync::Arc;
+
+    let mut policy = policy;
+
+    // --- HF Hotel: reuse the pool this binary already has -----------------
+    if policy.branches.contains(&Branch::Hfhotel) {
+        match legacy_pool {
+            Some(pool) => {
+                policy = policy.with_legacy_room_flags(
+                    Branch::Hfhotel,
+                    Arc::new(MssqlRoomFlagsSource::new(pool.clone(), "hfhotel")),
+                );
+                tracing::info!(
+                    "/hk iHOTEL room-status reader attached for hfhotel (reusing the \
+                     existing legacy pool)"
+                );
+            }
+            None => tracing::warn!(
+                "/hk iHOTEL room-status reader NOT attached for hfhotel — no legacy \
+                 pool. The maid list falls back to the canonical PG mirror with the \
+                 stale note."
+            ),
+        }
+    }
+
+    // --- HF Ville: only once the branch is admitted -----------------------
+    if policy.branches.contains(&Branch::Hfville) {
+        match config::VilleLegacyDbConfig::from_env() {
+            Some(cfg) => {
+                tracing::info!(
+                    "/hk iHOTEL room-status: connecting HF Ville legacy MSSQL at {}:{} (db {})",
+                    cfg.server,
+                    cfg.port,
+                    cfg.database
+                );
+                match create_pool(&cfg).await {
+                    Ok(pool) => {
+                        policy = policy.with_legacy_room_flags(
+                            Branch::Hfville,
+                            Arc::new(MssqlRoomFlagsSource::new(pool, "hfville")),
+                        );
+                        tracing::info!("/hk iHOTEL room-status reader attached for hfville");
+                    }
+                    Err(e) => tracing::warn!(
+                        "/hk iHOTEL room-status reader NOT attached for hfville ({}) — \
+                         falling back to the canonical PG mirror with the stale note",
+                        e
+                    ),
+                }
+            }
+            None => tracing::warn!(
+                "/hk iHOTEL room-status reader NOT attached for hfville — no usable \
+                 password (set VILLE_MSSQL_PASSWORD, or DB_PASSWORD while both sites \
+                 share the sa credential). Falling back to the canonical PG mirror."
+            ),
+        }
+    }
+
+    policy
+}
+
+/// SSE endpoint path, excluded from the access log below.
+const SSE_PATH: &str = "/api/events";
+
+/// Request-level access log for `/api/*`: method, path, status, latency — at
+/// INFO, one line per request.
+///
+/// The backend had **no** request logging: `tower_http`'s `TraceLayer` emits
+/// at DEBUG and the deployed filter is `hotel_backend=info,tower_http=info`,
+/// so the 2026-07-29 500-burst was completely invisible and the diagnosis had
+/// to be reconstructed from `pg_stat_activity` and the browser console. One
+/// INFO line per request makes the next occurrence a grep.
+///
+/// A hand-rolled middleware rather than reconfiguring `TraceLayer` because
+/// `DefaultMakeSpan` records the **full URI including the query string**, and
+/// our query strings carry guest-identifying parameters (`?q=`, `?book_no=`,
+/// customer ids). This logs `uri().path()` only — never a query string, never
+/// a header, never a body, never a token.
+///
+/// `/api/events` is excluded outright: an SSE stream stays open for hours, so
+/// its "latency" is a disconnect timestamp, not a service time — logging it
+/// would bury the data-endpoint lines this exists to surface. Non-`/api`
+/// paths (`/health` polls, installer downloads) are skipped as noise.
+async fn access_log(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api/") || path == SSE_PATH {
+        return next.run(req).await;
+    }
+
+    let method = req.method().clone();
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+
+    tracing::info!(
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "api request",
+    );
+
+    response
 }
 
 /// Default CORS allowlist when `BACKEND_ALLOWED_ORIGINS` is unset.
@@ -492,7 +819,7 @@ fn parse_allowed_origins() -> AllowOrigin {
 /// operator opts in. The middleware is applied to THIS subrouter only
 /// — `/api/auth/*` and `/health` are mounted separately in `main()`
 /// and stay public.
-fn build_new_routes(app_state: AppState) -> Router {
+fn build_new_routes(app_state: AppState, room_flags_readers: RoomFlagsReaders) -> Router {
     let auth_layer =
         axum_middleware::from_fn_with_state(app_state.clone(), app_middleware::require_auth);
 
@@ -570,6 +897,14 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/customers/{id}/stats",
             get(routes::customers::get_customer_stats),
+        )
+        // Loyalty membership link (migration 086) — desk set/clear. A
+        // dedicated PUT (not a field on the general customer update) so a
+        // stale edit form can never clobber a freshly-scanned link, and so
+        // clearing is expressible. PG-canonical only, no legacy writeback.
+        .route(
+            "/api/customers/{id}/membership",
+            put(routes::new_customers::set_membership),
         )
         // Branch-aware stats (HF Hotel + HF Ville) — the sole stats path.
         .route("/api/stats", get(routes::stats::get_stats))
@@ -656,6 +991,42 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/housekeeping/rooms/{id}/maintenance",
             post(routes::housekeeping::set_maintenance),
+        )
+        // Reception's live view of TODAY's maid cleaning progress
+        // (`ht_hk_cleaning_events`, one row per room, latest event wins).
+        // Read-only; pairs with the `RoomCleaningStarted` / `RoomMarkedClean` /
+        // `RoomMarkedDirty` SSE names the แผนกแม่บ้าน board subscribes to.
+        .route(
+            "/api/housekeeping/cleaning",
+            get(routes::housekeeping::list_cleaning_progress),
+        )
+        // Room signals — the DESK half of ADR 0008 (migration 089). Same
+        // request/response shapes and the same service as the `/hk` twins, so
+        // reception and the maid surface cannot answer the same action
+        // differently; the role here is constantly `SignalRole::Desk`.
+        // PG-canonical only: no writeback intent, no legacy write. Unlike the
+        // `/hk` paths these are NOT ville-guard-exempt — an exemption exists so
+        // a maid's work is not collateral damage of a FRONT-DESK write-policy
+        // toggle, and these are front-desk mutations.
+        .route(
+            "/api/housekeeping/signals",
+            get(routes::housekeeping::list_signals),
+        )
+        .route(
+            "/api/housekeeping/rooms/{id}/signals",
+            post(routes::housekeeping::raise_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/ack",
+            post(routes::housekeeping::ack_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/done",
+            post(routes::housekeeping::done_signal),
+        )
+        .route(
+            "/api/housekeeping/signals/{id}/cancel",
+            post(routes::housekeeping::cancel_signal),
         )
         // Bookings CRUD (canonical)
         .route(
@@ -860,6 +1231,14 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/reports/sales-by-customer",
             get(routes::new_reports::get_sales_by_customer),
         )
+        // Direct-booking program D3 — bookings / room-nights / gross revenue /
+        // cancellations bucketed by `ht_bookings.book_channel` + `book_source`
+        // (docs/channel-rollup.md). Read-only, branch-aware, booking-centric
+        // (NOT the check-in basis the five reports above share).
+        .route(
+            "/api/reports/channel-rollup",
+            get(routes::new_reports::get_channel_rollup),
+        )
         // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
         .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Daily guest rosters / desk paperwork (task #43). FULL lists (no silent
@@ -1031,7 +1410,13 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/products/{id}/stock-adjust",
             post(routes::new_products::adjust_stock),
         )
-        // Maintenance Management
+        // Maintenance — READ-ONLY HISTORY as of wave-5 (2026-08-16). The PMS
+        // แจ้งซ่อม intake duplicated the Housekeeping ops app, which the owner
+        // made the system of record for work orders, so the three writes answer
+        // 410 Gone (Thai body naming the housekeeping app) and the Kanban UI
+        // that drove them is deleted. The GETs stay so the existing rows remain
+        // readable — the table held 0 rows at both properties when this landed.
+        // Same disposition as the retired `ht_hk_broken_reports` intake.
         .route(
             "/api/maintenance/categories",
             get(routes::new_maintenance::list_categories),
@@ -1039,22 +1424,32 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/maintenance/requests",
             get(routes::new_maintenance::list_requests)
-                .post(routes::new_maintenance::create_request),
+                .post(routes::new_maintenance::retired_create_request),
         )
         .route(
             "/api/maintenance/requests/{id}",
-            get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request),
+            get(routes::new_maintenance::get_request)
+                .put(routes::new_maintenance::retired_update_request),
         )
         .route(
             "/api/maintenance/requests/{id}/status",
-            put(routes::new_maintenance::update_request_status),
+            put(routes::new_maintenance::retired_update_request_status),
         )
         // Sync status
         .route("/api/sync/status", get(routes::new_sync::get_sync_status))
         // Real-time domain-event stream (Phase 4a per architecture.md §3.6e).
-        // Long-lived SSE connection; one PgListener per client.
+        // Long-lived SSE connection, but POOL-FREE after auth: it subscribes
+        // to the per-site broadcast fan-out fed by the startup listener tasks
+        // above (was one PgListener — i.e. one pool slot — per client until
+        // the 2026-07-29 exhaustion incident).
         .route("/api/events", get(routes::events::stream))
         .with_state(app_state)
+        // iHOTEL room-status readers for `GET /api/housekeeping/cleaning`
+        // (wave-5 IF-1). Read-only adapters, shared with `/hk` rather than
+        // rebuilt, so the maid and reception merge the same answer. Absent =
+        // the supported fallback (canonical mirror + stale flag), which is why
+        // the handler extracts it as `Option<Extension<_>>`.
+        .layer(Extension(room_flags_readers))
         // Phase 4 PR2: gate every route above behind the cookie-session
         // auth middleware. The middleware itself is a no-op when
         // `AUTH_ENABLED=false` (the production default), so this is
@@ -1067,36 +1462,7 @@ fn build_new_routes(app_state: AppState) -> Router {
         .layer(ville_write_guard_layer)
 }
 
-/// Guard: when `HFVILLE_WRITES_ENABLED` is off, reject any mutating
-/// (POST/PUT/PATCH/DELETE) request carrying `?branch=hfville` with 403 — before
-/// it can reach a handler that would write the HF Hotel pool. Robustly parses
-/// the `branch` query param (URL-decoded) rather than substring-matching.
-async fn ville_write_guard(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let mutating = matches!(
-        *req.method(),
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
-    if mutating && !state.hfville_writes_enabled {
-        let targets_ville = req
-            .uri()
-            .query()
-            .map(|q| {
-                form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "branch" && v == "hfville")
-            })
-            .unwrap_or(false);
-        if targets_ville {
-            return hotel_backend::error::ApiError::Forbidden(
-                "HF Ville writes are disabled (HFVILLE_WRITES_ENABLED=false); manage HF Ville via iHOTEL"
-                    .to_string(),
-            )
-            .into_response();
-        }
-    }
-    next.run(req).await
-}
+// `ville_write_guard` now lives in the lib
+// (`hotel_backend::middleware::ville_guard`) so its decision matrix is
+// unit-testable and integration tests can mount the real layered router.
+use hotel_backend::middleware::ville_guard::ville_write_guard;
