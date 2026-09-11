@@ -50,6 +50,8 @@
 //! and the writeback recipes already round-trip; we don't introduce a
 //! new enum.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use uuid::Uuid;
@@ -58,6 +60,7 @@ use crate::db::DbPool;
 use crate::outbox::event::{BookingSnapshot, DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, GateField, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::checkin::resolve_customer_or_eager_mirror;
 use crate::sync::parent_loader::BookingAggregate;
@@ -118,7 +121,10 @@ impl MssqlChangeMapper for BookingHeaderMapper {
         // row is NULL, but the watcher's `pk_<col>` aliasing keeps the
         // value addressable by the same column name (verified in
         // `bin/sync.rs::materialise_row`).
-        row.try_get_str("Book_ID").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_ID")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -145,8 +151,8 @@ impl MssqlChangeMapper for BookingRoomsMapper {
         // For D rows we cannot resolve `Book_No` from this row alone
         // (CT only carries the actual PK); the per-tick coalescing
         // layer picks the parent up via its own header / sibling CT
-        // row almost always present in the same TX (cheatsheet §3.3
-        // "Cancel cascade" + "Delete on edit").
+        // row almost always present in the same TX (cheatsheet
+        // §"Table: `HT_Book_Ds` (A)" "Cancel cascade" + "Delete on edit").
         &["id"]
     }
 
@@ -169,7 +175,10 @@ impl MssqlChangeMapper for BookingRoomsMapper {
         //         return None and rely on a sibling CT row (header
         //         UPDATE or another child's I/U) to pull this booking
         //         into the aggregate sweep.
-        row.try_get_str("Book_No").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_No")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -211,7 +220,10 @@ impl MssqlChangeMapper for BookingDatesMapper {
     }
 
     fn coalesce_key(&self, row: &dyn MappableRow) -> Option<String> {
-        row.try_get_str("Book_no").ok().flatten().map(str::to_string)
+        row.try_get_str("Book_no")
+            .ok()
+            .flatten()
+            .map(str::to_string)
     }
 }
 
@@ -236,22 +248,33 @@ struct ExistingBooking {
     book_deposit_amount: Option<f64>,
     book_checkin: NaiveDate,
     book_checkout: NaiveDate,
-    /// Current `ht_booking_rooms` row count for this booking. Needed by
-    /// `existing_matches` so a header-unchanged + rooms-changed transition
-    /// (notably N→0 from iHOTEL's §3.7 delete-then-reinsert or §3.6
-    /// cancel-on-room flows) is NOT treated as idempotent. Without this
-    /// the early-return skips `replace_rooms` and leaves stale junction
-    /// rows behind — regression caught by
+    /// Current `ht_booking_rooms` CONTENT for this booking — the
+    /// `(br_room_id, br_price_per_night)` pair per junction row. Needed
+    /// by `existing_matches` so a header-unchanged + rooms-changed
+    /// transition (notably N→0 from iHOTEL's §3.7 delete-then-reinsert
+    /// or §3.6 cancel-on-room flows) is NOT treated as idempotent.
+    /// Without this the early-return skips `replace_rooms` and leaves
+    /// stale junction rows behind — regression caught by
     /// `re_apply_with_zero_rooms_clears_stale_booking_rooms` in CI on
     /// 2026-05-18.
     ///
-    /// Compared against the count of RESOLVABLE projection lines (not
-    /// raw `projection.rooms.len()`) since 2026-06-11: a line whose
-    /// room can't be found in `ht_rooms_new` is warn-skipped by
-    /// `replace_rooms`, so comparing against the raw count made
-    /// `existing_matches` permanently false and every CT touch on the
-    /// booking re-emitted `BookingModified` forever.
-    rooms_count: i64,
+    /// Was a bare `count(*)` until 2026-07-28. A count is blind to the
+    /// single most common iHOTEL room edit: `FrmAddBook2.SAVE_EDIT` is
+    /// field-agnostic (DELETE + re-INSERT of all four booking tables on
+    /// ANY edit), so a receptionist swapping room 402→403 re-writes an
+    /// otherwise byte-identical header at a CONSTANT room count. Every
+    /// gate term held, `apply_booking_aggregate` returned `Ok(None)`
+    /// before `replace_rooms` ever ran, and canonical kept the old room
+    /// permanently. The reconcile hash can't catch it either
+    /// (`booking_canonical_hash` hashes `book_id|checkin|checkout|
+    /// cust_no` only — no room data), so the class was silent in BOTH
+    /// detection paths. 1176 of 1178 live bookings carry room numbers.
+    ///
+    /// Compared against the RESOLVED projection lines (not raw
+    /// `projection.rooms`) since 2026-06-11 — see
+    /// [`booking_rooms_match`] for why that stays true of the set
+    /// comparison.
+    rooms: Vec<ExistingBookingRoom>,
     /// Denormalised customer pointer — compared by `existing_matches`
     /// since 2026-06-11 (audit P1 #6): iHOTEL's customer-delete cascade
     /// (`UPDATE HT_Book_H SET Book_Cust_ID='C0000'`, cheatsheet §3.24)
@@ -259,10 +282,34 @@ struct ExistingBooking {
     /// silently skipped the re-point.
     legacy_cust_no: Option<String>,
     /// Booking notes — included in the idempotency comparison (guarded
-    /// on the projection carrying a value, mirroring the
-    /// `COALESCE($7, book_notes)` write semantics) so a notes-only
-    /// iHOTEL edit re-applies instead of silently skipping.
+    /// on the projection, mirroring the `COALESCE($7, book_notes)` write
+    /// semantics) so a notes-only iHOTEL edit re-applies instead of
+    /// silently skipping. Since ADR 0005 / issue #269, the gate also
+    /// recognises a genuine legacy clear (`LegacyNotes::Cleared`) as a
+    /// mismatch against any non-empty value here — see
+    /// `HEADER_GATE_FIELDS`'s `book_notes` term.
     book_notes: Option<String>,
+    /// Current `ht_bookings.book_room_type_id` (migration 094 / #304
+    /// B8c). Compared by the `book_room_type_id` gate term so a legacy
+    /// room-TYPE change on a "ระบุประเภทห้อง" booking re-applies instead
+    /// of freezing behind an otherwise-identical header (that booking
+    /// shape has no `ht_booking_rooms` rows either, so the room stage
+    /// cannot notice it).
+    book_room_type_id: Option<i32>,
+}
+
+/// One `ht_booking_rooms` row as it currently lives in PG. Deliberately
+/// the same shape as [`ResolvedRoomLine`] (the write side): the gate's
+/// job is to answer "would `replace_rooms` be a no-op?", so it compares
+/// the room identity + price EXACTLY as `replace_rooms` writes them
+/// (`br_room_id`, `br_price_per_night`). No `ht_rooms_new` join is
+/// needed — `room_no` is `NOT NULL UNIQUE` there, so `room_id` is a
+/// faithful stand-in for the legacy room identity, and keying on the FK
+/// removes any chance of the gate and the mutation disagreeing.
+#[derive(Debug, Clone, PartialEq)]
+struct ExistingBookingRoom {
+    room_id: i32,
+    price_per_night: Option<f64>,
 }
 
 /// In-memory projection of the legacy aggregate, in canonical PG shape.
@@ -276,17 +323,104 @@ struct CanonicalProjection {
     book_checkout: NaiveDate,
     total_amount: Option<f64>,
     deposit_amount: Option<f64>,
-    notes: Option<String>,
+    /// Classified from the raw `Book_room_note` column — see
+    /// [`LegacyNotes`]. NOT a plain `Option<String>`: that representation
+    /// is exactly what let a genuine legacy clear (raw empty string)
+    /// collapse onto "never observed" (raw NULL), the issue #269 /
+    /// ADR 0005 §3b silent-clear gap.
+    notes: LegacyNotes,
     /// One per `HT_Book_Ds` row — the room number (legacy stores it in
     /// the misleading `Book_Room_Type` column per cheatsheet §3.4) +
     /// optional per-room price.
     rooms: Vec<RoomLine>,
+    /// RAW legacy room-TYPE code, populated ONLY for a
+    /// `HT_Book_H.Book_room_type = 1` booking ("ระบุประเภทห้อง", cheatsheet
+    /// §3.3), where `HT_Book_Ds.Book_Room_Type` holds a type code rather than
+    /// a room number. Taken from the first non-cancelled Ds line — the same
+    /// "first line speaks for the booking" convention `build_event` already
+    /// uses for `room_no`. `None` for a mode-2 booking (there the type is
+    /// DERIVED from the assigned room) and for a header with no usable line.
+    ///
+    /// Kept separate from `book_room_type_id` because projection is PURE:
+    /// resolving a code to a canonical id needs the transaction.
+    book_room_type_code: Option<String>,
+    /// Canonical `ht_bookings.book_room_type_id` (migration 094 / issue #304
+    /// B8c) — filled by [`resolve_projected_room_type`] AFTER projection and
+    /// BEFORE the idempotency gate, so the gate compares what will actually
+    /// be written. `None` = type unknown, which `repository::channel` reads
+    /// as "cap this parked claim property-wide" (the #304 fallback).
+    book_room_type_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct RoomLine {
     room_no: String,
     price_per_night: Option<f64>,
+}
+
+/// Tri-state classification of the raw legacy `Book_room_note` column
+/// (ADR 0005 §4 — `book_notes` half of issue #269).
+///
+/// `Option<String>` cannot represent "legacy explicitly cleared the note"
+/// separately from "legacy never populated / we haven't observed it" —
+/// both a raw SQL NULL and a raw empty string collapsed onto `None`
+/// before this fix (`project_aggregate`'s old
+/// `.filter(|s| !s.is_empty())`), so a receptionist's ordinary
+/// "select-all, delete, save" edit (which writes an empty string, not
+/// NULL) was indistinguishable from "nothing changed" and silently
+/// skipped by the guarded gate term — no reconcile signal either, since
+/// `book_notes` is not a reconcile-hash input (§2/§3b of the ADR).
+///
+/// Unlike `legacy_cust_no` (ADR 0005 §4, "Unset vs. Cleared cannot be
+/// read off the raw column alone"), classification here needs no context
+/// from `fetch_existing` / INSERT-vs-UPDATE: `Book_room_note` is a plain
+/// nullable column (`docs/legacy-app/SCHEMA.sql` §"Table: dbo.HT_Book_H" "[Book_room_note] text"), so raw
+/// NULL vs. raw `""` vs. raw non-empty is a real, always-available
+/// distinction straight off the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacyNotes {
+    /// Raw SQL NULL. No opinion — the gate treats this as "nothing to
+    /// check" and the write preserves whatever canonical already has
+    /// (`COALESCE($n, book_notes)` with a NULL `$n`), same as the old
+    /// `None` behaviour.
+    Unset,
+    /// Raw empty string — an explicit legacy clear. Must defeat the gate
+    /// and bind a real (non-NULL) value so `COALESCE` actually applies
+    /// it.
+    Cleared,
+    /// Raw non-empty string — the current legacy note text.
+    Value(String),
+}
+
+/// Classify a raw `try_get_str("Book_room_note")` result into
+/// [`LegacyNotes`]. See that type's doc comment for the NULL/""/value
+/// distinction this exists to preserve.
+fn classify_legacy_notes(raw: Option<&str>) -> LegacyNotes {
+    match raw {
+        None => LegacyNotes::Unset,
+        Some("") => LegacyNotes::Cleared,
+        Some(s) => LegacyNotes::Value(s.to_string()),
+    }
+}
+
+/// What to bind for `book_notes`'s `COALESCE($n, book_notes)` write
+/// parameter, kept in lock-step with the [`LegacyNotes`] gate term below
+/// (ADR 0005 §4's "the write must change in lock-step with the gate, or
+/// a `Cleared` mismatch just spins"):
+///
+/// * `Unset` binds SQL NULL — `COALESCE` preserves the existing value,
+///   today's (pre-fix) behaviour, unchanged.
+/// * `Cleared` binds `Some("")` — a real, non-NULL bind so `COALESCE`
+///   actually applies it. This mirrors the raw legacy byte content (an
+///   explicit empty string, not a magic sentinel) rather than inventing
+///   new plumbing; the SQL text itself does not change.
+/// * `Value(x)` binds `Some(x)`, unchanged.
+fn notes_bind(notes: &LegacyNotes) -> Option<&str> {
+    match notes {
+        LegacyNotes::Unset => None,
+        LegacyNotes::Cleared => Some(""),
+        LegacyNotes::Value(v) => Some(v.as_str()),
+    }
 }
 
 /// Re-sync one booking aggregate. Idempotent — safe to call any number
@@ -335,11 +469,14 @@ struct RoomLine {
 /// 2. **FrmAddBook2.SAVE_EDIT delete-then-reinsert** (cheatsheet §3.7)
 ///    transiently deletes every `HT_Book_Ds` before re-inserting the
 ///    edited set. CT can surface a snapshot mid-edit.
-/// 3. **Pre-bootstrap / pre-CT data**: bookings that completed before
-///    Phase 5.x CT bootstrap may have lost their Ds rows to the
-///    `frmMain1` 60-day startup prune (cheatsheet §3.7 "Startup prune")
-///    while the legacy app retains the header for receipt / audit
-///    lookups via `HT_CheckIn_H.Cin_Book_no`.
+/// 3. **Pre-bootstrap / pre-CT data**: historical bookings can simply
+///    have no surviving Ds rows — the header is retained for receipt /
+///    audit lookups via `HT_CheckIn_H.Cin_Book_no` long after an edit or
+///    a cancel-on-room left the detail set empty. (NB: `frmMain1`'s
+///    60-day startup prune — cheatsheet §3.7 / §6.7 — deletes
+///    `HT_Book_Date` NIGHT rows only, never `HT_Book_Ds`; that prune is
+///    why `BookingAggregate::nights` may be empty, see
+///    `sync/parent_loader.rs`.)
 ///
 /// We MUST mirror these faithfully so downstream FKs that point at the
 /// header (most importantly `HT_CheckIn_H.Cin_Book_no` →
@@ -363,20 +500,28 @@ pub async fn apply_booking_aggregate(
         return apply_cancelled(tx, book_id).await;
     }
 
-    let projection = project_aggregate(aggregate, book_id)?;
+    let mut projection = project_aggregate(aggregate, book_id)?;
     let existing = fetch_existing(tx, book_id).await?;
 
     // Resolve the per-line room FKs BEFORE the idempotency check so the
-    // junction count comparison only counts RESOLVABLE lines (2026-06-11
-    // fix — see `ExistingBooking::rooms_count`). Unresolvable lines are
-    // warn-skipped, matching `replace_rooms`'s historical behaviour.
+    // junction comparison sees only RESOLVABLE lines (2026-06-11 fix —
+    // see `ExistingBooking::rooms`). Unresolvable lines are skipped,
+    // matching `replace_rooms`'s historical behaviour: the gate compares
+    // what will be WRITTEN against what is STORED, never the raw legacy
+    // line list.
     let resolved_rooms = resolve_room_lines(tx, book_id, &projection.rooms).await?;
 
-    // Idempotent skip — every projected field matches the canonical row.
+    // Room-type attribution (B8c / migration 094) — resolved BEFORE the
+    // idempotency gate so the gate compares what will actually be written,
+    // the same discipline `resolved_rooms` follows.
+    projection.book_room_type_id =
+        resolve_projected_room_type(tx, book_id, &projection, &resolved_rooms).await?;
+
+    // Idempotent skip — every projected field matches the canonical row,
+    // INCLUDING the per-room (room_id, price) set (2026-07-28: a bare
+    // room count let iHOTEL's constant-cardinality room swap through).
     if let Some(ex) = existing.as_ref() {
-        if existing_matches(ex, &projection, resolved_rooms.len() as i64)
-            && ex.aggregate_id.is_some()
-        {
+        if existing_matches(ex, &projection, &resolved_rooms) && ex.aggregate_id.is_some() {
             return Ok(None);
         }
     }
@@ -533,10 +678,11 @@ fn project_aggregate(
 
     let total_amount = header.try_get_decimal("Book_Price_Total")?;
     let deposit_amount = header.try_get_decimal("Book_Price_Pay")?;
-    let notes = header
-        .try_get_str("Book_room_note")?
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
+    // Classify NULL vs "" vs a real value (ADR 0005 §4 / issue #269) —
+    // do NOT collapse the raw empty-string clear onto `None` here as the
+    // old code did; that collapse is exactly what made a genuine legacy
+    // clear indistinguishable from "never observed".
+    let notes = classify_legacy_notes(header.try_get_str("Book_room_note")?);
 
     // `HT_Book_H.Book_room_type` disambiguates what `HT_Book_Ds.
     // Book_Room_Type` holds (cheatsheet §1.5 / §3.3 / §3.4):
@@ -555,6 +701,11 @@ fn project_aggregate(
     // path).
     let book_room_type = header.try_get_i32("Book_room_type").ok().flatten();
     let mut rooms = Vec::with_capacity(agg.rooms.len());
+    // B8c (migration 094): on a mode-1 booking those same Ds lines carry the
+    // room-TYPE code the reservation wants. It is the ONLY record of what a
+    // parked booking claims, so capture it here instead of dropping the lines
+    // entirely as the pre-B8c code did.
+    let mut book_room_type_code: Option<String> = None;
     if book_room_type != Some(1) {
         for r in &agg.rooms {
             // Skip cancelled lines (Book_status=3 per cheatsheet §3.4).
@@ -574,12 +725,31 @@ fn project_aggregate(
             });
         }
     } else if !agg.rooms.is_empty() {
+        // First non-cancelled line wins — the same "first line speaks for the
+        // booking" rule `build_event` uses for `room_no`, and the same one the
+        // desk path applies when it derives the type from the first assigned
+        // room. A blank code stays `None`: iHOTEL leaves `Book_Room_Type=''`
+        // on cancelled lines (observed on R014826).
+        book_room_type_code = agg
+            .rooms
+            .iter()
+            .filter(|r| r.try_get_i32("Book_status").ok().flatten() != Some(3))
+            .find_map(|r| {
+                r.try_get_str("Book_Room_Type")
+                    .ok()
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+            });
         tracing::debug!(
             target: "sync::booking",
             book_id,
             ds_lines = agg.rooms.len(),
+            room_type_code = ?book_room_type_code,
             "Book_room_type=1 (no specific rooms): Ds lines carry room-TYPE \
-             codes — projecting header-only, no ht_booking_rooms assignments"
+             codes — projecting header-only, no ht_booking_rooms assignments; \
+             the first live line's code becomes book_room_type_id"
         );
     }
 
@@ -593,6 +763,10 @@ fn project_aggregate(
         deposit_amount,
         notes,
         rooms,
+        book_room_type_code,
+        // Resolved against `ht_room_types` by `resolve_projected_room_type`
+        // once a transaction is available — projection stays pure.
+        book_room_type_id: None,
     })
 }
 
@@ -612,18 +786,20 @@ fn legacy_status_to_pg(legacy: &str) -> &'static str {
 /// (legacy stores them at midnight per the booking-create recipe). PG's
 /// `book_checkin/checkout` are `DATE` columns — drop the time component.
 fn derive_stay_range(header: &dyn MappableRow) -> Result<(NaiveDate, NaiveDate), SyncError> {
-    let date_in: NaiveDateTime = header
-        .try_get_datetime("Book_Date_in")?
-        .ok_or_else(|| SyncError::Mapper {
-            table: BOOK_H_TABLE,
-            message: "Book_Date_in is NULL on header".into(),
-        })?;
-    let date_out: NaiveDateTime = header
-        .try_get_datetime("Book_Date_out")?
-        .ok_or_else(|| SyncError::Mapper {
-            table: BOOK_H_TABLE,
-            message: "Book_Date_out is NULL on header".into(),
-        })?;
+    let date_in: NaiveDateTime =
+        header
+            .try_get_datetime("Book_Date_in")?
+            .ok_or_else(|| SyncError::Mapper {
+                table: BOOK_H_TABLE,
+                message: "Book_Date_in is NULL on header".into(),
+            })?;
+    let date_out: NaiveDateTime =
+        header
+            .try_get_datetime("Book_Date_out")?
+            .ok_or_else(|| SyncError::Mapper {
+                table: BOOK_H_TABLE,
+                message: "Book_Date_out is NULL on header".into(),
+            })?;
     Ok((date_in.date(), date_out.date()))
 }
 
@@ -636,21 +812,26 @@ async fn fetch_existing(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_book_id: &str,
 ) -> Result<Option<ExistingBooking>, SyncError> {
-    let row = sqlx::query_as::<_, (
-        i32,
-        Option<Uuid>,
-        Option<String>,
-        i32,
-        Option<f64>,
-        Option<f64>,
-        NaiveDate,
-        NaiveDate,
-        Option<String>,
-        Option<String>,
-    )>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            i32,
+            Option<Uuid>,
+            Option<String>,
+            i32,
+            Option<f64>,
+            Option<f64>,
+            NaiveDate,
+            NaiveDate,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+        ),
+    >(
         "SELECT book_id, aggregate_id, book_status, book_cust_id, \
                 book_total_amount::float8, book_deposit_amount::float8, \
-                book_checkin, book_checkout, legacy_cust_no, book_notes \
+                book_checkin, book_checkout, legacy_cust_no, book_notes, \
+                book_room_type_id \
            FROM ht_bookings \
           WHERE legacy_book_id = $1 \
           LIMIT 1",
@@ -670,17 +851,30 @@ async fn fetch_existing(
         book_checkout,
         legacy_cust_no,
         book_notes,
+        book_room_type_id,
     )) = row
     else {
         return Ok(None);
     };
 
-    let rooms_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    // Room CONTENT, not a count (2026-07-28) — a count is blind to the
+    // constant-cardinality room swap that iHOTEL's field-agnostic
+    // `SAVE_EDIT` produces. `::float8` mirrors the header amounts'
+    // read-back cast; the column is `DECIMAL(10,2)`.
+    let rooms: Vec<ExistingBookingRoom> = sqlx::query_as::<_, (i32, Option<f64>)>(
+        "SELECT br_room_id, br_price_per_night::float8 \
+           FROM ht_booking_rooms \
+          WHERE br_book_id = $1",
     )
     .bind(book_id_serial)
-    .fetch_one(&mut **tx)
-    .await?;
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|(room_id, price_per_night)| ExistingBookingRoom {
+        room_id,
+        price_per_night,
+    })
+    .collect();
 
     Ok(Some(ExistingBooking {
         book_id_serial,
@@ -691,42 +885,318 @@ async fn fetch_existing(
         book_deposit_amount,
         book_checkin,
         book_checkout,
-        rooms_count,
+        rooms,
         legacy_cust_no,
         book_notes,
+        book_room_type_id,
     }))
 }
 
 /// Compare the existing canonical row to the freshly projected legacy
 /// one. Skip publication when every mirrored field matches.
 ///
-/// `resolvable_rooms_count` is the number of projection lines whose room
-/// actually resolves in `ht_rooms_new` — NOT `p.rooms.len()`. Lines that
-/// don't resolve are warn-skipped by `replace_rooms`, so comparing
-/// against the raw count could never converge (every CT touch would
-/// re-emit `BookingModified`).
+/// `resolved` is the output of [`resolve_room_lines`] — the projection
+/// lines whose room actually resolves in `ht_rooms_new`, i.e. EXACTLY
+/// what `replace_rooms` is about to write. It is NOT `p.rooms`: lines
+/// that don't resolve never reach the junction, so comparing against the
+/// raw projection could never converge (every CT touch would re-emit
+/// `BookingModified`). See [`booking_rooms_match`].
 ///
-/// `legacy_cust_no` and `notes` comparisons are guarded on the
-/// projection carrying a value, mirroring their `COALESCE($n, existing)`
-/// write-semantics: a transient NULL on the legacy side never overwrites
-/// the canonical value, so treating it as a mismatch would also force a
-/// non-converging re-apply every tick. A Some-valued change — including
-/// the `'C0000'` customer-delete-cascade re-point (cheatsheet §3.24) and
-/// a notes-only edit — MUST mismatch so the apply re-runs.
+/// `legacy_cust_no` is guarded on the projection carrying a value,
+/// mirroring its `COALESCE($n, existing)` write-semantics: a transient
+/// NULL on the legacy side never overwrites the canonical value, so
+/// treating it as a mismatch would also force a non-converging re-apply
+/// every tick. A Some-valued change — including the `'C0000'`
+/// customer-delete-cascade re-point (cheatsheet §3.24) — MUST mismatch
+/// so the apply re-runs. `legacy_cust_no` still cannot represent a
+/// genuine legacy NULL-clear (ADR 0005 §3a — no known live trigger,
+/// deliberately not fixed here).
+///
+/// `notes` is guarded the same way on [`LegacyNotes::Unset`] (no
+/// opinion), but — unlike `legacy_cust_no` — it ALSO catches a genuine
+/// clear: `LegacyNotes::Cleared` (raw legacy empty string) mismatches
+/// against any non-empty canonical value, so a notes-only edit AND a
+/// notes-clear both re-run the apply (ADR 0005 §4 / issue #269
+/// `book_notes` fix).
 fn existing_matches(
     ex: &ExistingBooking,
     p: &CanonicalProjection,
-    resolvable_rooms_count: i64,
+    resolved: &[ResolvedRoomLine],
 ) -> bool {
-    ex.book_status.as_deref() == Some(p.book_status.as_str())
-        && ex.book_total_amount == p.total_amount
-        && ex.book_deposit_amount == p.deposit_amount
-        && ex.book_checkin == p.book_checkin
-        && ex.book_checkout == p.book_checkout
-        && ex.rooms_count == resolvable_rooms_count
-        && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
-        && (p.notes.is_none() || ex.book_notes == p.notes)
+    // Two stages, deliberately NOT flattened into one table: the header
+    // terms compare `ExistingBooking` against the projection, while the
+    // room stage compares two SLICES. Both are pure, so evaluating the
+    // header block first is behaviour-identical to the previous
+    // hand-written `&&` chain.
+    HEADER_GATE_FIELDS.iter().all(|f| (f.matches)(ex, p))
+        && booking_rooms_match(&ex.rooms, resolved)
 }
+
+/// The header half of the idempotency gate, as NAMED comparators.
+///
+/// [`existing_matches`] is `.all()` over this table, so removing a name
+/// removes the comparison. Names are the canonical (PG) column, which is
+/// also what `scheduler::sync::booking_canonical_hash` reads, so
+/// [`HASH_INPUTS`] cites them directly. See [`crate::sync::gate_guard`].
+const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 8] = [
+    GateField {
+        name: "book_status",
+        guarded: false,
+        matches: |ex, p| ex.book_status.as_deref() == Some(p.book_status.as_str()),
+    },
+    GateField {
+        name: "book_total_amount",
+        guarded: false,
+        matches: |ex, p| ex.book_total_amount == p.total_amount,
+    },
+    GateField {
+        name: "book_deposit_amount",
+        guarded: false,
+        matches: |ex, p| ex.book_deposit_amount == p.deposit_amount,
+    },
+    GateField {
+        name: "book_checkin",
+        guarded: false,
+        matches: |ex, p| ex.book_checkin == p.book_checkin,
+    },
+    GateField {
+        name: "book_checkout",
+        guarded: false,
+        matches: |ex, p| ex.book_checkout == p.book_checkout,
+    },
+    // Guarded — `COALESCE($9, legacy_cust_no)` write semantics: a
+    // transient NULL never overwrites, so treating it as a mismatch
+    // would re-emit `BookingModified` every tick without converging. A
+    // Some→Some move (including the `'C0000'` delete cascade) still
+    // mismatches, which is what the reconcile hash needs.
+    GateField {
+        name: "legacy_cust_no",
+        guarded: true,
+        matches: |ex, p| p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no,
+    },
+    // Guarded — `COALESCE($7, book_notes)` — but now tri-state-aware
+    // (ADR 0005 §4 / issue #269): `Unset` still short-circuits to "no
+    // opinion" (same as the old `None` behaviour), while `Cleared` is a
+    // genuine legacy empty-string clear and MUST mismatch against a
+    // populated canonical value so the apply re-runs and the write
+    // actually converges instead of silently freezing forever.
+    GateField {
+        name: "book_notes",
+        guarded: true,
+        matches: |ex, p| match &p.notes {
+            LegacyNotes::Unset => true,
+            LegacyNotes::Cleared => matches!(ex.book_notes.as_deref(), None | Some("")),
+            LegacyNotes::Value(v) => ex.book_notes.as_deref() == Some(v.as_str()),
+        },
+    },
+    // UNGUARDED on purpose (B8c / migration 094). `book_room_type_id` is
+    // written unconditionally — no COALESCE — so the comparison converges in
+    // one apply in BOTH directions, including a legacy type that becomes
+    // unresolvable (Some → None). Guarding it would make a type change
+    // invisible on exactly the booking shape that needs it most: a
+    // "ระบุประเภทห้อง" booking has no `ht_booking_rooms` rows either, so
+    // nothing else in the gate could notice.
+    //
+    // Note the comparison is against the RESOLVED id, which is why
+    // `apply_booking_aggregate` fills `p.book_room_type_id` before calling
+    // `existing_matches` — the same rule the room stage follows.
+    GateField {
+        name: "book_room_type_id",
+        guarded: false,
+        matches: |ex, p| ex.book_room_type_id == p.book_room_type_id,
+    },
+];
+
+/// The second gate stage: the `ht_booking_rooms` SET comparison.
+///
+/// Modelled as ONE named term (`rooms`) covering both the room identity
+/// and its per-room price, because that is the granularity the stage
+/// actually decides at. Shipped 2026-07-28 after a bare room COUNT let
+/// iHOTEL's constant-cardinality 402→403 swap through the gate.
+const ROOM_SET_GATE_FIELD: GateField<[ExistingBookingRoom], [ResolvedRoomLine]> = GateField {
+    name: "rooms",
+    guarded: false,
+    matches: |existing, resolved| {
+        use std::collections::HashMap;
+
+        // Intended junction state = resolved lines deduped by room_id,
+        // first-wins (mirrors ON CONFLICT DO NOTHING).
+        let mut intended: HashMap<i32, Option<f64>> = HashMap::with_capacity(resolved.len());
+        for r in resolved {
+            intended.entry(r.room_id).or_insert(r.price_per_night);
+        }
+
+        // `uq_ht_br_bookroom UNIQUE (br_book_id, br_room_id)` guarantees
+        // the stored side is already unique per room, so a length check
+        // on the deduped map is exact.
+        if existing.len() != intended.len() {
+            return false;
+        }
+        existing.iter().all(|ex| match intended.get(&ex.room_id) {
+            Some(price) => prices_match(ex.price_per_night, *price),
+            None => false,
+        })
+    },
+};
+
+/// Gate term names (both stages), for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    let mut names = gate_guard::gate_field_names(&HEADER_GATE_FIELDS);
+    names.push(ROOM_SET_GATE_FIELD.name);
+    names
+}
+
+/// The inputs `scheduler::sync::booking_canonical_hash` consumes, as a
+/// descriptor table over the SAME projection the gate compares.
+///
+/// Order IS the hash-body order; byte parity is pinned by
+/// `bookings_hash_bytes_unchanged_for_golden_inputs`.
+///
+/// `book_status` is deliberately absent — legacy `View_Booking_Ds.
+/// Book_Status` is an integer ledger code while canonical
+/// `ht_bookings.book_status` is a translated literal, so it is not a
+/// hash input (the gate compares it anyway; the invariant only requires
+/// gate ⊇ hash).
+const HASH_INPUTS: [HashInput<CanonicalProjection>; 4] = [
+    HashInput {
+        name: "legacy_book_id",
+        // Row identity: `fetch_existing` SELECTs `WHERE legacy_book_id =
+        // $1`.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.legacy_book_id.clone(),
+        mutate: |p| p.legacy_book_id = "R999999".into(),
+    },
+    HashInput {
+        name: "book_checkin",
+        gated_by: &["book_checkin"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.book_checkin.to_string(),
+        mutate: |p| {
+            p.book_checkin = p
+                .book_checkin
+                .succ_opt()
+                .expect("fixture date has a successor")
+        },
+    },
+    HashInput {
+        name: "book_checkout",
+        gated_by: &["book_checkout"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.book_checkout.to_string(),
+        mutate: |p| {
+            p.book_checkout = p
+                .book_checkout
+                .succ_opt()
+                .expect("fixture date has a successor")
+        },
+    },
+    HashInput {
+        name: "legacy_cust_no",
+        gated_by: &["legacy_cust_no"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.legacy_cust_no.clone().unwrap_or_default(),
+        // Some→Some, mirroring iHOTEL's customer-delete cascade
+        // (cheatsheet §3.24). The gate term is guarded, so a Some→None
+        // mutation would NOT defeat it — and must not, since the
+        // COALESCE write could never converge that transition.
+        mutate: |p| p.legacy_cust_no = Some("C0000".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// Render the `bookings` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — see the customer mapper's equivalent for why.
+#[cfg(test)]
+fn hash_body(p: &CanonicalProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
+}
+
+/// True when `ht_booking_rooms` already holds exactly what
+/// [`replace_rooms`] would write. Ports the check-in mapper's proven
+/// `rooms_match` pattern (`sync::mappers::checkin::rooms_match`, Track
+/// B2 / T2 HIGH-2) from `(room, status)` pairs to `(room, price)` pairs:
+/// compares the SET, not the sequence, and not a count.
+///
+/// ## Why the SET (2026-07-28)
+///
+/// iHOTEL's `FrmAddBook2.SAVE_EDIT` is field-agnostic — it DELETEs and
+/// re-INSERTs all four booking tables on ANY edit. A receptionist
+/// swapping room 402→403 therefore re-writes a byte-identical header at
+/// an unchanged room count, and the old `rooms_count == count` term
+/// held, short-circuiting `apply_booking_aggregate` to `Ok(None)` before
+/// `replace_rooms` ever ran. Canonical kept the stale room forever, and
+/// the reconcile sweep was blind to it too (`booking_canonical_hash`
+/// carries no room data). Order-insensitivity matters because neither
+/// SELECT is ordered and iHOTEL re-inserts in edit-dialog order.
+///
+/// ## Unresolvable lines (intent preserved from the 2026-06-11 fix)
+///
+/// Both sides of this comparison are post-resolution, so an unresolvable
+/// line is invisible to BOTH: `resolve_room_lines` drops blank-`room_no`
+/// lines (observed on cancelled iHOTEL lines, e.g. R014826) before we
+/// ever get here, and `project_aggregate` projects `Book_room_type=1`
+/// (room-TYPE-code) bookings as header-only. A non-blank room that
+/// misses `ht_rooms_new` never reaches this function at all —
+/// `resolve_room_lines` errors and the watcher holds the watermark. So
+/// the gate compares "what will be written" against "what is stored",
+/// never "what legacy sent" — which is precisely what stopped the
+/// forever-re-emitting `BookingModified` loop, and it stays true term
+/// for term now that the comparison is content-aware.
+///
+/// ## Duplicate room lines
+///
+/// `replace_rooms` INSERTs with `ON CONFLICT (br_book_id, br_room_id) DO
+/// NOTHING`, so two resolved lines for the same room collapse to ONE
+/// junction row carrying the FIRST line's price. The fold below keeps
+/// the first occurrence per `room_id` for the same reason: a comparison
+/// that counted the duplicate would never converge (2 intended vs 1
+/// stored), reintroducing the exact loop this design avoids.
+///
+/// The comparison itself lives in [`ROOM_SET_GATE_FIELD`] so the gate
+/// stage carries a name the contract registry can see; this stays as the
+/// call site + documentation anchor.
+fn booking_rooms_match(existing: &[ExistingBookingRoom], resolved: &[ResolvedRoomLine]) -> bool {
+    (ROOM_SET_GATE_FIELD.matches)(existing, resolved)
+}
+
+/// Compare two per-room prices at the resolution
+/// `ht_booking_rooms.br_price_per_night` can actually store
+/// (`DECIMAL(10,2)`).
+///
+/// Exact `f64` equality is wrong here: legacy `HT_Book_Ds.
+/// Book_Room_Price` is a SQL Server `float`, so a value with sub-satang
+/// precision is ROUNDED on the way into the column and can never read
+/// back equal to the projection. That would leave the gate permanently
+/// false and re-emit `BookingModified` on every CT touch — the same
+/// non-convergence failure mode the 2026-06-11 resolvable-count fix
+/// removed. Two prices are therefore "the same" iff they land on the
+/// same stored value: less than half a satang apart, with a hair of
+/// slack for the float noise in that boundary.
+///
+/// NULL is NOT a value: `replace_rooms` binds `None` as SQL NULL, so
+/// `NULL` vs `0.00` is a real difference and must re-apply.
+fn prices_match(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a - b).abs() < PRICE_MATCH_EPSILON,
+        _ => false,
+    }
+}
+
+/// Half of the `DECIMAL(10,2)` storage resolution (0.005) plus float
+/// slack. Any genuine 1-satang change (0.01) is still a mismatch.
+const PRICE_MATCH_EPSILON: f64 = 0.005_000_1;
 
 async fn update_existing(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -760,8 +1230,9 @@ async fn update_existing(
                 legacy_book_id      = COALESCE(legacy_book_id, $8), \
                 legacy_cust_no      = COALESCE($9, legacy_cust_no), \
                 aggregate_id        = COALESCE(aggregate_id, $10), \
+                book_room_type_id   = $11, \
                 updated_at          = NOW() \
-          WHERE book_id = $11",
+          WHERE book_id = $12",
     )
     .bind(cust_id)
     .bind(p.book_checkin)
@@ -769,10 +1240,17 @@ async fn update_existing(
     .bind(&p.book_status)
     .bind(p.total_amount)
     .bind(p.deposit_amount)
-    .bind(&p.notes)
+    .bind(notes_bind(&p.notes))
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
     .bind(agg_id)
+    // NOT COALESCEd (B8c): the legacy aggregate is the truth for a
+    // legacy-owned booking, so a type that becomes unresolvable must be able
+    // to clear back to NULL. NULL is the honest "unknown", and
+    // `repository::channel` handles it by capping the claim property-wide
+    // (the #304 rule) — strictly safer than freezing a stale type that would
+    // block the WRONG room type forever.
+    .bind(p.book_room_type_id)
     .bind(book_id_serial)
     .execute(&mut **tx)
     .await?;
@@ -792,9 +1270,10 @@ async fn insert_new(
         "INSERT INTO ht_bookings \
              (book_no, book_cust_id, book_checkin, book_checkout, \
               book_status, book_total_amount, book_deposit_amount, book_notes, \
-              legacy_book_id, legacy_cust_no, book_source) \
+              legacy_book_id, legacy_cust_no, book_room_type_id, book_source) \
          VALUES \
-             ($1, $2, $3, $4, $5, $6::float8, $7::float8, $8, $9, $10, 'legacy_app') \
+             ($1, $2, $3, $4, $5, $6::float8, $7::float8, $8, $9, $10, $11, \
+              'legacy_app') \
          RETURNING book_id",
     )
     .bind(&p.legacy_book_id)
@@ -804,9 +1283,10 @@ async fn insert_new(
     .bind(&p.book_status)
     .bind(p.total_amount)
     .bind(p.deposit_amount)
-    .bind(&p.notes)
+    .bind(notes_bind(&p.notes))
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
+    .bind(p.book_room_type_id)
     .fetch_one(&mut **tx)
     .await?;
     Ok(row.0)
@@ -819,13 +1299,24 @@ async fn insert_new(
 struct ResolvedRoomLine {
     room_id: i32,
     price_per_night: Option<f64>,
+    /// The room's own `ht_rooms_new.room_type_id`, read in the SAME lookup
+    /// that resolves `room_id` (B8c / migration 094). On a mode-2 booking
+    /// (`HT_Book_H.Book_room_type = 2`) this is what
+    /// `book_room_type_id` is DERIVED from — matching the desk path, which
+    /// derives from the first assigned room rather than trusting a
+    /// caller-supplied type. Deliberately NOT part of the room-set gate
+    /// comparison: `replace_rooms` does not write it, and the gate's job is
+    /// to answer "would `replace_rooms` be a no-op?".
+    room_type_id: Option<i32>,
 }
 
 /// Resolve every projection room line against `ht_rooms_new`. The
-/// RESOLVED set is what both `existing_matches` (count) and
-/// `replace_rooms` (content) operate on, so the idempotency comparison
-/// and the junction mutation can never disagree (2026-06-11 fix for the
-/// forever-re-emitting `BookingModified` loop on unresolvable lines).
+/// RESOLVED set is what both `existing_matches` (via
+/// [`booking_rooms_match`]) and `replace_rooms` operate on, so the
+/// idempotency comparison and the junction mutation can never disagree
+/// (2026-06-11 fix for the forever-re-emitting `BookingModified` loop on
+/// unresolvable lines; still the invariant now that the comparison is
+/// content-aware rather than a count — 2026-07-28).
 ///
 /// Miss handling (2026-06-12, audit follow-up — matches the checkin
 /// mapper's posture):
@@ -853,16 +1344,17 @@ async fn resolve_room_lines(
             );
             continue;
         }
-        let room_id_row: Option<(i32,)> = sqlx::query_as(
-            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
+        let room_id_row: Option<(i32, Option<i32>)> = sqlx::query_as(
+            "SELECT room_id, room_type_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
         )
         .bind(&r.room_no)
         .fetch_optional(&mut **tx)
         .await?;
         match room_id_row {
-            Some((room_id,)) => out.push(ResolvedRoomLine {
+            Some((room_id, room_type_id)) => out.push(ResolvedRoomLine {
                 room_id,
                 price_per_night: r.price_per_night,
+                room_type_id,
             }),
             None => {
                 return Err(SyncError::Mapper {
@@ -879,6 +1371,140 @@ async fn resolve_room_lines(
         }
     }
     Ok(out)
+}
+
+/// Distinct legacy room-TYPE codes we have already warned about, so an
+/// unmappable code logs ONCE per process instead of once per CT tick forever.
+///
+/// A `HashSet` rather than a counter because the interesting fact is WHICH
+/// codes are unknown (an operator adds the missing `ht_room_types` row from
+/// that list); bounded in practice by iHOTEL's eight-row `HT_SET_RoomType`.
+static UNKNOWN_ROOM_TYPE_CODES: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Decide `ht_bookings.book_room_type_id` for this aggregate (B8c /
+/// migration 094 / issue #304).
+///
+/// Two sources, in the order legacy actually carries the fact:
+///
+/// 1. **A mode-1 booking** (`HT_Book_H.Book_room_type = 1`, iHOTEL's
+///    "ระบุประเภทห้อง" form — cheatsheet §3.3) states the type EXPLICITLY in
+///    `HT_Book_Ds.Book_Room_Type`. This is the case the whole feature exists
+///    for: such a booking projects as header-only, so canonical would
+///    otherwise hold a parked claim with no type at all.
+/// 2. **A mode-2 booking** names rooms, so the type is DERIVED from the first
+///    resolved room — the same rule `service::booking::resolve_room_type`
+///    applies at the desk, which is what makes our own write-back echo
+///    converge instead of flapping.
+///
+/// An unresolvable code yields `None` and is logged once (see
+/// [`UNKNOWN_ROOM_TYPE_CODES`]) — never an error. Erroring would hold the CT
+/// watermark on a pure data-quality value, and unlike the customer FK there
+/// is nothing to lose by proceeding: NULL simply means "type unknown", which
+/// `repository::channel` handles with the property-wide cap that predates
+/// this column. Nothing is dropped — the aggregate still applies in full.
+async fn resolve_projected_room_type(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book_id: &str,
+    p: &CanonicalProjection,
+    resolved_rooms: &[ResolvedRoomLine],
+) -> Result<Option<i32>, SyncError> {
+    if let Some(code) = p.book_room_type_code.as_deref() {
+        let resolved = resolve_room_type_code(tx, code).await?;
+        if resolved.is_none() {
+            // `unwrap_or_else(into_inner)` rather than `unwrap_or(false)`: a
+            // poisoned mutex means some other thread panicked while holding
+            // it, which says nothing about the validity of the SET — and
+            // treating it as "already warned" would silence this diagnostic
+            // for the rest of the process's life, exactly when something has
+            // already gone wrong. Take the inner value and carry on.
+            let mut seen = UNKNOWN_ROOM_TYPE_CODES
+                .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let first_sighting = seen.insert(code.to_string());
+            drop(seen);
+            if first_sighting {
+                tracing::warn!(
+                    target: "sync::booking",
+                    book_id,
+                    room_type_code = %code,
+                    "legacy HT_Book_Ds.Book_Room_Type '{code}' matches no \
+                     ht_room_types row (type_code / type_name / type_name_en) AND \
+                     no ht_rooms_new.room_no — leaving \
+                     ht_bookings.book_room_type_id NULL, so this parked claim is \
+                     capped property-wide instead of per type. Logged once per \
+                     distinct value; add the missing room type (or room) to fix."
+                );
+            }
+        }
+        return Ok(resolved);
+    }
+
+    // Mode 2 (or no usable Ds line): derive from the first assigned room.
+    Ok(resolved_rooms.first().and_then(|r| r.room_type_id))
+}
+
+/// Resolve one legacy mode-1 `HT_Book_Ds.Book_Room_Type` value to a canonical
+/// `ht_room_types.type_id`.
+///
+/// Two lookups, in this order, because production data proves the column is
+/// not as pure as the decompile suggested.
+///
+/// ## 1. As a room TYPE (the documented meaning)
+///
+/// iHOTEL's `HT_SET_RoomType` maps onto our table via `backfill_rooms`:
+/// `id_full → type_code` and `name → type_name` (also copied to
+/// `type_name_en`). Which of those the booking grid writes is not pinned by
+/// the decompile — the column is a free varchar(50) — so all three are
+/// accepted, with the UNIQUE `type_code` winning a tie. Comparison is on the
+/// trimmed literal; no case folding, because Thai type names have no case and
+/// a Latin mismatch should surface as an unmapped-code warning rather than be
+/// silently absorbed.
+///
+/// ## 2. As a room NUMBER (observed, 2026-09-11)
+///
+/// The pre-merge verification against BOTH live sites
+/// (`docs/coexistence/PENDING-VERIFICATIONS.md`, V17) found HF Hotel holds 6
+/// `Book_room_type = 1` headers out of 16,208 and 4 joined `HT_Book_Ds` rows —
+/// three carrying a type NAME (`เตียงเดี่ยว`, `HT_SET_RoomType.name` id 2) and
+/// **one, `R014814`, carrying the room number `402`**. HF Ville holds none at
+/// all (0 of 2,460).
+///
+/// So a mode-1 line CAN hold a room number, and the pure-type reading would
+/// have left `R014814` unattributed. Falling back to `ht_rooms_new.room_no`
+/// and taking that room's own type is both correct for it and strictly safer
+/// than the alternative: the type lookup runs FIRST, so a value that is a
+/// genuine type can never be mistaken for a room, and a value that is neither
+/// still lands on `None` (logged once, property-wide cap).
+///
+/// This does NOT turn the line into a room ASSIGNMENT — `project_aggregate`
+/// still projects mode-1 bookings header-only, which is what keeps the
+/// 2026-06-11 forever-re-emitting loop closed. Only the type is borrowed.
+async fn resolve_room_type_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    code: &str,
+) -> Result<Option<i32>, SyncError> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT type_id FROM ht_room_types \
+          WHERE type_code = $1 OR type_name = $1 OR type_name_en = $1 \
+          ORDER BY (type_code = $1) DESC, type_id \
+          LIMIT 1",
+    )
+    .bind(code)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((type_id,)) = row {
+        return Ok(Some(type_id));
+    }
+
+    // Not a type — try it as a room number (the `R014814` shape).
+    let by_room: Option<(Option<i32>,)> =
+        sqlx::query_as("SELECT room_type_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1")
+            .bind(code)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(by_room.and_then(|(room_type_id,)| room_type_id))
 }
 
 /// Replace `ht_booking_rooms` for this booking. Conservative: drop and
@@ -1116,7 +1742,9 @@ mod tests {
     #[test]
     fn project_aggregate_skips_cancelled_ds_rows() {
         let mut cancelled = ds_row("R014810", "402");
-        cancelled.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let agg = BookingAggregate {
             header: Some(header_row("R014810", "C21610", "จอง")),
             rooms: vec![cancelled, ds_row("R014810", "414")],
@@ -1140,8 +1768,14 @@ mod tests {
         assert!(err.to_string().contains("Book_Date_in"));
     }
 
+    /// ADR 0005 §4 / issue #269: a raw empty string on `Book_room_note`
+    /// (an ordinary "select-all, delete, save" clear in iHOTEL's notes
+    /// box) must classify as `Cleared` — NOT collapse onto `Unset` the
+    /// way the pre-fix code's `.filter(|s| !s.is_empty())` did. Renamed
+    /// from `project_aggregate_drops_empty_notes`, which pinned the old
+    /// (buggy) collapsing behaviour this fix removes.
     #[test]
-    fn project_aggregate_drops_empty_notes() {
+    fn project_aggregate_classifies_empty_note_as_cleared() {
         let mut header = header_row("R014810", "C21610", "จอง");
         header
             .cells
@@ -1152,7 +1786,40 @@ mod tests {
             nights: vec![],
         };
         let p = project_aggregate(&agg, "R014810").unwrap();
-        assert!(p.notes.is_none());
+        assert_eq!(p.notes, LegacyNotes::Cleared);
+    }
+
+    /// Raw SQL NULL (the `header_row` fixture default) classifies as
+    /// `Unset` — distinct from `Cleared` — so an unpopulated/never-
+    /// observed note still behaves like the old `None` (no opinion,
+    /// gate always matches, write preserves canonical).
+    #[test]
+    fn project_aggregate_classifies_null_note_as_unset() {
+        let agg = BookingAggregate {
+            header: Some(header_row("R014810", "C21610", "จอง")), // Book_room_note = Null
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R014810").unwrap();
+        assert_eq!(p.notes, LegacyNotes::Unset);
+    }
+
+    /// A non-empty raw value classifies as `Value(x)`, unchanged from the
+    /// pre-fix behaviour (both old and new code preserve real note text).
+    #[test]
+    fn project_aggregate_classifies_nonempty_note_as_value() {
+        let mut header = header_row("R014810", "C21610", "จอง");
+        header.cells.insert(
+            "Book_room_note".into(),
+            MockValue::Str("late arrival".into()),
+        );
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R014810").unwrap();
+        assert_eq!(p.notes, LegacyNotes::Value("late arrival".into()));
     }
 
     // ----- Book_room_type=1 (room-TYPE-code Ds lines, cheatsheet §3.3) ----
@@ -1165,8 +1832,8 @@ mod tests {
     /// touch forever. Type-1 must project header-only.
     #[test]
     fn project_aggregate_type1_booking_projects_no_room_assignments() {
-        let header = header_row("R015301", "C21610", "จอง")
-            .with("Book_room_type", MockValue::I32(1));
+        let header =
+            header_row("R015301", "C21610", "จอง").with("Book_room_type", MockValue::I32(1));
         let agg = BookingAggregate {
             header: Some(header),
             // Ds line carries a TYPE code ("4" = some room category),
@@ -1189,8 +1856,8 @@ mod tests {
     /// room-number interpretation.
     #[test]
     fn project_aggregate_type2_booking_projects_room_assignments() {
-        let header = header_row("R015302", "C21610", "จอง")
-            .with("Book_room_type", MockValue::I32(2));
+        let header =
+            header_row("R015302", "C21610", "จอง").with("Book_room_type", MockValue::I32(2));
         let agg = BookingAggregate {
             header: Some(header),
             rooms: vec![ds_row("R015302", "402")],
@@ -1236,7 +1903,10 @@ mod tests {
             nights: vec![],
         };
         let p = project_aggregate(&agg, "R001329").expect("header-only must project");
-        assert!(p.rooms.is_empty(), "header-only aggregate yields zero room lines");
+        assert!(
+            p.rooms.is_empty(),
+            "header-only aggregate yields zero room lines"
+        );
         assert_eq!(p.legacy_book_id, "R001329");
         assert_eq!(p.book_status, "confirmed");
     }
@@ -1247,9 +1917,13 @@ mod tests {
         // line. Projection drops them — same canonical shape as a true
         // header-only aggregate.
         let mut cancelled1 = ds_row("R001388", "402");
-        cancelled1.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled1
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let mut cancelled2 = ds_row("R001388", "414");
-        cancelled2.cells.insert("Book_status".into(), MockValue::I32(3));
+        cancelled2
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
         let agg = BookingAggregate {
             header: Some(header_row("R001388", "C21611", "ยกเลิก")),
             rooms: vec![cancelled1, cancelled2],
@@ -1313,13 +1987,54 @@ mod tests {
             book_checkout: chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
             total_amount: Some(890.0),
             deposit_amount: Some(0.0),
-            notes: None,
+            notes: LegacyNotes::Unset,
             rooms: vec![],
+            book_room_type_code: None,
+            book_room_type_id: None,
         }
     }
 
+    // Canonical `ht_rooms_new.room_id`s for the fixture rooms. Room
+    // numbers are the human handle in iHOTEL; the junction (and so the
+    // gate) keys on the resolved FK — see `ExistingBookingRoom`.
+    const ROOM_402: i32 = 4002;
+    const ROOM_403: i32 = 4003;
+    const ROOM_414: i32 = 4014;
+
+    fn resolved(room_id: i32, price: f64) -> ResolvedRoomLine {
+        ResolvedRoomLine {
+            room_id,
+            price_per_night: Some(price),
+            // Not part of the room-set gate comparison (`replace_rooms` never
+            // writes it); the mode-2 derivation is covered by the integration
+            // suite, which has real `ht_rooms_new` rows to derive from.
+            room_type_id: None,
+        }
+    }
+
+    /// `ht_booking_rooms` content mirroring the given resolved lines —
+    /// i.e. what `replace_rooms` would have left behind.
+    fn stored(resolved: &[ResolvedRoomLine]) -> Vec<ExistingBookingRoom> {
+        resolved
+            .iter()
+            .map(|r| ExistingBookingRoom {
+                room_id: r.room_id,
+                price_per_night: r.price_per_night,
+            })
+            .collect()
+    }
+
     /// Existing canonical row that exactly mirrors `p` — tests mutate
-    /// one field at a time.
+    /// one field at a time. `p.rooms` is the pre-resolution projection,
+    /// so the junction starts empty; room-aware tests set `ex.rooms`
+    /// explicitly via [`stored`].
+    ///
+    /// `book_notes` is derived via the SAME [`notes_bind`] helper the
+    /// production write path uses, not a hand-rolled mapping — so
+    /// "existing exactly mirrors p" means "what `update_existing`/
+    /// `insert_new` would actually have persisted for p", which is also
+    /// what makes the convergence tests below meaningful (they reuse
+    /// this same function to simulate a write, not a fresh assumption).
     fn make_existing(p: &CanonicalProjection) -> ExistingBooking {
         ExistingBooking {
             book_id_serial: 1,
@@ -1330,9 +2045,10 @@ mod tests {
             book_deposit_amount: p.deposit_amount,
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
-            rooms_count: p.rooms.len() as i64,
+            rooms: Vec::new(),
             legacy_cust_no: p.legacy_cust_no.clone(),
-            book_notes: p.notes.clone(),
+            book_notes: notes_bind(&p.notes).map(str::to_string),
+            book_room_type_id: p.book_room_type_id,
         }
     }
 
@@ -1340,7 +2056,7 @@ mod tests {
     fn existing_matches_returns_true_for_unchanged_row() {
         let p = sample_projection();
         let ex = make_existing(&p);
-        assert!(existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(existing_matches(&ex, &p, &[]));
     }
 
     #[test]
@@ -1348,7 +2064,7 @@ mod tests {
         let p = sample_projection();
         let mut ex = make_existing(&p);
         ex.book_status = Some("cancelled".into());
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
     #[test]
@@ -1356,14 +2072,14 @@ mod tests {
         let p = sample_projection();
         let mut ex = make_existing(&p);
         ex.book_total_amount = Some(900.0);
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
     #[test]
     fn existing_matches_returns_false_when_rooms_count_differs() {
         let p = sample_projection();
-        let ex = make_existing(&p);
-        assert!(!existing_matches(&ex, &p, (p.rooms.len() + 1) as i64));
+        let ex = make_existing(&p); // zero junction rows
+        assert!(!existing_matches(&ex, &p, &[resolved(ROOM_402, 890.0)]));
     }
 
     /// Audit 2026-06-11 P1 #6 — iHOTEL's customer-delete cascade
@@ -1378,7 +2094,7 @@ mod tests {
         let mut ex = make_existing(&p);
         ex.legacy_cust_no = Some("C0000".into()); // canonical lags the cascade
         assert!(
-            !existing_matches(&ex, &p, p.rooms.len() as i64),
+            !existing_matches(&ex, &p, &[]),
             "a cust_no-only change MUST force a re-apply (C0000 cascade)"
         );
     }
@@ -1387,29 +2103,532 @@ mod tests {
     #[test]
     fn existing_matches_returns_false_when_only_notes_changed() {
         let mut p = sample_projection();
-        p.notes = Some("late arrival".into());
+        p.notes = LegacyNotes::Value("late arrival".into());
         let mut ex = make_existing(&p);
         ex.book_notes = None;
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
-    /// …but a None-notes projection against a populated canonical value
-    /// must NOT mismatch: `update_existing` writes notes through
-    /// `COALESCE($7, book_notes)`, so the canonical value would never
-    /// converge to NULL and the mismatch would re-emit BookingModified
-    /// every tick forever. Same guard pattern for legacy_cust_no.
+    /// …but an `Unset` (raw NULL) notes projection against a populated
+    /// canonical value must NOT mismatch: `update_existing` writes notes
+    /// through `COALESCE($7, book_notes)` with a NULL `$7`, so the
+    /// canonical value would never converge to NULL and the mismatch
+    /// would re-emit BookingModified every tick forever. Same guard
+    /// pattern for legacy_cust_no. Distinct from `Cleared` — see
+    /// [`existing_matches_returns_false_when_notes_cleared`] below, the
+    /// case `Unset` deliberately does NOT cover.
     #[test]
     fn existing_matches_guards_none_projection_against_populated_canonical() {
         let mut p = sample_projection();
-        p.notes = None;
+        p.notes = LegacyNotes::Unset;
         p.legacy_cust_no = None;
         let mut ex = make_existing(&p);
         ex.book_notes = Some("kept".into());
         ex.legacy_cust_no = Some("C21610".into());
         assert!(
-            existing_matches(&ex, &p, p.rooms.len() as i64),
+            existing_matches(&ex, &p, &[]),
             "None projection vs Some canonical must stay idempotent \
              (COALESCE write semantics can never converge it)"
+        );
+    }
+
+    // ----- book_notes silent-clear fix (ADR 0005 §4 / issue #269) --------
+
+    /// THE BUG this fix closes. Pre-fix, `project_aggregate` collapsed a
+    /// raw legacy empty string onto `None`, and the gate's `book_notes`
+    /// term was `p.notes.is_none() || ...` — a genuine legacy clear was
+    /// therefore indistinguishable from "nothing to check" and
+    /// `existing_matches` returned `true` (idempotent skip): no write,
+    /// no domain event, and — because `book_notes` is not a
+    /// reconcile-hash input (`HASH_INPUTS` above has no `book_notes`
+    /// entry) — no reconcile-log row either. Canonical froze on the
+    /// stale note forever with zero operational signal (ADR 0005 §3b).
+    ///
+    /// Red-capable: reverting `classify_legacy_notes`/the gate term back
+    /// to the old `Option<String>` + `.is_none()` shape makes this
+    /// assertion fail (`existing_matches` would return `true`, so `!` is
+    /// `false`) — verified by hand against the pre-fix code during
+    /// development of this test.
+    #[test]
+    fn existing_matches_returns_false_when_notes_cleared() {
+        let mut p = sample_projection();
+        p.notes = LegacyNotes::Value("late arrival".into());
+        let ex = make_existing(&p); // canonical converged on "late arrival"
+
+        // Legacy now genuinely clears the notes box (raw "", not raw
+        // NULL) — reception selected-all + deleted the text.
+        p.notes = LegacyNotes::Cleared;
+
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "a legacy Some->Cleared notes edit MUST force a re-apply — \
+             pre-fix this collapsed to Unset and matched, so canonical \
+             kept the stale note forever with no reconcile signal"
+        );
+    }
+
+    /// Write-converges + no-infinite-loop, in one pure test (this file
+    /// has no DB-backed test harness, so this simulates the write via
+    /// the SAME [`notes_bind`] function `update_existing`/`insert_new`
+    /// actually call — not a duplicated assumption about what the SQL
+    /// does).
+    ///
+    /// Tick 1: legacy clears the note; canonical still holds the old
+    /// value → gate must mismatch (detects, per the test above). Apply
+    /// `notes_bind` the way the UPDATE's `COALESCE($7, book_notes)`
+    /// would (bind `Some("")`, which overwrites). Tick 2: same `Cleared`
+    /// projection again (the watcher re-observes an unchanged row, or a
+    /// retry) — canonical has now caught up, so the gate must report a
+    /// match instead of re-emitting `BookingModified` forever.
+    #[test]
+    fn book_notes_cleared_converges_after_one_apply_no_infinite_loop() {
+        let mut p = sample_projection();
+        p.notes = LegacyNotes::Value("late arrival".into());
+        let mut ex = make_existing(&p);
+
+        p.notes = LegacyNotes::Cleared;
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "tick 1 must detect the clear"
+        );
+
+        // Simulate what `update_existing` persists for `$7`.
+        ex.book_notes = notes_bind(&p.notes).map(str::to_string);
+        assert_eq!(
+            ex.book_notes.as_deref(),
+            Some(""),
+            "the write must actually clear canonical (empty string, not \
+             a frozen stale value) — proves the fix HEALS, not just \
+             DETECTS"
+        );
+
+        assert!(
+            existing_matches(&ex, &p, &[]),
+            "tick 2 (same Cleared projection, now-converged canonical) \
+             must match — otherwise the fix trades a permanent silent \
+             freeze for a permanent re-emit loop"
+        );
+    }
+
+    /// Direct unit coverage of the write-bind contract each `LegacyNotes`
+    /// state maps to, independent of the gate — pins the exact values
+    /// `update_existing`/`insert_new` bind for `$7`/`$8` respectively.
+    #[test]
+    fn notes_bind_maps_each_state_to_the_coalesce_contract() {
+        assert_eq!(
+            notes_bind(&LegacyNotes::Unset),
+            None,
+            "Unset must bind NULL so COALESCE preserves the existing value"
+        );
+        assert_eq!(
+            notes_bind(&LegacyNotes::Cleared),
+            Some(""),
+            "Cleared must bind a real (non-NULL) empty string so \
+             COALESCE actually applies the clear"
+        );
+        assert_eq!(
+            notes_bind(&LegacyNotes::Value("late arrival".into())),
+            Some("late arrival"),
+            "Value(x) must bind Some(x), unchanged from pre-fix behaviour"
+        );
+    }
+
+    // ----- booking_rooms_match (2026-07-28 constant-count room swap) ------
+    //
+    // iHOTEL's FrmAddBook2.SAVE_EDIT is field-agnostic: it DELETEs and
+    // re-INSERTs all four booking tables on ANY edit. Swapping a room
+    // therefore re-writes a byte-identical header, so the ONLY signal
+    // that anything changed lives in the per-room set. A count-based
+    // gate saw none of it and canonical kept the old room permanently —
+    // silent in the reconcile sweep too (`booking_canonical_hash`
+    // carries no room data).
+
+    /// THE BUG: room swapped 402→403 at a constant room count. Must NOT
+    /// match, or `apply_booking_aggregate` short-circuits before
+    /// `replace_rooms` and canonical keeps room 402 forever.
+    #[test]
+    fn booking_rooms_match_detects_pure_room_swap() {
+        let before = [resolved(ROOM_402, 890.0)];
+        let after = [resolved(ROOM_403, 890.0)];
+        assert!(
+            !booking_rooms_match(&stored(&before), &after),
+            "402→403 at constant count MUST re-apply"
+        );
+    }
+
+    /// Same rooms, different order — iHOTEL re-inserts in edit-dialog
+    /// order and neither SELECT is ordered, so a sequence comparison
+    /// would re-apply (and re-emit `BookingModified`) on every CT touch.
+    #[test]
+    fn booking_rooms_match_is_order_independent() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0), resolved(ROOM_414, 1200.0)]);
+        let reordered = [resolved(ROOM_414, 1200.0), resolved(ROOM_402, 890.0)];
+        assert!(
+            booking_rooms_match(&stored_rows, &reordered),
+            "the SET is what matters, not the sequence"
+        );
+    }
+
+    /// A per-room price edit at an unchanged room set must re-apply —
+    /// `br_price_per_night` is mirrored state, and the header total can
+    /// stay put when one room's rate is corrected against another's.
+    #[test]
+    fn booking_rooms_match_detects_price_change_at_constant_rooms() {
+        let before = [resolved(ROOM_402, 890.0)];
+        let after = [resolved(ROOM_402, 950.0)];
+        assert!(!booking_rooms_match(&stored(&before), &after));
+    }
+
+    /// A 1-satang change is still a change (guards the epsilon from
+    /// being widened into a real-difference mask).
+    #[test]
+    fn booking_rooms_match_detects_one_satang_price_change() {
+        let before = [resolved(ROOM_402, 890.00)];
+        let after = [resolved(ROOM_402, 890.01)];
+        assert!(!booking_rooms_match(&stored(&before), &after));
+    }
+
+    /// …but sub-satang float noise must NOT: legacy `Book_Room_Price` is
+    /// a SQL Server `float` and our column is `DECIMAL(10,2)`, so the
+    /// stored value is rounded. Exact `f64` equality would leave the
+    /// gate permanently false and re-emit `BookingModified` on every CT
+    /// touch — the non-convergence failure mode this design avoids.
+    #[test]
+    fn booking_rooms_match_ignores_sub_satang_rounding() {
+        let stored_rows = vec![ExistingBookingRoom {
+            room_id: ROOM_402,
+            price_per_night: Some(890.33), // as DECIMAL(10,2) stored it
+        }];
+        let projected = [resolved(ROOM_402, 890.333_333_3)];
+        assert!(
+            booking_rooms_match(&stored_rows, &projected),
+            "a difference the column cannot store is not a difference"
+        );
+    }
+
+    /// NULL is not 0.00 — `replace_rooms` binds `None` as SQL NULL, so
+    /// the transition is real and must re-apply.
+    #[test]
+    fn booking_rooms_match_treats_null_price_as_distinct_from_zero() {
+        let stored_rows = vec![ExistingBookingRoom {
+            room_id: ROOM_402,
+            price_per_night: None,
+        }];
+        let projected = [resolved(ROOM_402, 0.0)];
+        assert!(!booking_rooms_match(&stored_rows, &projected));
+    }
+
+    /// The N→0 case the count-based gate was originally added for
+    /// (iHOTEL §3.7 delete-then-reinsert / §3.6 cancel-on-room) must
+    /// keep re-applying so `replace_rooms` drops the stale junction rows
+    /// — regression pinned by
+    /// `re_apply_with_zero_rooms_clears_stale_booking_rooms`.
+    #[test]
+    fn booking_rooms_match_detects_all_rooms_dropped() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(!booking_rooms_match(&stored_rows, &[]));
+    }
+
+    /// Header-only booking on both sides — the steady state for
+    /// `Book_room_type=1` bookings and post-cancel headers. Must match,
+    /// or every CT touch on them re-emits forever.
+    #[test]
+    fn booking_rooms_match_true_when_both_sides_empty() {
+        assert!(booking_rooms_match(&[], &[]));
+    }
+
+    /// UNRESOLVABLE LINES — intent preserved from the 2026-06-11 fix.
+    ///
+    /// `resolve_room_lines` drops blank-`room_no` lines (observed on
+    /// cancelled iHOTEL lines, e.g. R014826) and `project_aggregate`
+    /// drops `Book_room_type=1` room-TYPE codes, so they are absent from
+    /// `resolved` — the ONLY room input the gate sees. They must
+    /// therefore be invisible on both sides: the projection carries two
+    /// lines, only one resolves, the junction holds that one, and the
+    /// gate MUST match. Comparing against `p.rooms` instead would make
+    /// the gate permanently false and re-apply on every tick — the exact
+    /// failure mode the count-based design was avoiding.
+    ///
+    /// (A non-blank room missing from `ht_rooms_new` never reaches here:
+    /// `resolve_room_lines` errors and the watcher holds the watermark.)
+    #[test]
+    fn existing_matches_ignores_unresolvable_projection_lines() {
+        let mut p = sample_projection();
+        p.rooms = vec![
+            RoomLine {
+                room_no: "402".into(),
+                price_per_night: Some(890.0),
+            },
+            RoomLine {
+                // Blank room_no — dropped by `resolve_room_lines`, so it
+                // reaches neither the junction nor this comparison.
+                room_no: String::new(),
+                price_per_night: Some(890.0),
+            },
+        ];
+        let resolved_rooms = [resolved(ROOM_402, 890.0)];
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&resolved_rooms);
+        assert!(
+            existing_matches(&ex, &p, &resolved_rooms),
+            "unresolvable lines must be invisible to BOTH sides of the \
+             gate — comparing against p.rooms could never converge"
+        );
+    }
+
+    /// Duplicate resolved lines for one room collapse to a single
+    /// junction row via `ON CONFLICT (br_book_id, br_room_id) DO
+    /// NOTHING`, so the gate must dedupe the same way — otherwise
+    /// 2-intended vs 1-stored never converges.
+    #[test]
+    fn booking_rooms_match_dedupes_duplicate_room_lines_like_replace_rooms() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0)]);
+        let duplicated = [resolved(ROOM_402, 890.0), resolved(ROOM_402, 890.0)];
+        assert!(booking_rooms_match(&stored_rows, &duplicated));
+    }
+
+    /// End-to-end at the gate level: header byte-identical, room swapped
+    /// — `existing_matches` must be false so the caller falls through to
+    /// `replace_rooms`.
+    #[test]
+    fn existing_matches_returns_false_when_only_room_swapped() {
+        let p = sample_projection();
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(
+            !existing_matches(&ex, &p, &[resolved(ROOM_403, 890.0)]),
+            "a room-only SAVE_EDIT MUST force a re-apply"
+        );
+    }
+
+    /// …and the same gate with a per-room price edit only.
+    #[test]
+    fn existing_matches_returns_false_when_only_room_price_changed() {
+        let p = sample_projection();
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(!existing_matches(&ex, &p, &[resolved(ROOM_402, 950.0)]));
+    }
+
+    // ----- gate ⊇ reconcile-hash (see `crate::sync::gate_guard`) ---------
+
+    /// Behavioural half of the gate/hash invariant, for bookings.
+    ///
+    /// Executes the PRODUCTION gate against a genuinely mutated
+    /// projection, so it cannot be satisfied by editing a list. Each
+    /// mutator must also move its own hashed segment, which is what
+    /// stops a no-op mutator from faking a pass.
+    #[test]
+    fn bookings_hash_mutations_all_defeat_the_idempotency_gate() {
+        let base = sample_projection();
+        let ex = make_existing(&base);
+        assert!(
+            existing_matches(&ex, &base, &[]),
+            "fixture must start converged, else the test proves nothing"
+        );
+
+        for input in HASH_INPUTS.iter() {
+            if input.lookup_key {
+                // Identity — `fetch_existing` resolves BY it.
+                continue;
+            }
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment",
+                input.name,
+            );
+            assert!(
+                !existing_matches(&ex, &mutated, &[]),
+                "GATE/HASH INVARIANT VIOLATED — bookings: a legacy edit that \
+                 moves reconcile-hash input `{}` is idempotency-SKIPPED. The CT \
+                 delta ages out inside the 2-day retention window and the \
+                 reconcile sweep flags a row it can never close \
+                 (force_converge re-drives this same gate). Widen \
+                 HEADER_GATE_FIELDS. Mechanism: d09e756.",
+                input.name,
+            );
+        }
+    }
+
+    /// Byte-parity pin — see the customer mapper's equivalent for why a
+    /// single byte of drift invalidates every stored hash.
+    #[test]
+    fn bookings_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{booking_canonical_hash, sha256};
+
+        let p = sample_projection();
+        // Literal body under the format string this table replaced:
+        //   format!("{}|{}|{}|{}", book_id, checkin, checkout, cust_no)
+        //   with `.unwrap_or("")` per Option.
+        let expected = sha256("R014810|2026-04-25|2026-04-26|C21610");
+
+        assert_eq!(
+            booking_canonical_hash(
+                &p.legacy_book_id,
+                Some(p.book_checkin.to_string()).as_deref(),
+                Some(p.book_checkout.to_string()).as_deref(),
+                p.legacy_cust_no.as_deref(),
+            ),
+            expected,
+            "production booking hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    // ----- book_room_type_id gate term (B8c / migration 094) -------------
+
+    /// The `book_room_type_id` term is UNGUARDED, and this is the transition
+    /// that proves it has to be.
+    ///
+    /// `make_existing` builds the stored row FROM the projection, so it copies
+    /// whatever `book_room_type_id` the projection carries and the term
+    /// trivially matches — a test that only used the fixture as-is would pass
+    /// against a gate that never compared the column at all. Every assertion
+    /// below therefore mutates the projection AFTER the fixture is built.
+    #[test]
+    fn gate_notices_a_room_type_change_in_both_directions() {
+        // Some -> None: iHOTEL repointed a "ระบุประเภทห้อง" booking at a code
+        // we can no longer map. If the gate held here, the write that clears
+        // the column would never run and canonical would keep subtracting a
+        // parked claim from the WRONG type forever.
+        let mut p = sample_projection();
+        p.book_room_type_id = Some(7);
+        let ex = make_existing(&p);
+        assert!(
+            existing_matches(&ex, &p, &[]),
+            "fixture sanity: an unmutated projection must match"
+        );
+
+        p.book_room_type_id = None;
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> None must mismatch — the term is unguarded precisely so an \
+             unresolvable legacy type converges to NULL instead of freezing"
+        );
+
+        // Some -> Some: the ordinary receptionist retype.
+        p.book_room_type_id = Some(9);
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "Some -> Some must mismatch"
+        );
+
+        // None -> Some: first sighting on a booking canonical had no type for.
+        let mut cleared = sample_projection();
+        cleared.book_room_type_id = None;
+        let ex_cleared = make_existing(&cleared);
+        cleared.book_room_type_id = Some(3);
+        assert!(
+            !existing_matches(&ex_cleared, &cleared, &[]),
+            "None -> Some must mismatch"
+        );
+    }
+
+    /// A `Book_room_type=1` header with NO surviving `HT_Book_Ds` rows carries
+    /// no type code at all — the shape iHOTEL's §3.6 cancel-on-room leaves
+    /// behind (it deletes every Ds line but keeps the header). It must project
+    /// header-only with NO type, not panic and not invent one from thin air.
+    #[test]
+    fn project_aggregate_mode_1_without_ds_rows_carries_no_type_code() {
+        let mut header = header_row("R015401", "C21610", "จอง");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015401").expect("must project");
+        assert!(p.rooms.is_empty(), "no Ds lines ⇒ no room assignments");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "no Ds line ⇒ nothing states a type; the claim stays untyped and \
+             falls back to the property-wide cap"
+        );
+    }
+
+    /// Every Ds line CANCELLED (`Book_status=3`) is the same story: iHOTEL's
+    /// §3.5 cancel marks the lines rather than deleting them, so the rows are
+    /// present but none of them speaks for the booking.
+    #[test]
+    fn project_aggregate_mode_1_ignores_cancelled_ds_lines_for_the_type_code() {
+        let mut header = header_row("R015402", "C21610", "ยกเลิก");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let mut cancelled = ds_row("R015402", "DELUXE");
+        cancelled
+            .cells
+            .insert("Book_status".into(), MockValue::I32(3));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![cancelled],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015402").expect("must project");
+        assert_eq!(
+            p.book_room_type_code, None,
+            "a cancelled line must not attribute a type — the same status set \
+             that keeps it out of the room assignments keeps it out of here"
+        );
+    }
+
+    /// The gate table must expose exactly the terms the contract
+    /// registry advertises — including the `rooms` set-comparison stage,
+    /// which is a separate function and would otherwise be invisible to
+    /// the name-level check.
+    #[test]
+    fn gate_field_names_include_the_room_set_stage() {
+        let names = gate_field_names();
+        assert!(names.contains(&"rooms"), "room stage missing: {names:?}");
+        assert!(names.contains(&"book_checkin"));
+        assert!(names.contains(&"book_checkout"));
+        assert!(names.contains(&"legacy_cust_no"));
+    }
+
+    /// Documents the ONE booking hash input that rests on a guarded
+    /// (Some-only) gate term, and its residual weakness.
+    ///
+    /// `legacy_cust_no` is written `COALESCE($9, legacy_cust_no)`, so a
+    /// legacy `Book_Cust_ID` going NULL cannot converge and is
+    /// deliberately not treated as a mismatch — while the reconcile hash
+    /// WOULD move (`Some("C21610")` → `""`). Every observed iHOTEL edit
+    /// is Some→Some (the `'C0000'` cascade included), so this is an
+    /// accepted, recorded gap rather than an unnoticed one. Removing the
+    /// guard would trade it for a permanent re-emit loop.
+    #[test]
+    fn guarded_gate_terms_are_recorded_with_their_residual_weakness() {
+        use std::collections::HashSet;
+
+        let guarded: HashSet<&str> = gate_guard::guarded_gate_field_names(&HEADER_GATE_FIELDS)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            guarded,
+            ["legacy_cust_no", "book_notes"]
+                .into_iter()
+                .collect::<HashSet<&str>>(),
+        );
+
+        let hash_inputs_on_guarded_terms: Vec<&str> = HASH_INPUTS
+            .iter()
+            .filter(|i| i.gated_by.iter().any(|n| guarded.contains(n)))
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(
+            hash_inputs_on_guarded_terms,
+            vec!["legacy_cust_no"],
+            "a new hash input landed on a guarded gate term — decide \
+             explicitly whether Some→None invisibility is acceptable for it"
         );
     }
 
@@ -1552,8 +2771,7 @@ mod tests {
         let h_row = header_row("R014810", "C21610", "จอง");
         let ds_row1 = ds_row("R014810", "402");
         let ds_row2 = ds_row("R014810", "414");
-        let date_rows: Vec<HashMapRow> =
-            (0..5).map(|_| date_row("R014810", "402")).collect();
+        let date_rows: Vec<HashMapRow> = (0..5).map(|_| date_row("R014810", "402")).collect();
 
         let mut keys = std::collections::HashSet::new();
         if let Some(k) = header.coalesce_key(&h_row) {

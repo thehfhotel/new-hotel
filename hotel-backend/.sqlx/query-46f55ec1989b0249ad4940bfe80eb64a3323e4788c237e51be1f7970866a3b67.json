@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(c.cin_status, '') AS \"cin_status!\",\n               cu.cust_membership_id,\n               c.cin_checkin_time,\n               c.cin_checkout_time,\n               c.cin_expected_checkout\n          FROM ht_checkins c\n          JOIN ht_customers cu ON cu.cust_id = c.cin_cust_id\n         WHERE c.cin_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cin_status!",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_membership_id",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ht_customers",
+            "name": "cust_membership_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "cin_checkin_time",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "ht_checkins",
+            "name": "cin_checkin_time"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cin_checkout_time",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "ht_checkins",
+            "name": "cin_checkout_time"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "cin_expected_checkout",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "ht_checkins",
+            "name": "cin_expected_checkout"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "46f55ec1989b0249ad4940bfe80eb64a3323e4788c237e51be1f7970866a3b67"
+}

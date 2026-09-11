@@ -90,12 +90,18 @@ CREATE TABLE IF NOT EXISTS ht_customers (
     -- Migration 069 — guest date of birth captured at check-in registration
     -- (Thai ID chip / passport MRZ). PG-canonical-only: legacy HT_Customers
     -- has no DOB column, so this is never mirrored to MSSQL.
-    cust_dob DATE
+    cust_dob DATE,
+    -- Migration 086 — loyalty membership id (loyalty-app link). PG-canonical
+    -- only: legacy HT_Customers has no membership column, never mirrored.
+    cust_membership_id VARCHAR(64)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_customers_name ON ht_customers(cust_firstname, cust_lastname);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_phone ON ht_customers(cust_phone);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_idcard ON ht_customers(cust_idcard);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_passport ON ht_customers(cust_passport);
+-- Migration 086 — membership → guest lookup (checkout hook + desk member-QR).
+CREATE INDEX IF NOT EXISTS ix_ht_customers_membership_id
+    ON ht_customers (cust_membership_id) WHERE cust_membership_id IS NOT NULL;
 
 -- ht_room_types - Room type definitions
 CREATE TABLE IF NOT EXISTS ht_room_types (
@@ -185,6 +191,14 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     -- key so a double-POST of one OTA reservation can't create two bookings.
     -- PG-canonical only (not mirrored to legacy).
     book_ext_ref TEXT,
+    -- Migration 095 (issue #305 B8d) — SHA-256 over the canonicalised request
+    -- that minted book_ext_ref, written in the SAME statement so a crash can
+    -- never leave a key without the request it is bound to. Lets the
+    -- booking-side idempotency replay answer 422 on a reused key with a
+    -- different request once the ht_channel_idempotency row is gone (crash, or
+    -- its 24 h TTL). A key is therefore one-shot for the LIFE OF THE BOOKING.
+    -- NULL = no fingerprint recorded (the OTA path). PG-canonical only.
+    book_ext_ref_fingerprint TEXT,
     book_total_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_date TIMESTAMP,
@@ -199,6 +213,19 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     book_notify_dismissed_at TIMESTAMPTZ,
     book_cancelled_at TIMESTAMP,
     book_cancel_reason VARCHAR(500),
+    -- Migration 086 — payment-hold deadline for loyalty-channel TENTATIVE
+    -- bookings (book_channel='loyalty', book_status='pending'). PG-canonical
+    -- only; the scheduler sweep cancels holds past this instant.
+    book_hold_expires_at TIMESTAMPTZ,
+    -- Migration 094 (issue #304 B8c) — the room type this booking claims. The
+    -- load-bearing case is a PARKED (roomless) booking, which otherwise records
+    -- no type anywhere and can only be subtracted from availability
+    -- property-wide. Written by the desk create/edit path (request `roomTypeId`,
+    -- which must AGREE with the first assigned room's type or is DERIVED from
+    -- it) and by the CT mapper from HT_Book_Ds.Book_Room_Type when
+    -- HT_Book_H.Book_room_type = 1. NULL = type unknown → property-wide cap.
+    -- PG-canonical only; never mirrored to legacy.
+    book_room_type_id INTEGER,
     -- Writeback resolver back-populates these (migration 014).
     legacy_book_id VARCHAR(20),
     legacy_cust_no VARCHAR(20),
@@ -210,6 +237,11 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
 
     CONSTRAINT fk_ht_bookings_customer FOREIGN KEY (book_cust_id)
         REFERENCES ht_customers(cust_id),
+    -- Migration 094 — a parked claim may never name a type that does not exist.
+    -- ON DELETE SET NULL: removing a room type must not block, and a claim whose
+    -- type vanished is exactly the NULL-type case the property-wide cap handles.
+    CONSTRAINT fk_ht_bookings_room_type FOREIGN KEY (book_room_type_id)
+        REFERENCES ht_room_types(type_id) ON DELETE SET NULL,
     CONSTRAINT ck_ht_bookings_dates CHECK (book_checkout > book_checkin)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_customer ON ht_bookings(book_cust_id);
@@ -229,6 +261,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_channel_ext_ref
 -- Migration 064 (task #53) — active-reminder lookup for the notification bell.
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_active_reminders
     ON ht_bookings (book_checkin) WHERE book_notify_dismissed_at IS NULL;
+-- Migration 086 — expiry-sweep lookup: pending loyalty-channel holds only.
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_hold_expiry
+    ON ht_bookings (book_hold_expires_at)
+    WHERE book_hold_expires_at IS NOT NULL AND book_status = 'pending';
+-- Migration 094 — parked-claim aggregation (repository::channel groups live
+-- ROOMLESS bookings by type over a stay-date range) and the FK's
+-- referencing-side index. Partial: every pre-094 row is NULL.
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_room_type
+    ON ht_bookings (book_room_type_id)
+    WHERE book_room_type_id IS NOT NULL;
 
 -- ht_booking_rooms - Junction table for booking-room assignments
 CREATE TABLE IF NOT EXISTS ht_booking_rooms (
@@ -265,6 +307,14 @@ CREATE TABLE IF NOT EXISTS ht_checkins (
     cin_status VARCHAR(20) DEFAULT 'active',
     cin_rate_per_night DECIMAL(10,2) DEFAULT 0,
     cin_total_amount DECIMAL(12,2) DEFAULT 0,
+    -- Migration 079 — ROOM-ONLY folio total, mirrored from legacy
+    -- `HT_CheckIn_H.Total_Price_Room`. `cin_total_amount` above mirrors
+    -- `Total_Price_Net` = Room + Product, so it is NOT a usable room basis once
+    -- a POS line exists. Deliberately nullable with NO DEFAULT: NULL means
+    -- "never projected" and makes the folio read path fall back to
+    -- `cin_total_amount`, whereas 0 is a legitimate room charge on a
+    -- product-only folio. See migrations/pg/079_ht_checkins_room_amount.sql.
+    cin_room_amount DECIMAL(12,2),
     cin_paid_amount DECIMAL(12,2) DEFAULT 0,
     cin_payment_method VARCHAR(50),
     cin_payment_status VARCHAR(50),
@@ -371,14 +421,23 @@ CREATE TABLE IF NOT EXISTS ht_guest_doc_backfill_skip (
 
 -- ht_hk_cleaning_events - Maid-reported room-cleaning progress (employee-login
 -- plan Phase 4, migration 077). Append-only event log; latest event per room per
--- Thai day = current progress on the /hk maid surface. PG-CANONICAL ONLY (no
--- legacy counterpart, no sync, no writeback — deliberately does NOT touch
--- ht_rooms_new.room_clean). Identity = verified HF ID badge (Cloudflare Access
--- claims), no FK to ht_users. Per-site (connection-level scoping).
+-- Thai day = current progress on the /hk maid surface. The TABLE is
+-- PG-canonical only (no legacy counterpart, no sync mapper).
+-- CHANGED 2026-08-11 (housekeeping-ops): the `done` phase is no longer
+-- legacy-inert — routes/hk.rs delegates it to
+-- service::housekeeping::mark_clean_if_dirty, which flips
+-- ht_rooms_new.room_clean and enqueues the MarkRoomClean writeback in one
+-- transaction so reception sees the finished room in iHOTEL. `started` stays
+-- PG-only (iHOTEL's Room_Clean_Time drives its room-power countdown).
+-- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
+-- ht_users. Per-site (connection-level scoping).
+-- Migration 087 widened hkev_status to also accept 'dirty' (maid-reported
+-- "ห้องยังไม่สะอาด", gated by HK_MARK_DIRTY_ENABLED) — inlined into the CHECK
+-- below; the schema_migrations seed row for 087 is near the end of this file.
 CREATE TABLE IF NOT EXISTS ht_hk_cleaning_events (
     hkev_id         BIGSERIAL    PRIMARY KEY,
     hkev_room_id    INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
-    hkev_status     TEXT         NOT NULL CHECK (hkev_status IN ('started', 'done')),
+    hkev_status     TEXT         NOT NULL CHECK (hkev_status IN ('started', 'done', 'dirty')),
     hkev_badge      TEXT         NOT NULL,
     hkev_name       TEXT,
     hkev_created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -408,6 +467,228 @@ CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_room_created
     ON ht_hk_broken_reports (hkbr_room_id, hkbr_created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_status
     ON ht_hk_broken_reports (hkbr_status, hkbr_created_at DESC);
+
+-- ht_hk_linen_reports - Maid-reported linen shortages (ขาดผ้า) from the /hk
+-- surface (migration 088), COMPLETABLE since migration 090.
+-- Append-only, one row per (submission, kind); hklr_report_uuid groups the rows
+-- of ONE submission and is generated server-side in
+-- service::housekeeping::report_linen_shortage.
+-- A report is OPEN until a maid marks the room restocked (เติมผ้าแล้ว, migration
+-- 090). Completion is ROOM-LEVEL — one tap resolves every open row for that
+-- room — and hklr_resolved_at IS NULL is the status, so there is no separate
+-- status column to disagree with it. The room's ขาดผ้า indication means "has
+-- OPEN reports" of ANY age: completion supersedes day-rollover, the same
+-- visible-until-done convention as ht_hk_room_signals. Still append-only — a
+-- resolved row keeps everything it was filed with and only gains who/when.
+-- PG-CANONICAL ONLY: iHOTEL has no linen counterpart at all, so no sync mapper,
+-- no writeback, no domain event, no notification (the boards re-poll).
+-- hklr_kind is TEXT with NO CHECK on purpose — the kind allowlist lives in
+-- routes::hk::VALID_LINEN_KINDS (bed_sheet | pillowcase | duvet_cover |
+-- bath_towel | face_towel | foot_towel), so adding a kind later needs no
+-- migration and no window where the deployed binary and the deployed CHECK
+-- disagree. The qty bound IS a data invariant and is enforced here as well as
+-- in the app.
+-- Identity = verified HF ID badge (Cloudflare Access claims) on BOTH sides —
+-- who reported and who restocked — with no FK to ht_users.
+-- Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_linen_reports (
+    hklr_id             BIGSERIAL    PRIMARY KEY,
+    hklr_report_uuid    UUID         NOT NULL,
+    hklr_room_id        INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    hklr_kind           TEXT         NOT NULL,
+    hklr_qty            INTEGER      NOT NULL CHECK (hklr_qty >= 1 AND hklr_qty <= 20),
+    hklr_badge          TEXT         NOT NULL,
+    hklr_name           TEXT,
+    hklr_created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    hklr_resolved_at    TIMESTAMPTZ,
+    hklr_resolved_badge TEXT,
+    hklr_resolved_name  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_room_created
+    ON ht_hk_linen_reports (hklr_room_id, hklr_created_at DESC);
+-- The open-backlog hot path (list EXISTS, detail totals, the resolve UPDATE).
+-- PARTIAL, for ix_ht_hk_room_signals_live's reason: resolved rows are unbounded
+-- history that only the audit reads.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_linen_reports_open
+    ON ht_hk_linen_reports (hklr_room_id)
+    WHERE hklr_resolved_at IS NULL;
+
+-- ht_hk_room_signals - Canned room signals between reception and maids
+-- (ADR 0008, migration 089). One room per signal, broadcast to the other role
+-- at that room's branch; NO free-text column anywhere, by decision.
+-- Lifecycle open -> acked -> done; the creator's SIDE may cancel while open.
+-- A maid's เสร็จแล้ว cleaning report auto-completes that room's open/acked
+-- priority_clean + checked_out signals in the SAME transaction
+-- (sig_done_source='clean_report'); room_check completes ONLY via its answer
+-- endpoint, which also spawns one child signal per problem (sig_parent_id).
+-- PG-CANONICAL ONLY: iHOTEL has no counterpart, so no sync mapper, no
+-- writeback, no WritebackIntent. The domain events it publishes
+-- (RoomSignalRaised/Acked/Completed/Cancelled) are UI plumbing over the
+-- existing event_log + pg_notify('domain_events') fan-out.
+-- sig_type / sig_outcome / sig_done_source are TEXT with NO CHECK on purpose —
+-- the vocabulary lives in domain::hk_signal (mirroring app/hk/signal-vocab.ts)
+-- so extending it needs no migration (the 088 rationale). sig_direction and
+-- sig_status ARE checked because they are structural, not product vocabulary.
+-- sig_escalated_at is both the once-only escalation stamp and the monthly
+-- LINE-push quota ledger (HK_ESCALATION_MONTHLY_CAP).
+-- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
+-- ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_room_signals (
+    sig_id            BIGSERIAL   PRIMARY KEY,
+    sig_room_id       INTEGER     NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    sig_direction     TEXT        NOT NULL CHECK (sig_direction IN ('desk_to_maid', 'maid_to_desk')),
+    sig_type          TEXT        NOT NULL,
+    sig_status        TEXT        NOT NULL DEFAULT 'open'
+                                  CHECK (sig_status IN ('open', 'acked', 'done', 'cancelled')),
+    sig_outcome       TEXT        NULL,
+    sig_parent_id     BIGINT      NULL REFERENCES ht_hk_room_signals(sig_id),
+    sig_created_badge TEXT        NOT NULL,
+    sig_created_name  TEXT,
+    sig_created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sig_acked_badge   TEXT,
+    sig_acked_name    TEXT,
+    sig_acked_at      TIMESTAMPTZ,
+    sig_done_badge    TEXT,
+    sig_done_name     TEXT,
+    sig_done_at       TIMESTAMPTZ,
+    sig_done_source   TEXT        NULL,
+    sig_escalated_at  TIMESTAMPTZ NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_live
+    ON ht_hk_room_signals (sig_status, sig_room_id)
+    WHERE sig_status IN ('open', 'acked');
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_signals_room_created
+    ON ht_hk_room_signals (sig_room_id, sig_created_at DESC);
+
+-- ht_hk_room_reports / ht_hk_room_report_items / ht_hk_room_report_photos -
+-- Report HK, the maid's per-room daily attestation and reception's
+-- countersignature (migration 091; owner's Report HK.xlsx digitized, vocabulary
+-- in app/hk/report-vocab.ts and CONTEXT.md Housekeeping).
+-- The header carries the room-status code as SHE reported it (vc|co|oo|so,
+-- prefilled client-side from known room facts but overridable), the
+-- exception-based checklist flag, and the identities of both transitions.
+-- Lifecycle submitted -> verified | returned; a RETURNED report is never edited
+-- but superseded by a NEW submission carrying rr_parent_id, so history is
+-- append-only. There is NO free-text column anywhere in these three tables --
+-- the return reason is canned, the same discipline ADR 0008 records for signals.
+-- rr_date is the Bangkok civil day the report is FOR, stored (not derived):
+-- a maid finishing a floor at 00:10 is still on yesterday's sheet, and
+-- CURRENT_DATE is banned because it is the SERVER's date.
+-- rr_room_status, rr_return_reason and rri_item are TEXT with NO CHECK on
+-- purpose -- the vocabulary lives in domain::hk_report (mirroring
+-- app/hk/report-vocab.ts) so extending it needs no migration (the 088
+-- rationale). rr_status and rri_problem ARE checked because they are
+-- structural: every transition is written over the first, and the second is the
+-- pair the item_missing / item_damaged room signals are built on.
+-- SUPERSEDED BY MIGRATION 092 (same day): items are no longer EXCEPTIONS but
+-- PHOTO-BACKED TICKS -- one row per checklist item per report, all 22 every
+-- time, each with rri_state (ok|missing|damaged) and rri_photo_id. A perfect
+-- room is four camera taps, one per capture zone. rr_all_items_ok is now
+-- DERIVED (true iff no tick is a problem); the column stays and is still
+-- written, for v1 readers.
+-- Photos are BYTEA + mime (the 077 ht_hk_broken_reports pattern); a submission
+-- carries 4..=24 DISTINCT photos across its ticks and extras, a verification
+-- 1..=4 of its own. rrp_side is DERIVED from the uploader's role, never
+-- client-sent, and rrp_report_id is NULLABLE because a phone uploads BEFORE the
+-- form is submitted -- the submit/verify transaction binds them (WHERE
+-- rrp_report_id IS NULL AND rrp_badge = the caller), which makes "your own, not
+-- already attached" one atomic check.
+-- RETENTION: photos are KEPT FOREVER (owner decision 2026-09-02). No purge job,
+-- no TTL, no sweeper, for attached or unattached rows. The only deletion path
+-- is DELETE /api/hk/report-photos/{id}, which is uploader-only and refuses
+-- anything already attached to a report.
+-- PG-CANONICAL ONLY: iHOTEL has no Report HK counterpart at all, so no sync
+-- mapper, no writeback, no WritebackIntent, and no domain event of its own --
+-- but a submission with item exceptions raises the EXISTING item_missing /
+-- item_damaged room signals (089) in the SAME transaction, one per problem
+-- kind, so reception hears about chargeable items immediately.
+-- Identity = verified HF ID badge (Cloudflare Access claims) on every side, no
+-- FK to ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_room_reports (
+    rr_id              BIGSERIAL   PRIMARY KEY,
+    rr_room_id         INTEGER     NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    rr_date            DATE        NOT NULL,
+    rr_status          TEXT        NOT NULL DEFAULT 'submitted'
+                                   CHECK (rr_status IN ('submitted', 'verified', 'returned')),
+    rr_room_status     TEXT        NOT NULL,
+    rr_all_items_ok    BOOLEAN     NOT NULL,
+    rr_return_reason   TEXT        NULL,
+    rr_parent_id       BIGINT      NULL REFERENCES ht_hk_room_reports(rr_id),
+    rr_submitted_badge TEXT        NOT NULL,
+    rr_submitted_name  TEXT,
+    rr_submitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    rr_verified_badge  TEXT,
+    rr_verified_name   TEXT,
+    rr_verified_at     TIMESTAMPTZ
+);
+-- The day overview's hot path: the LATEST report per room for one date.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_reports_room_date
+    ON ht_hk_room_reports (rr_room_id, rr_date, rr_id DESC);
+-- The submit guard and reception's queue. PARTIAL, for
+-- ix_ht_hk_room_signals_live's reason: judged rows are unbounded history.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_reports_open
+    ON ht_hk_room_reports (rr_room_id, rr_date)
+    WHERE rr_status = 'submitted';
+
+-- The photos table is declared BEFORE the items table, because migration 092
+-- made rri_photo_id a foreign key into it (the tick names the picture that
+-- backs it) and a fresh cluster runs this file top to bottom.
+CREATE TABLE IF NOT EXISTS ht_hk_room_report_photos (
+    rrp_id         BIGSERIAL   PRIMARY KEY,
+    rrp_report_id  BIGINT      NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
+    rrp_side       TEXT        NOT NULL CHECK (rrp_side IN ('maid', 'reception')),
+    rrp_photo      BYTEA       NOT NULL,
+    rrp_photo_mime TEXT        NOT NULL,
+    rrp_badge      TEXT        NOT NULL,
+    -- Migration 092: the capture zone (bed|desk|bathroom|general), which is
+    -- INFORMATIONAL ONLY -- nothing joins or filters on it, and the
+    -- one-photo-per-zone rule is the client's -- and the stored size, so the
+    -- upload response and the report's photo strip need not detoast the image.
+    -- TEXT with NO CHECK on the zone, the 088 rationale: the shooting order is
+    -- app-owned vocabulary (domain::hk_report::REPORT_ZONES).
+    rrp_zone       TEXT,
+    rrp_bytes      INTEGER,
+    rrp_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_report
+    ON ht_hk_room_report_photos (rrp_report_id, rrp_side, rrp_id)
+    WHERE rrp_report_id IS NOT NULL;
+-- "My unattached photos" -- the attach predicate's own index.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_photos_open
+    ON ht_hk_room_report_photos (rrp_badge, rrp_id)
+    WHERE rrp_report_id IS NULL;
+
+-- The TICK table since migration 092 (was EXCEPTIONS-only in 091): ONE ROW PER
+-- ITEM PER REPORT -- all 22, every time -- each carrying the state the maid
+-- recorded and the photo that backs it. rri_qty is NULL for an ok tick and
+-- 1..=99 for a problem; rri_problem is NULL for an ok tick and otherwise EQUALS
+-- rri_state, written from the same value by one statement so the two cannot
+-- disagree (which keeps the v1 "exceptions" projection correct for old
+-- bundles). rri_photo_id IS NULL is what a v1 row looks like, and is therefore
+-- the discriminator every read uses. ON DELETE CASCADE on the photo FK is a
+-- cascade-ORDERING backstop, not a feature: the app refuses to delete a photo a
+-- report names, so it can only fire from the room->report cascade.
+CREATE TABLE IF NOT EXISTS ht_hk_room_report_items (
+    rri_id        BIGSERIAL PRIMARY KEY,
+    rri_report_id BIGINT    NOT NULL REFERENCES ht_hk_room_reports(rr_id) ON DELETE CASCADE,
+    rri_item      TEXT      NOT NULL,
+    rri_state     TEXT      NOT NULL DEFAULT 'ok'
+                            CONSTRAINT ht_hk_room_report_items_rri_state_check
+                            CHECK (rri_state IN ('ok', 'missing', 'damaged')),
+    rri_problem   TEXT      NULL CHECK (rri_problem IN ('missing', 'damaged')),
+    rri_qty       INTEGER   NULL CHECK (rri_qty >= 1 AND rri_qty <= 99),
+    rri_photo_id  BIGINT    NULL REFERENCES ht_hk_room_report_photos(rrp_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_report
+    ON ht_hk_room_report_items (rri_report_id, rri_id);
+-- One row per item per report -- the invariant the tick model is built on.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_hk_room_report_items_report_item
+    ON ht_hk_room_report_items (rri_report_id, rri_item);
+-- The problem-count read behind problemCount and the DERIVED allItemsOk.
+-- PARTIAL: 21 of 22 ticks in a healthy property are ok.
+CREATE INDEX IF NOT EXISTS ix_ht_hk_room_report_items_problems
+    ON ht_hk_room_report_items (rri_report_id)
+    WHERE rri_state <> 'ok';
 
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
@@ -964,7 +1245,25 @@ INSERT INTO sync_status (entity_type) VALUES
     ('customers'),
     ('rooms'),
     ('bookings'),
-    ('checkins')
+    ('checkins'),
+    -- Migration 080 — Phase 6-A payments reconcile arm (ships DARK behind
+    -- RECONCILE_PAYMENTS_ARM_ENABLED). `record_success` UPDATEs by
+    -- entity_type, so the row must exist or the counters silently no-op.
+    ('payments'),
+    -- Migration 081 — Phase 6-B guest-registry (companion folio) reconcile
+    -- arm (ships DARK behind RECONCILE_GUEST_REGISTRY_ARM_ENABLED). Same
+    -- reason: `record_success` UPDATEs by entity_type.
+    ('guest_registry'),
+    -- Migration 082 — Phase 6-C generic mirror probe (ships DARK behind
+    -- RECONCILE_MIRROR_PROBE_ENABLED). Same reason again: `record_error`
+    -- UPDATEs by entity_type, so without this row a probe failure updates
+    -- zero rows and leaves only a log line.
+    ('mirror_probe'),
+    -- Migration 083 — Phase 6-D payment-ledger per-folio probe (ships DARK
+    -- behind RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED). Same reason again:
+    -- without this row a probe failure updates zero rows and leaves only a
+    -- log line, and the success path has no consecutive_failures to reset.
+    ('payment_ledger_probe')
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- Add source column to existing tables
@@ -2323,13 +2622,22 @@ CREATE TABLE IF NOT EXISTS ht_cash_ledger (
                      CHECK (cash_source IN ('legacy', 'app')),
     cash_created_by  VARCHAR(100),
     cash_synced_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- Writeback correlation id (v4, minted at INSERT for app rows). Added by
+    -- migration 085 (issue #202) — inlined here for fresh installs.
+    aggregate_id     UUID,
     CONSTRAINT ht_cash_ledger_legacy_id_key UNIQUE (cash_legacy_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_cash_ledger_entry_date
     ON ht_cash_ledger (cash_entry_date);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_ht_cash_ledger_aggregate_id
+    ON ht_cash_ledger (aggregate_id) WHERE aggregate_id IS NOT NULL;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('059', '059_create_ht_cash_ledger.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('085', '085_ht_cash_ledger_aggregate_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
@@ -2609,6 +2917,89 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('077', '077_create_ht_housekeeping_reports.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 087 — widen ht_hk_cleaning_events.hkev_status to accept 'dirty'
+-- (maid-reported "ห้องยังไม่สะอาด" on /hk, gated by HK_MARK_DIRTY_ENABLED,
+-- default off). The CHECK is inlined into the CREATE TABLE above, so a fresh
+-- seed already has the widened constraint; this row records the migration as
+-- applied so the drift check sees zero pending. The table stays PG-canonical
+-- only — only the ht_rooms_new.room_clean FLAG crosses to legacy, via the
+-- existing byte-pinned MarkRoomClean / MarkRoomDirty recipes.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('087', '087_hk_cleaning_events_dirty_status.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 088 — ht_hk_linen_reports, the maid's linen-shortage (ขาดผ้า)
+-- report on /hk (table + index inlined above, after the ht_hk_broken_reports
+-- block). RECORD-ONLY and PG-canonical only: no legacy counterpart, no sync, no
+-- writeback, no domain event, no notification. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('088', '088_create_ht_hk_linen_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 089 — ht_hk_room_signals, the canned reception<->maid room signals
+-- of ADR 0008 (table + both indexes inlined above, after the
+-- ht_hk_linen_reports block). PG-canonical only: no legacy counterpart, no sync
+-- mapper, no writeback; the domain events it publishes are UI plumbing over the
+-- existing SSE fan-out. This seed row records the migration as applied so the
+-- drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('089', '089_create_ht_hk_room_signals.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 090 — make the linen-shortage report COMPLETABLE: the three
+-- hklr_resolved_* columns and the partial open-backlog index are inlined into
+-- the ht_hk_linen_reports block above. A report is OPEN until a maid marks the
+-- room restocked (เติมผ้าแล้ว, POST /api/hk/rooms/{id}/linen-shortage/resolve),
+-- completion is room-level, and the ขาดผ้า indication becomes "has OPEN
+-- reports" of any age rather than a day-scoped flag. Still PG-canonical only:
+-- no legacy counterpart, no sync, no writeback, no domain event. This seed row
+-- records the migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('090', '090_hk_linen_reports_resolution.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 091 - Report HK: ht_hk_room_reports + ht_hk_room_report_items +
+-- ht_hk_room_report_photos (tables + all five indexes inlined above, after the
+-- ht_hk_room_signals block). One maid's per-room daily attestation, verified or
+-- returned by reception with a canned reason; exception-based checklist,
+-- two-sided photo evidence, append-only history via rr_parent_id.
+-- PG-canonical only: no legacy counterpart, no sync mapper, no writeback, no
+-- domain event of its own -- item exceptions raise the existing item_missing /
+-- item_damaged room signals (089) in the submit's own transaction. This seed
+-- row records the migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('091', '091_create_ht_hk_room_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 092 - Report HK v2: the equipment checklist becomes PHOTO-BACKED
+-- TICKS (owner directives 2026-09-02, "1 picture for each tick"). Columns and
+-- indexes inlined above: ht_hk_room_report_items gains rri_state +
+-- rri_photo_id, drops NOT NULL on rri_qty and rri_problem, and gains
+-- UNIQUE (rri_report_id, rri_item) plus a partial problem index;
+-- ht_hk_room_report_photos gains rrp_zone (capture zone, informational) and
+-- rrp_bytes (stored size). ONE ROW PER ITEM PER REPORT -- all 22, every time --
+-- so "the room is fine" and "she did not look" stop being the same submission;
+-- rr_all_items_ok becomes DERIVED. Photos are kept FOREVER (owner decision);
+-- the only deletion path is the uploader-only, unattached-only DELETE
+-- /api/hk/report-photos/{id}. Still PG-canonical only: no legacy counterpart,
+-- no sync mapper, no writeback, no domain event of its own -- problem ticks
+-- raise the existing item_missing / item_damaged room signals (089) in the
+-- submit's own transaction, one per problem kind. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('092', '092_hk_room_report_photo_backed_ticks.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 086 — loyalty-app channel + membership link:
+-- `ht_customers.cust_membership_id` + `ht_bookings.book_hold_expires_at`
+-- (columns + partial indexes inlined above). Both PG-canonical only — no
+-- legacy counterpart, never written back. This seed row records the migration
+-- as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('086', '086_loyalty_channel.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Migration 078: re-seed legacy_ct_state_per_table from the global watermark
 -- Mirrors migrations/pg/078_reseed_ct_state_per_table.sql. No schema change —
@@ -2666,6 +3057,225 @@ ON CONFLICT (table_name) DO UPDATE
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('078', '078_reseed_ct_state_per_table.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 079 — `ht_checkins.cin_room_amount` (room-only folio total mirrored
+-- from legacy `HT_CheckIn_H.Total_Price_Room`). The column is declared inline in
+-- the `ht_checkins` CREATE TABLE above, so a fresh seed already has it; this row
+-- just tells scripts/migrate.sh not to re-apply the ALTER.
+-- -----------------------------------------------------------------------------
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('079', '079_ht_checkins_room_amount.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 080 — `ht_receipts_legacy`, the per-PK ack cache for the Phase 6-A
+-- `payments` reconcile arm (legacy `HT_Receipt_H` ↔ canonical `ht_payments`),
+-- plus the `ht_payments.pay_reference` index its canonical probe needs. The
+-- `sync_status` seed row rides the `sync_status` INSERT above.
+--
+-- The arm SHIPS DARK (`RECONCILE_PAYMENTS_ARM_ENABLED`, compose default false);
+-- with the flag off this table simply stays empty. Cache ONLY — never canonical
+-- state. See migrations/pg/080_ht_receipts_legacy.sql for the full rationale.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_receipts_legacy (
+    id          SERIAL PRIMARY KEY,
+    receipt_no  VARCHAR(50) NOT NULL UNIQUE,
+    sync_hash   VARCHAR(64),
+    synced_at   TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_receipts_legacy_synced ON ht_receipts_legacy(synced_at);
+
+CREATE INDEX IF NOT EXISTS ix_ht_payments_pay_reference
+    ON ht_payments (pay_reference) WHERE pay_reference IS NOT NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('080', '080_ht_receipts_legacy.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 081 — `ht_guest_registry_legacy`, the per-FOLIO ack cache for the
+-- Phase 6-B `guest_registry` reconcile arm (legacy `HT_CheckIn_Other_People` ↔
+-- canonical `ht_guest_registry`). The `sync_status` seed row rides the
+-- `sync_status` INSERT above.
+--
+-- The unit of reconciliation is the FOLIO (every companion sharing one
+-- `Cin_no`), not the row: iHOTEL edits companions by DELETE+REINSERT, so a
+-- per-row arm would false-positive on every edit. The arm SHIPS DARK
+-- (`RECONCILE_GUEST_REGISTRY_ARM_ENABLED`, compose default false); with the
+-- flag off this table simply stays empty. Cache ONLY — never canonical state.
+-- No new index (every lookup is covered by ix_ht_guestreg_checkin /
+-- ix_ht_checkins_legacy_cin_no / ix_ht_checkins_checkin). See
+-- migrations/pg/081_ht_guest_registry_legacy.sql for the full rationale.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_guest_registry_legacy (
+    id         SERIAL PRIMARY KEY,
+    cin_no     VARCHAR(50) NOT NULL UNIQUE,
+    sync_hash  VARCHAR(64),
+    synced_at  TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_guest_registry_legacy_synced
+    ON ht_guest_registry_legacy(synced_at);
+
+-- ht_reconcile_era_floor — durable, non-decreasing scope watermark per
+-- reconcile arm. Seeded lazily by the arm on its first tick and thereafter
+-- moved only FORWARD (GREATEST clamp in the upsert), so one historical row
+-- gaining a mirrored counterpart cannot drag a derived MIN() floor backwards
+-- and expand the scan by years (~19.6k permanently-open rows at HF Hotel).
+-- Operators may move a floor forward by hand; the clamp makes that stick. The
+-- ONLY way to lower one is to DELETE the row and let the next tick re-derive —
+-- which is the documented remedy when a watermark was seeded before a
+-- coverage-widening backfill (do not enable an arm at a site until that site's
+-- `--all` backfill has completed; a sustained hold raises the
+-- `era_floor_held:` Slack alert).
+--
+-- TWO bases, exactly one per arm (migration 084): `era_floor` (TIMESTAMP —
+-- oldest parent time; arm `guest_registry`) and `era_floor_id` (BIGINT —
+-- lowest legacy IDENTITY; arm `payment_ledger_probe`, whose mirror is keyed on
+-- an integer id and whose date column would have to cross the naive-Thai /
+-- TIMESTAMPTZ boundary). The row key is the arm's own
+-- ht_reconcile_log.table_name / sync_status.entity_type literal, so the two
+-- arms cannot collide on the PK. `era_floor` is NULLABLE because an ID-basis
+-- arm has no honest timestamp to write; the CHECK forbids a row with neither.
+CREATE TABLE IF NOT EXISTS ht_reconcile_era_floor (
+    table_name   VARCHAR(50)  PRIMARY KEY,
+    era_floor    TIMESTAMP,
+    era_floor_id BIGINT,
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_ht_reconcile_era_floor_basis
+        CHECK (era_floor IS NOT NULL OR era_floor_id IS NOT NULL)
+);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('081', '081_ht_guest_registry_legacy.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 082 — `sync_status` row for the Phase 6-C mirror probe
+-- (`entity_type = 'mirror_probe'`). The row itself rides the `sync_status`
+-- INSERT above; this block only records the migration as applied.
+--
+-- No table, no index: the probe is detection-only and keeps no ack cache — it
+-- compares live aggregates on both sides every tick. The row exists purely so
+-- `record_error` / `record_success`'s `UPDATE … WHERE entity_type =
+-- 'mirror_probe'` matches something; without it a probe failure updates zero
+-- rows and leaves only a log line, and the success path has no
+-- `consecutive_failures` to reset. See
+-- migrations/pg/082_sync_status_mirror_probe.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('082', '082_sync_status_mirror_probe.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 083 — `sync_status` row for the Phase 6-D payment-ledger probe
+-- (`entity_type = 'payment_ledger_probe'`). The row itself rides the
+-- `sync_status` INSERT above; this block only records the migration as applied.
+--
+-- No table, no index: like 082 the probe is detection-only and keeps no ack
+-- cache — it re-derives the MIN(ledger_legacy_id) coverage floor and both
+-- sides' per-folio aggregates live every tick. The row exists purely so
+-- `record_error` / `record_success`'s `UPDATE … WHERE entity_type =
+-- 'payment_ledger_probe'` matches something. See
+-- migrations/pg/083_sync_status_payment_ledger_probe.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('083', '083_sync_status_payment_ledger_probe.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 084 — `ht_reconcile_era_floor.era_floor_id` (BIGINT), the ID basis
+-- the Phase 6-D payment-ledger probe clamps its coverage floor to, plus the
+-- `era_floor` NOT NULL drop and the one-basis-minimum CHECK. All three are
+-- declared inline in the `ht_reconcile_era_floor` CREATE TABLE above, so a
+-- fresh seed already has them; this row just tells scripts/migrate.sh not to
+-- re-apply the ALTERs.
+--
+-- Why: the probe's floor was a raw `MIN(ledger_legacy_id)`, which is only a
+-- valid coverage boundary while coverage is an id-contiguous SUFFIX. A
+-- date-windowed `backfill_payment_ledger --days=212` mirrors folios WHOLE, and
+-- on 2026-07-30 one 2025-08 line on a monthly-billed long-stay dragged the
+-- floor back ~7 months, sweeping 404 never-mirrored folios into the scan as
+-- `missing_pg`. A persisted floor that only ratchets FORWARD removes the class.
+-- See migrations/pg/084_reconcile_era_floor_id.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('084', '084_reconcile_era_floor_id.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 093 - Caller-side request idempotency for the loyalty-app booking
+-- channel (docs/loyalty-channel.md). One row per (caller identity,
+-- Idempotency-Key) carrying the response that request produced, so a client
+-- retry REPLAYS it instead of creating a second hold. The UNIQUE constraint is
+-- load-bearing twice: it is the replay lookup AND the concurrency serializer --
+-- the reserving INSERT holds an uncommitted index entry for the whole create,
+-- so a simultaneous duplicate blocks and then replays. PG-canonical only: no
+-- legacy counterpart, no sync mapper, no writeback, no domain event. Requests
+-- without a key write no row and behave exactly as before.
+-- See migrations/pg/093_create_ht_channel_idempotency.sql.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_channel_idempotency (
+    idem_id           BIGSERIAL   PRIMARY KEY,
+    idem_caller       TEXT        NOT NULL,
+    idem_key          TEXT        NOT NULL,
+    idem_endpoint     TEXT        NOT NULL,
+    idem_fingerprint  TEXT        NOT NULL,
+    idem_status       SMALLINT    NULL,
+    idem_body         TEXT        NULL,
+    idem_book_id      INTEGER     NULL,
+    idem_created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    idem_completed_at TIMESTAMPTZ NULL,
+    idem_expires_at   TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+    CONSTRAINT ux_ht_channel_idempotency_caller_key UNIQUE (idem_caller, idem_key)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_channel_idempotency_expires
+    ON ht_channel_idempotency (idem_expires_at);
+
+COMMENT ON TABLE ht_channel_idempotency IS
+    'Caller-side request idempotency for the loyalty-app booking channel, migration 093. '
+    'One row per (idem_caller, idem_key): the SHA-256 of the presented channel bearer '
+    'plus the client''s Idempotency-Key header. Stores the response status + body that '
+    'key produced so a retry REPLAYS it instead of creating a second hold, and the '
+    'UNIQUE constraint doubles as the concurrency serializer. idem_fingerprint is a '
+    'SHA-256 over the CANONICALISED request; the same key with a different request is '
+    'answered 422. 24 h TTL (idem_expires_at), swept opportunistically; an expired row '
+    'reads as absent. PG-CANONICAL ONLY. Per-site (connection-level scoping).';
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('093', '093_create_ht_channel_idempotency.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 094 — ht_bookings.book_room_type_id (issue #304 B8c): the room type
+-- a PARKED (roomless) booking claims, so loyalty-channel availability can
+-- subtract the claim from the RIGHT type instead of only capping property-wide.
+-- Column, fk_ht_bookings_room_type and ix_ht_bookings_room_type are inlined into
+-- the ht_bookings block above. PG-canonical only: HT_Book_H has no counterpart
+-- column (its own Book_room_type is a 1/2 MODE discriminator, not a type), the
+-- byte-parity writeback recipes are untouched, and nothing writes this back to
+-- legacy. This seed row records the migration as applied so the drift check sees
+-- zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('094', '094_ht_bookings_room_type.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 095 — ht_bookings.book_ext_ref_fingerprint (issue #305 B8d): the
+-- SHA-256 of the canonicalised request that minted book_ext_ref, inlined into
+-- the ht_bookings block above. Binds a stored caller-idempotency key to the
+-- request it came from, so a reused key carrying a DIFFERENT request is
+-- answered 422 instead of replaying an unrelated booking, even after the
+-- ht_channel_idempotency row is gone. PG-canonical only: no legacy counterpart,
+-- no sync mapper, no writeback, no dark flag. This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('095', '095_ht_bookings_ext_ref_fingerprint.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react'
 import { X, AlertCircle, Loader2, LogOut, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import RoomCheckPanel from '@/components/v2/signals/RoomCheckPanel'
+import AppDepositNotice from '@/components/v2/AppDepositNotice'
 
 /**
  * Check-out & settle modal (M1 task #37).
@@ -64,6 +66,17 @@ interface CheckOutModalProps {
   room: RoomLite
   onClose: () => void
   onSuccess: () => void
+  /**
+   * Opt-in: append the ขอเช็คห้อง room-signal panel (ADR 0008) below the
+   * existing modal body.
+   *
+   * OPT-IN, not always-on, and deliberately so. This one modal is mounted by
+   * three surfaces — the v2 rooms board, the v1 dashboard, and the v1 rooms
+   * page — and only the v2 desk surface is in the room-signals build. Without
+   * the flag the component is not even mounted, so the v1 screens issue no
+   * signal read, open no event stream, and render no new control.
+   */
+  roomCheck?: boolean
 }
 
 type PaymentMethod = 'cash' | 'credit' | 'transfer' | 'qr'
@@ -93,7 +106,12 @@ function formatCurrency(amount: number): string {
   }).format(amount)
 }
 
-export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModalProps) {
+export default function CheckOutModal({
+  room,
+  onClose,
+  onSuccess,
+  roomCheck = false,
+}: CheckOutModalProps) {
   const branchFetch = useBranchFetch()
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
@@ -109,6 +127,14 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
   // release. Seeded with the clicked room once the room list loads.
   const [rooms, setRooms] = useState<RoomLine[]>([])
   const [selectedCrIds, setSelectedCrIds] = useState<Set<number>>(new Set())
+  // Task B7a — the ORIGINATING booking's channel + deposit, for the B7
+  // app-deposit signpost. Checkout is the last moment the divergence can bite
+  // (iHOTEL has shown this booking's deposit as 0 all stay), and it is also the
+  // moment money changes hands, so it belongs here as much as on the folio.
+  const [bookingDeposit, setBookingDeposit] = useState<{
+    bookChannel: string | null
+    amount: number | null
+  }>({ bookChannel: null, amount: null })
 
   // Find the currently active check-in for this room.
   useEffect(() => {
@@ -166,6 +192,28 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
         })
       })
       .catch(() => {})
+    return () => { cancelled = true }
+  }, [activeCheckin, branchFetch])
+
+  // Task B7a — the originating booking's channel + deposit, read from the SAME
+  // endpoint the /billing folio uses (`GET /api/checkins/:id/deposits` carries
+  // `bookChannel` + `bookingDepositAmount` alongside the per-room lines). No new
+  // backend field: the checkout-quote DTO deliberately stays money-only.
+  useEffect(() => {
+    if (!activeCheckin) return
+    let cancelled = false
+    branchFetch(`/api/checkins/${activeCheckin.id}/deposits`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d?.success) return
+        setBookingDeposit({
+          bookChannel: d.bookChannel ?? null,
+          amount: d.bookingDepositAmount ?? null,
+        })
+      })
+      .catch(() => {
+        /* silent — the notice simply stays hidden, checkout is unaffected */
+      })
     return () => { cancelled = true }
   }, [activeCheckin, branchFetch])
 
@@ -303,6 +351,16 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
             </div>
           ) : activeCheckin ? (
             <>
+              {/* Task B7a — the stay came from a booking the guest paid in the
+                  app. iHOTEL showed that booking's deposit as 0 all stay long,
+                  and this screen is where the remaining balance gets taken, so
+                  the signpost sits ABOVE the folio and the tender select — not
+                  after the money is collected. Silent for walk-ins and OTA. */}
+              <AppDepositNotice
+                bookChannel={bookingDeposit.bookChannel}
+                depositAmount={bookingDeposit.amount}
+              />
+
               <div className="bg-sky-50 border border-sky-200 rounded p-3 space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-600">เลขที่เช็คอิน:</span>
@@ -433,6 +491,12 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
                   ? 'ยอดคงเหลือจะถูกบันทึกเป็นการชำระเงินก่อนเช็คเอ้าท์'
                   : 'ไม่มียอดค้างชำระ เช็คเอ้าท์ได้ทันที'}
               </div>
+
+              {/* ADR 0008 room-check — APPENDED at the end of the body so no
+                  existing checkout step moves, and adjacent to the confirm
+                  button, which is where an unresolved ของหาย/ของเสียหาย has
+                  to be seen. Manual by contract: it never fires on open. */}
+              {roomCheck && <RoomCheckPanel roomId={room.id} roomNo={room.roomNo} />}
             </>
           ) : null}
 

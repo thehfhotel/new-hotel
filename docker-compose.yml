@@ -126,6 +126,8 @@ services:
       - NEW_DB_PORT=${PGPORT:-5439}
       - NEW_DB_NAME=${POSTGRES_DB}
       - NEW_DB_USER=${POSTGRES_USER}
+      # Headroom over the code default of 10 (config.rs) after the 2026-07-29 SSE pool-exhaustion incident.
+      - NEW_DB_POOL_MAX=${NEW_DB_POOL_MAX:-20}
       # NEW_DB_PASSWORD — sourced from /run/secrets/postgres_password.
       # config.rs::NewDbConfig::from_env still reads `NEW_DB_PASSWORD`;
       # the hydrator copies POSTGRES_PASSWORD → NEW_DB_PASSWORD when only
@@ -138,14 +140,27 @@ services:
       # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Per-job slack notification kill-switches (2026-05-15).
-      # Default `true` preserves prior behavior — only set `false` when
-      # actively running a CT-watcher backfill window and the operator
-      # wants to silence the cron-driven noise. Registered in
-      # `scheduler::jobs::init_scheduler`.
-      - HOURLY_REPORT_ENABLED=${HOURLY_REPORT_ENABLED:-true}
-      - CHECKIN_NOTIFICATIONS_ENABLED=${CHECKIN_NOTIFICATIONS_ENABLED:-true}
-      - CHECKOUT_NOTIFICATIONS_ENABLED=${CHECKOUT_NOTIFICATIONS_ENABLED:-true}
-      - BOOKING_NOTIFICATIONS_ENABLED=${BOOKING_NOTIFICATIONS_ENABLED:-true}
+      # Registered in `scheduler::jobs::init_scheduler`.
+      #
+      # DEFAULT FLIPPED true -> false (2026-07-28) — fail CLOSED. All four
+      # jobs are purely informational and POST to Slack once PER ROW, on the
+      # same webhook that carries every `:rotating_light:` page; there is no
+      # severity routing. A `true` default meant any environment that had not
+      # explicitly opted out — a fresh stack, a fork, a cleared variable —
+      # drowned the alert channel in a booking feed. Absence of config must
+      # mean quiet. Matching fail-closed default in
+      # `scheduler::jobs::notification_flag_enabled` (strict `true`/`1`).
+      #
+      # NOT part of the ADR-0004 compose-owned set below: unlike the
+      # reconcile / watermark flags, these four ARE injected by
+      # docker-build.yml (`vars.X || 'true'`), so in production the GitHub
+      # repo variables win and the defaults here are unreachable. All four
+      # have been `false` there since 2026-05-19 — this flip is a no-op for
+      # production and only fixes the fallback for everyone else.
+      - HOURLY_REPORT_ENABLED=${HOURLY_REPORT_ENABLED:-false}
+      - CHECKIN_NOTIFICATIONS_ENABLED=${CHECKIN_NOTIFICATIONS_ENABLED:-false}
+      - CHECKOUT_NOTIFICATIONS_ENABLED=${CHECKOUT_NOTIFICATIONS_ENABLED:-false}
+      - BOOKING_NOTIFICATIONS_ENABLED=${BOOKING_NOTIFICATIONS_ENABLED:-false}
       - HOST=0.0.0.0
       - PORT=3003
       # HF Ville — Phase 5 Ville cutover (#76, 2026-04-30): ville_pool
@@ -158,6 +173,8 @@ services:
       - VILLE_DB_PORT=${VILLE_DB_PORT:-5439}
       - VILLE_DB_NAME=${VILLE_DB_NAME:-hotelville}
       - VILLE_DB_USER=${VILLE_DB_USER:-${POSTGRES_USER}}
+      # Headroom over the code default of 5 (config.rs) after the 2026-07-29 SSE pool-exhaustion incident.
+      - VILLE_DB_POOL_MAX=${VILLE_DB_POOL_MAX:-10}
       # VILLE_DB_PASSWORD — sourced from /run/secrets/ville_db_password
       # CORS allowlist (Phase 3 hardening). Comma-separated absolute
       # origins. Default (when unset) covers the Next.js dev server on
@@ -200,6 +217,79 @@ services:
       # AUD tag of its path-scoped CF Access app; every /api/hk 401s
       # while unset (ships dark).
       - CF_ACCESS_HK_AUD=${CF_ACCESS_HK_AUD:-}
+      # /hk maid surface policy (wave-4 housekeeping). Same defaults as
+      # HkPolicy::from_env() in hotel-backend/src/main.rs. HK_BRANCHES
+      # defaults hfhotel-only — HF Ville needs repair_room_legacy_keys
+      # first (PENDING-VERIFICATIONS.md V13). HK_MARK_DIRTY_ENABLED ships
+      # OFF (invariant #6 — a maid's phone as the write TRIGGER needs its
+      # own reception-coordinated window, see PENDING-VERIFICATIONS.md V12).
+      - HK_MARK_DIRTY_ENABLED=${HK_MARK_DIRTY_ENABLED:-false}
+      - HK_BRANCHES=${HK_BRANCHES:-hfhotel}
+      # CR-1 (iHOTEL-WINS room status on /hk): HF Ville's LEGACY MSSQL target
+      # for the READ-ONLY `SELECT Room_no, Room_Clean FROM HT_Rooms` the maid
+      # list is reconciled against (hotel-backend/src/legacy_room_status.rs).
+      #
+      # HF Hotel needs NOTHING here: this container already carries DB_SERVER /
+      # DB_NAME / DB_USER / MSSQL_PORT + the db_password secret (above) for the
+      # scheduler's reconcile backstop, and the reader reuses that same pool.
+      #
+      # Values mirror the `sync-hfville` / `writeback-hfville` sidecars
+      # verbatim (Ville legacy MSSQL via the WG path, DNAT through MikroTik).
+      # Literals-as-defaults, exactly like those sidecars — no deploy-payload
+      # entry and no new GH variable is needed. The password reuses
+      # /run/secrets/db_password (both sites' legacy MSSQL share one `sa`
+      # credential today); set VILLE_MSSQL_PASSWORD to split them when one
+      # site rotates first.
+      #
+      # Named VILLE_MSSQL_* and NOT VILLE_DB_* on purpose — the latter is the
+      # Ville POSTGRES mirror further down. Two databases sharing an env
+      # prefix is how a read ends up pointed at the wrong server.
+      #
+      # The backend connects here ONLY when HK_BRANCHES admits hfville (V13),
+      # so while HK_BRANCHES=hfhotel this opens zero connections. Unset or
+      # unreachable is a supported state: /hk falls back to the canonical PG
+      # value with a visible Thai note.
+      - VILLE_MSSQL_SERVER=${VILLE_MSSQL_SERVER:-192.168.11.51}
+      - VILLE_MSSQL_PORT=${VILLE_MSSQL_PORT:-1436}
+      - VILLE_MSSQL_NAME=${VILLE_MSSQL_NAME:-HOTEL}
+      - VILLE_MSSQL_USER=${VILLE_MSSQL_USER:-sa}
+      # Per-employee location enforcement (wave-4 housekeeping C). HK_BRANCHES
+      # above answers "which properties does this DEPLOYMENT serve"; it never
+      # answered "which property does THIS MAID work at", so a HF Ville maid
+      # was offered HF Hotel in the picker and could file against the wrong
+      # property. With this ON, /api/hk/me serves HK_BRANCHES ∩ {the
+      # employee's HF ID location} and every room endpoint refuses a branch
+      # that is not hers.
+      #
+      # Ships OFF (invariant #6): flipping it can lock staff OUT of the
+      # surface — anyone whose HF ID Employee.location is NULL is refused, by
+      # design and with no fallback. Preconditions, in order (see
+      # PENDING-VERIFICATIONS.md V14): the owner sets every maid's location in
+      # HF ID (badge 421 is the only NULL today) → HFID_LOCATION_URL and
+      # HFID_RESOLVE_SECRET are both live → only THEN flip this.
+      #
+      # With the flag ON and the lookup unconfigured, EVERY /hk request 503s
+      # (fail closed — "unconfigured" must never equal "allowed"). The startup
+      # line logs `location_enforcement_enabled=… (lookup configured: …)`.
+      - HK_LOCATION_ENFORCEMENT_ENABLED=${HK_LOCATION_ENFORCEMENT_ENABLED:-false}
+      # FULL URL of HF ID's badge → location endpoint, path included —
+      # http://192.168.100.228:5000/api/private/reader/resolve-badge
+      # (fingerprint-time-logger app/api/reader.py). A full URL rather than a
+      # base + hardcoded path so a peer-side path change is a variable edit,
+      # not a code change.
+      #
+      # LAN ONLY — never route this through Cloudflare. It is a
+      # server-to-server call inside the property network sitting in the
+      # request path of every /hk read; an edge hop would add an auth surface,
+      # a failure mode and latency to it.
+      #
+      # Deliberately no default: unset must read as "unconfigured" (⇒ 503,
+      # fail closed), never as a confident lookup against a guessed path.
+      - HFID_LOCATION_URL=${HFID_LOCATION_URL:-}
+      # HF ID's on-duty escalation endpoint (ADR 0008 room signals). Same
+      # posture: no default — unset means the escalation scheduler never
+      # registers (one startup log line), which is "off", not an error.
+      - HFID_ESCALATE_URL=${HFID_ESCALATE_URL:-}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap
@@ -301,6 +391,209 @@ services:
       # ENABLED after the HF Ville canary healed C2413 / R002066 on
       # 2026-07-27 (16 days stranded) with correct data and no legacy write.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A — `payments` reconcile arm (legacy HT_Receipt_H ↔ canonical
+      # ht_payments, keyed on Receipt_no). DETECTION ONLY: it records
+      # divergence into ht_reconcile_log and writes nothing but its own ack
+      # cache (ht_receipts_legacy, migration 080); it is deliberately NOT in
+      # FORCE_CONVERGE_VALUE_DRIFT_TABLES / REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls sync_payments, so the
+      # arm issues zero MSSQL and zero PG queries. Enable HF VILLE FIRST, soak
+      # 48h, then HF Hotel — pre-set LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>
+      # or enable in an announced window.
+      #
+      # SCOPE: the scan is floored at the canonical mirror's own coverage era
+      # (PAYMENTS_ERA_FLOOR_SQL — derived from MIN(ht_payments.pay_date), never
+      # configured). Receipts older than that were never imported and never can
+      # be, so hashing them would build a PERMANENT missing_pg backlog: >20k
+      # rows at HF Hotel on 2026-07-28 (21,566 ref-carrying legacy receipts vs
+      # 1,154 canonical payments, all 2026-04-27+). Those rows are unclosable —
+      # missing_pg is never acked and `payments` is in neither self-heal list —
+      # and would have starved every other entity out of the 500-row auto-resolve
+      # batch. Floored, the same data yields ~13 first-enable finds.
+      #
+      # So do NOT expect a big transient backlog here: what lands is small and
+      # each row needs OPERATOR ACTION (nothing auto-closes it), and the >72h
+      # escalation tier will fire on any that sit. This backend runs HF Hotel's
+      # reconcile; sync-hfville runs Ville's (its own HFVILLE_ override below).
+      # ENABLED 2026-07-31 (T2 rollout step 2 of 8) after a clean 46h Ville
+      # soak: 165 consecutive ticks, 0 findings, 0 alerts. Runs on backend-1's
+      # own MSSQL pool, architecturally isolated from sync-1's CT watcher —
+      # see #275, which gates the REMAINING arms on Ville (shared pool) but
+      # not this one.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-true}
+      # Phase 6-B — `guest_registry` reconcile arm (legacy
+      # HT_CheckIn_Other_People ↔ canonical ht_guest_registry). Reconciles per
+      # FOLIO (the whole companion set of one Cin_no), NOT per row: iHOTEL
+      # edits companions by DELETE+REINSERT, so per-row keying would report a
+      # divergence on every correctly-applied edit. DETECTION ONLY: it records
+      # into ht_reconcile_log and writes nothing but its own ack cache
+      # (ht_guest_registry_legacy, migration 081); it is deliberately NOT in
+      # FORCE_CONVERGE_VALUE_DRIFT_TABLES / REINGEST_MISSING_PG_TABLES —
+      # "repairing" a folio would mean DELETING canonical companion rows,
+      # i.e. a sweep destroying TM.30 immigration-registry state.
+      #
+      # SHIPS DARK. With this false, run_sync never calls sync_guest_registry,
+      # so the arm issues zero MSSQL and zero PG queries. Enable HF VILLE
+      # FIRST, soak 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: folios are admitted only when their parent check-in exists in
+      # canonical AND is at/after the mirror's own coverage era (derived from
+      # MIN(ht_checkins.cin_checkin_time) over check-ins carrying a mirrored
+      # companion; never configured). ht_guest_registry is CT-populated with
+      # no historical backfill while ht_checkins IS backfilled to 2021, so
+      # unfloored the first tick would open ~19.6k rows here (HF Hotel) that
+      # can NEVER close and would starve the 500-row auto-resolve batch.
+      # Floored, live 2026-07-28: 830 in-era legacy folios vs 818 canonical
+      # (~12 first-enable finds). Each needs OPERATOR ACTION — nothing
+      # auto-closes it, and the >72h escalation tier will fire on any that
+      # sit. This backend runs HF Hotel's reconcile; sync-hfville runs
+      # Ville's (its own HFVILLE_ override below).
+      #
+      # ENABLED 2026-08-01 (T2 rollout step 4 of 8), after a ~20h Ville soak
+      # rather than the nominal 48h — recorded deliberately, not skipped. What
+      # the soak showed: 0 new findings since the first scan, the companion
+      # mirror provably keeping pace with legacy (max guest_legacy_id 24918 →
+      # 24926, no divergence), a full night cycle covered, and Ville's own 30
+      # finds already backfilled and swept closed. The arm is detection-only,
+      # and the remedy for whatever lands here is already built and proven:
+      # backfill_guest_registry_companions, made site-parameterized for
+      # exactly this step.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-true}
+      # Phase 6-C — generic mirror-table probe: the 8 CT-mirrored
+      # legacy_mirror.* tables (cupon / checkin_product / deposit /
+      # changed_room / bill_debt_h / bill_debt_ds / rooms_cancel / book_pro)
+      # plus canonical ht_room_calendar. Compares ONE UNION-ALL aggregate
+      # batch per side (COUNT, MAX(pk), SUM of the money total on the 5
+      # tables that carry one) and only pays for a per-key diff when that
+      # aggregate disagrees. DETECTION ONLY: it records into
+      # ht_reconcile_log and writes nothing else — no ack cache, no new PG
+      # table, and no probe key is in FORCE_CONVERGE_VALUE_DRIFT_TABLES /
+      # REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls run_mirror_probe,
+      # so the probe issues zero MSSQL and zero PG queries. Enable HF VILLE
+      # FIRST, soak 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: the legacy scan is floored at MIN(mirror pk) — the mirror's
+      # own coverage boundary, derived, never configured. HT_Rooms_Cancel is
+      # why: it is the one CT-mirrored table missing from the --bootstrap
+      # snapshot set, so 315 of its HF Hotel rows (36 at Ville) predate the
+      # mirror and can never converge. Floored, 8 of the 9 probes are
+      # EXACTLY converged at both sites today (2026-07-28, read-only).
+      #
+      # FALSE PENDING DEPLOY-THEN-FLIP (#282, fixed in code 2026-08-10): the
+      # calendar arm is now a real (room, night) SET-DIFF that classifies
+      # genuine missing_pg (records) vs class-A surplus (#281, logged only)
+      # vs class-B stale back-pointer (converged + healable). The old COUNT
+      # comparison failed live in both directions (phantom surplus at Ville
+      # 2026-07-31; phantom deficit at HF Hotel 2026-08-04 — room 405 nights
+      # 05-11..13, present both sides, only the back-pointer NULL).
+      #
+      # FLIPPED 2026-08-10 after the checklist passed: set-diff image
+      # deployed (741bdd, backend-1 restarted 06:32Z), classification
+      # re-run live immediately before the flip — 0 legacy-only pairs
+      # (no deficit), 137 class-A (log-only), 3 class-B (heal candidates,
+      # separate flag below). Expect probes=9 converged=9.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-true}
+      # #282 class-B heal: re-stamps rcal_legacy_id on tiles whose (room,
+      # night) still exists in legacy under a rebound id. Canonical-only
+      # UPDATE, per-tick cap 100, cannot violate the partial unique index.
+      # FLIPPED 2026-08-10 as the first live test — HF Hotel had exactly 3
+      # fully-predicted candidates (rcal_id 48/49/50 <- legacy
+      # 50980/50981/50982, the #282 room-405 tiles), verified row-by-row
+      # after the first tick. No reception coordination needed — no legacy
+      # traffic. Steady state: restamped=0 except after iHOTEL id-reuse
+      # rebinds, where it heals the pointer within one tick.
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-true}
+      # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
+      # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
+      # itemized amount + receipt-deduped ACTIVE tender. The folio is the
+      # unit because the CT mapper DELETEs a Cin_No's lines and re-INSERTs
+      # the whole current set; the tender dedupe is the house convention
+      # (task #63) because iHOTEL replicates the tender split onto every
+      # line of a multi-line receipt. DETECTION ONLY: it records into
+      # ht_reconcile_log and writes nothing else — no ack cache, no new PG
+      # table, and the key is in neither FORCE_CONVERGE_VALUE_DRIFT_TABLES
+      # nor REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls the probe, so it
+      # issues zero MSSQL and zero PG queries. Enable HF VILLE FIRST, soak
+      # 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: the legacy scan is floored at GREATEST(persisted watermark,
+      # MIN(ledger_legacy_id)) — the canonical mirror's own coverage
+      # boundary, derived, never configured, but CLAMPED to a non-decreasing
+      # watermark in ht_reconcile_era_floor.era_floor_id (migration 084).
+      # It is applied as a HAVING over the per-folio MIN, so a folio
+      # straddling the boundary is excluded whole rather than compared on a
+      # partial line set.
+      #
+      # The clamp is not theory: a raw MIN is only a valid boundary while
+      # coverage is an id-contiguous SUFFIX, and the mirror writes WHOLE
+      # folios. On 2026-07-30 a `backfill_payment_ledger --days=212` run
+      # mirrored a monthly-billed Ville long-stay carrying a 2025-08 line,
+      # dragging the floor back ~7 months and sweeping 404 never-mirrored
+      # folios into the scan as missing_pg (zero genuine). The ratchet makes
+      # that unrepeatable; the tick log and the aggregate row now print
+      # BOTH the derived and the effective floor, so a future drag attempt
+      # is visible rather than silent.
+      #
+      # ENABLE-ORDER CONSTRAINT — do NOT turn this on at a site until that
+      # site's `backfill_payment_ledger --all` has COMPLETED. The first
+      # enabled tick seeds ht_reconcile_era_floor.era_floor_id from whatever
+      # coverage exists at that moment and the ratchet then holds it, so a
+      # floor seeded from a narrow date-windowed coverage window would keep
+      # excluding the older folios a later `--all` lands — forever. If a
+      # watermark was seeded before a coverage-widening backfill, fix it
+      # with `DELETE FROM ht_reconcile_era_floor WHERE
+      # table_name='payment_ledger_probe'` on that site's canonical DB and
+      # let the next tick re-derive. A watermark that holds for ~1h raises
+      # the `era_floor_held:` Slack alert naming both floors.
+      #
+      # HF HOTEL STATUS 2026-08-01: the `--all` backfill has NOT run yet —
+      # it is scheduled for tonight. Until it completes, this flag stays
+      # false. EXPECT ON THE FIRST TICK AFTER IT: the 19 missing_pg folios
+      # measured 2026-07-28 (CH26-004952…CH26-004971 minus CH26-004960 —
+      # folios the Track J7e backfill never reached) should already be
+      # CLOSED by that run, which also lowers the derived floor to the
+      # absolute legacy minimum, making the in-era set the whole legacy
+      # table. If they are still open, they are real: money the round
+      # report under-counts, CLOSEABLE by re-driving with
+      # `docker compose run --rm backend backfill_payment_ledger`, after
+      # which the next auto-resolve sweep resolves them. Nothing closes
+      # such a row on its own, and the >72h escalation tier WILL fire if it
+      # is left, so flip in a window (or pre-set
+      # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>).
+      #
+      # ENABLED 2026-08-04 (T2 rollout step 6 of 8), AFTER the prerequisite
+      # `--all` backfill ran on this site the same evening: 20,389 folios /
+      # 28,744 lines mirrored, 0 errors, and MIN(ledger_legacy_id) fell
+      # 52805 -> 15806, the absolute legacy minimum. That ORDER is
+      # load-bearing: the era-floor ratchet (migration 084) makes the first
+      # ENABLED tick durable, so flipping before the backfill would have
+      # frozen the artifact floor 52805 and permanently hidden everything
+      # below it. Coverage is now complete, so the derived floor cannot be
+      # dragged again — there is no older row left to reach.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-true}
+      # ADR 0005 NULL-clear sentinel tripwire (docs/adr/0005-null-clear-sentinel-semantics.md).
+      # Two read-only SELECT COUNT(*)s per reconcile tick (HT_Book_H.Book_Cust_ID,
+      # HT_CheckIn_H.Cin_cust_no IS NULL) guarding the ADR's one accepted gap: a
+      # guarded reconcile-gate term cannot represent a legacy Some->None clear, so
+      # a genuine one produces an ht_reconcile_log row that can NEVER auto-close.
+      # The owner accepted the gap because the ADR's pre-flight audit found zero
+      # rows on both columns at both sites (2026-07-31) and iHOTEL has no code
+      # path that writes a literal NULL there (its customer-delete cascade writes
+      # the 'C0000' sentinel instead) — so the only live trigger is a legacy
+      # hand-edit outside iHOTEL.
+      #
+      # UNLIKE every Phase 6 reconcile arm above, this defaults ON: it is
+      # read-only and writes nothing to legacy or canonical, so it carries none
+      # of the "ship dark" risk that gate exists to manage (same posture as
+      # CF_AUTO_LOGIN). This backend runs HF Hotel's reconcile; sync-hfville runs
+      # Ville's (its own HFVILLE_ override below). Silence with
+      # NULL_SENTINEL_TRIPWIRE_ENABLED=false if it ever proves noisy.
+      - NULL_SENTINEL_TRIPWIRE_ENABLED=${NULL_SENTINEL_TRIPWIRE_ENABLED:-true}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -320,11 +613,108 @@ services:
       # Dir holding the card-reader middleware installers, served by
       # /api/downloads/middleware/{platform}. Bind-mounted read-only below.
       - MIDDLEWARE_ASSETS_DIR=${MIDDLEWARE_ASSETS_DIR:-/run/assets/middleware}
+      # OTA booking bridge (docs/ota-bridge.md) — the machine surface ota-desk
+      # calls on /api/ota/*. Both flags default OFF: the surface answers 503
+      # until ENABLED, then accepts un-credentialed calls (with a per-request
+      # WARN) until ENFORCE. The shared bearer itself is a SECRET, delivered as
+      # /run/secrets/ota_bridge_token — never an environment: entry.
+      #
+      # ADR 0004 applies to these two exactly as to the reconcile flags above:
+      # the DEFAULTS BELOW ARE THE LIVE PRODUCTION VALUES, they are deliberately
+      # NOT in .github/workflows/docker-build.yml, and they are NOT GitHub repo
+      # variables. Flip one by editing its default here — docker-compose.yml is
+      # in the workflow's `deploy` paths filter, so the edit triggers its own
+      # deploy and the flip is a one-line reviewable diff. Adding either key
+      # back to the workflow would make these defaults unreachable and silently
+      # revert the authentication posture on the next deploy.
+      #
+      # Flipping ENFORCE is NOT "just config": it is what turns an accepted
+      # unauthenticated ota-desk call into a 401. Precondition is 24h of zero
+      # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
+      - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-true}
+      - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-true}
+      # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+      #
+      # ADR 0004 applies to LOYALTY_CHANNEL_ENABLED exactly as to OTA_BRIDGE_*
+      # above: THE DEFAULT BELOW IS THE LIVE PRODUCTION VALUE, the key is
+      # deliberately NOT in .github/workflows/docker-build.yml, and it is NOT a
+      # GitHub repo variable. Flip it by editing the default here —
+      # docker-compose.yml is in the workflow's `deploy` paths filter, so the
+      # edit triggers its own deploy and the flip is a one-line reviewable diff
+      # that `git log -S LOYALTY_CHANNEL_ENABLED` can date. Adding the key back
+      # to the workflow would make this default unreachable and leave this file
+      # asserting the channel is dark while it is writing to the legacy DB;
+      # `lint-deploy-flag-ownership` fails CI if anyone does.
+      #
+      # Off ⇒ EVERY /api/channel/* request answers 503 before any credential is
+      # looked at (middleware::channel_token). Flipping it on is NOT "just
+      # config": a channel hold writes into the shared legacy DB as a normal จอง
+      # the moment it is created (coexistence invariant #6), so it needs a
+      # reception-coordinated live verification.
+      #
+      # There is ONE flag for BOTH properties — routes::channel::
+      # channel_service_for gates only HF Ville mutations (on
+      # HFVILLE_WRITES_ENABLED) and HF Hotel has no second gate — so this flip
+      # opens the mutating channel at HF Hotel and HF Ville in the same deploy.
+      # A single-property canary can only be enforced by the caller (the loyalty
+      # app choosing which `property=` it sends). See docs/loyalty-channel.md →
+      # "Go-live checklist".
+      - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
+      # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
+      # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
+      # secret file; with either missing, LoyaltyClient::from_config yields None
+      # and no stay ever accrues points (the checkout itself is unaffected).
+      #
+      # Unlike the flag above this one DOES ride the workflow as
+      # `vars.LOYALTY_APP_URL || ''` — a per-environment URL is the category ADR
+      # 0004 leaves on the variable path (ROUND_WRITEBACK_ENABLED /
+      # HFID_LOCATION_URL family). The two literals must stay identical;
+      # `lint-deploy-flag-ownership` asserts it.
+      - LOYALTY_APP_URL=${LOYALTY_APP_URL:-}
+      # NOTE: LOYALTY_CHANNEL_TOKEN and LOYALTY_SERVICE_TOKEN are SECRETS and so
+      # deliberately have NO `environment:` entry. They ride the deploy payload's
+      # `.secrets` block → /home/deploy/secrets/<name> → /run/secrets/<name>
+      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP maps both files).
+      # Their compose `secrets:` declaration landed ONE DEPLOY AFTER the payload
+      # keys (#296), exactly as ota_bridge_token and hfid_resolve_secret did —
+      # see the `secrets:` list below and docs/loyalty-channel.md →
+      # "Provisioning (deploy plumbing)" step 2. Mounting the files does not
+      # open anything: the channel still needs LOYALTY_CHANNEL_ENABLED (false,
+      # just above) and the stay hook still needs LOYALTY_APP_URL (blank).
     secrets:
       - db_password
       - postgres_password
       - ville_db_password
       - slack_webhook_url
+      # OTA booking bridge (docs/ota-bridge.md). SAFE to declare only because
+      # the deploy payload has carried `.secrets.ota_bridge_token{,_previous}`
+      # since the previous deploy, so both host files exist. run-deploy.sh
+      # writes a file for EVERY key in .secrets — including empty values — so
+      # an unset GH secret yields an empty file: the hydrator skips it (empty ==
+      # missing), the env var stays unset and the gate fails closed. A MISSING
+      # file, by contrast, aborts the entire stack start.
+      - ota_bridge_token
+      - ota_bridge_token_previous
+      # /hk employee-location lookup (hotel-backend/src/hfid_location.rs).
+      # SAFE to declare only because the deploy payload has carried
+      # `.secrets.hfid_resolve_secret` since the previous deploy, so the host
+      # file exists. Same one-deploy stagger, and the same reason, as the OTA
+      # pair above: run-deploy.sh writes a file for EVERY key in `.secrets`
+      # including empty values, so an unset GH secret yields an empty file
+      # (the hydrator skips it, no lookup client is built, the gate fails
+      # closed with 503) — whereas a compose `secrets:` entry pointing at a
+      # MISSING file aborts the ENTIRE stack start, not just backend.
+      #
+      # Backend only; no worker resolves badges.
+      - hfid_resolve_secret
+      # Loyalty-app bearers (docs/loyalty-channel.md). Backend only — no worker
+      # serves /api/channel/* or fires the checkout stay hook. SAFE to declare
+      # for the same reason as the entries above: the deploy payload has carried
+      # both `.secrets` keys since #296, so run-deploy.sh has already written
+      # both host files (empty while the GH secrets are unset, which the
+      # hydrator treats as absent — every gate stays closed).
+      - loyalty_channel_token
+      - loyalty_service_token
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -401,6 +791,24 @@ services:
       - WRITEBACK_ENABLED=${WRITEBACK_ENABLED:-true}
       - WRITEBACK_POLL_INTERVAL_SECS=${WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${WRITEBACK_MAX_ATTEMPTS:-3}
+      # ADR 0006 — reception "iHOTEL's room grid is stale" hint. Default false
+      # (ship DARK). When on, the worker publishes ONE coalesced `pg_notify`
+      # per drain tick after its legacy MSSQL commits; the SSE listener
+      # forwards it and the reception PC's Tauri tray middleware raises a
+      # toast with an opt-in refresh. Writes NOTHING to legacy — but it does
+      # put a notification in front of reception, so it flips only after the
+      # pilot on one terminal (docs/adr/0006-legacy-stale-notification.md
+      # "Pilot acceptance gate": <=1 toast/30 min over a full shift, plus the
+      # receptionist confirming she used it rather than ignored it).
+      # Delivery is silently no-op without both a tray app and an open v2
+      # browser tab on that PC, so flipping this early is safe but pointless.
+      # Flip via editing this line's default to `:-true` and pushing (per ADR
+      # 0004, this key is deliberately absent from docker-build.yml — the
+      # compose default IS production; `gh variable set` here is a silent
+      # no-op). docker-compose.yml is in the deploy paths filter, so the edit
+      # triggers its own deploy. Rollback = edit back to `:-false` and push
+      # (nothing to undo at runtime).
+      - LEGACY_STALE_NOTIFY_ENABLED=${LEGACY_STALE_NOTIFY_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
     secrets:
       - db_password
@@ -466,8 +874,13 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - NEW_DB_SERVER=newdb
       - NEW_DB_PORT=${PGPORT:-5439}
-      # Slack notifier — schema fingerprint drift, CT retention overflow,
-      # mapper consecutive-failure threshold all alert here.
+      # Slack notifier — schema fingerprint drift and CT retention overflow
+      # alert here. (Removed 2026-07-28: a "mapper consecutive-failure
+      # threshold" claim describing a breaker that does not exist. The
+      # nearest real knobs, LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD /
+      # _COOLDOWN_SECS, were deleted 2026-06-30 as parsed-but-dead; a
+      # sustained unreachable legacy is paged by the watchdog's probe-outage
+      # escalation instead.)
       # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Phase 5.5 watcher knobs (per docs/architecture.md §3.6d, §7).
@@ -500,12 +913,12 @@ services:
       # one hot table stalls all 19. ON = each table advances independently
       # from `legacy_ct_state_per_table`.
       #
-      # *** DO NOT SET TRUE — NOT SAFE AS SHIPPED. *** The global row freezes
-      # under per-table mode and `run_watermark_watchdog` has no per-table
-      # awareness, so the watchdog pages forever with no all-clear and rollback
-      # hard-fails after ~2 days. Full rationale on the sync-hfville copy of
-      # this key and in docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
-      # (Migration 078's reseed prerequisite IS satisfied; these two are not.)
+      # SAFE to enable since #259 (the global row is now written as a
+      # conservative min-of-per-table floor, and the watchdog names the stalest
+      # table), but left OFF: the stall it prevents is loud, bounded (~2 days
+      # of CT retention) and rare — one 74-min instance in ~2.5 months. Enable
+      # if a wedge actually happens, not as routine hygiene.
+      # Procedure + 24h soak checklist: RUNBOOK-reconcile-flag-flips.md §2.
       - SYNC_PER_TABLE_WATERMARK=${SYNC_PER_TABLE_WATERMARK:-false}
       # Self-healing re-ingest arm for the reconcile sweep's `missing_pg` rows
       # (dropped legacy changes). INERT in this process — only a process that
@@ -516,6 +929,32 @@ services:
       # if WORKER_RECONCILE_ENABLED is ever turned on here, this is already
       # correct rather than silently stale.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A `payments` reconcile arm — INERT in this process for the same
+      # reason as the re-ingest knob above (only a process that runs a reconcile
+      # reads it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED
+      # at its default-false). Carried here so the two HF Hotel processes never
+      # read differently. Ships DARK; see the backend service for the rollout.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # Phase 6-B `guest_registry` (companion folio) reconcile arm — INERT in
+      # this process for the same reason as the two knobs above. Carried here
+      # so the two HF Hotel processes never read differently. Ships DARK; see
+      # the backend service for the rollout.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      # Phase 6-C mirror-table probe — INERT in this process for the same
+      # reason as the knobs above (only a process that runs a reconcile
+      # reads it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED
+      # at its default-false). Carried here so the two HF Hotel processes
+      # never read differently. Ships DARK; see the backend service for the
+      # rollout and for what the first enabled tick is expected to say.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
+      # Phase 6-D payment-ledger probe — INERT in this process for the same
+      # reason as the knobs above (only a process that runs a reconcile reads
+      # it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED at
+      # its default-false). Carried here so the two HF Hotel processes never
+      # read differently. Ships DARK; see the backend service for the rollout
+      # and for what the first enabled tick is expected to open.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -641,24 +1080,152 @@ services:
       # Per-table CT watermarks (Resilience PR R3, migration 050) — sibling of
       # the sync service's SYNC_PER_TABLE_WATERMARK above.
       #
-      # *** DO NOT SET TRUE — NOT SAFE AS SHIPPED. *** Two prerequisites are
-      # missing: (1) under per-table mode the global `legacy_ct_state` row is
-      # never written (bin/sync.rs gates the advance on !per_table_watermark),
-      # so it FREEZES; (2) `run_watermark_watchdog` reads only that global row
-      # and has no per-table awareness. Together they make the watchdog fire
-      # `:rotating_light: CT watermark STUCK` every 30min forever with no
-      # possible all-clear, and once the frozen row falls below
-      # CHANGE_TRACKING_MIN_VALID_VERSION (~2 days) the startup gate refuses to
-      # start and recovery needs --bootstrap.
-      # Migration 078's reseed IS done (Ville's rows were pinned at 9060 against
-      # a global of 37843) — that prerequisite is satisfied; the two above are
-      # not. See docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
+      # SAFE to enable since #259: under per-table mode `run_one_tick` now
+      # writes the global row as a conservative floor (the MINIMUM per-table
+      # watermark across polled tables), so it no longer freezes and the
+      # watchdog / /health / sync-status.sh keep working; the watchdog also
+      # names the stalest table. The refuse-to-start guard is gone.
+      #
+      # Left OFF deliberately — the wedge it prevents is loud, bounded (~2 days
+      # of CT retention) and rare. Ville is the canary if you do enable it.
+      # Migration 078's reseed is done (Ville's rows were pinned at 9060 against
+      # a global of 37843). Procedure + 24h soak checklist:
+      # docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
       - SYNC_PER_TABLE_WATERMARK=${HFVILLE_SYNC_PER_TABLE_WATERMARK:-false}
       # Self-healing re-ingest arm for `missing_pg` reconcile rows (dropped CT
       # events) — sibling of the backend's RECONCILE_REINGEST_MISSING_PG_ENABLED.
       # This worker DOES run Ville's reconcile (WORKER_RECONCILE_ENABLED above),
       # so the knob is live here. Per-site so Ville canaries first. Ships dark.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A — `payments` reconcile arm (legacy HT_Receipt_H ↔ canonical
+      # ht_payments, keyed on Receipt_no). DETECTION ONLY; writes nothing but
+      # its own ack cache (ht_receipts_legacy, migration 080). This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary
+      # for it: enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. NOTE the canary is WEAK by construction: Ville has 105
+      # ref-carrying legacy receipts vs 4 canonical payments, so a green Ville
+      # soak says nothing about HF Hotel's 21.5k-receipt history — that is what
+      # the canonical era floor (PAYMENTS_ERA_FLOOR_SQL) exists to bound, not
+      # this soak. Findings need operator action; nothing here auto-closes.
+      # ENABLED 2026-07-29 (T2 rollout step 1 of 8): Ville canary live, 48h
+      # soak before flipping the backend (HF Hotel) default above.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${HFVILLE_RECONCILE_PAYMENTS_ARM_ENABLED:-true}
+      # Phase 6-B — `guest_registry` (companion folio) reconcile arm (legacy
+      # HT_CheckIn_Other_People ↔ canonical ht_guest_registry, keyed on Cin_no,
+      # compared per FOLIO). DETECTION ONLY; writes nothing but its own ack
+      # cache (ht_guest_registry_legacy, migration 081). This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. Unlike the payments canary this one is REPRESENTATIVE:
+      # Ville has 2,184 legacy companion folios and 545 canonical ones, the
+      # same shape and era boundary as HF Hotel, so the ~29 first-enable finds
+      # here really do predict HF Hotel's ~12. Findings need operator action;
+      # nothing here auto-closes, and a TM.30 under-count is the exact class
+      # this arm exists to surface.
+      # ENABLED 2026-07-31 (T2 rollout step 3 of 8). Ville is the canary and
+      # this arm is the REPRESENTATIVE one — 2,184 legacy companion folios vs
+      # 545 canonical here, the same shape and era boundary as HF Hotel, so
+      # the ~29 first-enable finds really do predict HF Hotel's ~12. Soak 48h
+      # before flipping the backend (step 4). Findings need operator triage;
+      # nothing auto-closes, and a TM.30 under-count is exactly the class
+      # this arm exists to surface.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${HFVILLE_RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-true}
+      # Phase 6-C — generic mirror-table probe (8 legacy_mirror.* tables +
+      # ht_room_calendar). DETECTION ONLY; writes nothing but
+      # ht_reconcile_log — no ack cache and no new PG table. This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. The canary is REPRESENTATIVE for the 8 mirror tables
+      # (Ville is exactly converged on all of them once floored, same as HF
+      # Hotel) and for the calendar gap, which Ville has in a WORSE ratio
+      # (1302 in-era legacy rows vs 1071 canonical, against 1507 vs 1298).
+      # So a green 48h soak here really does predict HF Hotel. The calendar
+      # gap is observe_only — logged with both counts each tick, never
+      # recorded into ht_reconcile_log, because no sweep or self-heal can
+      # close such a row and a hand-resolved one re-mints itself. It starts
+      # recording only when a closure path lands (issue #273; deferred
+      # past 6-D).
+      # REVERTED TO false 2026-07-31, same day it was pulled forward. It WAS
+      # enabled on the reasoning that backfill_room_calendar had closed the
+      # night deficit, so the arm should be silent. It was not: the first tick
+      # opened `mirror_ht_room_calendar` as missing_mssql, legacy 1637 vs pg
+      # 1676 — a difference of exactly 39, which is precisely the count of
+      # app-authored rows (`rcal_legacy_id IS NULL`) the backfill correctly
+      # left alone because they have no legacy counterpart by design.
+      #
+      # So the probe compares RAW counts and books legitimate app-authored
+      # rows as divergence, producing a row no sweep or operator can ever
+      # close. That is the exact failure #273 was filed to prevent
+      # ("detection with no remediation"). The business-key re-key fixed the
+      # KEYING; it did not teach the comparison to exclude rows that
+      # structurally cannot have a legacy counterpart.
+      #
+      # RE-ENABLED 2026-08-01 with that fix in place: the canonical side of
+      # the business-key comparison now counts MIRRORED rows only
+      # (rcal_legacy_id IS NOT NULL), in the one fetch shared by detection
+      # and closure, so the count identity holds (Ville 1,637 vs 1,637) and
+      # a recorded row can actually close. NB the excluded rows are DETACHED
+      # formerly-mirrored tiles (mapper id-reuse pre-clear), a genuine
+      # surplus class deliberately out of scope here and tracked as #281 —
+      # probe silence means "mirrored state matches legacy", not "canonical
+      # is clean".
+      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
+      # #282 class-B heal — enabled 2026-08-10 after the HF Hotel first
+      # live test verified row-by-row (restamped=3, exactly the predicted
+      # rcal_id 48/49/50 <- legacy 50980/50981/50982). Ville has 0
+      # candidates today; this makes future id-rebinds heal within a tick.
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${HFVILLE_RECONCILE_CALENDAR_RESTAMP_ENABLED:-true}
+      # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
+      # ht_payment_ledger). DETECTION ONLY; writes nothing but
+      # ht_reconcile_log — no ack cache and no new PG table. This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. Ville measured EXACTLY converged on 2026-07-28
+      # (read-only: 1016 in-era folios, identical line counts, itemized
+      # amounts AND receipt-deduped tenders on both sides), so a green soak
+      # here is a clean baseline rather than proof the detector fires. Watch
+      # for a QUIET ledger; anything new here is a genuine mirror gap in the
+      # money the round report reads, remediable with the
+      # backfill_payment_ledger bin.
+      #
+      # ENABLED 2026-08-01 (T2 rollout step 5 of 8). This canary is about
+      # BEHAVIOUR, not data: silence here proves the arm runs cleanly, not
+      # that the detector works. That distinction matters — the mirror probe
+      # was enabled on 2026-07-31 predicting silence and instead minted an
+      # unclosable row (it counts app-authored rows as divergence, see
+      # #273), so an arm misbehaving in an unforeseen way is a live risk,
+      # which is exactly what a canary is for.
+      #
+      # AND IT FIRED. On 2026-07-30 a `backfill_payment_ledger --days=212`
+      # mirrored a monthly-billed long-stay (CH25-000076) WHOLE, its 2025-08
+      # line dragged MIN(ledger_legacy_id) from ~40470 to 39113, and the
+      # probe reported 404 never-mirrored pre-coverage folios as missing_pg
+      # — zero genuine. A date-windowed backfill and an id-derived floor are
+      # NOT interchangeable definitions of coverage when the mirror writes
+      # whole folios. Remediated HERE 2026-08-01 by Ville's `--all` backfill
+      # (Ville coverage is now COMPLETE: its floor is 39014, the absolute
+      # legacy minimum, so the in-era set is the whole legacy table and the
+      # baseline is no longer "1016 in-era folios"); the CLASS is closed by
+      # the migration-084 era-floor ratchet, which lets the floor move only
+      # FORWARD.
+      #
+      # ENABLE-ORDER CONSTRAINT (satisfied here, NOT yet at HF Hotel): do
+      # not enable this probe at a site until that site's
+      # `backfill_payment_ledger --all` has completed. The first enabled
+      # tick seeds ht_reconcile_era_floor.era_floor_id and the ratchet holds
+      # it, so a floor seeded before a coverage-widening backfill would
+      # permanently exclude the folios that backfill lands. If that happens,
+      # `DELETE FROM ht_reconcile_era_floor WHERE
+      # table_name='payment_ledger_probe'` on that site's canonical DB and
+      # let the next tick re-derive. A watermark holding for ~1h raises the
+      # `era_floor_held:` Slack alert naming both floors.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-true}
+      # ADR 0005 NULL-clear sentinel tripwire — see the backend service's
+      # comment for the full rationale. This worker runs Ville's reconcile,
+      # so the knob is LIVE here (not the inert-carried-for-parity pattern
+      # the other RECONCILE_* arms use). Read-only, writes nothing, so —
+      # unlike those — it defaults ON rather than shipping dark.
+      - NULL_SENTINEL_TRIPWIRE_ENABLED=${HFVILLE_NULL_SENTINEL_TRIPWIRE_ENABLED:-true}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -713,6 +1280,32 @@ services:
       - WRITEBACK_ENABLED=${HFVILLE_WRITEBACK_ENABLED:-true}
       - WRITEBACK_POLL_INTERVAL_SECS=${HFVILLE_WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${HFVILLE_WRITEBACK_MAX_ATTEMPTS:-3}
+      # Per-intent allowlist for Ville's iHOTEL (housekeeping-ops 2026-08-11).
+      # BREAK-GLASS RESTRICTION, not a launch flag. Ville coequal writes are
+      # LIVE (HFVILLE_WRITES_ENABLED=true since 2026-06-29), so the steady
+      # state is EMPTY = inert: every intent dispatches, as before.
+      #
+      # SETTING it narrows the live worker — any intent not listed is parked
+      # terminal as status='skipped' instead of reaching Ville's iHOTEL, so
+      # canonical PG moves while legacy does not. Use it to stop ONE class of
+      # Ville legacy write mid-incident while the rest keeps flowing; to stop
+      # them ALL use HFVILLE_WRITEBACK_ENABLED=false above.
+      #
+      # Set it via the GitHub repo variable, never by hand on the host: the
+      # deploy payload re-materializes .env on every deploy and would wipe a
+      # local edit. Entries are validated at startup — an unknown intent PANICS
+      # this worker at boot rather than silently parking every job.
+      - HFVILLE_WRITEBACK_INTENTS=${HFVILLE_WRITEBACK_INTENTS:-}
+      # ADR 0006 — see the HF Hotel writeback service for the full rationale.
+      # Distinct `HFVILLE_`-prefixed source variable, so the per-site canary
+      # falls out of the two-service topology for free: HF Ville is the pilot
+      # terminal (DESKTOP-0BE5LED — lower volume, and it matches the flag
+      # rollout order used for every other coexistence flag), FRONT2 second.
+      # FLIPPED 2026-08-10: middleware v1.1.0 installed on the pilot via SSH,
+      # serving in the console session, autostart registered. The HF Hotel
+      # sibling stays false until the pilot's one-shift soak passes
+      # (<=1 toast/30min + the receptionist actually uses it).
+      - LEGACY_STALE_NOTIFY_ENABLED=${HFVILLE_LEGACY_STALE_NOTIFY_ENABLED:-true}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
     secrets:
       - db_password
@@ -744,6 +1337,12 @@ services:
     command: ["./backfill_rooms"]
     profiles:
       - backfill
+    # #284: the image bakes a HEALTHCHECK curling :3003/health; a one-shot
+    # batch binary never opens that port, so without this override every
+    # `docker compose run` of this service is unhealthy by construction and
+    # Netdata pages on jobs that succeeded. Same pattern as the workers.
+    healthcheck:
+      disable: true
     # Security audit 2026-05-14: DB_PASSWORD + pre-baked DATABASE_URL
     # moved to secret-file hydration. Backfill is one-shot, so an operator
     # running this without secrets mounted would hit the loud `require_secret`
@@ -780,6 +1379,10 @@ services:
     command: ["./backfill_payment_ledger"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     environment:
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
@@ -809,6 +1412,10 @@ services:
     command: ["./backfill_payment_ledger"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     environment:
       - DB_SERVER=192.168.11.51
       - DB_NAME=HOTEL
@@ -848,6 +1455,10 @@ services:
     command: ["./backfill_checkin_rooms"]
     profiles:
       - backfill
+    # #284: neutralise the baked :3003 HEALTHCHECK — one-shot binary,
+    # never serves HTTP. See backfill-rooms.
+    healthcheck:
+      disable: true
     # Security audit 2026-05-14: same secret-file migration as backfill-rooms.
     environment:
       - SITE_ID=${SITE_ID:-hfhotel}
@@ -891,15 +1502,36 @@ networks:
 # reads `std::env::var("DB_PASSWORD")` keeps working unchanged.
 #
 # DEPLOY-TIME PREREQUISITES on evergreen (must exist BEFORE merge / pipeline
-# runs `docker compose up`). The deploy script (`/srv/run-deploy.sh` on
-# evergreen, NOT in this repo) is responsible for writing these from GH
-# secrets, chmod 0400, chown deploy:docker:
+# runs `docker compose up`). The deploy script (`scripts/deploy/run-deploy.sh`
+# in this repo, self-updating `/srv/run-deploy.sh` on evergreen) is responsible
+# for writing these from the payload's `.secrets` block — `install -m 0444 -o
+# deploy -g docker`, one uniform loop over EVERY key, so a newly added secret
+# lands with exactly the same mode as the ones below.
+#
+# 0444, not 0400: the backend container's non-root `appuser` has to read the
+# bind-mounted file (v2.66.2 operator note). Tightening it is a tracked
+# follow-up with its own reasoning block in run-deploy.sh — do not "fix" the
+# mode in passing.
+#
+# One file per key under the top-level `secrets:` block at the end of this
+# file — that block is the authority; keep this list in step with it:
 #
 #     /home/deploy/secrets/db_password
 #     /home/deploy/secrets/postgres_password
-#     /home/deploy/secrets/ville_db_password   # symlink to postgres_password
-#                                              # until ADR 0001 Phase 8 split
+#     /home/deploy/secrets/ville_db_password   # a REAL file per key (one value
+#                                              # per secret, no symlink); still
+#                                              # the postgres value until HF
+#                                              # Ville gets its own credential
+#                                              # (ADR 0002)
 #     /home/deploy/secrets/slack_webhook_url
+#     /home/deploy/secrets/ota_bridge_token
+#     /home/deploy/secrets/ota_bridge_token_previous   # normally EMPTY
+#     /home/deploy/secrets/hfid_resolve_secret
+#     /home/deploy/secrets/loyalty_channel_token       # EMPTY until minted
+#     /home/deploy/secrets/loyalty_service_token       # EMPTY until minted
+#
+# An EMPTY file is fine (the hydrator treats it as absent, the gate stays
+# closed); a MISSING file is not — see below.
 #
 # An entry under `secrets:` that points to a missing file fails fast with
 #     "no such file or directory" before any container starts — operators
@@ -924,3 +1556,45 @@ secrets:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/ville_db_password
   slack_webhook_url:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/slack_webhook_url
+  # OTA booking bridge shared bearer + its rotation slot (docs/ota-bridge.md).
+  # Declared ONE DEPLOY AFTER the docker-build.yml payload key that creates the
+  # files — see the note above about a missing file aborting the whole stack.
+  # `ota_bridge_token` MUST hold the identical string as ota-desk's
+  # `PMS_BRIDGE_TOKEN`; compare `sha256(token)[0..6]` on both sides rather than
+  # the values.
+  ota_bridge_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token
+  ota_bridge_token_previous:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ota_bridge_token_previous
+  # Shared secret for the `/hk` employee-location lookup
+  # (hotel-backend/src/hfid_location.rs → `X-Reader-Secret`). Declared ONE
+  # DEPLOY AFTER the docker-build.yml payload key that creates the file — see
+  # the note above about a missing file aborting the whole stack.
+  #
+  # It MUST hold the identical string as fingerprint-time-logger's
+  # `READER_RESOLVE_SECRET` (HF ID guards its entire app↔central surface with
+  # that one secret — there is no separate credential to find). Same value as
+  # this stack's own `READER_RESOLVE_SECRET`; the distinct name keeps the two
+  # consumers independently rotatable. See CLAUDE.md → "Credentials & Docker
+  # secrets" for the three-names-one-secret table.
+  hfid_resolve_secret:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/hfid_resolve_secret
+  # Loyalty-app integration bearers (docs/loyalty-channel.md → "Provisioning
+  # (deploy plumbing)", step 2). Declared ONE DEPLOY AFTER the docker-build.yml
+  # payload keys `.secrets.loyalty_channel_token` / `.secrets.loyalty_service_token`
+  # (landed in #296), so both host files exist — the same stagger, and the same
+  # reason, as the OTA pair and hfid_resolve_secret above.
+  #
+  # `loyalty_channel_token` is the INBOUND bearer the loyalty app presents on
+  # /api/channel/*; `loyalty_service_token` is the OUTBOUND bearer this PMS
+  # presents on the checkout stay hook (it must hold the identical string as the
+  # loyalty app's own service token).
+  #
+  # Mounting them changes NOTHING about the dark state: the channel surface is
+  # additionally gated on LOYALTY_CHANNEL_ENABLED (false, compose-owned per ADR
+  # 0004) and the stay hook needs LOYALTY_APP_URL as well. An unset GH secret
+  # yields an EMPTY file, which the hydrator treats as absent.
+  loyalty_channel_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token
+  loyalty_service_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_service_token
