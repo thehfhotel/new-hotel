@@ -26,8 +26,12 @@
 //!    to fetch the MSSQL `HT_CheckIn_H` / `HT_CheckIn_Ds` /
 //!    `HT_CheckIn_Pay` aggregate.
 //! 3. Calls `sync::mappers::apply_checkin_aggregate(...)` to project +
-//!    INSERT into canonical `ht_checkins` + `ht_checkin_rooms` +
-//!    `ht_payments`. The mapper is idempotent — re-runs short-circuit.
+//!    INSERT into canonical `ht_checkins` + `ht_checkin_rooms` ONLY —
+//!    it does NOT touch `ht_payments` (stale claim corrected 2026-07-31,
+//!    issue #278 side-finding; `ht_payments` is populated separately by
+//!    the `HT_Receipt_H` mapper — see `bin/backfill_receipt_payments`
+//!    for that table's own backfill-ordering-race gap). The mapper is
+//!    idempotent — re-runs short-circuit.
 //! 4. On successful apply, marks every `ht_reconcile_log` row for that
 //!    PK as `resolved_at = NOW()`.
 //!

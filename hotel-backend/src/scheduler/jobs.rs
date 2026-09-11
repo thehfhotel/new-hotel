@@ -12,11 +12,17 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 use crate::config::{SiteConfig, SlackConfig};
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
     build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
+use crate::outbox::{EventBus, OutboxRepository};
+use crate::repository::{
+    CustomerRepository, PgBookingRepository, PgCustomerRepository,
+};
+use crate::service::{BookingService, ChannelService, CustomerService};
 use super::notification_state::{
     load_watermark, now_thai_local, save_watermark, NotificationType,
 };
@@ -46,6 +52,33 @@ impl Default for SchedulerState {
             last_booking_timestamp: None,
         }
     }
+}
+
+/// Read one of the four per-job Slack notification kill-switches.
+///
+/// FAIL-CLOSED (2026-07-28): an absent — or unrecognised — value means
+/// DISABLED. These four jobs are purely informational and POST to Slack
+/// once PER ROW, on the same webhook that carries every
+/// `:rotating_light:` page; there is no severity routing. The previous
+/// `.map(|v| v != "false").unwrap_or(true)` shape meant any environment
+/// that had not explicitly opted out — a fresh stack, a fork, a cleared
+/// GitHub variable — turned the alerting channel into a booking feed and
+/// buried the real pages under it.
+///
+/// This is a no-op for production. Unlike the ADR-0004 compose-owned
+/// flags, these four ARE injected by `docker-build.yml`
+/// (`vars.X || 'true'`) into the deploy payload → `.env` → compose, so
+/// the process always sees an explicit value and never reaches the
+/// fallback. All four GitHub repo variables have been `false` since
+/// 2026-05-19. The default only governs environments outside that
+/// pipeline — which is exactly the case this guards.
+///
+/// Strict comparison matches the idiom `routes/mode.rs` uses for the
+/// dark-shipped writeback flags.
+fn notification_flag_enabled(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
 
 /// Initialize the cron job scheduler.
@@ -167,6 +200,168 @@ pub async fn init_scheduler(
             ville_covered = ville_pg_pool.is_some(),
             "[Scheduler] - Stale-checkin tripwire: hourly (pure-PG dropped-checkout safety net)"
         );
+
+        // Loyalty-channel hold expiry sweep (docs/loyalty-channel.md).
+        // Belt-and-braces behind the loyalty app's own `release` call: any
+        // `book_channel='loyalty'` hold still `pending` past its
+        // `book_hold_expires_at` is auto-cancelled through the SAME
+        // release path the API uses (status-guarded on 'pending', normal
+        // CancelBooking writeback → iHOTEL sees the room free again).
+        // Registered unconditionally (not gated on LOYALTY_CHANNEL_ENABLED):
+        // the query is a cheap partial-index scan that matches nothing while
+        // the channel is dark, and an operator turning the channel OFF with
+        // holds outstanding still wants those holds to expire. Every 5
+        // minutes; per-hold failures are logged and skipped inside
+        // `sweep_expired_holds` so one bad row can't wedge the tick. Covers
+        // both sites (same pattern as the stale-checkin tripwire above —
+        // the backend is where both canonical pools are co-resident).
+        let sweep_pg = pg.clone();
+        let sweep_ville = ville_pg_pool.clone();
+        let sweep_site = site.id.clone();
+        let sweep_job = Job::new_async("0 */5 * * * *", move |_uuid, _l| {
+            let pg = sweep_pg.clone();
+            let ville = sweep_ville.clone();
+            let site_id = sweep_site.clone();
+            Box::pin(async move {
+                let released = channel_service_for_pool(&pg)
+                    .sweep_expired_holds(&site_id)
+                    .await;
+                if released > 0 {
+                    tracing::info!(site = %site_id, released, "[Scheduler] loyalty hold sweep released expired holds");
+                }
+                // Guard against an unexpected hfville-primary config
+                // double-sweeping the same DB (mirrors the tripwire above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        let released = channel_service_for_pool(vp)
+                            .sweep_expired_holds("hfville")
+                            .await;
+                        if released > 0 {
+                            tracing::info!(site = "hfville", released, "[Scheduler] loyalty hold sweep released expired holds");
+                        }
+                    }
+                }
+            })
+        })?;
+        scheduler.add(sweep_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty hold expiry sweep: every 5 minutes"
+        );
+
+        // Track F5 — loyalty-channel writeback-leg stall tripwire
+        // (docs/runbooks/writeback-leg-degraded.md). A hold is worth nothing
+        // to reception until its writeback reaches iHOTEL's room board as
+        // `จอง`; when the leg is down the hold commits in PG, dies at its 2h
+        // TTL, and no pre-existing alert is fast enough to mention it (the
+        // level digest needs 4h, the burst alert 50 rows/hr, the queue-depth
+        // janitor 500 pending jobs).
+        //
+        // REGISTERED HERE, NOT IN THE WRITEBACK WORKER, ON PURPOSE: the
+        // failure mode is "the worker is not draining the queue", whose most
+        // likely cause is that the worker container itself is down. A
+        // detector inside that worker shares its fate and goes silent in
+        // exactly the case it exists for. The scheduler is a different
+        // container, reads only canonical PG, and therefore keeps reporting
+        // while the legacy leg is unreachable.
+        //
+        // Registered unconditionally, like the sweep above: the query costs
+        // an empty partial-index scan while the channel is dark, and holds
+        // outstanding at the moment an operator turns the channel OFF are
+        // precisely the ones that must not go unwatched. Every 2 minutes at
+        // :30 so the tick never lands on the sweep's or the reconcile's
+        // boundary; worst-case detection is the threshold + 2 minutes.
+        // Covers both sites from the one process where both canonical pools
+        // are co-resident.
+        let stall_pg = pg.clone();
+        let stall_ville = ville_pg_pool.clone();
+        let stall_slack: Option<SlackClient> = if slack_config.is_configured() {
+            Some(SlackClient::new(slack_config.clone()))
+        } else {
+            None
+        };
+        let stall_site = site.id.clone();
+        let stall_job = Job::new_async("30 */2 * * * *", move |_uuid, _l| {
+            let pg = stall_pg.clone();
+            let ville = stall_ville.clone();
+            let slack = stall_slack.clone();
+            let site_id = stall_site.clone();
+            Box::pin(async move {
+                sync::check_loyalty_writeback_stall_and_alert(&pg, slack.as_ref(), &site_id).await;
+                // Guard against an unexpected hfville-primary config
+                // double-alerting on the same DB (mirrors the sweep above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        sync::check_loyalty_writeback_stall_and_alert(
+                            vp,
+                            slack.as_ref(),
+                            "hfville",
+                        )
+                        .await;
+                    }
+                }
+            })
+        })?;
+        scheduler.add(stall_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty writeback-leg stall tripwire: every 2 minutes (pure-PG; \
+             survives a writeback-worker outage)"
+        );
+
+
+        // Room-signal escalation valve (ADR 0008). Every 30 seconds: a
+        // ขอเช็คห้อง still unacked after 2 minutes is POSTed to HF ID, which
+        // LINE-pushes the ON-DUTY maids of that branch once. This is the ONLY
+        // path in the housekeeping feature that spends a metered LINE message;
+        // everything else rides PG + SSE and costs nothing, forever.
+        //
+        // SHIPS DARK: with `HFID_ESCALATE_URL` unset the job is NOT REGISTERED
+        // and this logs the fact ONCE here — never per tick. There is no
+        // default URL, because a guessed path would turn a misconfiguration
+        // into confident spend on a metered channel.
+        //
+        // Covers both sites from the one process where both canonical pools are
+        // co-resident, guarded against an hfville-primary config
+        // double-escalating the same DB — the same pattern as the tripwire and
+        // the loyalty sweep above. Per-signal failures are logged and skipped
+        // inside `run_escalation_tick`, which never returns an error.
+        let escalation_cfg = crate::config::HkEscalationConfig::from_env();
+        if escalation_cfg.is_configured() {
+            let esc_pg = pg.clone();
+            let esc_ville = ville_pg_pool.clone();
+            let esc_site = site.id.clone();
+            let esc_cfg = escalation_cfg.clone();
+            let escalation_job = Job::new_async("0/30 * * * * *", move |_uuid, _l| {
+                let pg = esc_pg.clone();
+                let ville = esc_ville.clone();
+                let site_id = esc_site.clone();
+                let cfg = esc_cfg.clone();
+                Box::pin(async move {
+                    super::hk_escalation::run_escalation_tick(&pg, &site_id, &cfg).await;
+                    if let Some(ref vp) = ville {
+                        if site_id != "hfville" {
+                            super::hk_escalation::run_escalation_tick(vp, "hfville", &cfg).await;
+                        }
+                    }
+                })
+            })?;
+            scheduler.add(escalation_job).await?;
+            tracing::info!(
+                site = %site.id,
+                ville_covered = ville_pg_pool.is_some(),
+                monthly_cap = escalation_cfg.monthly_cap,
+                "[Scheduler] - HK room-check escalation: every 30s (ADR 0008 LINE valve, ENABLED)"
+            );
+        } else {
+            tracing::info!(
+                site = %site.id,
+                "[Scheduler] - HK room-check escalation: DISABLED (HFID_ESCALATE_URL unset) — \
+                 no LINE messages will be sent for unacked ขอเช็คห้อง"
+            );
+        }
     }
 
     // Slack notification jobs only run if Slack is configured
@@ -214,10 +409,9 @@ pub async fn init_scheduler(
     // CT-watcher backfill window (`backfill_legacy_checkins` +
     // `backfill_legacy_bookings`) to suppress the hourly occupancy
     // summary while we're churning canonical state and the numbers
-    // would mislead the receptionist channel. Default: enabled.
-    let hourly_enabled = std::env::var("HOURLY_REPORT_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // would mislead the receptionist channel. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let hourly_enabled = notification_flag_enabled("HOURLY_REPORT_ENABLED");
     if hourly_enabled {
         let hourly_job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
             let pool = pool_hourly.clone();
@@ -232,7 +426,7 @@ pub async fn init_scheduler(
         scheduler.add(hourly_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED=false)"
+            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED != true)"
         );
     }
 
@@ -244,10 +438,8 @@ pub async fn init_scheduler(
     // backfill binaries deliberately do not publish DomainEvents, but
     // operators may still want a hard kill-switch on the poll-based
     // alert path while batch-importing historical state. Default:
-    // enabled.
-    let checkin_notifications_enabled = std::env::var("CHECKIN_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // DISABLED — see `notification_flag_enabled`.
+    let checkin_notifications_enabled = notification_flag_enabled("CHECKIN_NOTIFICATIONS_ENABLED");
     if checkin_notifications_enabled {
         let checkin_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_checkins.clone();
@@ -265,7 +457,7 @@ pub async fn init_scheduler(
         scheduler.add(checkin_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Check-in polling: DISABLED (CHECKIN_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Check-in polling: DISABLED (CHECKIN_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -274,10 +466,10 @@ pub async fn init_scheduler(
     // Feature flag: `CHECKOUT_NOTIFICATIONS_ENABLED=false` skips
     // registration entirely so the checkout Slack alert doesn't fire.
     // Same shape as `CHECKIN_NOTIFICATIONS_ENABLED` /
-    // `BOOKING_NOTIFICATIONS_ENABLED`. Default: enabled.
-    let checkout_notifications_enabled = std::env::var("CHECKOUT_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // `BOOKING_NOTIFICATIONS_ENABLED`. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let checkout_notifications_enabled =
+        notification_flag_enabled("CHECKOUT_NOTIFICATIONS_ENABLED");
     if checkout_notifications_enabled {
         let checkout_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_checkouts.clone();
@@ -295,7 +487,7 @@ pub async fn init_scheduler(
         scheduler.add(checkout_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Checkout polling: DISABLED (CHECKOUT_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Checkout polling: DISABLED (CHECKOUT_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -305,10 +497,9 @@ pub async fn init_scheduler(
     // registration entirely so the new-booking Slack alert
     // (`จองใหม่` template) doesn't fire. Same shape and rationale as
     // `CHECKIN_NOTIFICATIONS_ENABLED` above — operators may want a
-    // hard kill-switch during noisy windows. Default: enabled.
-    let booking_notifications_enabled = std::env::var("BOOKING_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // hard kill-switch during noisy windows. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let booking_notifications_enabled = notification_flag_enabled("BOOKING_NOTIFICATIONS_ENABLED");
     if booking_notifications_enabled {
         let booking_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_bookings.clone();
@@ -327,7 +518,7 @@ pub async fn init_scheduler(
         scheduler.add(booking_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Booking polling: DISABLED (BOOKING_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Booking polling: DISABLED (BOOKING_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -350,6 +541,31 @@ pub async fn init_scheduler(
     Ok(())
 }
 
+/// Build a per-site [`ChannelService`] from stateless parts + the site's
+/// canonical pool — the same construction shape as
+/// `AppState::resolve_write_services` (every collaborator is a stateless
+/// struct; the pool handle is the only real state), so the sweep's cancel
+/// path enqueues its writeback + event into the SAME site DB the hold lives
+/// in (the per-site writeback worker LISTENs there).
+fn channel_service_for_pool(pg: &PgPool) -> ChannelService {
+    let outbox = Arc::new(OutboxRepository::new());
+    let events = Arc::new(EventBus::new());
+    let customers_repo: Arc<dyn CustomerRepository> = Arc::new(PgCustomerRepository::new());
+    let bookings = Arc::new(BookingService::new(
+        Arc::new(PgBookingRepository::new()),
+        outbox.clone(),
+        events.clone(),
+        pg.clone(),
+    ));
+    let customers = Arc::new(CustomerService::new(
+        customers_repo.clone(),
+        outbox,
+        events,
+        pg.clone(),
+    ));
+    ChannelService::new(pg.clone(), bookings, customers, customers_repo)
+}
+
 /// Apply the task #69 site-id prefix to a Block-Kit Slack message in
 /// place. The `text` field is what shows in Slack notification previews
 /// and channel summaries — prefixing it lets an operator triage which
@@ -370,43 +586,42 @@ async fn send_hourly_report(
     let mut conn = pool.get().await?;
 
     // Get occupied rooms count
-    let occupied_rows = conn
-        .simple_query(
-            r#"
-            SELECT COUNT(*) as count FROM HT_Rooms
-            WHERE Room_Use = 'yes' OR Room_Book = 'yes'
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let occupied_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        r#"
+        SELECT COUNT(*) as count FROM HT_Rooms
+        WHERE Room_Use = 'yes' OR Room_Book = 'yes'
+        "#,
+        MssqlOpKind::Read,
+    )
+    .await?;
     let occupied_rooms: i32 = occupied_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))
         .unwrap_or(0);
 
     // Get total rooms count
-    let total_rows = conn
-        .simple_query("SELECT COUNT(*) as count FROM HT_Rooms")
-        .await?
-        .into_first_result()
-        .await?;
+    let total_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT COUNT(*) as count FROM HT_Rooms",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let total_rooms: i32 = total_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))
         .unwrap_or(0);
 
     // Get today's new bookings count
-    let bookings_rows = conn
-        .simple_query(
-            r#"
-            SELECT COUNT(*) as count FROM View_Booking_Ds
-            WHERE CAST(Book_Date AS DATE) = CAST(GETDATE() AS DATE)
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let bookings_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        r#"
+        SELECT COUNT(*) as count FROM View_Booking_Ds
+        WHERE CAST(Book_Date AS DATE) = CAST(GETDATE() AS DATE)
+        "#,
+        MssqlOpKind::Read,
+    )
+    .await?;
     let today_bookings: i32 = bookings_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))
@@ -762,5 +977,100 @@ async fn persist_watermark(
              will retry on next advance",
             label_for_log, advanced_to, e
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure unit tests for the per-job notification kill-switches. The
+    //! job bodies themselves need live MSSQL/PG pools and are covered by
+    //! the integration suite.
+    use super::*;
+
+    /// The four informational Slack jobs registered by
+    /// `init_scheduler`, in registration order.
+    const NOTIFICATION_FLAGS: [&str; 4] = [
+        "HOURLY_REPORT_ENABLED",
+        "CHECKIN_NOTIFICATIONS_ENABLED",
+        "CHECKOUT_NOTIFICATIONS_ENABLED",
+        "BOOKING_NOTIFICATIONS_ENABLED",
+    ];
+
+    /// Env-var manipulation across parallel cargo tests would race; we
+    /// serialise these tests behind a Mutex and restore the prior value.
+    /// The lock is process-wide because `set_var` is too. Same shape as
+    /// `scheduler::sync::tests::with_mode_env`.
+    fn with_flag_env<F: FnOnce() -> bool>(var: &str, value: Option<&str>, f: F) -> bool {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let prior = std::env::var(var).ok();
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let out = f();
+        match prior {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        out
+    }
+
+    #[test]
+    fn every_notification_flag_defaults_to_disabled_when_unset() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                !with_flag_env(var, None, || notification_flag_enabled(var)),
+                "{var} must default to DISABLED — these jobs POST to Slack once \
+                 per row on the same webhook as every page, so absence of config \
+                 must mean quiet, not a booking feed"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_enables_on_explicit_true() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                with_flag_env(var, Some("true"), || notification_flag_enabled(var)),
+                "{var}=true must still enable the job — the opt-in path is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_enables_on_explicit_one() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                with_flag_env(var, Some("1"), || notification_flag_enabled(var)),
+                "{var}=1 must enable the job (repo idiom accepts \"true\" or \"1\")"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_stays_disabled_on_explicit_false() {
+        // This is the live production value for all four (GitHub repo
+        // variables, set 2026-05-19) — pinning it proves the
+        // default flip is a production no-op.
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                !with_flag_env(var, Some("false"), || notification_flag_enabled(var)),
+                "{var}=false must remain DISABLED"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_notification_flag_value_is_disabled() {
+        for var in NOTIFICATION_FLAGS {
+            for value in ["TRUE", "yes", "on", ""] {
+                assert!(
+                    !with_flag_env(var, Some(value), || notification_flag_enabled(var)),
+                    "{var}={value:?} is not a recognised opt-in and must stay DISABLED"
+                );
+            }
+        }
     }
 }

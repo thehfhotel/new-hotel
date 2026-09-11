@@ -1,0 +1,97 @@
+-- Migration: 083_sync_status_payment_ledger_probe
+-- Version: vNext
+-- Date: 2026-07-28
+-- Description: `sync_status` row for the Phase 6-D payment-ledger probe
+--              (`entity_type = 'payment_ledger_probe'`), so the probe's
+--              failure counter is not a silent no-op.
+--
+-- ## What the probe is
+--
+-- `scheduler/payment_ledger_probe.rs` compares legacy `HT_CheckIn_Pay`
+-- against canonical `ht_payment_ledger` per FOLIO (`Cin_No`) — the unit the
+-- CT mapper writes atomically (`mirror_payment_ledger` DELETEs the folio's
+-- lines and re-INSERTs the loader's current set) — on three values:
+-- `line_count`, the itemized `amount_sum` summed RAW, and a `tender_sum`
+-- over ACTIVE lines DEDUPED to one line per receipt. The dedupe is the house
+-- convention (`routes/new_shifts.rs::ROUND_INCOME_BY_TENDER_SQL`, task #63):
+-- iHOTEL replicates the tender split onto every line of a multi-line
+-- receipt, so a raw tender sum triples the money a receipt actually took.
+-- Divergence is recorded into `ht_reconcile_log` as
+-- `table_name = 'payment_ledger_probe'`, `legacy_pk = Cin_No` (or the
+-- `<aggregate>` sentinel past the per-tick finding cap).
+--
+-- ## Why a migration exists for ONE row
+--
+-- `scheduler/sync.rs::record_error` is an `UPDATE sync_status … WHERE
+-- entity_type = $2` wrapped in `let _ =`: with no matching row it updates
+-- ZERO rows and discards the result, so a probe failure (legacy-pool
+-- acquire, the MSSQL grouped scan, either PG read) leaves nothing behind but
+-- a `tracing::error!` line — invisible to any dashboard reading
+-- `sync_status.consecutive_failures` / `last_error`, and indistinguishable
+-- from "the probe found nothing".
+--
+-- The SUCCESS side updates the same row and matters just as much:
+-- `record_success` is the ONLY statement that zeroes
+-- `consecutive_failures`, clears `last_error`/`last_error_at` and stamps
+-- `last_sync_at`. Without it the counter would be a monotonic LIFETIME
+-- failure count instead of a "currently broken" signal.
+--
+-- Migrations 080 (`payments`), 081 (`guest_registry`) and 082
+-- (`mirror_probe`) added their rows for the same reason.
+--
+-- Like 082 this migration adds NO table and NO index — the probe is
+-- detection-only and keeps no ack cache (it re-derives the
+-- `MIN(ledger_legacy_id)` coverage floor and both sides' aggregates live
+-- every tick). So there is no `CARDINALITY_MAP.md` entry: no new `ht_*`
+-- table exists to describe.
+--
+-- ## Scope, and what the first enabled tick does
+--
+-- The legacy scan is floored at `MIN(ledger_legacy_id)` — the canonical
+-- mirror's own coverage boundary, derived, never configured — and admits a
+-- folio only when its WHOLE line set is in era (`HAVING MIN(id) >= floor`,
+-- not `WHERE id >= floor`, so a folio straddling the boundary is excluded
+-- rather than compared on a partial line set). Live read-only counts
+-- 2026-07-28: HF Ville is EXACTLY converged (1,016 in-era folios, all three
+-- values equal on both sides); HF Hotel opens exactly 19 rows, all
+-- `missing_pg`, all contiguous at the era boundary
+-- (`CH26-004952`…`CH26-004971`, minus `CH26-004960`) — folios whose
+-- payments the Track J7e backfill never reached, i.e. money the round report
+-- under-counts today. Unfloored the same tick would weigh ~20k legacy
+-- folios against ~1.3k canonical ones.
+--
+-- Those rows are CLOSEABLE: re-drive them with
+-- `cargo run --release --bin backfill_payment_ledger` and the next
+-- auto-resolve sweep sees equal hashes and resolves them. Nothing closes
+-- them on its own — `payment_ledger_probe` is in NEITHER
+-- `FORCE_CONVERGE_VALUE_DRIFT_TABLES` nor `REINGEST_MISSING_PG_TABLES`, and
+-- per-arm self-heal extensions come only after this arm's detection has
+-- soaked.
+--
+-- The probe writes NOTHING while `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED` is
+-- false (compose default on every service, ADR 0004), so this row simply
+-- sits at `consecutive_failures = 0` until the flag is flipped. Rollout is
+-- Ville-first → 48h soak → HF Hotel, in an announced window.
+--
+-- STRICTLY ADDITIVE — no legacy DDL, no legacy write, no canonical data
+-- touched. Applies to both `hotelnew` and `hotelville` via
+-- `scripts/migrate.sh --site`.
+
+-- =============================================================================
+-- UP MIGRATION
+-- =============================================================================
+
+-- Both `record_error` and `record_success` UPDATE this row by entity_type;
+-- without it the probe's failure counter silently no-ops and its success
+-- counter has nothing to reset.
+INSERT INTO sync_status (entity_type) VALUES ('payment_ledger_probe')
+ON CONFLICT (entity_type) DO NOTHING;
+
+-- Schema-migrations row is inserted by scripts/migrate.sh (same TX, includes
+-- the file checksum). Do NOT INSERT here.
+
+-- =============================================================================
+-- DOWN MIGRATION (commented for reference)
+-- =============================================================================
+-- DELETE FROM sync_status WHERE entity_type = 'payment_ledger_probe';
+-- DELETE FROM schema_migrations WHERE version = '083';

@@ -1,7 +1,8 @@
 //! Schema fingerprint guard.
 //!
-//! Per `docs/architecture.md` §4e — the writeback worker queries MSSQL on
-//! startup for the column shapes of every table it writes to
+//! Per `docs/architecture.md` §"4e. Schema fingerprint guard" "refuse to write and alert"
+//! — the writeback worker queries MSSQL on startup for the column shapes
+//! of every table it writes to
 //! ([`WRITEBACK_FINGERPRINTED_TABLES`] — 20 tables as of the 2026-06-11
 //! audit), hashes the `(table, ord, column, type)` tuples, and refuses to
 //! start if the hash differs from a hardcoded baseline. The CT watcher
@@ -130,7 +131,8 @@ pub fn ct_fingerprinted_tables() -> Vec<&'static str> {
 }
 
 /// Captured column tuples from `docs/legacy-spike/schema/01-baseline-schema.txt`
-/// (lines 119–529). Format per row: `(table, ordinal, column, data_type)`.
+/// (`01-baseline-schema.txt:119-529`). Format per row:
+/// `(table, ordinal, column, data_type)`.
 ///
 /// Used by the [`tests::fingerprint_constant_matches_baseline`] test as the
 /// canonical source of [`EXPECTED_FINGERPRINT`]. Marked `#[allow(dead_code)]`
@@ -159,7 +161,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     //   HT_Book_*, HT_Changed_Room, HT_CheckIn_*, HT_Cupon, HT_Customers,
     //   HT_POWER_LOG, HT_Receipt_*, HT_Room_Status, HT_Rooms, HT_Rooms_Cancel.
 
-    // HT_Book_Date — spike baseline lines 119-126
+    // HT_Book_Date — schema-baseline.txt:119-126
     ("HT_Book_Date", 1, "id", "int"),
     ("HT_Book_Date", 2, "Book_no", "varchar"),
     ("HT_Book_Date", 3, "Book_type", "varchar"),
@@ -168,7 +170,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_Date", 6, "Book_USE", "int"),
     ("HT_Book_Date", 7, "Book_ok", "int"),
     ("HT_Book_Date", 8, "Cin_no", "varchar"),
-    // HT_Book_Ds — lines 127-137
+    // HT_Book_Ds — schema-baseline.txt:127-137
     ("HT_Book_Ds", 1, "id", "int"),
     ("HT_Book_Ds", 2, "Book_No", "varchar"),
     ("HT_Book_Ds", 3, "Book_Room_Type", "varchar"),
@@ -180,7 +182,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_Ds", 9, "Book_Room_PriceToTal", "float"),
     ("HT_Book_Ds", 10, "Book_Room_Note", "varchar"),
     ("HT_Book_Ds", 11, "Book_status", "int"),
-    // HT_Book_H — lines 146-163 (key columns through Book_Sale)
+    // HT_Book_H — schema-baseline.txt:146-163 (key columns through Book_Sale)
     ("HT_Book_H", 1, "Book_ID", "varchar"),
     ("HT_Book_H", 2, "Book_Date", "datetime"),
     ("HT_Book_H", 3, "Book_Date_in", "datetime"),
@@ -199,7 +201,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_H", 16, "Book_Notify_Day", "int"),
     ("HT_Book_H", 17, "Book_Notify_Note", "varchar"),
     ("HT_Book_H", 18, "Book_Sale", "varchar"),
-    // HT_Changed_Room — Wave 5a item 5. Spike baseline lines 200-207.
+    // HT_Changed_Room — Wave 5a item 5. schema-baseline.txt:200-207.
     // 8 columns. Not yet touched by a recipe (room-move audit) but
     // fingerprinted so a future recipe doesn't drift unobserved.
     ("HT_Changed_Room", 1, "id", "int"),
@@ -210,7 +212,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Changed_Room", 6, "room_before_price", "float"),
     ("HT_Changed_Room", 7, "Note", "varchar"),
     ("HT_Changed_Room", 8, "ToPrice", "varchar"),
-    // HT_CheckIn_Ds — lines 208-226
+    // HT_CheckIn_Ds — schema-baseline.txt:208-226
     ("HT_CheckIn_Ds", 1, "id", "int"),
     ("HT_CheckIn_Ds", 2, "Cin_No", "varchar"),
     ("HT_CheckIn_Ds", 3, "Cin_Room_No", "varchar"),
@@ -230,7 +232,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_Ds", 17, "Cin_cupon", "int"),
     ("HT_CheckIn_Ds", 18, "Cin_Dep_return_date", "datetime"),
     ("HT_CheckIn_Ds", 19, "Cin_Dep_return_by", "varchar"),
-    // HT_CheckIn_H — lines 227-248
+    // HT_CheckIn_H — schema-baseline.txt:227-248
     ("HT_CheckIn_H", 1, "Cin_no", "varchar"),
     ("HT_CheckIn_H", 2, "Cin_Date", "datetime"),
     ("HT_CheckIn_H", 3, "Cin_Book_no", "varchar"),
@@ -254,13 +256,13 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_H", 21, "Cin_foreign", "varchar"),
     ("HT_CheckIn_H", 22, "Cin_Work_number", "int"),
     // HT_CheckIn_Other_People — 2026-06-11 audit P1-8 (moved from the
-    // CT-extra baseline). schema-baseline.txt lines 249-252, 4 columns.
+    // CT-extra baseline). schema-baseline.txt:249-252, 4 columns.
     // TM.30 registry INSERT from walkin / checkin_to_booking.
     ("HT_CheckIn_Other_People", 1, "id", "int"),
     ("HT_CheckIn_Other_People", 2, "Cin_no", "varchar"),
     ("HT_CheckIn_Other_People", 3, "Cin_name", "varchar"),
     ("HT_CheckIn_Other_People", 4, "Cin_contry", "varchar"),
-    // HT_CheckIn_Pay — Wave 5a item 5. Spike baseline lines 253-274.
+    // HT_CheckIn_Pay — Wave 5a item 5. schema-baseline.txt:253-274.
     // 22 columns. Payment recipe `INSERT INTO [HT_CheckIn_Pay] (...)`.
     ("HT_CheckIn_Pay", 1, "id", "int"),
     ("HT_CheckIn_Pay", 2, "Pay_no", "varchar"),
@@ -285,7 +287,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_Pay", 21, "Branch", "varchar"),
     ("HT_CheckIn_Pay", 22, "Cin_Pay_web", "float"),
     // HT_CheckIn_Product — 2026-06-11 audit P1-8 (moved from the CT-extra
-    // baseline). schema-baseline.txt lines 275-286, 12 columns.
+    // baseline). schema-baseline.txt:275-286, 12 columns.
     // Product-line writes from the POS / stock-adjust / refund flows.
     ("HT_CheckIn_Product", 1, "id", "int"),
     ("HT_CheckIn_Product", 2, "Cin_No", "varchar"),
@@ -299,7 +301,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_Product", 10, "Cin_Pro_priceTotal", "float"),
     ("HT_CheckIn_Product", 11, "Cin_Pro_pay", "float"),
     ("HT_CheckIn_Product", 12, "Cin_Pro_note", "varchar"),
-    // HT_Cupon — Wave 5a item 5. Spike baseline lines 292-298.
+    // HT_Cupon — Wave 5a item 5. schema-baseline.txt:292-298.
     // 7 columns. Walkin / checkin_to_booking emit the mark-printed
     // UPDATE via helpers::mark_cupon_printed.
     ("HT_Cupon", 1, "cupon_no", "int"),
@@ -309,7 +311,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Cupon", 5, "cupon_gen_date", "datetime"),
     ("HT_Cupon", 6, "cupon_by", "varchar"),
     ("HT_Cupon", 7, "cupon_print", "int"),
-    // HT_Customers — lines 299-335 (35 columns)
+    // HT_Customers — schema-baseline.txt:299-333 (35 columns)
     ("HT_Customers", 1, "id", "int"),
     ("HT_Customers", 2, "Cust_no", "varchar"),
     ("HT_Customers", 3, "Cust_perfix", "varchar"),
@@ -346,7 +348,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Customers", 34, "Cust_Contry", "varchar"),
     ("HT_Customers", 35, "Cust_Work_Tax", "varchar"),
     // HT_Housewife — 2026-06-11 audit P1-8 (previously verified NOWHERE).
-    // schema-baseline.txt lines 347-353, 7 columns. Housekeeping log
+    // schema-baseline.txt:347-353, 7 columns. Housekeeping log
     // INSERT from mark_clean / checkout.
     ("HT_Housewife", 1, "id", "int"),
     ("HT_Housewife", 2, "h_name", "varchar"),
@@ -355,7 +357,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Housewife", 5, "h_note", "text"),
     ("HT_Housewife", 6, "h_cin", "varchar"),
     ("HT_Housewife", 7, "h_cin_name", "varchar"),
-    // HT_POWER_LOG — Wave 5a item 5. Spike baseline lines 422-429.
+    // HT_POWER_LOG — Wave 5a item 5. schema-baseline.txt:422-429.
     // 8 columns. Walkin / checkin_to_booking INSERT (lights on);
     // checkin_cancel / checkout UPDATE (lights off).
     ("HT_POWER_LOG", 1, "id", "int"),
@@ -367,7 +369,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_POWER_LOG", 7, "ROOM_POWER_NOTE", "varchar"),
     ("HT_POWER_LOG", 8, "ROOM_POWER_NOTE2", "varchar"),
     // HT_Products — 2026-06-11 audit P1-8 (previously verified NOWHERE).
-    // schema-baseline.txt lines 430-440, 11 columns. `Pro_Amt` stock
+    // schema-baseline.txt:430-440, 11 columns. `Pro_Amt` stock
     // mutations (cheatsheet §6.3 pairing) from the POS / stock flows.
     ("HT_Products", 1, "id", "int"),
     ("HT_Products", 2, "Pro_no", "varchar"),
@@ -380,7 +382,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Products", 9, "Pro_Unit", "varchar"),
     ("HT_Products", 10, "Pro_cap", "float"),
     ("HT_Products", 11, "Pro_Barcode", "varchar"),
-    // HT_Receipt_Ds — Wave 5a item 5. Spike baseline lines 445-454.
+    // HT_Receipt_Ds — Wave 5a item 5. schema-baseline.txt:445-454.
     // 10 columns. Payment recipe INSERT (receipt line for room charge).
     ("HT_Receipt_Ds", 1, "id", "int"),
     ("HT_Receipt_Ds", 2, "S_Sale_id", "int"),
@@ -392,7 +394,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Receipt_Ds", 8, "S_Total", "float"),
     ("HT_Receipt_Ds", 9, "S_PriceDiscount", "float"),
     ("HT_Receipt_Ds", 10, "S_PriceDiscount_per", "varchar"),
-    // HT_Receipt_H — lines 455-474 (20 columns)
+    // HT_Receipt_H — schema-baseline.txt:455-474 (20 columns)
     ("HT_Receipt_H", 1, "id", "int"),
     ("HT_Receipt_H", 2, "Receipt_no", "varchar"),
     ("HT_Receipt_H", 3, "Receipt_Date", "datetime"),
@@ -413,7 +415,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Receipt_H", 18, "Receipt_note", "text"),
     ("HT_Receipt_H", 19, "Receipt_Tax", "varchar"),
     ("HT_Receipt_H", 20, "Receipt_noteUP", "text"),
-    // HT_Room_Status — lines 493-500
+    // HT_Room_Status — schema-baseline.txt:493-500
     ("HT_Room_Status", 1, "id", "int"),
     ("HT_Room_Status", 2, "room_no", "varchar"),
     ("HT_Room_Status", 3, "room_date", "datetime"),
@@ -422,7 +424,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Room_Status", 6, "room_Book_No", "varchar"),
     ("HT_Room_Status", 7, "room_CheckIn_No", "varchar"),
     ("HT_Room_Status", 8, "room_date_oa", "float"),
-    // HT_Rooms — lines 501-523 (23 columns)
+    // HT_Rooms — schema-baseline.txt:501-523 (23 columns)
     ("HT_Rooms", 1, "id", "int"),
     ("HT_Rooms", 2, "Room_no", "varchar"),
     ("HT_Rooms", 3, "Room_Type", "varchar"),
@@ -446,7 +448,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Rooms", 21, "Room_Power_CLOSE", "varchar"),
     ("HT_Rooms", 22, "Room_Power_STATUS", "varchar"),
     ("HT_Rooms", 23, "Room_Clean_Time", "varchar"),
-    // HT_Rooms_Cancel — lines 524-529
+    // HT_Rooms_Cancel — schema-baseline.txt:524-529
     ("HT_Rooms_Cancel", 1, "id", "int"),
     ("HT_Rooms_Cancel", 2, "room_no", "varchar"),
     ("HT_Rooms_Cancel", 3, "cin_no", "varchar"),
@@ -454,7 +456,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Rooms_Cancel", 5, "cancel_by", "varchar"),
     ("HT_Rooms_Cancel", 6, "cancel_note", "text"),
     // Tb_Save_Image — 2026-06-11 audit P1-8 (previously verified
-    // NOWHERE). schema-baseline.txt lines 601-607, 7 columns. Photo-link
+    // NOWHERE). schema-baseline.txt:601-607, 7 columns. Photo-link
     // UPDATE from walkin / checkin_to_booking. Sorts after every HT_*
     // table under the server's case-insensitive collation.
     ("Tb_Save_Image", 1, "id", "int"),
@@ -494,7 +496,7 @@ pub const EXPECTED_FINGERPRINT: &str =
 /// startup check stays orthogonal to the CT startup check.
 #[allow(dead_code)]
 const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
-    // HT_Bill_Debt_Ds — baseline lines 92-100, 9 columns
+    // HT_Bill_Debt_Ds — schema-baseline.txt:92-100, 9 columns
     ("HT_Bill_Debt_Ds", 1, "id", "int"),
     ("HT_Bill_Debt_Ds", 2, "Bill_No", "varchar"),
     ("HT_Bill_Debt_Ds", 3, "DS_ID", "int"),
@@ -504,7 +506,7 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Bill_Debt_Ds", 7, "DS_NUM", "float"),
     ("HT_Bill_Debt_Ds", 8, "DS_PRICE", "float"),
     ("HT_Bill_Debt_Ds", 9, "DS_PRICE_TOTAL", "float"),
-    // HT_Bill_Debt_H — baseline lines 101-118, 18 columns
+    // HT_Bill_Debt_H — schema-baseline.txt:101-118, 18 columns
     ("HT_Bill_Debt_H", 1, "Bill_No", "varchar"),
     ("HT_Bill_Debt_H", 2, "Bill_Cust_ID", "varchar"),
     ("HT_Bill_Debt_H", 3, "Bill_Cust_Name", "varchar"),
@@ -523,7 +525,7 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Bill_Debt_H", 16, "Bill_Status", "varchar"),
     ("HT_Bill_Debt_H", 17, "Bill_by", "varchar"),
     ("HT_Bill_Debt_H", 18, "Bill_Note", "varchar"),
-    // HT_Book_Pro — schema-baseline.txt lines 179-187, 9 columns.
+    // HT_Book_Pro — schema-baseline.txt:179-187, 9 columns.
     // Pre-booked products attached to a booking (Phase 5/E2).
     ("HT_Book_Pro", 1, "id", "int"),
     ("HT_Book_Pro", 2, "B_NO", "varchar"),
@@ -534,7 +536,7 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_Pro", 7, "B_PRICE", "float"),
     ("HT_Book_Pro", 8, "B_PRICE_TOTAL", "float"),
     ("HT_Book_Pro", 9, "B_PRO_ID", "int"),
-    // HT_Deposit — baseline lines 334-341, 8 columns
+    // HT_Deposit — schema-baseline.txt:334-341, 8 columns
     ("HT_Deposit", 1, "id", "int"),
     ("HT_Deposit", 2, "Dep_no", "varchar"),
     ("HT_Deposit", 3, "Dep_Date", "datetime"),
@@ -971,7 +973,7 @@ mod tests {
             .iter()
             .filter(|(t, _, _, _)| *t == "HT_CheckIn_Pay")
             .collect();
-        // 22 columns per baseline schema lines 253-274.
+        // 22 columns per schema-baseline.txt:253-274.
         assert_eq!(pay_rows.len(), 22);
         assert!(pay_rows.iter().any(|(_, _, c, _)| *c == "Cin_Pay_Tran"));
         assert!(pay_rows.iter().any(|(_, _, c, _)| *c == "Cin_Pay_web"));
@@ -983,7 +985,7 @@ mod tests {
             .iter()
             .filter(|(t, _, _, _)| *t == "HT_Receipt_Ds")
             .collect();
-        // 10 columns per baseline schema lines 445-454.
+        // 10 columns per schema-baseline.txt:445-454.
         assert_eq!(ds_rows.len(), 10);
         assert!(ds_rows.iter().any(|(_, _, c, _)| *c == "S_PriceDiscount"));
     }
@@ -994,7 +996,7 @@ mod tests {
             .iter()
             .filter(|(t, _, _, _)| *t == "HT_POWER_LOG")
             .collect();
-        // 8 columns per baseline schema lines 422-429.
+        // 8 columns per schema-baseline.txt:422-429.
         assert_eq!(pl_rows.len(), 8);
         assert!(pl_rows.iter().any(|(_, _, c, _)| *c == "ROOM_POWER_NOTE"));
     }
@@ -1005,7 +1007,7 @@ mod tests {
             .iter()
             .filter(|(t, _, _, _)| *t == "HT_Changed_Room")
             .collect();
-        // 8 columns per baseline schema lines 200-207.
+        // 8 columns per schema-baseline.txt:200-207.
         assert_eq!(rows.len(), 8);
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_before"));
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_after"));

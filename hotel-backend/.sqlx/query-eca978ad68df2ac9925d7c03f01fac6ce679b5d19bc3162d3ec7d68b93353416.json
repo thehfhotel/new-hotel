@@ -1,0 +1,121 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT book_id,\n               book_no,\n               COALESCE(book_status, 'pending') AS \"status!\",\n               book_channel,\n               book_cust_id,\n               book_checkin,\n               book_checkout,\n               COALESCE(book_total_amount, 0)::float8 AS \"total_amount!\",\n               COALESCE(book_deposit_amount, 0)::float8 AS \"deposit_amount!\",\n               book_hold_expires_at\n          FROM ht_bookings\n         WHERE book_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "book_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "book_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_no"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "book_channel",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_channel"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "book_cust_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_cust_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "book_checkin",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_checkin"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "book_checkout",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_checkout"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "total_amount!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "deposit_amount!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "book_hold_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ht_bookings",
+            "name": "book_hold_expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      true,
+      false,
+      false,
+      false,
+      null,
+      null,
+      true
+    ]
+  },
+  "hash": "eca978ad68df2ac9925d7c03f01fac6ce679b5d19bc3162d3ec7d68b93353416"
+}
