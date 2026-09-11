@@ -287,14 +287,37 @@ then finds nothing to insert and reads a COMPLETE row. There is no advisory
 lock and no Redis, and the stored response commits in the same transaction that
 reserved the key — so a rollback loses both, never one without the other.
 
-**Residual gap, documented rather than papered over:** the hold and the
-idempotency record are two transactions (the hold rides `BookingService::create`,
-which owns its own). If the process dies in the gap between them, the hold is
-committed and the key is not, so a retry re-enters as a fresh request and creates
-a second hold — exactly the pre-existing behaviour, not a regression. Closing it
-would mean threading the key through `BookingService::create` as a second
-`book_ext_ref`-style natural key; that is a deliberate follow-up, not something
-to bolt on.
+**The gap between the two writes — CLOSED (B8d / issue #305).** The hold and
+the idempotency record are, and must remain, two transactions: the hold rides
+`BookingService::create`, which owns its own, while the reservation stays open
+across it. A process that died in between left the hold COMMITTED and the key
+GONE, so the retry re-entered as a fresh request and created a second hold.
+
+The key is now threaded through `create_hold` as the hold's own
+`ht_bookings.book_ext_ref` — `idem:{caller-digest}:{key}`, alongside
+`book_channel = 'loyalty'` — so migration **076**'s partial UNIQUE index
+`(book_channel, book_ext_ref)` dedupes INSIDE the booking's transaction, the
+one place a crash cannot separate from the booking itself. (That index was
+ruled out for the general case above because a loyalty hold has no
+channel-native id; it applies perfectly once the KEY plays that role.) The
+caller digest is in the value because `book_ext_ref` is unique only within
+`book_channel`, which is the constant `'loyalty'` for every hold — without it
+two callers, or one caller either side of a token rotation, could collide on a
+key as ordinary as `"1"` and the second would replay the first's booking.
+
+A retry after the crash therefore answers with the SURVIVING hold: same
+**201**, `Idempotency-Replayed: true`, and the payload rendered from the stored
+row — its total, and its ORIGINAL 2 h deadline, never a re-quote of the retry.
+The same path catches two retries racing each other (`BookingService::create`
+rolls its half-built row back on the unique violation and re-selects the
+winner). The lookup runs BEFORE the guest match-or-create, so a replay also
+leaves no duplicate `ht_customers` row behind.
+
+Unkeyed requests stamp no `book_ext_ref` and are completely unchanged: every
+call mints a new hold. Covered by
+`tests/test_channel.rs::hold_retry_after_a_crash_between_the_two_writes_replays_the_same_hold`,
+which reproduces the crash deterministically by abandoning the reservation
+after the hold commits.
 
 Implementation: `service::channel_idempotency` (policy, fingerprinting, the
 reservation guard) + `repository::channel_idempotency` (SQL) + the keyed branch

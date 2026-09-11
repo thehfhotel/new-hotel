@@ -44,6 +44,22 @@
 //!
 //! Mechanism and TTL live in `service::channel_idempotency` (migration 093).
 //!
+//! ### The gap between the two writes (B8d / issue #305)
+//!
+//! The key row and the booking commit in DIFFERENT transactions — they have
+//! to, because the reservation must stay open across the create. A process
+//! that dies between them leaves the hold COMMITTED and the key GONE, so the
+//! retry reserves fresh and, before this change, minted a second hold.
+//!
+//! The fix is to give the hold its own copy of the key:
+//! `ht_bookings.book_ext_ref = hold_ext_ref(caller, key)` alongside
+//! `book_channel = 'loyalty'`, which puts the dedupe on migration 076's
+//! partial UNIQUE index — INSIDE the booking's transaction, the one place a
+//! crash cannot separate from the booking. A retry then finds the survivor and
+//! replays it (same 201, `Idempotency-Replayed: true`, the STORED total and
+//! the ORIGINAL deadline), and the same path catches two retries racing each
+//! other. Unkeyed requests stamp nothing and are unchanged.
+//!
 //! ## Property ↔ branch mapping
 //!
 //! The contract identifies properties as `"hf"` (The Harbour Front Hotel)
@@ -72,8 +88,8 @@ use super::mode::{AppState, Branch};
 use crate::error::ApiError;
 use crate::outbox::event::EventSource;
 use crate::service::{
-    caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, ChannelService,
-    CreateHoldCommand, PaymentPlan, Reserved, ServiceError, StoredResponse,
+    caller_identity, fingerprint_of, hold_ext_ref, normalize_key, ChannelIdempotency,
+    ChannelService, CreateHoldCommand, PaymentPlan, Reserved, ServiceError, StoredResponse,
     ENDPOINT_CREATE_BOOKING, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_REPLAYED_HEADER,
 };
 
@@ -442,9 +458,17 @@ fn create_booking_fingerprint(
 /// Create the hold and render the 201 payload as a STRING — the exact bytes
 /// that get sent and, on a keyed request, stored for replay.
 ///
-/// Returns the rendered body plus the created `book_id`, or a ready-to-send
-/// error `Response`.
+/// `ext_ref` is the hold's own copy of the caller-idempotency key (B8d /
+/// issue #305). Passing it makes migration 076's `(book_channel,
+/// book_ext_ref)` UNIQUE index dedupe the create INSIDE the booking
+/// transaction, which is the only place that survives a crash between the
+/// booking's commit and `ht_channel_idempotency`'s. `None` for an unkeyed
+/// request, which keeps that path byte-for-byte what it always was.
+///
+/// Returns the rendered body, the `book_id`, and whether the service answered
+/// with an EXISTING hold — or a ready-to-send error `Response`.
 #[allow(clippy::result_large_err)] // see parse_property
+#[allow(clippy::too_many_arguments)] // one machine-surface request, unpacked
 async fn perform_create_hold(
     state: &AppState,
     service: &ChannelService,
@@ -454,7 +478,8 @@ async fn perform_create_hold(
     check_in: NaiveDate,
     check_out: NaiveDate,
     body: &CreateChannelBookingRequest,
-) -> Result<(String, i32), Response> {
+    ext_ref: Option<String>,
+) -> Result<(String, i32, bool), Response> {
     // Same daily allocator as the booking form (per-branch pool).
     let pool = state.write_pool(Some(branch)).map_err(api_error_response)?;
     let book_no = super::new_bookings::generate_book_no(state, pool)
@@ -472,6 +497,7 @@ async fn perform_create_hold(
             guest_phone: body.guest.phone.clone(),
             membership_id: body.membership_id.clone(),
             payment: body.payment.into(),
+            ext_ref,
             source: channel_event_source(),
         })
         .await
@@ -490,7 +516,7 @@ async fn perform_create_hold(
         )
     })?;
 
-    Ok((body, outcome.book_id))
+    Ok((body, outcome.book_id, outcome.replayed))
 }
 
 pub async fn create_booking(
@@ -534,7 +560,8 @@ pub async fn create_booking(
         Err(resp) => return resp,
     };
 
-    // No key — exactly the pre-existing behaviour, no row written.
+    // No key — exactly the pre-existing behaviour, no row written and no
+    // `book_ext_ref` stamped, so every call mints a new hold.
     let Some(key) = key else {
         return match perform_create_hold(
             &state,
@@ -545,10 +572,11 @@ pub async fn create_booking(
             check_in,
             check_out,
             &body,
+            None,
         )
         .await
         {
-            Ok((rendered, _)) => json_response(StatusCode::CREATED, rendered, false),
+            Ok((rendered, _, _)) => json_response(StatusCode::CREATED, rendered, false),
             Err(resp) => resp,
         };
     };
@@ -590,10 +618,13 @@ pub async fn create_booking(
         check_in,
         check_out,
         &body,
+        // B8d: the hold carries the key itself, so the (book_channel,
+        // book_ext_ref) index dedupes even when this reservation never commits.
+        Some(hold_ext_ref(&caller, &key)),
     )
     .await
     {
-        Ok((rendered, book_id)) => {
+        Ok((rendered, book_id, replayed)) => {
             if let Err(err) = reservation
                 .complete(StatusCode::CREATED.as_u16(), &rendered, Some(book_id))
                 .await
@@ -601,18 +632,22 @@ pub async fn create_booking(
                 // The hold IS committed (its own transaction); only the record
                 // of the key failed. Report the created booking — refusing it
                 // would tell the client nothing happened when a real iHOTEL
-                // `จอง` exists. A retry of this key re-enters as a fresh
-                // request, which is the pre-existing behaviour, not a
-                // regression.
+                // `จอง` exists. Since B8d a retry of this key no longer creates
+                // a second hold: it re-enters as a fresh reservation, the
+                // service recognises the booking by its `book_ext_ref`, and the
+                // SAME hold comes back marked as a replay.
                 tracing::error!(
                     error = %err,
                     idempotency_key = %key,
                     book_id,
                     "hold created but its idempotency key could not be recorded; a retry of this \
-                     key would create a second hold"
+                     key replays the hold via its book_ext_ref"
                 );
             }
-            json_response(StatusCode::CREATED, rendered, false)
+            // `replayed` here means the BOOKING was the survivor of an earlier
+            // attempt (crash between the two writes, or a lost concurrent
+            // race) — the response is the original hold, so say so.
+            json_response(StatusCode::CREATED, rendered, replayed)
         }
         Err(resp) => {
             // Errors are never cached: free the key so the client may retry it.

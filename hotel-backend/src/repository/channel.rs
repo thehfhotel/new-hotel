@@ -24,7 +24,7 @@
 //!   byte-for-byte the overlap predicate of `room_is_available` /
 //!   `validate_booking` (spike Phase 3), generalized across rooms.
 //!
-//! ## Parked (roomless) bookings — B8a
+//! ## Parked (roomless) bookings — B8a, then B8c
 //!
 //! The predicate above joins bookings through `ht_booking_rooms`, so a
 //! **parked** booking — a live `ht_bookings` row with ZERO
@@ -35,31 +35,53 @@
 //! it. Every physical room still looks free while a parked booking already
 //! claims one of them, so the channel could hold the property's last room.
 //!
-//! The fix is an inventory-pressure term computed from the SAME status set
-//! and the SAME half-open overlap rule: a parked live booking is one claim
-//! on one unidentified physical room for its nights, so
+//! B8a fixed the oversell with an inventory-pressure term computed from the
+//! SAME status set and the SAME half-open overlap rule, but — because
+//! canonical then recorded no room type for a parked booking at all — it
+//! could only cap property-wide:
 //!
 //! ```text
 //! surplus            = max(free rooms property-wide − parked claims, 0)
 //! available(type)    = min(free rooms of the type, surplus)
 //! ```
 //!
-//! **Why property-wide and not per-type.** A parked booking records no room
-//! type anywhere in the canonical schema — `ht_bookings` has no type column,
-//! `ht_booking_rooms.br_room_type_id` only exists on a row that already
-//! carries `br_room_id NOT NULL`, and neither the OTA bridge request shape
-//! (`routes::new_bookings::CreateUpdateBookingRequest`) nor the CT mapper
-//! carries one. Per-type attribution is therefore not a query we can write
-//! today; it needs a `book_room_type_id` column plus writers that populate
-//! it (deliberately NOT in this change). Until then the type-agnostic form
-//! above is the honest specialization: it never lets the channel sell a room
-//! a parked booking will need, and — because it caps rather than subtracts —
-//! it does not invent false sold-outs while the property still has slack
-//! (the failure mode `loyalty-app` ADR-0003 rejected allotments over).
+//! That never oversells, but it never blocks the RIGHT type either: a parked
+//! claim on a Deluxe let the channel sell the property's last Deluxe as long
+//! as some Standard was free.
 //!
-//! Cost: one extra aggregate per availability/pick call, over the free-room
+//! **B8c (migration 094)** supplies the missing fact —
+//! `ht_bookings.book_room_type_id`, written by the desk create/edit path and
+//! by the CT mapper (from `HT_Book_Ds.Book_Room_Type` on an iHOTEL
+//! "ระบุประเภทห้อง" booking, `HT_Book_H.Book_room_type = 1`). Parked claims
+//! therefore split in two and the rule becomes:
+//!
+//! ```text
+//! surplus            = max(free rooms property-wide − ALL parked claims, 0)
+//! available(type)    = min( max(free(type) − parked_typed(type), 0), surplus )
+//! ```
+//!
+//! Read the two terms as what they are:
+//!
+//! * the **per-type** term SUBTRACTS — a parked claim that names a type
+//!   removes a room of exactly that type, so the last Deluxe is now refused
+//!   while the Standard stays sellable;
+//! * the **property-wide** term still CAPS, and its arithmetic is
+//!   byte-for-byte what B8a shipped (every parked claim is counted, typed or
+//!   not). A claim whose type is NULL — unknown legacy code, an untyped room,
+//!   a pre-094 row — therefore behaves EXACTLY as it did under #304, which is
+//!   the deliberate fallback, not an oversight.
+//!
+//! The two compose without double-counting because the type term is a
+//! `LEAST`, not a second subtraction: a type's own claims can never be
+//! deducted twice, and claims on OTHER types still bound it through
+//! `surplus`. Capping (rather than subtracting) property-wide is also what
+//! keeps false sold-outs out while the property has slack — the failure mode
+//! `loyalty-app` ADR-0003 rejected allotments over.
+//!
+//! Cost: two extra aggregates per availability/pick call, over the free-room
 //! CTE those calls already build plus a `ht_bookings` date-range scan served
-//! by `ix_ht_bookings_daterange`.
+//! by `ix_ht_bookings_daterange` (the typed grouping is served by the partial
+//! `ix_ht_bookings_room_type`).
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -75,17 +97,28 @@ pub struct RoomTypeAvailability {
     pub available_count: i64,
 }
 
-/// Inventory pressure for one stay window (B8a) — the three numbers the
-/// counter and the picker are both derived from, exposed so operators (and
-/// tests) can see WHY a type reads sold out without re-deriving the SQL.
+/// Inventory pressure for one stay window (B8a, extended by B8c) — the
+/// numbers the counter and the picker are both derived from, exposed so
+/// operators (and tests) can see WHY a type reads sold out without
+/// re-deriving the SQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventorySnapshot {
     /// Physically free rooms property-wide for the window.
     pub free_rooms: i64,
-    /// Live bookings overlapping the window that have no room assigned yet.
+    /// Live bookings overlapping the window that have no room assigned yet —
+    /// typed and untyped together. This is the term `surplus` subtracts, and
+    /// its meaning is unchanged from B8a.
     pub parked_claims: i64,
+    /// The subset of `parked_claims` that names a room type (B8c / migration
+    /// 094). These are subtracted from THEIR OWN type's free-room count as
+    /// well as counted property-wide.
+    pub parked_claims_typed: i64,
+    /// The subset of `parked_claims` with `book_room_type_id IS NULL` — type
+    /// unknown, so they can only be capped property-wide (the #304 rule).
+    /// `parked_claims_typed + parked_claims_untyped == parked_claims`.
+    pub parked_claims_untyped: i64,
     /// `max(free_rooms - parked_claims, 0)` — what the channel may still
-    /// sell. `0` ⇒ every free room is already spoken for.
+    /// sell property-wide. `0` ⇒ every free room is already spoken for.
     pub surplus: i64,
 }
 
@@ -172,6 +205,12 @@ const FREE_ROOM_PREDICATE: &str = concat!(
 ///
 /// A cancelled/checked-out/no-show parked booking is excluded by the status
 /// set, exactly as it is for a roomed one.
+///
+/// B8c deliberately does NOT add a type term here: this predicate defines
+/// "which bookings are parked claims", and every parked claim counts toward
+/// the property-wide cap whether or not its type is known. The typed split is
+/// an extra aggregate over the SAME predicate (see [`inventory_ctes`]), so
+/// the two can never disagree about the population.
 const PARKED_CLAIM_PREDICATE: &str = concat!(
     r#"
       b.book_status IN ("#,
@@ -192,9 +231,20 @@ const PARKED_CLAIM_PREDICATE: &str = concat!(
 /// three cannot drift:
 ///
 /// * `free_rooms` — one row per physically free room (id, number, type);
-/// * `parked_claims` — how many live roomless bookings overlap the window;
+/// * `parked_claims` — how many live roomless bookings overlap the window,
+///   typed and untyped together (the property-wide pressure term);
+/// * `parked_claims_typed` — the same population grouped by
+///   `book_room_type_id`, NULL types excluded (B8c / migration 094);
 /// * `inventory_surplus` — free rooms that are NOT already spoken for by a
-///   parked booking, floored at 0.
+///   parked booking, floored at 0 — arithmetically identical to what B8a
+///   shipped, which is what preserves the #304 behaviour for a NULL-type
+///   claim;
+/// * `type_availability` — the ONE expression that decides what a type may
+///   sell: `min( max(free(type) − parked_typed(type), 0), surplus )`, one row
+///   per `ht_room_types` row (including inactive ones; the counter filters).
+///   Both the counter and the picker read it, so a type the counter shows as
+///   `0` is a type the picker refuses, by construction rather than by two
+///   parallel edits.
 ///
 /// A function rather than a `const` only because it interpolates two other
 /// consts. Callers prefix it with `WITH `. Binds `$1=check_in, $2=check_out`.
@@ -211,12 +261,38 @@ fn inventory_ctes() -> String {
               FROM ht_bookings b
              WHERE {PARKED_CLAIM_PREDICATE}
         ),
+        parked_claims_typed AS (
+            SELECT b.book_room_type_id AS type_id, COUNT(*)::int8 AS n
+              FROM ht_bookings b
+             WHERE {PARKED_CLAIM_PREDICATE}
+               AND b.book_room_type_id IS NOT NULL
+             GROUP BY b.book_room_type_id
+        ),
+        free_rooms_by_type AS (
+            SELECT room_type_id AS type_id, COUNT(*)::int8 AS n
+              FROM free_rooms
+             WHERE room_type_id IS NOT NULL
+             GROUP BY room_type_id
+        ),
         inventory_surplus AS (
             SELECT GREATEST(
                        (SELECT COUNT(*)::int8 FROM free_rooms)
                        - (SELECT n FROM parked_claims),
                        0::int8
                    ) AS n
+        ),
+        type_availability AS (
+            SELECT rt.type_id,
+                   LEAST(
+                       GREATEST(
+                           COALESCE(f.n, 0::int8) - COALESCE(p.n, 0::int8),
+                           0::int8
+                       ),
+                       (SELECT n FROM inventory_surplus)
+                   ) AS n
+              FROM ht_room_types rt
+              LEFT JOIN free_rooms_by_type   f ON f.type_id = rt.type_id
+              LEFT JOIN parked_claims_typed  p ON p.type_id = rt.type_id
         )
         "#
     )
@@ -228,10 +304,11 @@ fn inventory_ctes() -> String {
 /// states. Runtime `sqlx::query` — the SQL interpolates the shared
 /// [`inventory_ctes`] (static, no user input).
 ///
-/// B8a: the per-type free-room count is capped by `inventory_surplus`, so a
-/// parked (roomless) live booking removes a room from the channel's view even
-/// though no specific room looks taken. See the module docs for why the cap
-/// is property-wide rather than per-type.
+/// B8a/B8c: the count comes straight from the shared `type_availability`
+/// CTE — a parked (roomless) live booking removes a room from the channel's
+/// view even though no specific room looks taken, from its OWN type when it
+/// names one and property-wide otherwise. See the module docs for the two
+/// terms and why the property-wide one still only caps.
 pub async fn availability_by_type(
     pool: &PgPool,
     check_in: NaiveDate,
@@ -247,16 +324,11 @@ pub async fn availability_by_type(
                rt.type_name,
                rt.type_description,
                COALESCE(rt.type_base_price, 0)::float8 AS nightly_price,
-               LEAST(
-                   COUNT(f.room_id),
-                   (SELECT n FROM inventory_surplus)
-               )::int8 AS available_count
+               COALESCE(ta.n, 0::int8) AS available_count
           FROM ht_room_types rt
-          LEFT JOIN free_rooms f ON f.room_type_id = rt.type_id
+          LEFT JOIN type_availability ta ON ta.type_id = rt.type_id
          WHERE COALESCE(rt.type_active, true) = true
            AND ($3::int IS NULL OR rt.type_max_guests IS NULL OR rt.type_max_guests >= $3)
-         GROUP BY rt.type_id, rt.type_name, rt.type_description,
-                  rt.type_base_price, rt.type_sort_order
          ORDER BY rt.type_sort_order NULLS LAST, rt.type_id
         "#,
         ctes = inventory_ctes()
@@ -291,10 +363,11 @@ pub async fn availability_by_type(
 /// same room (same race window the walk-in / booking form has today; the
 /// existing create path accepts it and the shadow validator observes it).
 ///
-/// B8a: gated on the same `inventory_surplus` the counter caps with, so the
-/// picker REFUSES while the property is oversubscribed by parked (roomless)
-/// bookings even though this specific room looks free. Counter and picker
-/// read one shared definition ([`inventory_ctes`]) — they cannot drift.
+/// B8a/B8c: gated on the same `type_availability` row the counter reports, so
+/// the picker REFUSES while this TYPE is spoken for by parked (roomless)
+/// bookings — or while the property as a whole is oversubscribed — even
+/// though this specific room looks free. Counter and picker read one shared
+/// definition ([`inventory_ctes`]); they cannot drift.
 pub async fn pick_free_room(
     pool: &PgPool,
     type_id: i32,
@@ -312,7 +385,10 @@ pub async fn pick_free_room(
           JOIN ht_room_types rt ON rt.type_id = f.room_type_id
          WHERE f.room_type_id = $3
            AND (rt.type_max_guests IS NULL OR rt.type_max_guests >= $4)
-           AND (SELECT n FROM inventory_surplus) > 0
+           AND COALESCE(
+                 (SELECT ta.n FROM type_availability ta WHERE ta.type_id = $3),
+                 0::int8
+               ) > 0
          ORDER BY f.room_no
          LIMIT 1
         "#,
@@ -334,11 +410,13 @@ pub async fn pick_free_room(
     }))
 }
 
-/// Inventory pressure for `[check_in, check_out)` (B8a) — free rooms, parked
-/// claims and the resulting surplus, read through the SAME
-/// [`inventory_ctes`] the counter and the picker use. Diagnostic /
-/// test-facing: it answers "is this type sold out because its own rooms are
-/// taken, or because a parked booking claimed the property's last room?".
+/// Inventory pressure for `[check_in, check_out)` (B8a/B8c) — free rooms,
+/// parked claims (split into typed and untyped) and the resulting
+/// property-wide surplus, read through the SAME [`inventory_ctes`] the
+/// counter and the picker use. Diagnostic / test-facing: it answers "is this
+/// type sold out because its own rooms are taken, because a parked booking
+/// claimed a room OF THAT TYPE, or because an untyped parked booking claimed
+/// the property's last room?".
 pub async fn inventory_snapshot(
     pool: &PgPool,
     check_in: NaiveDate,
@@ -351,6 +429,11 @@ pub async fn inventory_snapshot(
         WITH {ctes}
         SELECT (SELECT COUNT(*)::int8 FROM free_rooms) AS free_rooms,
                (SELECT n FROM parked_claims)           AS parked_claims,
+               COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0::int8)
+                                                       AS parked_claims_typed,
+               (SELECT n FROM parked_claims)
+                 - COALESCE((SELECT SUM(n) FROM parked_claims_typed), 0::int8)
+                                                       AS parked_claims_untyped,
                (SELECT n FROM inventory_surplus)       AS surplus
         "#,
         ctes = inventory_ctes()
@@ -365,6 +448,8 @@ pub async fn inventory_snapshot(
     Ok(InventorySnapshot {
         free_rooms: row.try_get("free_rooms").unwrap_or(0),
         parked_claims: row.try_get("parked_claims").unwrap_or(0),
+        parked_claims_typed: row.try_get("parked_claims_typed").unwrap_or(0),
+        parked_claims_untyped: row.try_get("parked_claims_untyped").unwrap_or(0),
         surplus: row.try_get("surplus").unwrap_or(0),
     })
 }
@@ -426,6 +511,82 @@ pub async fn get_channel_booking(
         deposit_amount: r.deposit_amount,
         hold_expires_at: r.book_hold_expires_at,
     }))
+}
+
+/// The channel projection of the booking a `(book_channel, book_ext_ref)`
+/// natural key names — migration 076's partial UNIQUE index guarantees at
+/// most one (B8d / issue #305).
+///
+/// This is the READ half of making a hold-create replay-safe ACROSS a crash.
+/// `ht_channel_idempotency` (migration 093) records the key in a transaction
+/// SEPARATE from the booking's, so a crash between the two commits leaves the
+/// hold committed and the key gone — and the retry, entering as a fresh
+/// reservation, used to mint a SECOND hold. Stamping the key onto the booking
+/// itself as `book_ext_ref` moves the dedupe INSIDE the booking transaction;
+/// this lookup is how the service recognises the survivor and replays it
+/// instead of creating another.
+///
+/// Returns the same shape as [`get_channel_booking`] so the replay payload is
+/// rendered from the STORED hold (its own total, its own 2 h deadline), never
+/// re-quoted from the retry's request.
+pub async fn channel_booking_by_ext_ref(
+    pool: &PgPool,
+    channel: &str,
+    ext_ref: &str,
+) -> Result<Option<ChannelBookingRow>, sqlx::Error> {
+    // Runtime query (not `query!`): `book_ext_ref` postdates the committed
+    // `.sqlx` offline snapshot — same rationale as
+    // `repository::booking::find_by_channel_ext_ref`.
+    let row: Option<(
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        i32,
+        NaiveDate,
+        NaiveDate,
+        Option<f64>,
+        Option<f64>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT book_id, book_no, book_status, book_channel, book_cust_id, \
+                book_checkin, book_checkout, \
+                book_total_amount::float8, book_deposit_amount::float8, \
+                book_hold_expires_at \
+           FROM ht_bookings \
+          WHERE book_channel = $1 AND book_ext_ref = $2 \
+          ORDER BY book_id LIMIT 1",
+    )
+    .bind(channel)
+    .bind(ext_ref)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(
+        |(
+            book_id,
+            book_no,
+            status,
+            channel,
+            customer_id,
+            check_in,
+            check_out,
+            total_amount,
+            deposit_amount,
+            hold_expires_at,
+        )| ChannelBookingRow {
+            book_id,
+            book_no,
+            status: status.unwrap_or_else(|| "pending".to_string()),
+            channel,
+            customer_id,
+            check_in,
+            check_out,
+            total_amount: total_amount.unwrap_or(0.0),
+            deposit_amount: deposit_amount.unwrap_or(0.0),
+            hold_expires_at,
+        },
+    ))
 }
 
 /// Same projection, `FOR UPDATE` inside the caller's transaction — serializes

@@ -60,7 +60,8 @@ pub use booking::{
     ModifyBookingCommand,
 };
 pub use channel::{
-    ChannelService, ConfirmOutcome, CreateHoldCommand, HoldOutcome, PaymentPlan, ReleaseOutcome,
+    hold_ext_ref, ChannelService, ConfirmOutcome, CreateHoldCommand, HoldOutcome, PaymentPlan,
+    ReleaseOutcome,
 };
 pub use channel_idempotency::{
     caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, Reservation, Reserved,

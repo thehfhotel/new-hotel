@@ -27,8 +27,9 @@ use hotel_backend::outbox::{EventBus, OutboxRepository};
 use hotel_backend::repository::channel as channel_repo;
 use hotel_backend::repository::{CustomerRepository, PgBookingRepository, PgCustomerRepository};
 use hotel_backend::service::{
-    fingerprint_of, BookingService, ChannelIdempotency, ChannelService, CreateHoldCommand,
-    CustomerService, PaymentPlan, Reserved, ServiceError, ENDPOINT_CREATE_BOOKING,
+    fingerprint_of, hold_ext_ref, BookingService, ChannelIdempotency, ChannelService,
+    CreateHoldCommand, CustomerService, PaymentPlan, Reserved, ServiceError,
+    ENDPOINT_CREATE_BOOKING,
 };
 use uuid::Uuid;
 
@@ -183,6 +184,9 @@ fn hold_cmd(book_no: &str, type_id: i32, check_in: &str, check_out: &str) -> Cre
         guest_phone: "0899990001".to_string(),
         membership_id: Some("TEST-LOYAL-M1".to_string()),
         payment: PaymentPlan::Deposit50,
+        // Unkeyed request: no `book_ext_ref`, so every call mints a hold —
+        // the pre-B8d behaviour these scenarios rely on.
+        ext_ref: None,
         source: source(),
     }
 }
@@ -762,6 +766,9 @@ fn idem_hold_cmd(book_no: &str, type_id: i32) -> CreateHoldCommand {
         guest_phone: "0899990091".to_string(),
         membership_id: None,
         payment: PaymentPlan::Deposit50,
+        // Stamped by `create_hold_with_key` for the keyed paths (B8d); left
+        // unset here so a bare call is the unkeyed shape.
+        ext_ref: None,
         source: source(),
     }
 }
@@ -799,27 +806,34 @@ async fn create_hold_with_key(
             body: stored.body,
             book_id: stored.book_id,
         }),
-        Reserved::Fresh(reservation) => match service.create_hold(cmd).await {
-            Ok(outcome) => {
-                // Stand-in for the real 201 payload; the point is that the
-                // stored bytes come back verbatim.
-                let body = format!(
-                    "{{\"pms_booking_id\":\"hf-{}\",\"total\":{}}}",
-                    outcome.book_id, outcome.total_baht
-                );
-                reservation
-                    .complete(201, &body, Some(outcome.book_id))
-                    .await?;
-                Ok(KeyedCreate::Created {
-                    body,
-                    book_id: outcome.book_id,
-                })
+        Reserved::Fresh(reservation) => {
+            // Mirrors `routes::channel::create_booking`: a keyed request hands
+            // the hold its own copy of the key, so the (book_channel,
+            // book_ext_ref) index dedupes inside the booking transaction.
+            let mut cmd = cmd;
+            cmd.ext_ref = Some(hold_ext_ref(IDEM_CALLER, &key));
+            match service.create_hold(cmd).await {
+                Ok(outcome) => {
+                    // Stand-in for the real 201 payload; the point is that the
+                    // stored bytes come back verbatim.
+                    let body = format!(
+                        "{{\"pms_booking_id\":\"hf-{}\",\"total\":{}}}",
+                        outcome.book_id, outcome.total_baht
+                    );
+                    reservation
+                        .complete(201, &body, Some(outcome.book_id))
+                        .await?;
+                    Ok(KeyedCreate::Created {
+                        body,
+                        book_id: outcome.book_id,
+                    })
+                }
+                Err(err) => {
+                    reservation.abandon().await;
+                    Err(err)
+                }
             }
-            Err(err) => {
-                reservation.abandon().await;
-                Err(err)
-            }
-        },
+        }
     }
 }
 
@@ -917,6 +931,154 @@ async fn hold_create_is_idempotent_per_key() {
             .expect("count keys")
             .get("n");
     assert_eq!(keys, 1, "an unkeyed request must write no idempotency row");
+
+    cleanup_idem(&pool).await;
+}
+
+async fn count_idem_keys(pool: &PgPool) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS n FROM ht_channel_idempotency WHERE idem_caller = $1")
+        .bind(IDEM_CALLER)
+        .fetch_one(pool)
+        .await
+        .expect("count keys")
+        .get("n")
+}
+
+async fn stored_hold_expiry(pool: &PgPool, book_id: i32) -> chrono::DateTime<Utc> {
+    sqlx::query("SELECT book_hold_expires_at FROM ht_bookings WHERE book_id = $1")
+        .bind(book_id)
+        .fetch_one(pool)
+        .await
+        .expect("read hold expiry")
+        .get::<Option<chrono::DateTime<Utc>>, _>("book_hold_expires_at")
+        .expect("a hold always commits with its deadline (migration 086)")
+}
+
+/// B8d / issue #305 — a retry after a crash BETWEEN the booking write and the
+/// idempotency write must replay, not create a second hold.
+///
+/// `ht_channel_idempotency` (migration 093) cannot cover this by itself: the
+/// key row and the booking commit in DIFFERENT transactions, so a process that
+/// dies in between leaves the hold committed and the key gone. The retry then
+/// reserves FRESH — and before this change went on to mint a second hold
+/// against a second room that nobody would release before its 2 h deadline.
+///
+/// `Reservation::abandon()` reproduces that state exactly and deterministically:
+/// the reservation's transaction rolls back, so afterwards the booking exists
+/// and no key row does. No sleep, no fault injection, no race.
+///
+/// The fix is that the hold now carries the key itself as
+/// `ht_bookings.book_ext_ref`, so migration 076's `(book_channel, book_ext_ref)`
+/// UNIQUE index dedupes INSIDE the booking transaction — the one place that
+/// survives the crash.
+#[tokio::test]
+async fn hold_retry_after_a_crash_between_the_two_writes_replays_the_same_hold() {
+    let pool = common::create_test_pool().await;
+    cleanup_idem(&pool).await;
+    let type_id = seed_idem_rooms(&pool).await;
+    let svc = service_for(&pool);
+    let store = ChannelIdempotency::new(pool.clone());
+
+    let key = "TEST-idem-crash-1".to_string();
+    let fingerprint = fingerprint_of(&["hf", "2026-11-02", "2026-11-04", "2"]);
+    let ext_ref = hold_ext_ref(IDEM_CALLER, &key);
+
+    // --- attempt 1: the hold commits; the key record never does. ---
+    let reservation = match store
+        .reserve(IDEM_CALLER, &key, ENDPOINT_CREATE_BOOKING, &fingerprint)
+        .await
+        .expect("first reserve")
+    {
+        Reserved::Fresh(r) => r,
+        _ => panic!("a never-seen key must reserve fresh"),
+    };
+    let mut cmd = idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0101"), type_id);
+    cmd.ext_ref = Some(ext_ref.clone());
+    let first = svc.create_hold(cmd).await.expect("first hold");
+    assert!(
+        !first.replayed,
+        "the first attempt genuinely creates the hold"
+    );
+    assert_eq!(count_idem_bookings(&pool).await, 1);
+
+    // The crash: the reservation rolls back, the committed hold stays.
+    reservation.abandon().await;
+    assert_eq!(
+        count_idem_keys(&pool).await,
+        0,
+        "the crash must leave NO idempotency record — that is the precondition \
+         of the bug this test covers"
+    );
+    let stored_expiry = stored_hold_expiry(&pool, first.book_id).await;
+
+    // --- the retry: to the key store this looks like a brand-new request. ---
+    let reservation = match store
+        .reserve(IDEM_CALLER, &key, ENDPOINT_CREATE_BOOKING, &fingerprint)
+        .await
+        .expect("retry reserve")
+    {
+        Reserved::Fresh(r) => r,
+        _ => panic!(
+            "with the record lost the retry MUST reserve fresh; if it replayed \
+             here the test would be proving migration 093, not B8d"
+        ),
+    };
+    // A retry allocates its own book_no, exactly as the route would. It must
+    // never be used.
+    let mut retry = idem_hold_cmd(&format!("{IDEM_BOOK_NO_PREFIX}-0102"), type_id);
+    retry.ext_ref = Some(ext_ref.clone());
+    let second = svc.create_hold(retry).await.expect("retry hold");
+
+    assert!(
+        second.replayed,
+        "the retry must be reported as a replay so the route can stamp \
+         Idempotency-Replayed: true"
+    );
+    assert_eq!(
+        second.book_id, first.book_id,
+        "the retry must return the SURVIVING hold, not a new one"
+    );
+    assert_eq!(
+        second.book_no, first.book_no,
+        "the retry's freshly-allocated book_no must be discarded"
+    );
+    assert_eq!(
+        count_idem_bookings(&pool).await,
+        1,
+        "a retry after the crash must not create a second hold"
+    );
+
+    // The replay quotes the STORED hold, never a re-quote of the retry: same
+    // money, and above all the ORIGINAL deadline (a retry must not silently
+    // extend a 2 h hold).
+    assert_eq!(second.total_baht, first.total_baht);
+    assert_eq!(second.amount_due_baht, first.amount_due_baht);
+    assert_eq!(
+        second.hold_expires_at, stored_expiry,
+        "the replay's deadline must be the one on the stored row"
+    );
+
+    // Only one room was ever consumed — the whole point (the second room of
+    // the fixture type is still free for the same window).
+    let assigned: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM ht_booking_rooms br \
+           JOIN ht_bookings b ON b.book_id = br.br_book_id \
+          WHERE b.book_no LIKE $1",
+    )
+    .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+    .fetch_one(&pool)
+    .await
+    .expect("count assigned rooms")
+    .get("n");
+    assert_eq!(assigned, 1, "exactly one room may be held for one key");
+
+    // Finish the retry's reservation the way the route does, so the NEXT retry
+    // short-circuits at the key store again.
+    reservation
+        .complete(201, "{\"replayed\":true}", Some(second.book_id))
+        .await
+        .expect("record the key on the retry");
+    assert_eq!(count_idem_keys(&pool).await, 1);
 
     cleanup_idem(&pool).await;
 }

@@ -209,6 +209,15 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     -- bookings (book_channel='loyalty', book_status='pending'). PG-canonical
     -- only; the scheduler sweep cancels holds past this instant.
     book_hold_expires_at TIMESTAMPTZ,
+    -- Migration 094 (issue #304 B8c) — the room type this booking claims. The
+    -- load-bearing case is a PARKED (roomless) booking, which otherwise records
+    -- no type anywhere and can only be subtracted from availability
+    -- property-wide. Written by the desk create/edit path (request `roomTypeId`,
+    -- which must AGREE with the first assigned room's type or is DERIVED from
+    -- it) and by the CT mapper from HT_Book_Ds.Book_Room_Type when
+    -- HT_Book_H.Book_room_type = 1. NULL = type unknown → property-wide cap.
+    -- PG-canonical only; never mirrored to legacy.
+    book_room_type_id INTEGER,
     -- Writeback resolver back-populates these (migration 014).
     legacy_book_id VARCHAR(20),
     legacy_cust_no VARCHAR(20),
@@ -220,6 +229,11 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
 
     CONSTRAINT fk_ht_bookings_customer FOREIGN KEY (book_cust_id)
         REFERENCES ht_customers(cust_id),
+    -- Migration 094 — a parked claim may never name a type that does not exist.
+    -- ON DELETE SET NULL: removing a room type must not block, and a claim whose
+    -- type vanished is exactly the NULL-type case the property-wide cap handles.
+    CONSTRAINT fk_ht_bookings_room_type FOREIGN KEY (book_room_type_id)
+        REFERENCES ht_room_types(type_id) ON DELETE SET NULL,
     CONSTRAINT ck_ht_bookings_dates CHECK (book_checkout > book_checkin)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_customer ON ht_bookings(book_cust_id);
@@ -243,6 +257,12 @@ CREATE INDEX IF NOT EXISTS ix_ht_bookings_active_reminders
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_hold_expiry
     ON ht_bookings (book_hold_expires_at)
     WHERE book_hold_expires_at IS NOT NULL AND book_status = 'pending';
+-- Migration 094 — parked-claim aggregation (repository::channel groups live
+-- ROOMLESS bookings by type over a stay-date range) and the FK's
+-- referencing-side index. Partial: every pre-094 row is NULL.
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_room_type
+    ON ht_bookings (book_room_type_id)
+    WHERE book_room_type_id IS NOT NULL;
 
 -- ht_booking_rooms - Junction table for booking-room assignments
 CREATE TABLE IF NOT EXISTS ht_booking_rooms (
@@ -3223,6 +3243,19 @@ COMMENT ON TABLE ht_channel_idempotency IS
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('093', '093_create_ht_channel_idempotency.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 094 — ht_bookings.book_room_type_id (issue #304 B8c): the room type
+-- a PARKED (roomless) booking claims, so loyalty-channel availability can
+-- subtract the claim from the RIGHT type instead of only capping property-wide.
+-- Column, fk_ht_bookings_room_type and ix_ht_bookings_room_type are inlined into
+-- the ht_bookings block above. PG-canonical only: HT_Book_H has no counterpart
+-- column (its own Book_room_type is a 1/2 MODE discriminator, not a type), the
+-- byte-parity writeback recipes are untouched, and nothing writes this back to
+-- legacy. This seed row records the migration as applied so the drift check sees
+-- zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('094', '094_ht_bookings_room_type.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

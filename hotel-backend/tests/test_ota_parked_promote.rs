@@ -30,7 +30,9 @@ use uuid::Uuid;
 use hotel_backend::domain::booking::BookingState;
 use hotel_backend::domain::shared::{DateRange, Money};
 use hotel_backend::outbox::intent::BookingChanges;
-use hotel_backend::outbox::{generate_idempotency_key, EventBus, EventSource, OutboxRepository, WritebackIntent};
+use hotel_backend::outbox::{
+    generate_idempotency_key, EventBus, EventSource, OutboxRepository, WritebackIntent,
+};
 use hotel_backend::repository::PgBookingRepository;
 use hotel_backend::service::{
     aggregate_uuid, AggregateKind, BookingRoomCommand, BookingService, BookingSnapshotInputs,
@@ -167,19 +169,223 @@ async fn cleanup(pool: &sqlx::PgPool, agg: Uuid, book_id: i32, room_id: i32, cus
 }
 
 async fn writeback_intents(pool: &sqlx::PgPool, agg: Uuid) -> Vec<(String, Uuid)> {
-    sqlx::query("SELECT intent, idempotency_key FROM writeback_jobs WHERE aggregate_id = $1 ORDER BY id")
-        .bind(agg)
-        .fetch_all(pool)
+    sqlx::query(
+        "SELECT intent, idempotency_key FROM writeback_jobs WHERE aggregate_id = $1 ORDER BY id",
+    )
+    .bind(agg)
+    .fetch_all(pool)
+    .await
+    .expect("query writeback_jobs")
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>("intent").unwrap(),
+            r.try_get::<Uuid, _>("idempotency_key").unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// B8c / issue #304 / migration 094 — the desk & OTA create path records the
+/// room type a booking claims, and the recorded value can never contradict the
+/// recorded room.
+///
+/// Four shapes, one body (shared fixtures; CI runs `--test-threads=1`):
+///   (a) PARKED create + `roomTypeId`  → stored as sent (the case the whole
+///       feature exists for: a roomless booking has nowhere else to put it)
+///   (b) roomed create, `roomTypeId` omitted → DERIVED from the assigned room
+///   (c) roomed create, `roomTypeId` contradicting the room → refused (400),
+///       and nothing is committed
+///   (d) the promote edit (parked booking gains its first room) re-derives
+#[tokio::test]
+async fn desk_create_records_the_claimed_room_type() {
+    let pool = common::create_test_pool().await;
+    let (cust_id, room_id, room_no) = create_fixtures(&pool, "03").await;
+
+    // Two types: the room's real one, and a decoy for the disagreement case.
+    let type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ('TEST-OP3A', 'TEST_ota_promote_type_a', 1200.00, 2) \
+         ON CONFLICT (type_code) DO UPDATE SET type_name = EXCLUDED.type_name \
+         RETURNING type_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed type A")
+    .try_get("type_id")
+    .unwrap();
+    let decoy_type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ('TEST-OP3B', 'TEST_ota_promote_type_b', 900.00, 2) \
+         ON CONFLICT (type_code) DO UPDATE SET type_name = EXCLUDED.type_name \
+         RETURNING type_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed type B")
+    .try_get("type_id")
+    .unwrap();
+    sqlx::query("UPDATE ht_rooms_new SET room_type_id = $1 WHERE room_id = $2")
+        .bind(type_id)
+        .bind(room_id)
+        .execute(&pool)
         .await
-        .expect("query writeback_jobs")
-        .into_iter()
-        .map(|r| {
-            (
-                r.try_get::<String, _>("intent").unwrap(),
-                r.try_get::<Uuid, _>("idempotency_key").unwrap(),
-            )
-        })
-        .collect()
+        .expect("type the fixture room");
+
+    let svc = service(&pool);
+
+    async fn stored_type(pool: &sqlx::PgPool, book_id: i32) -> Option<i32> {
+        sqlx::query("SELECT book_room_type_id FROM ht_bookings WHERE book_id = $1")
+            .bind(book_id)
+            .fetch_one(pool)
+            .await
+            .expect("read booking")
+            .try_get::<Option<i32>, _>("book_room_type_id")
+            .unwrap()
+    }
+
+    fn create_cmd(
+        book_no: &str,
+        cust_id: i32,
+        rooms: Vec<BookingRoomCommand>,
+        room_type_id: Option<i32>,
+        room_no: &str,
+    ) -> CreateBookingCommand {
+        CreateBookingCommand {
+            book_no: book_no.to_string(),
+            book_channel: None,
+            book_ext_ref: None,
+            hold_expires_at: None,
+            customer_id: cust_id,
+            check_in: CI,
+            check_out: CO,
+            adults: 2,
+            children: 0,
+            status: "pending".to_string(),
+            source_label: Some("ota".to_string()),
+            total_amount: Some(2400.0),
+            deposit_amount: None,
+            notes: None,
+            rooms,
+            room_type_id,
+            products: vec![],
+            writeback_context: wb_context(cust_id, room_no),
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        }
+    }
+
+    // --- (a) parked create carrying the type ------------------------------
+    let parked = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03A",
+            cust_id,
+            vec![],
+            Some(type_id),
+            "",
+        ))
+        .await
+        .expect("parked create with a declared type");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        Some(type_id),
+        "(a) a PARKED booking must record the type it claims — it is the only \
+         place the claim exists, and what lets the channel subtract per type"
+    );
+
+    // --- (b) roomed create, type omitted → derived ------------------------
+    let derived = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03B",
+            cust_id,
+            vec![BookingRoomCommand {
+                room_id,
+                price_per_night: Some(1200.0),
+            }],
+            None,
+            &room_no,
+        ))
+        .await
+        .expect("roomed create without a declared type");
+    assert_eq!(
+        stored_type(&pool, derived.book_id).await,
+        Some(type_id),
+        "(b) an omitted roomTypeId is DERIVED from the assigned room"
+    );
+
+    // --- (c) roomed create, type disagrees → refused ----------------------
+    let refused = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03C",
+            cust_id,
+            vec![BookingRoomCommand {
+                room_id,
+                price_per_night: Some(1200.0),
+            }],
+            Some(decoy_type_id),
+            &room_no,
+        ))
+        .await;
+    assert!(
+        refused.is_err(),
+        "(c) a roomTypeId that contradicts the assigned room must be refused, \
+         or the channel would subtract a claim from the wrong type"
+    );
+    let orphan: i64 = sqlx::query("SELECT COUNT(*) AS n FROM ht_bookings WHERE book_no = $1")
+        .bind("TEST-OTA-PARK-03C")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .try_get("n")
+        .unwrap();
+    assert_eq!(orphan, 0, "(c) the refused create must commit nothing");
+
+    // --- (d) promote: the parked booking gains its first room -------------
+    svc.modify(ModifyBookingCommand {
+        book_id: parked.book_id,
+        customer_id: cust_id,
+        check_in: CI,
+        check_out: CO,
+        adults: 2,
+        children: 0,
+        status: "pending".to_string(),
+        source_label: Some("ota".to_string()),
+        total_amount: Some(2400.0),
+        deposit_amount: None,
+        notes: None,
+        rooms: vec![BookingRoomCommand {
+            room_id,
+            price_per_night: Some(1200.0),
+        }],
+        // Still omitted — the edit re-derives from the newly assigned room.
+        room_type_id: None,
+        changes: empty_changes(),
+        promote_context: Some(wb_context(cust_id, &room_no)),
+        before_snapshot: None,
+        after_snapshot: snapshot(),
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+    })
+    .await
+    .expect("promote edit should succeed");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        Some(type_id),
+        "(d) assigning the first room re-derives the type from that room"
+    );
+
+    for book_id in [parked.book_id, derived.book_id] {
+        cleanup(
+            &pool,
+            aggregate_uuid(AggregateKind::Booking, book_id),
+            book_id,
+            room_id,
+            cust_id,
+        )
+        .await;
+    }
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code IN ('TEST-OP3A', 'TEST-OP3B')")
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 /// (a) roomless create → no legacy write; (b) later first-room add → exactly one
@@ -208,6 +414,9 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             deposit_amount: None,
             notes: None,
             rooms: vec![], // parked — no room yet
+            // Parked create with no declared type — the #304 fallback shape
+            // (migration 094 leaves book_room_type_id NULL).
+            room_type_id: None,
             products: vec![],
             writeback_context: wb_context(cust_id, ""),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -241,6 +450,8 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             room_id,
             price_per_night: Some(1200.0),
         }],
+        // Derived from the assigned room by `service::booking::resolve_room_type`.
+        room_type_id: None,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
         before_snapshot: None,
@@ -338,6 +549,9 @@ async fn already_mirrored_booking_takes_modify_path() {
                 room_id,
                 price_per_night: Some(1200.0),
             }],
+            // Omitted on purpose: the service DERIVES it from the assigned
+            // room (migration 094 agree-or-derive rule).
+            room_type_id: None,
             products: vec![],
             writeback_context: wb_context(cust_id, &room_no),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -350,7 +564,10 @@ async fn already_mirrored_booking_takes_modify_path() {
 
     let jobs = writeback_intents(&pool, agg).await;
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].0, "create_booking", "create-with-room enqueues CreateBooking");
+    assert_eq!(
+        jobs[0].0, "create_booking",
+        "create-with-room enqueues CreateBooking"
+    );
 
     // Simulate worker back-population of the legacy id → booking is now mirrored.
     sqlx::query("UPDATE ht_bookings SET legacy_book_id = 'R999002' WHERE book_id = $1")
@@ -376,6 +593,8 @@ async fn already_mirrored_booking_takes_modify_path() {
             room_id,
             price_per_night: Some(1200.0),
         }],
+        // Derived from the assigned room by `service::booking::resolve_room_type`.
+        room_type_id: None,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
         before_snapshot: None,

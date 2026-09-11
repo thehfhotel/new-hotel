@@ -80,7 +80,33 @@ pub struct CreateHoldCommand {
     pub guest_phone: String,
     pub membership_id: Option<String>,
     pub payment: PaymentPlan,
+    /// Caller-idempotency key for the hold, stamped onto the booking itself as
+    /// `ht_bookings.book_ext_ref` so migration 076's partial UNIQUE index
+    /// `(book_channel, book_ext_ref)` dedupes INSIDE the booking transaction
+    /// (B8d / issue #305). Built by the route from the caller identity + the
+    /// `Idempotency-Key` header — see [`hold_ext_ref`].
+    ///
+    /// `None` = an unkeyed request, which behaves exactly as it always has:
+    /// every call mints a new hold.
+    pub ext_ref: Option<String>,
     pub source: EventSource,
+}
+
+/// The `ht_bookings.book_ext_ref` a keyed loyalty hold carries (B8d).
+///
+/// `caller` is `routes::channel::caller_identity` — the SHA-256 of the
+/// presented channel bearer, the same value `ht_channel_idempotency.idem_caller`
+/// stores, and safe to persist for exactly that reason (it is a digest, never
+/// the token). Including it matters because `book_ext_ref` is unique only
+/// within `book_channel`, which is the constant `'loyalty'` for every hold:
+/// without the caller scope two clients — or the same client either side of a
+/// token rotation, which deliberately starts a fresh key space — could collide
+/// on a key as ordinary as `"1"` and the second would REPLAY the first's
+/// booking. The `idem:` prefix keeps the value self-describing in a psql
+/// session and keeps it out of the namespace a genuine OTA `channel_booking_id`
+/// would occupy.
+pub fn hold_ext_ref(caller: &str, key: &str) -> String {
+    format!("idem:{caller}:{key}")
 }
 
 /// Outcome of a successful hold create.
@@ -91,6 +117,15 @@ pub struct HoldOutcome {
     pub total_baht: f64,
     pub amount_due_baht: f64,
     pub hold_expires_at: DateTime<Utc>,
+    /// `true` when this call returned an EXISTING hold that the same
+    /// `ext_ref` already created, rather than minting one (B8d / issue #305).
+    /// The route stamps `Idempotency-Replayed: true` on the response.
+    ///
+    /// Distinct from the `ht_channel_idempotency` replay: that one short-circuits
+    /// before the service is entered at all. This one fires when the KEY record
+    /// is gone but the BOOKING survived — a crash between the two transactions —
+    /// which is precisely the case the key table could not cover.
+    pub replayed: bool,
 }
 
 /// Outcome of `confirm_payment` (payment-verified). `already_confirmed` is
@@ -117,6 +152,33 @@ pub struct ChannelService {
     bookings: Arc<BookingService>,
     customers_service: Arc<CustomerService>,
     customers_repo: Arc<dyn CustomerRepository>,
+}
+
+/// Render a [`HoldOutcome`] from a hold that ALREADY exists (B8d replay).
+///
+/// Every number comes from the stored row, not from a re-quote: `total_baht`
+/// is what the guest was originally charged and `hold_expires_at` is the
+/// ORIGINAL 2 h deadline, so a retry never silently extends a hold or moves
+/// its price. `amount_due_baht` is recomputed by the same pure
+/// [`amount_due_satang`] the first attempt used — the plan is part of the
+/// request fingerprint, so a replay always carries the same one.
+///
+/// `hold_expires_at` falls back to `now` when the stored value is NULL. That
+/// cannot happen for a hold (`BookingService::create` stamps the deadline in
+/// the insert's own transaction — migration 086), and reading it as
+/// already-expired is the safe interpretation if it ever did: the guest is
+/// told to start again rather than handed a hold with no deadline.
+fn replayed_hold(existing: channel_repo::ChannelBookingRow, payment: PaymentPlan) -> HoldOutcome {
+    let total = Money::from_satang((existing.total_amount * 100.0).round() as i64);
+    let due = Money::from_satang(amount_due_satang(total.as_satang(), payment));
+    HoldOutcome {
+        book_id: existing.book_id,
+        book_no: existing.book_no,
+        total_baht: total.as_satang() as f64 / 100.0,
+        amount_due_baht: due.as_satang() as f64 / 100.0,
+        hold_expires_at: existing.hold_expires_at.unwrap_or_else(Utc::now),
+        replayed: true,
+    }
 }
 
 impl ChannelService {
@@ -153,10 +215,52 @@ impl ChannelService {
     /// `status='pending'` + the hold deadline. Consumes availability
     /// immediately (the room is assigned) and mirrors to iHOTEL as `จอง`
     /// through the normal create writeback.
+    ///
+    /// ## Crash-safe idempotency (B8d / issue #305)
+    ///
+    /// When `cmd.ext_ref` is set, the hold carries it as
+    /// `ht_bookings.book_ext_ref` alongside `book_channel = 'loyalty'`, so
+    /// migration 076's partial UNIQUE index dedupes the create INSIDE the
+    /// booking's own transaction. That closes the window
+    /// `ht_channel_idempotency` (migration 093) structurally cannot: the key
+    /// row and the booking commit in DIFFERENT transactions, so a crash
+    /// between them leaves the hold committed and the key gone, and the retry
+    /// — entering as a FRESH reservation — used to mint a second hold against
+    /// a second room that nobody would release before its 2 h deadline.
+    ///
+    /// Two arms reach the same answer, and both return `replayed: true`:
+    ///
+    /// * the pre-check below, which also matters because it runs BEFORE the
+    ///   guest match-or-create — a retry must not leave a duplicate
+    ///   `ht_customers` row behind on its way to discovering the booking
+    ///   already exists;
+    /// * `BookingService::create`'s own unique-violation arm, for two retries
+    ///   racing each other (it rolls its half-built row back and re-selects
+    ///   the winner).
+    ///
+    /// The replay payload is rendered from the STORED hold — its total, its
+    /// original deadline — never re-quoted from the retry's request, so a
+    /// price change between attempts cannot alter what the guest was told.
     pub async fn create_hold(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldOutcome> {
         validate_stay(cmd.check_in, cmd.check_out)?;
         if cmd.guests < 1 {
             return Err(ServiceError::validation("guests must be >= 1"));
+        }
+
+        // Crash-recovery replay: a prior attempt committed the hold but never
+        // recorded its key. Answer with that hold and touch nothing else.
+        if let Some(ext_ref) = cmd.ext_ref.as_deref() {
+            if let Some(existing) =
+                channel_repo::channel_booking_by_ext_ref(&self.pg, LOYALTY_CHANNEL, ext_ref).await?
+            {
+                tracing::info!(
+                    book_id = existing.book_id,
+                    ext_ref,
+                    "loyalty hold create replayed from the booking's own ext_ref \
+                     (the idempotency record did not survive the first attempt)"
+                );
+                return Ok(replayed_hold(existing, cmd.payment));
+            }
         }
         let (first_name, last_name) = split_guest_name(&cmd.guest_name)?;
         let phone = cmd.guest_phone.trim();
@@ -274,14 +378,40 @@ impl ChannelService {
                     room_id: room.room_id,
                     price_per_night: Some(nightly.as_satang() as f64 / 100.0),
                 }],
+                // B8c / migration 094. `pick_free_room` already filtered on
+                // `room_type_id = $3`, so this AGREES with the picked room by
+                // construction — passing it explicitly turns that into a
+                // checked invariant (`service::booking::resolve_room_type`
+                // rejects a disagreement) rather than an assumption.
+                room_type_id: Some(cmd.room_type_id),
                 products: Vec::new(),
                 writeback_context,
                 book_channel: Some(LOYALTY_CHANNEL.to_string()),
-                book_ext_ref: None,
+                // B8d: the caller-idempotency key IS the natural key here, so
+                // the (book_channel, book_ext_ref) index dedupes the hold in
+                // the same transaction that creates it.
+                book_ext_ref: cmd.ext_ref.clone(),
                 hold_expires_at: Some(hold_expires_at),
                 source: cmd.source,
             })
             .await?;
+
+        // Lost the concurrent race inside `BookingService::create` — our row
+        // was rolled back and the winner's booking came back instead. Report
+        // the winner's stored numbers, not the ones we just quoted.
+        if outcome.deduped {
+            if let Some(existing) =
+                channel_repo::get_channel_booking(&self.pg, outcome.book_id).await?
+            {
+                tracing::info!(
+                    book_id = existing.book_id,
+                    ext_ref = ?cmd.ext_ref,
+                    "loyalty hold create lost the (book_channel, book_ext_ref) race; \
+                     replaying the winning hold"
+                );
+                return Ok(replayed_hold(existing, cmd.payment));
+            }
+        }
 
         Ok(HoldOutcome {
             book_id: outcome.book_id,
@@ -289,6 +419,7 @@ impl ChannelService {
             total_baht: total.as_satang() as f64 / 100.0,
             amount_due_baht: due.as_satang() as f64 / 100.0,
             hold_expires_at,
+            replayed: false,
         })
     }
 

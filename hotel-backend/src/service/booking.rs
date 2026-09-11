@@ -70,6 +70,17 @@ pub struct CreateBookingCommand {
     pub notes: Option<String>,
     pub rooms: Vec<BookingRoomCommand>,
 
+    /// Room type this booking claims (`ht_bookings.book_room_type_id`,
+    /// migration 094 / issue #304 B8c). The load-bearing case is a PARKED
+    /// (roomless) booking, which records no type anywhere else and would
+    /// otherwise only be subtractable from channel availability property-wide.
+    ///
+    /// Reconciled against the assigned rooms by [`resolve_room_type`]: when
+    /// `rooms` is non-empty the value must AGREE with the FIRST assigned room's
+    /// type, or — when `None` — is DERIVED from it. `None` on a roomless create
+    /// is the honest "type unknown" and keeps the property-wide cap.
+    pub room_type_id: Option<i32>,
+
     /// Pre-ordered product lines (task #52). Optional — empty for the common
     /// case. Persisted canonically; no legacy write-back today.
     pub products: Vec<BookingProductCommand>,
@@ -114,6 +125,13 @@ pub struct ModifyBookingCommand {
     pub deposit_amount: Option<f64>,
     pub notes: Option<String>,
     pub rooms: Vec<BookingRoomCommand>,
+
+    /// Room type this booking claims after the edit (migration 094). Same
+    /// agree-or-derive rule as the create command — an edit that assigns the
+    /// first room to a parked booking derives the type from that room, and an
+    /// edit that clears every room keeps whatever the caller sent (commonly
+    /// `None`, back to "type unknown").
+    pub room_type_id: Option<i32>,
 
     /// Field-level diff carried straight through to
     /// [`WritebackIntent::ModifyBooking`].
@@ -185,6 +203,14 @@ pub struct BookingOutcome {
     /// ext_ref)`). `None` on the normal create path (the caller already holds
     /// the freshly-generated number) and from `modify` / `cancel`.
     pub book_no: Option<String>,
+    /// `true` when `create` returned an EXISTING booking instead of inserting
+    /// one — the `(book_channel, book_ext_ref)` natural key already named a
+    /// row, either on the pre-check or after losing the unique-index race
+    /// (migration 076). Callers that must tell a fresh create from a replay
+    /// (the loyalty channel stamps `Idempotency-Replayed: true`) read this
+    /// rather than inferring it from `book_no.is_some()`. Always `false` from
+    /// `modify` / `cancel`.
+    pub deduped: bool,
 }
 
 /// Service handle for the booking aggregate.
@@ -209,7 +235,12 @@ impl BookingService {
         events: Arc<EventBus>,
         pg: PgPool,
     ) -> Self {
-        Self { repo, outbox, events, pg }
+        Self {
+            repo,
+            outbox,
+            events,
+            pg,
+        }
     }
 
     /// Create a booking + its assigned rooms + outbox writeback + event.
@@ -238,6 +269,7 @@ impl BookingService {
                     book_id: existing_id,
                     aggregate_id: aggregate_uuid(AggregateKind::Booking, existing_id),
                     book_no: Some(existing_no),
+                    deduped: true,
                 });
             }
         }
@@ -275,7 +307,9 @@ impl BookingService {
             // Channel-only provenance (loyalty holds — no caller-side booking
             // id exists, so there is no natural key to dedupe on; the channel
             // label alone drives the expiry sweep + channel-API guards).
-            self.repo.set_booking_channel(&mut tx, book_id, channel).await?;
+            self.repo
+                .set_booking_channel(&mut tx, book_id, channel)
+                .await?;
         }
 
         if let (Some(channel), Some(ext_ref)) =
@@ -306,6 +340,7 @@ impl BookingService {
                         book_id: existing_id,
                         aggregate_id: aggregate_uuid(AggregateKind::Booking, existing_id),
                         book_no: Some(existing_no),
+                        deduped: true,
                     });
                 }
                 Err(err) => return Err(ServiceError::from(err)),
@@ -322,6 +357,19 @@ impl BookingService {
                         price_per_night: assignment.price_per_night,
                     },
                 )
+                .await?;
+        }
+
+        // Room-type attribution (migration 094 / #304 B8c). Same transaction as
+        // the insert + the room rows, so a booking can never commit carrying a
+        // room and a type that contradict each other — which is what lets
+        // `repository::channel` trust the column when it subtracts a parked
+        // claim per type.
+        let room_type_id =
+            resolve_room_type(self.repo.as_ref(), &mut tx, cmd.room_type_id, &cmd.rooms).await?;
+        if room_type_id.is_some() {
+            self.repo
+                .set_booking_room_type(&mut tx, book_id, room_type_id)
                 .await?;
         }
 
@@ -349,12 +397,16 @@ impl BookingService {
         // resolver can map `writeback_jobs.aggregate_id` → `ht_bookings`
         // (migration 014). Same transaction as the INSERT — if the outbox
         // enqueue fails, the row never becomes visible.
-        self.repo.set_aggregate_id(&mut tx, book_id, aggregate_id).await?;
+        self.repo
+            .set_aggregate_id(&mut tx, book_id, aggregate_id)
+            .await?;
 
         // Loyalty-channel hold deadline (migration 086) — same-transaction
         // stamp so a hold can never commit without its expiry.
         if let Some(expires_at) = cmd.hold_expires_at {
-            self.repo.set_hold_expiry(&mut tx, book_id, expires_at).await?;
+            self.repo
+                .set_hold_expiry(&mut tx, book_id, expires_at)
+                .await?;
         }
 
         let nights = nights_between(cmd.check_in, cmd.check_out);
@@ -423,6 +475,7 @@ impl BookingService {
             book_id,
             aggregate_id,
             book_no: None,
+            deduped: false,
         })
     }
 
@@ -491,6 +544,16 @@ impl BookingService {
                 )
                 .await?;
         }
+
+        // Room-type attribution (migration 094). Unlike create this ALWAYS
+        // writes, including `None`: an edit is a full rewrite of the booking's
+        // rooms, so an edit that clears them back to parked must be able to
+        // clear a now-meaningless type too.
+        let room_type_id =
+            resolve_room_type(self.repo.as_ref(), &mut tx, cmd.room_type_id, &cmd.rooms).await?;
+        self.repo
+            .set_booking_room_type(&mut tx, cmd.book_id, room_type_id)
+            .await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, cmd.book_id);
 
@@ -587,6 +650,7 @@ impl BookingService {
             book_id: cmd.book_id,
             aggregate_id,
             book_no: None,
+            deduped: false,
         })
     }
 
@@ -608,7 +672,9 @@ impl BookingService {
         }
 
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, cmd.book_id);
-        let intent = WritebackIntent::CancelBooking { booking_id: aggregate_id };
+        let intent = WritebackIntent::CancelBooking {
+            booking_id: aggregate_id,
+        };
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
@@ -629,7 +695,68 @@ impl BookingService {
             book_id: cmd.book_id,
             aggregate_id,
             book_no: None,
+            deduped: false,
         })
+    }
+}
+
+/// Reconcile the requested `book_room_type_id` against the assigned rooms —
+/// the agree-or-derive rule behind migration 094 (issue #304 B8c).
+///
+/// | rooms | `requested` | result |
+/// |---|---|---|
+/// | empty | `None` | `None` — a parked booking of unknown type; channel availability falls back to the property-wide cap |
+/// | empty | `Some(t)` | `Some(t)` after an existence check (unknown ⇒ validation error, i.e. 400 not 500) |
+/// | non-empty | `None` | DERIVED from the FIRST assigned room's type (may itself be `None` for an untyped room) |
+/// | non-empty | `Some(t)` | `Some(t)` iff it EQUALS the first room's type; otherwise a validation error |
+///
+/// The first room is the same room the legacy write-back context is built from
+/// (`routes::new_bookings::build_writeback_context`) and the same one the CT
+/// mapper derives from, so all three agree on which room speaks for a
+/// multi-room booking.
+///
+/// Deriving rather than trusting is what makes the column safe for
+/// `repository::channel` to subtract per type: a committed row can never claim
+/// a Deluxe while holding a Standard.
+async fn resolve_room_type(
+    repo: &dyn BookingRepository,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    requested: Option<i32>,
+    rooms: &[BookingRoomCommand],
+) -> ServiceResult<Option<i32>> {
+    let Some(first) = rooms.first() else {
+        // Parked (roomless): nothing to derive from, so the caller's value
+        // stands — but it must name a real type, or the FK would turn a client
+        // typo into a 500.
+        let Some(type_id) = requested else {
+            return Ok(None);
+        };
+        if !repo.room_type_exists(tx, type_id).await? {
+            return Err(ServiceError::validation(format!(
+                "roomTypeId {type_id} does not exist"
+            )));
+        }
+        return Ok(Some(type_id));
+    };
+
+    let derived = repo
+        .room_type_for_room(tx, first.room_id)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::validation(format!("room {} does not exist", first.room_id))
+        })?;
+
+    match (requested, derived) {
+        (None, derived) => Ok(derived),
+        (Some(req), Some(actual)) if req == actual => Ok(Some(req)),
+        (Some(req), actual) => Err(ServiceError::validation(format!(
+            "roomTypeId {req} disagrees with the assigned room {}'s type ({}); \
+             omit roomTypeId to derive it, or assign a room of that type",
+            first.room_id,
+            actual
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ))),
     }
 }
 
@@ -801,10 +928,22 @@ mod modify_writeback_plan_tests {
     // HT_Book_H already exists; don't re-create it).
     #[test]
     fn already_mirrored_booking_always_modifies() {
-        assert_eq!(modify_writeback_plan(Some("R012345"), 1, 1), ModifyWriteback::Modify);
-        assert_eq!(modify_writeback_plan(Some("R012345"), 0, 1), ModifyWriteback::Modify);
-        assert_eq!(modify_writeback_plan(Some("R012345"), 1, 0), ModifyWriteback::Modify);
-        assert_eq!(modify_writeback_plan(Some("R012345"), 0, 0), ModifyWriteback::Modify);
+        assert_eq!(
+            modify_writeback_plan(Some("R012345"), 1, 1),
+            ModifyWriteback::Modify
+        );
+        assert_eq!(
+            modify_writeback_plan(Some("R012345"), 0, 1),
+            ModifyWriteback::Modify
+        );
+        assert_eq!(
+            modify_writeback_plan(Some("R012345"), 1, 0),
+            ModifyWriteback::Modify
+        );
+        assert_eq!(
+            modify_writeback_plan(Some("R012345"), 0, 0),
+            ModifyWriteback::Modify
+        );
     }
 
     // (c) Retry idempotency: the promoted CreateBooking's key depends ONLY on
