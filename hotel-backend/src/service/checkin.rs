@@ -2976,7 +2976,14 @@ mod checkin_to_booking_tests {
         .await
         .expect("a create_check_in outbox row must be enqueued");
         assert_eq!(job.0, "create_check_in");
-        let linked_booking = job.1["payload"]["linked_booking_id"].as_str();
+        // `WritebackIntent` is `#[serde(tag = "intent", content = "payload")]`,
+        // so the stored column is
+        // `{intent, payload: {check_in_id, payload: CreateCheckInPayload}}` —
+        // hence the doubled hop. `linked_booking_id` is what discriminates the
+        // §3d `checkin_to_booking` recipe from the §3a walk-in one, so a NULL
+        // here would mean the legacy mirror re-created the customer and wrote
+        // an empty `Book_No` into `HT_CheckIn_H`.
+        let linked_booking = job.1["payload"]["payload"]["linked_booking_id"].as_str();
         assert_eq!(
             linked_booking,
             Some(aggregate_uuid(AggregateKind::Booking, seed.book_id).to_string()).as_deref(),
