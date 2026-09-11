@@ -32,6 +32,11 @@ pub mod channel_idempotency;
 pub mod checkin;
 pub mod customer;
 pub mod inventory;
+// Booking-inventory serialisation lock (B8e / L3) — a PG advisory lock every
+// writer that CONSUMES a room takes around pick -> insert. Free functions +
+// an RAII guard, not a trait: there is one PostgreSQL implementation and
+// nothing to swap.
+pub mod inventory_lock;
 pub mod payment;
 pub mod room;
 pub mod session;
@@ -42,6 +47,7 @@ pub use booking::{BookingRepository, PgBookingRepository};
 pub use checkin::{CheckInRepository, PgCheckInRepository};
 pub use customer::{CustomerRepository, PgCustomerRepository};
 pub use inventory::{InventoryRepository, PgInventoryRepository};
+pub use inventory_lock::{InventoryLock, InventoryLockError};
 pub use payment::{PaymentRepository, PgPaymentRepository};
 pub use room::{PgRoomRepository, RoomRepository};
 pub use session::{PgSessionRepository, SessionRepository};

@@ -26,6 +26,7 @@ use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
 use crate::repository::booking::{
     BookingProductAssignment, BookingRepository, BookingRoomAssignment, BookingWrite,
 };
+use crate::repository::inventory_lock::InventoryLock;
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
@@ -152,6 +153,21 @@ pub struct CreateBookingCommand {
     /// 422 long after `ht_channel_idempotency` has expired or been lost to a
     /// crash. `None` for callers with no fingerprint (the OTA path).
     pub book_ext_ref_fingerprint: Option<String>,
+
+    /// Property whose booking-inventory lock this create must take for the
+    /// whole transaction (B8e / L3 — `repository::inventory_lock`), or `None`
+    /// when the CALLER already holds it.
+    ///
+    /// `Some("hf")` / `Some("hfville")` is the desk/OTA shape: the create
+    /// consumes a room (or parks a claim on one) and must not interleave with
+    /// a channel hold that is picking between its own SELECT and its INSERT.
+    ///
+    /// `None` is the loyalty channel's shape and is NOT "no locking":
+    /// `service::channel::create_hold` holds the same lock across pick →
+    /// create, and re-acquiring it here — on a different connection — would
+    /// deadlock against the caller's own guard. `None` is also every existing
+    /// test double's shape, which keeps those paths byte-for-byte unchanged.
+    pub inventory_lock: Option<String>,
 
     /// Payment-hold deadline (migration 086 — loyalty-channel TENTATIVE
     /// holds). `Some(_)` ⇒ the row is stamped with `book_hold_expires_at`
@@ -334,6 +350,18 @@ impl BookingService {
                 });
             }
         }
+
+        // B8e / L3 — serialise room consumption property-wide. Taken BEFORE
+        // the transaction opens and AFTER the (channel, ext_ref) dedupe
+        // pre-check above: a replay that writes nothing must not queue behind
+        // a live create. Held until the commit below, so a concurrent channel
+        // pick re-evaluates against THIS booking's committed rooms instead of
+        // the state it read before we started. `None` ⇒ the caller already
+        // holds it (see `CreateBookingCommand::inventory_lock`).
+        let inventory_lock = match cmd.inventory_lock.as_deref() {
+            Some(property) => Some(InventoryLock::acquire(&self.pg, property).await?),
+            None => None,
+        };
 
         let mut tx = self.pg.begin().await?;
 
@@ -544,6 +572,21 @@ impl BookingService {
             .map_err(|err| ServiceError::outbox(err.to_string()))?;
 
         tx.commit().await?;
+
+        // Free the lock at a deterministic point — right after OUR rooms are
+        // visible to the next writer's availability read. Dropping the guard
+        // would also free it (the rollback sqlx queues on connection return
+        // does), just not at a time we control; a failure here is therefore
+        // worth a line in the log and nothing more.
+        if let Some(lock) = inventory_lock {
+            if let Err(err) = lock.release().await {
+                tracing::warn!(
+                    error = %err,
+                    book_id,
+                    "releasing the booking-inventory lock failed; it frees on connection return"
+                );
+            }
+        }
 
         Ok(BookingOutcome {
             book_id,

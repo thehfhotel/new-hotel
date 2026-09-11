@@ -89,7 +89,12 @@ fn service_for(pool: &PgPool) -> ChannelService {
         events,
         pool.clone(),
     ));
-    ChannelService::new(pool.clone(), bookings, customers, customers_repo)
+    // B8e / L2: floor 0 — this file's scenarios predate the last-room guard
+    // and assert the pre-guard behaviour (idempotency, sweep, confirm). The
+    // guard has its own file (`test_channel_last_room.rs`); leaving it on here
+    // would make every assertion depend on how many rooms the host database
+    // happens to carry.
+    ChannelService::new(pool.clone(), bookings, customers, customers_repo, 0)
 }
 
 /// Seed one test room type (sleeps 2) with two active rooms. Returns type_id.
@@ -203,6 +208,7 @@ fn count_for(
 
 fn hold_cmd(book_no: &str, type_id: i32, check_in: &str, check_out: &str) -> CreateHoldCommand {
     CreateHoldCommand {
+        property: "hf".to_string(),
         book_no: book_no.to_string(),
         room_type_id: type_id,
         check_in: d(check_in),
@@ -789,6 +795,7 @@ async fn cleanup_idem(pool: &PgPool) {
 
 fn idem_hold_cmd(book_no: &str, type_id: i32) -> CreateHoldCommand {
     CreateHoldCommand {
+        property: "hf".to_string(),
         book_no: book_no.to_string(),
         room_type_id: type_id,
         check_in: d("2026-11-02"),
@@ -857,6 +864,15 @@ async fn create_hold_with_key(
                         HoldCreateOutcome::KeyReusedForDifferentRequest => {
                             reservation.abandon().await;
                             return Ok(KeyedCreate::Mismatch);
+                        }
+                        // Unreachable here: `service_for` pins the B8e floor
+                        // to 0 for this file. Panic rather than fold it into
+                        // Mismatch — a floor refusal arriving where a key
+                        // verdict is expected means the fixture changed, and
+                        // silently reporting the wrong verdict would hide it.
+                        HoldCreateOutcome::LastRoomHeldForDesk { .. } => {
+                            reservation.abandon().await;
+                            panic!("the last-room floor is disabled in this file's fixtures");
                         }
                     };
                     // Stand-in for the real 201 payload; the point is that the

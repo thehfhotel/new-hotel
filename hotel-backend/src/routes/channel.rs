@@ -173,6 +173,11 @@ fn channel_service_for(
         ws.bookings,
         ws.customers,
         state.customers.clone(),
+        // B8e / L2 — read per request, like every other channel flag: the
+        // floor is an operational dial reception may want moved between
+        // deploys, and a hold create is nowhere near hot enough for one
+        // `env::var` to matter.
+        crate::config::loyalty_last_room_floor(),
     ))
 }
 
@@ -243,6 +248,42 @@ fn mismatch_response(key: &str) -> Response {
              retry the original request unchanged, or use a new key"
         ),
     )
+}
+
+/// B8e / L2 — the machine-readable reason the last-room floor refused a hold.
+/// Stable: the loyalty app branches on this string to show its call-the-desk
+/// copy instead of a generic sold-out message, so renaming it is a contract
+/// change, not a refactor.
+pub const REASON_LAST_ROOM_HELD_FOR_DESK: &str = "last_room_held_for_desk";
+
+/// The property is at its last-room floor. **409**, with `reason` alongside
+/// the human `error` string.
+///
+/// 409 and not 503: the channel is up and the request is well-formed — the
+/// server state (this property, these nights) is what refuses it, and a
+/// different date range from the same client succeeds. A `reason` field
+/// rather than a code prefix inside `error` because `/api/channel/*` is a
+/// machine surface whose other refusals (422 key-reuse, 409 sold-out) are
+/// already distinguishable by status alone; this is the first one that shares
+/// a status with another outcome and therefore needs its own discriminator.
+///
+/// `free_rooms` is what the channel may still sell property-wide (the
+/// parked-claim-adjusted surplus), NOT the raw room count — reception reads
+/// this number out of a support ticket, so it has to mean the same thing the
+/// refusal was computed from.
+fn last_room_response(free_rooms: i64, floor: i64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "success": false,
+            "reason": REASON_LAST_ROOM_HELD_FOR_DESK,
+            "error": "the last rooms for these dates are held for the front desk — \
+                      please call the hotel to book",
+            "free_rooms": free_rooms,
+            "floor": floor,
+        })),
+    )
+        .into_response()
 }
 
 /// The bearer this request presented, for `caller_identity`.
@@ -491,6 +532,10 @@ async fn perform_create_hold(
     let outcome = service
         .create_hold(CreateHoldCommand {
             book_no,
+            // B8e / L3 — the booking-inventory lock scope. The SAME literal
+            // `routes::new_bookings` locks the desk create on, so the two
+            // paths actually exclude each other.
+            property: property.to_string(),
             room_type_id,
             check_in,
             check_out,
@@ -515,6 +560,14 @@ async fn perform_create_hold(
         // implementation detail the client neither sees nor needs.
         HoldCreateOutcome::KeyReusedForDifferentRequest => {
             return Err(mismatch_response(idempotency_key_label))
+        }
+        // B8e / L2. Returned as `Err` so the KEYED path's `reservation
+        // .abandon()` runs: a floor refusal must not be cached against the
+        // Idempotency-Key, because the very next minute a checkout or a
+        // cancellation can lift the floor and the same key should then be
+        // free to make the hold it was minted for.
+        HoldCreateOutcome::LastRoomHeldForDesk { free_rooms, floor } => {
+            return Err(last_room_response(free_rooms, floor))
         }
     };
 

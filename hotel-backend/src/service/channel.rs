@@ -39,6 +39,7 @@ use crate::outbox::intent::WritebackIntent;
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
 use crate::repository::channel as channel_repo;
 use crate::repository::channel::RoomTypeAvailability;
+use crate::repository::inventory_lock::InventoryLock;
 use crate::repository::CustomerRepository;
 
 use super::booking::naive_date_to_utc;
@@ -72,6 +73,13 @@ pub enum PaymentPlan {
 pub struct CreateHoldCommand {
     /// Route-generated `YYYYMMDD-NNNN` (same allocator as the booking form).
     pub book_no: String,
+    /// Contract property id (`hf` / `hfville`) — the scope of the
+    /// booking-inventory lock this hold takes across pick → create (B8e / L3,
+    /// `repository::inventory_lock`). The route already parsed it out of the
+    /// request body, so this is the SAME string the desk create path locks on
+    /// for the same property; the two must not drift or the lock stops
+    /// excluding.
+    pub property: String,
     pub room_type_id: i32,
     pub check_in: NaiveDate,
     pub check_out: NaiveDate,
@@ -151,6 +159,18 @@ pub enum HoldCreateOutcome {
     /// mistake, so a client cannot tell — and need not care — which of the two
     /// records caught it.
     KeyReusedForDifferentRequest,
+    /// **B8e / L2 — the last-room floor.** The property has `free_rooms`
+    /// sellable rooms left for the requested nights and the configured floor
+    /// is `floor`; `free_rooms <= floor`, so the channel stands down and the
+    /// remaining rooms stay for the FRONT DESK. **409** with a stable machine
+    /// reason, not a generic sold-out: the loyalty app shows call-the-desk
+    /// copy for this, and a guest who is told "sold out" while reception can
+    /// still sell the room has been told something false.
+    ///
+    /// A FLOOR, never a cap (the B8 analysis rejects allotments — loyalty-app
+    /// ADR-0003): it only bites on the last `floor` rooms, so a property with
+    /// slack sells through the channel exactly as it did before.
+    LastRoomHeldForDesk { free_rooms: i64, floor: i64 },
 }
 
 /// Outcome of `confirm_payment` (payment-verified). `already_confirmed` is
@@ -177,6 +197,12 @@ pub struct ChannelService {
     bookings: Arc<BookingService>,
     customers_service: Arc<CustomerService>,
     customers_repo: Arc<dyn CustomerRepository>,
+    /// B8e / L2 — how many sellable rooms the property keeps for the desk.
+    /// Injected rather than read from the environment inside `create_hold` so
+    /// a test can pin it without mutating process env (and so the number that
+    /// refused a hold is visible in the service that refused it).
+    /// `0` disables the guard.
+    last_room_floor: i64,
 }
 
 /// Decide what a surviving keyed booking means for THIS request (B8d).
@@ -263,17 +289,22 @@ fn replay_keyed_hold(
 }
 
 impl ChannelService {
+    /// `last_room_floor` is the B8e/L2 floor — the number of sellable rooms
+    /// the property holds back for the front desk (`config::
+    /// loyalty_last_room_floor`, default 1). `0` turns the guard off.
     pub fn new(
         pg: PgPool,
         bookings: Arc<BookingService>,
         customers_service: Arc<CustomerService>,
         customers_repo: Arc<dyn CustomerRepository>,
+        last_room_floor: i64,
     ) -> Self {
         Self {
             pg,
             bookings,
             customers_service,
             customers_repo,
+            last_room_floor,
         }
     }
 
@@ -322,6 +353,20 @@ impl ChannelService {
     /// The replay payload is rendered from the STORED hold — its total, its
     /// original deadline — never re-quoted from the retry's request, so a
     /// price change between attempts cannot alter what the guest was told.
+    ///
+    /// ## Serialized pick → create, and the last-room floor (B8e / L3 + L2)
+    ///
+    /// The pick and the insert it feeds run under the property's
+    /// booking-inventory advisory lock (`repository::inventory_lock`), which
+    /// the DESK create path takes too. Two concurrent holds for the last room
+    /// therefore no longer both succeed: the second one waits, re-runs the
+    /// picker against the first one's committed booking, and refuses.
+    ///
+    /// Inside that lock the hold is also checked against the property-wide
+    /// **last-room floor**: with `free_rooms <= last_room_floor` the channel
+    /// stands down ([`HoldCreateOutcome::LastRoomHeldForDesk`]) so the desk —
+    /// which is not gated — can still sell the room to the guest on the
+    /// phone. A floor, not an allotment: with slack the channel is unchanged.
     pub async fn create_hold(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldCreateOutcome> {
         validate_stay(cmd.check_in, cmd.check_out)?;
         if cmd.guests < 1 {
@@ -350,6 +395,36 @@ impl ChannelService {
                 );
             }
         }
+        // B8e / L3 — everything past this point CONSUMES inventory: the
+        // last-room floor reads it, the picker claims a room from it, and
+        // `BookingService::create` commits that claim. Hold the property's
+        // booking-inventory lock across all three, so a second hold — or a
+        // desk create for the same night — re-evaluates against our COMMITTED
+        // booking instead of the availability it read before we started. The
+        // guard is released right after the create commits; dropping it on an
+        // error path frees the lock too (see `repository::inventory_lock`).
+        let lock = InventoryLock::acquire(&self.pg, &cmd.property).await?;
+        let result = self.create_hold_locked(cmd).await;
+        if let Err(err) = lock.release().await {
+            tracing::warn!(
+                error = %err,
+                "releasing the booking-inventory lock failed; it frees on connection return"
+            );
+        }
+        result
+    }
+
+    /// The inventory-consuming half of [`ChannelService::create_hold`], run
+    /// with the property's booking-inventory lock held (B8e / L3).
+    ///
+    /// Split out purely so the lock guard lives in a scope that cannot
+    /// accidentally skip its release: every `?` in here returns into
+    /// `create_hold`, which releases and only then propagates.
+    ///
+    /// Validation that cannot touch inventory (stay range, guest count, the
+    /// crash-recovery replay) stays in the caller and runs UNLOCKED — a
+    /// malformed request must never make a real booking wait.
+    async fn create_hold_locked(&self, cmd: CreateHoldCommand) -> ServiceResult<HoldCreateOutcome> {
         let (first_name, last_name) = split_guest_name(&cmd.guest_name)?;
         let phone = cmd.guest_phone.trim();
         if phone.is_empty() {
@@ -367,6 +442,41 @@ impl ChannelService {
                         cmd.room_type_id
                     ))
                 })?;
+
+        // B8e / L2 — property-wide last-room floor. `surplus` is the shared
+        // inventory CTE's own answer to "what may the channel still sell
+        // property-wide for this window" (free rooms minus parked claims,
+        // floored at 0 — B8a/B8c), so this guard cannot drift from the
+        // counter or the picker: it reads the same number they do.
+        //
+        // Checked BEFORE the pick, and for the whole stay window rather than
+        // per night, because `free_rooms` already requires a room to be free
+        // for EVERY night of `[check_in, check_out)`.
+        //
+        // Type-independent on purpose: when the property is down to its last
+        // rooms the channel stands down entirely, whatever type was asked
+        // for. Answering "no Deluxe available" while reception can still sell
+        // the Deluxe would be a false sold-out; "the desk is holding the last
+        // rooms" is the true statement, and the loyalty app has copy for it.
+        if self.last_room_floor > 0 {
+            let snapshot =
+                channel_repo::inventory_snapshot(&self.pg, cmd.check_in, cmd.check_out).await?;
+            if snapshot.surplus <= self.last_room_floor {
+                tracing::info!(
+                    property = %cmd.property,
+                    check_in = %cmd.check_in,
+                    check_out = %cmd.check_out,
+                    free_rooms = snapshot.surplus,
+                    floor = self.last_room_floor,
+                    "loyalty hold refused: the property is at its last-room floor; \
+                     the remaining rooms stay for the desk"
+                );
+                return Ok(HoldCreateOutcome::LastRoomHeldForDesk {
+                    free_rooms: snapshot.surplus,
+                    floor: self.last_room_floor,
+                });
+            }
+        }
 
         let room = channel_repo::pick_free_room(
             &self.pg,
@@ -475,6 +585,11 @@ impl ChannelService {
                 products: Vec::new(),
                 writeback_context,
                 book_channel: Some(LOYALTY_CHANNEL.to_string()),
+                // B8e / L3: we already hold the property's booking-inventory
+                // lock (across the pick above and this create). Re-acquiring
+                // it inside `BookingService::create`, on a different pooled
+                // connection, would deadlock against our own guard.
+                inventory_lock: None,
                 // B8d: the caller-idempotency key IS the natural key here, so
                 // the (book_channel, book_ext_ref) index dedupes the hold in
                 // the same transaction that creates it.

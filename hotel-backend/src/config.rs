@@ -576,6 +576,38 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` (B8e / L2) — how many sellable rooms the
+/// property keeps back for the FRONT DESK.
+///
+/// When the channel's own property-wide surplus for the requested nights
+/// (`repository::channel::inventory_snapshot().surplus`) is at or below this
+/// number, `service::channel::create_hold` refuses the hold with a distinct
+/// 409 reason and the loyalty app shows call-the-desk copy. Reception is not
+/// gated: the desk can still book the room the channel just declined.
+///
+/// Default **1** — the guard is ON out of the box, which is the safe
+/// direction: the failure it prevents is a guest turned away at 22:00, and
+/// the failure it causes is a direct booking that becomes a phone call.
+/// `0` disables it. A non-numeric or negative value also reads as the
+/// default rather than as "off": a typo in the deploy env must not silently
+/// remove a guard (contrast [`flag_enabled`], where an unparseable value
+/// reads as off because there the closed state IS off).
+///
+/// Not an allotment — loyalty-app ADR-0003 rejects those and this is not one:
+/// it caps nothing while the property has slack, it only reserves the tail.
+pub fn loyalty_last_room_floor() -> i64 {
+    const DEFAULT_FLOOR: i64 = 1;
+    match std::env::var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .unwrap_or(DEFAULT_FLOOR),
+        Err(_) => DEFAULT_FLOOR,
+    }
+}
+
 /// Loyalty-app integration config (booking channel + checkout stay hook).
 ///
 /// Two independent halves, both fail-closed:
@@ -1415,6 +1447,37 @@ mod tests {
     ///   including empty values.
     ///
     /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// B8e / L2 — the last-room floor defaults to ON, and only an explicit,
+    /// parseable, non-negative number moves it.
+    ///
+    /// The asymmetry with [`flag_enabled`] is the point and is asserted here:
+    /// a garbled value there reads as OFF (the closed state), a garbled value
+    /// here reads as the DEFAULT (1, the closed state). Both fail safe; they
+    /// just fail safe in opposite directions, and a future edit that "makes
+    /// them consistent" would silently remove a guard.
+    #[test]
+    fn last_room_floor_defaults_to_one_and_only_a_real_number_moves_it() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["LOYALTY_CHANNEL_LAST_ROOM_FLOOR"]);
+
+        assert_eq!(loyalty_last_room_floor(), 1, "unset must keep the guard on");
+
+        for garbage in ["", "   ", "one", "true", "1.5", "-1"] {
+            env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", garbage);
+            assert_eq!(
+                loyalty_last_room_floor(),
+                1,
+                "'{garbage}' must fall back to the default, never silently disable the guard"
+            );
+        }
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", "0");
+        assert_eq!(loyalty_last_room_floor(), 0, "0 is the explicit opt-out");
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", " 3 ");
+        assert_eq!(loyalty_last_room_floor(), 3, "surrounding space is trimmed");
+    }
+
     /// never an empty-string "token" that the constant-time compare would then
     /// accept), and `LoyaltyConfig` must report the channel dark and the stay
     /// hook off — including with the flag forced on, which is the state the

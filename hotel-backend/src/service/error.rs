@@ -131,6 +131,26 @@ impl ServiceError {
     }
 }
 
+/// A booking-inventory lock (B8e / L3) that could not be taken.
+///
+/// The timeout is a **conflict**, not an internal error: the request is
+/// well-formed, nothing is broken, and another booking write simply held the
+/// property's lock longer than [`crate::repository::inventory_lock`] waits.
+/// Telling the caller to retry is the honest answer — and it must never be
+/// swallowed into a successful create, because a create that ran without the
+/// lock is exactly the double-sell this feature exists to stop.
+impl From<crate::repository::inventory_lock::InventoryLockError> for ServiceError {
+    fn from(err: crate::repository::inventory_lock::InventoryLockError) -> Self {
+        use crate::repository::inventory_lock::InventoryLockError;
+        match err {
+            InventoryLockError::Db(err) => ServiceError::Repository(err),
+            timeout @ InventoryLockError::Timeout { .. } => {
+                ServiceError::Conflict(timeout.to_string())
+            }
+        }
+    }
+}
+
 /// Bridge to the existing HTTP error type so today's `ApiResult`-typed routes
 /// can call services without a separate translation layer.
 ///

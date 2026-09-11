@@ -660,6 +660,17 @@ services:
       # app choosing which `property=` it sends). See docs/loyalty-channel.md →
       # "Go-live checklist".
       - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
+      # B8e / L2 — how many sellable rooms each property keeps for the FRONT
+      # DESK. With the channel's surplus for the requested nights at or below
+      # this number, a hold is refused 409 `last_room_held_for_desk` and the
+      # loyalty app shows call-the-desk copy; reception is NOT gated and can
+      # still sell the room. Default 1 = guard ON, which is the direction that
+      # fails safe (the alternative failure is a guest turned away at 22:00).
+      # `0` disables it. NOT a legacy-write flag and NOT an allotment — it caps
+      # nothing while the property has slack (loyalty-app ADR-0003) — but it is
+      # compose-owned like its siblings above so a change is a reviewable diff.
+      # Deliberately absent from docker-build.yml for that reason.
+      - LOYALTY_CHANNEL_LAST_ROOM_FLOOR=${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-1}
       # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
       # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
       # secret file; with either missing, LoyaltyClient::from_config yields None

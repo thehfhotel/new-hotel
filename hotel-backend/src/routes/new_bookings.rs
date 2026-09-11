@@ -517,6 +517,13 @@ pub async fn create_booking(
         // key, so there is no request fingerprint to bind (migration 095).
         // Only the loyalty channel sets this.
         book_ext_ref_fingerprint: None,
+        // B8e / L3 — the desk create takes the property's booking-inventory
+        // lock for the whole transaction, which is what stops a loyalty hold
+        // from picking a room between this handler's availability read and
+        // its INSERT. Taken unconditionally, ROOMLESS creates included: a
+        // parked (roomless) booking is a live claim on the property's surplus
+        // (B8a), so it moves channel inventory even though it names no room.
+        inventory_lock: Some(branch_property(query.branch).to_string()),
         // Manual / OTA-desk creates are never payment-holds (migration 086);
         // only the loyalty channel (`routes::channel`) sets a deadline.
         hold_expires_at: None,
@@ -728,6 +735,19 @@ pub struct ValidateBookingResponse {
 /// `[check_in, check_out)` range (`YYYY-MM-DD`). `exclude_booking_id` skips a
 /// booking being edited. Booking overlap mirrors `live_room_flags`; check-in
 /// overlap mirrors `calendar.rs`.
+/// The property label this branch's booking-inventory lock is scoped by
+/// (B8e / L3) — the same `hf` / `hfville` ids the channel contract uses, so a
+/// desk create and a channel hold for one property take ONE lock.
+///
+/// Mirrors [`AppState::write_pool`]'s own branch mapping exactly: `All`
+/// resolves to the HF Hotel pool, so it must resolve to the HF Hotel lock.
+fn branch_property(branch: Option<Branch>) -> &'static str {
+    match branch.unwrap_or_default() {
+        Branch::Hfville => "hfville",
+        Branch::Hfhotel | Branch::All => "hf",
+    }
+}
+
 async fn room_is_available(
     pool: &crate::db::PgPool,
     room_id: i32,
