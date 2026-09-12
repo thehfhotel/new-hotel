@@ -959,6 +959,13 @@ async fn booking_reapply_after_c0000_cascade_repoints_to_sentinel() {
 // codes in HT_Book_Ds.Book_Room_Type. Pre-fix each line failed the
 // room_no lookup, warn-skipped, and the rooms_count mismatch re-emitted
 // BookingModified on EVERY CT touch forever.
+//
+// The fixture line holds a ROOM NUMBER, not a type code — the R014814
+// shape PENDING-VERIFICATIONS V17 found live (2026-09-11: one of HF
+// Hotel's four mode-1 Ds rows carries `402`). That value is what makes
+// this test red-capable: an unresolvable filler like the old `"4"` reads
+// the same whether the mapper parses the Ds column in mode 1 or ignores
+// it outright.
 // =============================================================================
 
 #[tokio::test]
@@ -966,15 +973,42 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
     let pool = common::create_test_pool().await;
     let book_id = unique_book_id();
     let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
 
     let _cust_id = seed_customer(&pool, &cust_no).await;
 
+    // Give the numbered room a type of its OWN (freshly minted, so no other
+    // row in the DB carries it): an id that reaches `ht_bookings` can then
+    // only have come from reading THIS Ds value and following it to THIS room.
+    // `TV` keeps the code out of the `TP`/`TQ` window the parked-booking test
+    // in this same binary mints from.
+    let type_code = format!("TV{:04}", unique_residue() % 10_000);
+    let type_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ($1, $1, 1000.00, 2) RETURNING type_id",
+    )
+    .bind(&type_code)
+    .fetch_one(&pool)
+    .await
+    .expect("seed room type");
+    sqlx::query(
+        "INSERT INTO ht_rooms_new (room_no, room_type_id, room_clean, room_notes) \
+         VALUES ($1, $2, true, 'TEST_phase53_room') \
+         ON CONFLICT (room_no) DO UPDATE SET room_type_id = EXCLUDED.room_type_id",
+    )
+    .bind(&room_no)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed the numbered room");
+
     let header =
         header_row(&book_id, &cust_no, "จอง", 890.0).with("Book_room_type", MockValue::I32(1));
-    // Ds line carries a room-TYPE code, not a room number.
+    // Ds line carries a room NUMBER in the misleadingly-named
+    // `Book_Room_Type` column (V17 / the R014814 shape).
     let aggregate = BookingAggregate {
         header: Some(header),
-        rooms: vec![ds_row(&book_id, "4", 890.0)],
+        rooms: vec![ds_row(&book_id, &room_no, 890.0)],
         nights: vec![],
     };
 
@@ -985,8 +1019,10 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
     assert!(event.is_some(), "fresh aggregate emits BookingCreated");
     tx.commit().await.unwrap();
 
-    // Zero room assignments — the type code must NOT be treated as a
-    // room number.
+    // Zero room assignments — mode 1 stays header-only even when the line
+    // names a room that EXISTS. Drop the `book_room_type != Some(1)` guard in
+    // `project_aggregate` and this goes red with 1 (the seeded room now
+    // resolves, where the old `"4"` filler could only fail to).
     let rooms_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id IN \
          (SELECT book_id FROM ht_bookings WHERE legacy_book_id = $1)",
@@ -996,6 +1032,25 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
     .await
     .unwrap();
     assert_eq!(rooms_count, 0, "type-1 Ds lines must not become room rows");
+
+    // ...but the mapper MUST still READ that room number out of the Ds column
+    // and borrow the room's type. Delete the `ht_rooms_new.room_no` fallback
+    // in `resolve_room_type_code` — or the mode-1 `book_room_type_code`
+    // capture that feeds it — and this goes red with None: canonical would
+    // hold an untyped parked claim, which `repository::channel` can only cap
+    // property-wide.
+    let recorded: Option<i32> =
+        sqlx::query_scalar("SELECT book_room_type_id FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded,
+        Some(type_id),
+        "a mode-1 Ds line holding a ROOM NUMBER must attribute that room's \
+         type (V17 / R014814) — NULL here is the unattributed parked claim"
+    );
 
     // Re-apply with the identical aggregate: MUST be the idempotent
     // skip. Pre-fix the unresolvable-line count mismatch made this
@@ -1011,7 +1066,12 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
          BookingModified re-emission loop)"
     );
 
-    cleanup(&pool, &book_id, &cust_no, "no-room-seeded").await;
+    cleanup(&pool, &book_id, &cust_no, &room_no).await;
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code = $1")
+        .bind(&type_code)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 /// 2026-06-12 (audit follow-up) — a booking room line whose room_no is
