@@ -293,10 +293,13 @@ pub struct ChannelTotals {
     /// How many of `cancelled` were loyalty holds the expiry sweep
     /// AUTO-RELEASED because their payment window lapsed —
     /// `book_hold_auto_released_at IS NOT NULL` (migration 096, B13). A strict
-    /// SUBSET of `cancelled`: counted over the same rows, on the same
-    /// `book_checkin` basis, so `holdsExpired / bookings` in the `app` bucket
-    /// is the expired-hold rate B13 must read before taking a `HOLD_TTL`
-    /// decision. Structurally `0` in every non-`app` bucket, because only a
+    /// SUBSET of `cancelled` — structurally, because the aggregate repeats
+    /// `cancelled`'s own predicate rather than relying on the marker implying
+    /// it (a stamped hold can be revived from the legacy side, which would
+    /// otherwise let this exceed `cancelled`). Counted over the same rows on
+    /// the same `book_checkin` basis, so `holdsExpired / bookings` in the
+    /// `app` bucket is the expired-hold rate B13 must read before taking a
+    /// `HOLD_TTL` decision. Structurally `0` in every non-`app` bucket, because only a
     /// loyalty hold has a payment window to lapse.
     ///
     /// **The wire name is deliberately NOT the field name.** The column and
@@ -456,6 +459,17 @@ pub async fn load_channel_rollup(
     //     count those as TTL expiries, inflating the exact rate B13 exists to
     //     read, and would be one rename away from silently returning 0 with no
     //     compile error.
+    //   * **The `status = 'cancelled'` arm makes the subset STRUCTURAL, not
+    //     merely conventional.** The marker is only ever written alongside a
+    //     cancellation, so it looks redundant — but a stamped row can be
+    //     REVIVED from the legacy side afterwards: `sync::mappers::booking`
+    //     writes `book_status` unconditionally, and iHOTEL's `จอง` maps back
+    //     to `confirmed`. A receptionist reinstating a lapsed hold in iHOTEL
+    //     would then leave a row that is stamped but no longer cancelled, and
+    //     without this arm `holdsExpired` could exceed `cancelled` — breaking
+    //     the one invariant the metric is read through. Repeating the exact
+    //     predicate `cancelled` uses (the CTE's normalised `status`, not the
+    //     raw column) is what guarantees containment by construction.
     //   * **Same window basis as `cancelled`, on purpose.** Every figure here
     //     is attributed by `book_checkin` (arrival), so a hold that expired in
     //     January for a March stay lands in March. An expiry-time basis
@@ -493,7 +507,9 @@ pub async fn load_channel_rollup(
             source,
             COUNT(*)::bigint AS bookings,
             COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
-            COUNT(*) FILTER (WHERE auto_released_at IS NOT NULL)::bigint AS holds_auto_released,
+            COUNT(*) FILTER (
+                WHERE auto_released_at IS NOT NULL AND status = 'cancelled'
+            )::bigint AS holds_auto_released,
             COALESCE(
                 SUM(nights * rooms) FILTER (WHERE status IS DISTINCT FROM 'cancelled'), 0
             )::bigint AS room_nights,

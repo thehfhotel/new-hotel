@@ -36,10 +36,14 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 
+use hotel_backend::outbox::event::EventSource;
 use hotel_backend::outbox::{EventBus, OutboxRepository};
 use hotel_backend::repository::{CustomerRepository, PgBookingRepository, PgCustomerRepository};
 use hotel_backend::service::reports::channel_rollup::{load_channel_rollup, rollup, ChannelTotals};
-use hotel_backend::service::{BookingService, ChannelService, CustomerService, ReleaseCause};
+use hotel_backend::service::{
+    BookingService, CancelBookingCommand, ChannelService, CustomerService, ReleaseCause,
+};
+use uuid::Uuid;
 
 /// These tests share fixture markers and the rollup window, so they must not
 /// interleave.
@@ -58,7 +62,11 @@ fn date(d: (i32, u32, u32)) -> NaiveDate {
     NaiveDate::from_ymd_opt(d.0, d.1, d.2).expect("valid fixture date")
 }
 
-fn service_for(pool: &PgPool) -> ChannelService {
+/// The channel service plus the `BookingService` behind it, so a test can
+/// exercise the DESK cancel path (`BookingService::cancel`) as well as the
+/// channel's own release — they are different repository writes, and only one
+/// of them is allowed to stamp the marker.
+fn service_for(pool: &PgPool) -> (ChannelService, Arc<BookingService>) {
     let outbox = Arc::new(OutboxRepository::new());
     let events = Arc::new(EventBus::new());
     let customers_repo: Arc<dyn CustomerRepository> = Arc::new(PgCustomerRepository::new());
@@ -75,7 +83,10 @@ fn service_for(pool: &PgPool) -> ChannelService {
         pool.clone(),
     ));
     // Floor 0 — these scenarios are about the marker, not the last-room guard.
-    ChannelService::new(pool.clone(), bookings, customers, customers_repo, 0)
+    (
+        ChannelService::new(pool.clone(), bookings.clone(), customers, customers_repo, 0),
+        bookings,
+    )
 }
 
 async fn cleanup(pool: &PgPool) {
@@ -169,7 +180,7 @@ async fn sweep_stamps_the_marker_once_and_only_on_expiry() {
     let _guard = B13_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
-    let svc = service_for(&pool);
+    let (svc, _bookings) = service_for(&pool);
     let cust = seed_customer(&pool).await;
 
     // An overdue loyalty hold, and one whose window is still open.
@@ -250,7 +261,7 @@ async fn requested_release_and_manual_cancel_leave_the_marker_null() {
     let _guard = B13_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
-    let svc = service_for(&pool);
+    let (svc, bookings) = service_for(&pool);
     let cust = seed_customer(&pool).await;
 
     // The path `routes::channel::release` takes. Note the hold is ALSO overdue:
@@ -291,12 +302,45 @@ async fn requested_release_and_manual_cancel_leave_the_marker_null() {
         Some(Duration::minutes(-1)),
     )
     .await;
-    svc.release_with_cause(asked2, "desk cancelled the hold", ReleaseCause::Requested)
+    svc.release_with_cause(asked2, "guest abandoned checkout", ReleaseCause::Requested)
         .await
         .expect("explicit Requested release must succeed");
     assert_eq!(marker_of(&pool, asked2).await, None);
     assert!(!ReleaseCause::Requested.is_auto_release());
     assert!(ReleaseCause::PaymentWindowExpired.is_auto_release());
+
+    // A genuine DESK cancellation — `BookingService::cancel`, a different
+    // repository write that never mentions the marker column at all. Asserted
+    // rather than assumed: if someone later folds the stamp into the generic
+    // cancel path, every desk cancellation of a lapsed hold would start
+    // counting as a TTL expiry and this is what catches it.
+    let desk = seed_booking(
+        &pool,
+        "TESTB13-DESK",
+        cust,
+        Some("loyalty"),
+        "pending",
+        Some(Duration::minutes(-1)),
+    )
+    .await;
+    bookings
+        .cancel(CancelBookingCommand {
+            book_id: desk,
+            reason: Some("desk cancelled the hold".to_string()),
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
+        .await
+        .expect("desk cancel must succeed");
+    assert_eq!(
+        status_of(&pool, desk).await,
+        "cancelled",
+        "the desk cancel path still cancels"
+    );
+    assert_eq!(
+        marker_of(&pool, desk).await,
+        None,
+        "a desk cancellation is not a TTL expiry"
+    );
 
     cleanup(&pool).await;
 }
@@ -334,7 +378,7 @@ async fn channel_rollup_counts_holds_expired_as_a_subset_of_cancelled() {
     let _guard = B13_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
-    let svc = service_for(&pool);
+    let (svc, _bookings) = service_for(&pool);
     let cust = seed_customer(&pool).await;
 
     // Two overdue holds that the sweep will kill, one hold the app releases
@@ -369,10 +413,36 @@ async fn channel_rollup_counts_holds_expired_as_a_subset_of_cancelled() {
     )
     .await;
 
+    // A hold that will be swept and then REVIVED from the legacy side.
+    let revived = seed_booking(
+        &pool,
+        "TESTB13-R5",
+        cust,
+        Some("loyalty"),
+        "pending",
+        Some(Duration::minutes(-1)),
+    )
+    .await;
+
     svc.release(released, "guest abandoned checkout")
         .await
         .expect("requested release");
     svc.sweep_expired_holds("test").await;
+
+    // iHOTEL reinstates the lapsed hold: `sync::mappers::booking` writes
+    // book_status unconditionally and legacy `จอง` maps back to 'confirmed',
+    // so the row keeps its marker but is no longer cancelled. The room is sold
+    // again — it must NOT be counted as a hold we lost to the clock, and it
+    // must not be able to push holdsExpired above cancelled.
+    sqlx::query("UPDATE ht_bookings SET book_status = 'confirmed' WHERE book_id = $1")
+        .bind(revived)
+        .execute(&pool)
+        .await
+        .expect("simulate a CT-driven revive");
+    assert!(
+        marker_of(&pool, revived).await.is_some(),
+        "the revive leaves the marker behind — that is exactly the hazard"
+    );
 
     let rows = load_channel_rollup(&pool, date(WINDOW_FROM), date(WINDOW_TO))
         .await
@@ -384,18 +454,19 @@ async fn channel_rollup_counts_holds_expired_as_a_subset_of_cancelled() {
         .find(|b| b.key == "app")
         .expect("the loyalty bucket must be present");
 
-    assert_eq!(app.totals.bookings, 4, "all four arrive in the window");
+    assert_eq!(app.totals.bookings, 5, "all five arrive in the window");
     assert_eq!(
         app.totals.cancelled, 3,
-        "two swept + one requested release are all cancellations"
+        "two swept + one requested release; the revived one is confirmed again"
     );
     assert_eq!(
         app.totals.holds_auto_released, 2,
-        "only the two the clock killed count as expired holds"
+        "only the two the clock killed AND left cancelled count as expired holds \
+         — the stamped-then-revived row is excluded"
     );
     assert!(
         app.totals.holds_auto_released <= app.totals.cancelled,
-        "holdsExpired must stay a strict subset of cancelled"
+        "holdsExpired must stay a subset of cancelled even after a legacy revive"
     );
     assert_eq!(
         out.totals.holds_auto_released, 2,
