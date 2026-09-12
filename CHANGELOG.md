@@ -7,6 +7,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.77.0](https://github.com/thehfhotel/new-hotel/compare/v2.76.0...v2.77.0) (2026-09-12)
+
+
+### Added
+
+* **channel:** typed hold auto-release marker so the expired-hold rate is measurable (B13) ([#332](https://github.com/thehfhotel/new-hotel/issues/332)) ([867f181](https://github.com/thehfhotel/new-hotel/commit/867f181209672ffe5d5916ed1fd661a12457d04c))
+
+
+### Fixed
+
+* **bookings:** booking-level double-check-in guard (B7b) + inventory lock on room-moving edits (B8g) ([#325](https://github.com/thehfhotel/new-hotel/issues/325)) ([3607ee7](https://github.com/thehfhotel/new-hotel/commit/3607ee72ccc1f904b251b0b7a3e6623e552140e5))
+* **bookings:** single snapshot for the modify lock + promote decisions (B8h, from [#325](https://github.com/thehfhotel/new-hotel/issues/325) F6) ([#328](https://github.com/thehfhotel/new-hotel/issues/328)) ([4442b22](https://github.com/thehfhotel/new-hotel/commit/4442b22aff134ba3c3472c22f09a340f061af03e))
+
 ## [2.76.0](https://github.com/thehfhotel/new-hotel/compare/v2.75.0...v2.76.0) (2026-09-12)
 
 
