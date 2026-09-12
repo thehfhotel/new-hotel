@@ -35,6 +35,16 @@
 //!    moves no inventory, and one property-wide lock on every desk save would
 //!    serialise edits against creates for no benefit.
 //!
+//!    **Unlike 1 and 2, this one takes the lock INSIDE the caller's
+//!    transaction** (B8h): `modify` locks the booking row first, reads the
+//!    committed room set from behind that lock, and only then decides whether
+//!    to acquire this lock — so the predicate and the legacy promote decision
+//!    can no longer be made on two disagreeing snapshots. The lock is still
+//!    taken before any WRITE, which is all this lock's exclusion needs. Why
+//!    that inversion does not deadlock against 1 and 2 (and the one future
+//!    change that would break it) is written up in the "Lock order" section of
+//!    `service::checkin`'s module doc.
+//!
 //! **Everything else that moves inventory still runs unlocked**, by design and
 //! for now:
 //!

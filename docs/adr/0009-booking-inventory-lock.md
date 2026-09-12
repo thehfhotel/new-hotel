@@ -23,8 +23,17 @@ guard object owns, holds open and **never writes through**, and keep that guard 
 the caller's own (separate) create transaction.
 
 Key: `(classid = "BKIV" as i32, objid = fnv1a32(property))` — one lock per property. Taken by
-exactly two paths: `service::channel::create_hold`, and `service::booking::create` when
-`CreateBookingCommand::inventory_lock` is `Some`.
+exactly three paths: `service::channel::create_hold`; `service::booking::create` when
+`CreateBookingCommand::inventory_lock` is `Some`; and, since B8g (#325),
+`service::booking::modify` when `ModifyBookingCommand::inventory_lock` is `Some` **and** the
+edit changes the booking's room set.
+
+Since B8h, `modify` takes it *inside* its own transaction, after locking the booking row —
+the predicate and the legacy promote decision are then read from one snapshot instead of two.
+That inverts the lock order relative to the other two paths, and is sound only because no
+holder of this advisory lock ever locks a pre-existing `ht_bookings` row. The argument, and
+the change that would invalidate it, live in the "Lock order" section of `service::checkin`'s
+module doc.
 
 ## The alternative we did not take
 
@@ -58,9 +67,9 @@ The same caveat is repeated as a loud comment at the top of
 
 ## Scope limit (do not over-read the lock)
 
-Only the two paths named above take it. Walk-in check-in, room change, stay extension, the
-booking edit / parked-promote path and the CT sync mappers all still race exactly as they did
-before. What keeps the *channel* clear of those is the B8e **last-room floor** (L2), which
+Only the three paths named above take it. Walk-in check-in, room change, stay extension, a
+booking edit that only re-dates an unchanged room set, and the CT sync mappers all still race
+exactly as they did before. What keeps the *channel* clear of those is the B8e **last-room floor** (L2), which
 holds back a buffer of sellable rooms, not this lock. Widening the lock to those paths is a
 separate decision — they take real row locks inside their own transactions.
 

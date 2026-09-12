@@ -27,6 +27,10 @@ use crate::repository::booking::{
     BookingProductAssignment, BookingRepository, BookingRoomAssignment, BookingWrite,
 };
 use crate::repository::inventory_lock::InventoryLock;
+// B8h: the booking-row guard's `lock_timeout` (55P03) is contention, not a
+// fault. Shared with the B7b check-in guard so both `ht_bookings` row guards
+// answer a stalled row the same way — 503 + `Retry-After`, never a 500.
+use super::checkin::map_booking_lock_error;
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
@@ -619,68 +623,100 @@ impl BookingService {
     /// Mirrors today's `update_booking` route: deletes the existing
     /// `ht_booking_rooms` rows and re-inserts the supplied ones inside the
     /// same TX as the `ht_bookings` UPDATE.
+    ///
+    /// **One snapshot, taken behind the booking row lock** (B8h). Whether the
+    /// edit needs the per-property inventory lock, and whether it promotes to a
+    /// byte-parity legacy `CreateBooking`, are two readings of the same fact —
+    /// the booking's committed room set — and they are made from a single read
+    /// behind `SELECT … FOR NO KEY UPDATE`. See the comment block in the body
+    /// for what went wrong when they were two reads.
     pub async fn modify(&self, cmd: ModifyBookingCommand) -> ServiceResult<BookingOutcome> {
         validate_stay_range(cmd.check_in, cmd.check_out)?;
         validate_room_assignments(&cmd.rooms)?;
 
-        // B8e / L3, extended by B8g — serialise room consumption property-wide
-        // for the edits that actually MOVE inventory. `modify` replaces the
-        // booking's whole room set (delete + re-insert below), so an edit that
-        // assigns the first room to a parked booking, or swaps one room for
-        // another, consumes exactly what a concurrent channel hold is picking
-        // between its SELECT and its INSERT — the same window `create` closed.
-        //
-        // The prior room set is read on the POOL, before the transaction, for
-        // the same reason `create` takes its lock before opening one: the guard
-        // owns a connection of its own and must hold the lock across the whole
-        // write, not be nested inside it.
-        //
-        // Residual, accepted and NOT understated: this read and the in-tx
-        // `writeback_state` read below are two different snapshots of the same
-        // fact. Under a concurrent edit OF THE SAME BOOKING they can disagree,
-        // and the case that disagrees includes the headline one — if a rival
-        // edit clears the rooms between the two reads, this read sees "rooms
-        // unchanged" and skips the lock while `writeback_state` then sees 0
-        // prior rooms and PROMOTES, emitting the byte-parity `CreateBooking`
-        // unlocked. That is the exact write B8g exists to serialise.
-        //
-        // Why it is not fixed here: the sound fix is to take both reads AFTER
-        // `update_booking` has locked the booking row, which moves the
-        // promote-vs-modify decision onto a different snapshot — a change to
-        // the legacy write-back leg, not to a lock, and it deserves its own
-        // review rather than riding along in this one. The exposure needs two
-        // concurrent edits of ONE booking within a millisecond window, both
-        // from the desk (`update_booking` is the only production caller, and
-        // there is no OTA PUT); the channel never edits. The reviewer's
-        // suggested alternative — lock whenever `rooms` is non-empty — was NOT
-        // taken because it locks every notes-only save of a roomed booking,
-        // which is precisely the over-blocking B8g was asked to avoid.
-        let inventory_lock = match cmd.inventory_lock.as_deref() {
-            Some(property) => {
-                let prior_rooms = self.repo.booking_room_ids(&self.pg, cmd.book_id).await?;
-                if room_set_changed(&prior_rooms, &cmd.rooms) {
-                    Some(InventoryLock::acquire(&self.pg, property).await?)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
-
         let mut tx = self.pg.begin().await?;
 
-        // Capture the pre-modify write-back state BEFORE we touch the rooms:
-        // whether the booking is already mirrored to iHOTEL (`legacy_book_id`)
-        // and how many rooms it has right now. A parked (roomless, never
-        // mirrored) booking that gains its FIRST room here must produce the real
-        // byte-parity `CreateBooking`, not a `ModifyBooking` that has no legacy
-        // row to target. Missing row ⇒ `(None, 0)`; `update_booking` below
-        // still returns the not-found error.
-        let (prior_legacy_book_id, prior_room_count) = self
+        // ── B8h (#325 review F6): ONE snapshot for BOTH decisions ──────────
+        //
+        // Lock the booking row FIRST, then read — from behind that lock — the
+        // two facts this method decides on:
+        //
+        //   (a) does this edit MOVE the booking's rooms, and therefore need the
+        //       per-property inventory lock (B8e / L3, extended by B8g)?
+        //   (b) does it PROMOTE a parked booking to a byte-parity legacy
+        //       `CreateBooking`, or take the ordinary `ModifyBooking` leg?
+        //
+        // B8g read (a) on the POOL before the transaction and (b) in the
+        // transaction before the row was locked — two snapshots of one fact.
+        // Under a concurrent edit OF THE SAME BOOKING they could disagree, and
+        // the disagreeing case included the headline one: a rival edit clearing
+        // the rooms between the two reads made (a) see "rooms unchanged" and
+        // skip the lock while (b) then saw 0 prior rooms and promoted, emitting
+        // the room-consuming `CreateBooking` UNLOCKED — the exact write B8g
+        // exists to serialise.
+        //
+        // Both reads now happen after `SELECT … FOR NO KEY UPDATE` on the
+        // booking row, so a rival edit is either fully committed and visible to
+        // both, or has not started. The row lock is the SAME one
+        // `update_booking`'s `UPDATE` takes a few statements later, only taken
+        // earlier — no new blocking relationship, and notes-only saves stay
+        // free of the PROPERTY-wide lock, which is the over-blocking B8g was
+        // asked to avoid.
+        let state = self
             .repo
-            .writeback_state(&mut tx, cmd.book_id)
-            .await?
-            .unwrap_or((None, 0));
+            .lock_booking_for_modify(&mut tx, cmd.book_id)
+            .await
+            .map_err(map_booking_lock_error)?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!("booking {} does not exist", cmd.book_id))
+            })?;
+
+        // (a) The inventory lock, decided on the locked snapshot. Taken AFTER
+        // the booking row and BEFORE any write, which is a deliberate order:
+        //
+        //   * no holder of the advisory lock ever locks a PRE-EXISTING
+        //     `ht_bookings` row — `create` only touches the row it just
+        //     inserted, and the channel's floor check, `pick_free_room` and
+        //     ext-ref lookups are bare SELECTs — so "row then advisory" here
+        //     cannot close a cycle with "advisory then row" there;
+        //   * `acquire` polls `pg_try_advisory_xact_lock` and returns its
+        //     connection between attempts, so PostgreSQL never records a wait
+        //     edge for it: the worst case is a bounded 5 s wait ending in a
+        //     retryable 503, never an undetectable hang;
+        //   * the 3 s `lock_timeout` in `lock_booking_for_modify` bounds how
+        //     long we WAIT for the booking row, NOT how long we hold it — the
+        //     row stays locked for the rest of this transaction, the advisory
+        //     acquire below included, so the worst-case HOLD is ~10 s (the 5 s
+        //     `ACQUIRE_TIMEOUT`, plus up to another `PG_ACQUIRE_TIMEOUT` if the
+        //     last `pool.begin()` starts just under that deadline on a
+        //     saturated pool) before it gives up with Busy and rolls back.
+        //     What the 3 s does buy is that everything queued behind this
+        //     booking row meanwhile gets a retryable 503 rather than a hang.
+        //
+        // ⚠️ That reasoning is narrow, and the "Lock order" section of
+        // `service::checkin`'s module doc now records it: ANY future path that
+        // locks a pre-existing booking row while holding the inventory lock
+        // (widening the lock over check-in / change_room / extend_stay is the
+        // live candidate) closes the cycle this escapes, and must make `modify`
+        // take the advisory lock first again.
+        let inventory_lock = match cmd.inventory_lock.as_deref() {
+            Some(property) if room_set_changed(&state.room_ids, &cmd.rooms) => {
+                Some(InventoryLock::acquire(&self.pg, property).await?)
+            }
+            // Either the caller opted out of the lock entirely (the channel,
+            // which holds its own), or this edit leaves the room set alone —
+            // notes, price, guest counts, status. It moves no inventory.
+            _ => None,
+        };
+
+        // (b) The legacy write-back leg, from that same locked snapshot.
+        // `legacy_book_id` says whether iHOTEL already has this booking; the
+        // room ids' LENGTH is the prior room count. A parked (roomless, never
+        // mirrored) booking that gains its FIRST room here must produce the
+        // real byte-parity `CreateBooking`, not a `ModifyBooking` with no
+        // legacy row to target.
+        let prior_legacy_book_id = state.legacy_book_id;
+        let prior_room_count = state.room_ids.len() as i64;
 
         let rows_affected = self
             .repo
@@ -703,6 +739,11 @@ impl BookingService {
             )
             .await?;
 
+        // Unreachable since B8h — `lock_booking_for_modify` above already
+        // reported the missing row, and nothing can DELETE it while we hold
+        // `FOR NO KEY UPDATE` on it. Kept as a cheap belt-and-braces that
+        // answers 404 rather than silently committing an edit that wrote
+        // nothing.
         if rows_affected == 0 {
             return Err(ServiceError::not_found(format!(
                 "booking {} does not exist",
