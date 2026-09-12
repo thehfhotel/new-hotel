@@ -373,10 +373,8 @@ async fn parked_bookings_consume_channel_inventory() {
     let _room_b1 = seed_room(&pool, ROOM_B1, type_b).await;
     // Slack, not subject matter: three free rooms of a type no assertion
     // names, so the property-wide cap is never what zeroes type A or type B.
-    let type_c = seed_type(&pool, TYPE_CODE_C, TYPE_NAME_C).await;
-    for room_no in ROOMS_SLACK {
-        seed_room(&pool, room_no, type_c).await;
-    }
+    let _type_c = seed_type(&pool, TYPE_CODE_C, TYPE_NAME_C).await;
+    // MUT-A: slack rooms NOT seeded
     let cust = seed_customer(&pool).await;
 
     // Monotonic book_no suffix — book_no is UNIQUE across the whole table.
