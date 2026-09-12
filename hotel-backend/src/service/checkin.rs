@@ -33,6 +33,7 @@
 //! | [`CheckInService::check_out`], per-room | `set_booking_completed` (header-completion block) | `mark_room_available_dirty` loop, after |
 //! | `service::housekeeping::lock_room_clean`, `service::hk_reports`'s `lock_room` | — | room only, so they can never close a cycle |
 //! | `repository::channel`'s `lock_channel_booking`, `BookingService::cancel` | booking only | — |
+//! | `BookingService::modify` (B8h) | `lock_booking_for_modify`, the transaction's FIRST statement | `FOR KEY SHARE` on `ht_rooms_new` via the `ht_booking_rooms` FK, after |
 //!
 //! Checkout used to run room-then-booking, which was harmless while check-in
 //! took no booking lock. B7b's guard made check-in booking-first, and that
