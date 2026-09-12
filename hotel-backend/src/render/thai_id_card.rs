@@ -4,8 +4,9 @@
 //! A check-in captured via OUR chip card-reader should produce the same card
 //! iHOTEL prints. We composite it server-side (rather than on a client
 //! `<canvas>`) for ONE reason: correct Thai complex-script shaping. resvg drives
-//! `rustybuzz`, which lays out Thai combining vowels / tone marks correctly;
-//! naïve canvas text draws them mis-positioned.
+//! a HarfBuzz-derived shaper (`harfrust` since resvg 0.48, `rustybuzz` before
+//! it), which lays out Thai combining vowels / tone marks correctly; naïve
+//! canvas text draws them mis-positioned.
 //!
 //! ## Provenance — this is a faithful port of the reference paint handler
 //!
@@ -117,7 +118,7 @@ pub enum RenderError {
 ///
 /// Reads `template_path` (PNG) and `font_path` (TTF/OTF) from disk, base64-
 /// embeds the template + `face_jpeg` into an SVG, shapes the text with the
-/// loaded font via resvg/rustybuzz, and rasterises to a 446×273 PNG.
+/// loaded font via resvg/harfrust, and rasterises to a 446×273 PNG.
 ///
 /// Returns [`RenderError`] (never panics) when an asset is missing/unreadable
 /// or the SVG fails to parse/render.
