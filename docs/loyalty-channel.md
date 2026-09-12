@@ -386,7 +386,8 @@ its whole pick→insert span (`repository::inventory_lock`):
 |---|---|
 | Key | `pg_advisory_xact_lock(classid, objid)` — `classid` = `BKIV` as ASCII/int32 (`INVENTORY_LOCK_CLASS`), `objid` = FNV-1a/32 of the property id (`hf` / `hfville`). Both slots are greppable in `pg_locks`. |
 | Scope | **One lock per property.** NOT per (type, date) — see below. |
-| Who takes it | `service::channel::create_hold` across floor-check → pick → `BookingService::create`; and `BookingService::create` itself whenever `CreateBookingCommand::inventory_lock` is set, which `routes::new_bookings::create_booking` (the desk form / OTA bridge) always does. |
+| Who takes it | `service::channel::create_hold` across floor-check → pick → `BookingService::create`; `BookingService::create` itself whenever `CreateBookingCommand::inventory_lock` is set, which `routes::new_bookings::create_booking` (the desk form / OTA bridge) always does; and **`BookingService::modify` (B8g)** whenever `ModifyBookingCommand::inventory_lock` is set — `routes::new_bookings::update_booking` always sets it — **and** the edit changes the booking's room set. |
+| Which EDITS take it (B8g) | `modify` replaces the booking's whole room set, so an edit that assigns the first room to a parked booking, swaps a room, adds one or releases one consumes or frees exactly what a live hold is picking between. Those lock. An edit that leaves the room set alone (notes, price, guest counts, status) takes **nothing**: it moves no inventory, and one property-wide lock on every desk save would serialise every edit behind every create for a race it cannot lose. The predicate is `service::booking::room_set_changed` — a sorted multiset compare, so a re-ordered but identical list is not a change. |
 | Lifetime | Transaction-scoped on a transaction the guard owns and never writes through, so an error path that skips `release()` still frees it — sqlx queues the `ROLLBACK` and flushes it when the connection returns to the pool. |
 | Waiting | `pg_try_advisory_xact_lock` in a 5 ms→50 ms backoff loop, 5 s deadline, **returning the pooled connection between attempts**. A blocking `pg_advisory_xact_lock` would pin one connection per waiter while the holder needs a second one — a pool-exhaustion deadlock waiting for a burst (`NEW_DB_POOL_MAX` defaults to 10). A pool timeout while trying counts as the same contention, not a 500. |
 | Giving up | **`503` + `Retry-After: 1`, on BOTH routers** — `reason: "inventory_lock_timeout"` on `/api/channel/*`, `ApiError::Busy` on the desk form and the OTA bridge. Never `409`, and above all never `400`: nothing was written and the condition clears in milliseconds, so a 4xx would tell a machine caller its request was wrong and an OTA booking would be dropped for a race we already know how to survive. |
@@ -401,16 +402,16 @@ while the L2 floor is property-wide by definition, a type term cannot
 serialise either quantity. Booking creates at both properties are human-paced,
 so a correct coarse lock beats a fine-grained one that does not exclude.
 
-**Exactly two paths take this lock.** Do not read it as "inventory is now
-serialised" — it is not. Everything else that moves inventory still races as
-it did before:
+**Exactly three paths take this lock** (two until B8g added the booking edit).
+Do not read it as "inventory is now serialised" — it is not. Everything else
+that moves inventory still races as it did before:
 
 | unlocked path | |
 |---|---|
 | walk-in check-in (`service::checkin::create`) | consumes a room directly |
 | room change (`service::checkin::change_room`) | moves an occupied stay |
 | stay extension (`service::checkin::extend_stay`) | lengthens a claim |
-| booking edit / parked promote (`service::booking::modify` via `PUT /api/new/bookings/{id}`) | assigns the FIRST room to a parked booking |
+| booking edit that only RE-DATES an unchanged room set (`service::booking::modify`) | shifts which room-nights are consumed without touching the room set, so B8g's predicate does not fire — same class as the two rows above; widening the lock to dates is its own decision |
 | CT sync mappers (`bin/sync.rs`) | replay iHOTEL's own writes — iHOTEL cannot be asked to take our lock |
 
 What keeps the *channel* clear of those is **not** the lock, it is the L2 floor
@@ -477,6 +478,28 @@ sides.
 The desk/OTA router carries the same `inventory_lock_timeout` code on its own
 `ApiError::Busy` body (`crate::error::BUSY_REASON` is the single definition),
 so the two surfaces describe that one condition identically.
+
+It also carries one `reason` of its own, on `POST /api/new/checkins` (B7b):
+
+| `reason` | status | when |
+|---|---|---|
+| `booking_already_checked_in` | 409 | the booking already has as many OPEN check-ins as it has assigned rooms |
+
+```
+409 { "success": false,
+      "reason": "booking_already_checked_in",
+      "error":  "booking 812 is already checked in (check-in 4242) — open that folio instead of creating a second one",
+      "conflictingId": 4242 }
+```
+
+`conflictingId` is the open check-in's `ht_checkins.cin_id`, so the desk can be
+sent to the folio that already exists rather than told only that it failed.
+Before B7b the check-in service guarded the TARGET ROOM only, so a second POST
+for the same `booking_id` aimed at a different free room created a SECOND stay
+on one reservation — two canonical folios and two byte-parity `HT_CheckIn_H`
+rows in iHOTEL, which nothing downstream unpicks. The constant lives in
+`crate::error::BOOKING_ALREADY_CHECKED_IN_REASON`; renaming it is a contract
+change.
 
 ### Rollout: the floor ships at 0
 

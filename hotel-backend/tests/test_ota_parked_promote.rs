@@ -382,6 +382,9 @@ async fn desk_create_records_the_claimed_room_type() {
         room_type_id: RoomTypeEdit::Keep,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
         before_snapshot: None,
         after_snapshot: snapshot(),
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -481,6 +484,9 @@ async fn ordinary_edit_of_a_parked_booking_preserves_its_room_type() {
             room_type_id,
             changes: empty_changes(),
             promote_context: None,
+            // B8g: the test drives the service directly, so it keeps the
+            // unlocked shape every other double uses.
+            inventory_lock: None,
             before_snapshot: None,
             after_snapshot: snapshot(),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -659,6 +665,9 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
         room_type_id: RoomTypeEdit::Keep,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
         before_snapshot: None,
         after_snapshot: snapshot(),
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -808,6 +817,9 @@ async fn already_mirrored_booking_takes_modify_path() {
         room_type_id: RoomTypeEdit::Keep,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
         before_snapshot: None,
         after_snapshot: snapshot(),
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
