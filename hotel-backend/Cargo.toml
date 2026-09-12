@@ -219,22 +219,27 @@ rust_xlsxwriter = "0.99"
 
 # Thai national-ID card server-side compositing (render/thai_id_card.rs) — a
 # clean reimplement of the iHOTEL ReportReg card face, NO vendor lib. resvg
-# drives rustybuzz under the hood for correct Thai complex-script shaping (the
-# whole reason we render server-side instead of on a client <canvas>).
+# drives a HarfBuzz-derived shaper under the hood for correct Thai
+# complex-script shaping (the whole reason we render server-side instead of on
+# a client <canvas>).
 #
-# Version set = the resvg 0.47 line, which co-resolves cleanly: resvg 0.47 →
-# usvg 0.47 (pins `fontdb ^0.23`, `tiny-skia-path ^0.12`, `rustybuzz ^0.20`)
-# and `tiny-skia ^0.12`. DEFAULT features are left ON so `text`
-# (fontdb + rustybuzz) and `raster-images` (embedded PNG/JPEG `<image>` decode)
+# Version set = the resvg 0.48 line, which co-resolves cleanly: resvg 0.48 →
+# usvg 0.48 (pins `fontdb ^0.24`, `tiny-skia-path ^0.12`) and `tiny-skia
+# ^0.12`. resvg 0.48 swapped the text stack from `ttf-parser`/`rustybuzz` to
+# `skrifa`/`harfrust` (still fontations/HarfBuzz-derived, still pure Rust) and
+# is the FIRST line that takes `fontdb ^0.24` — the reason a fontdb-only bump
+# (Dependabot #317) cannot compile. DEFAULT features are left ON so `text`
+# (fontdb + shaper) and `raster-images` (embedded PNG/JPEG `<image>` decode)
 # are wired without hand-picking the feature graph — all pure Rust, no C libs.
-# `fontdb` is declared at the SAME 0.23 line usvg pins so our
+# `fontdb` is declared at the SAME 0.24 line usvg pins so our
 # `fontdb::Database` unifies to the exact type `usvg::Options` expects
-# (0.x is semver-incompatible across minors — a 0.24 here would be a *different*
-# type and fail to compile). `base64` (already a dep) encodes the data-URLs.
-resvg = "0.47"
-usvg = "0.47"
+# (0.x is semver-incompatible across minors — a different minor here would be a
+# *different* type and fail to compile). `base64` (already a dep) encodes the
+# data-URLs.
+resvg = "0.48"
+usvg = "0.48"
 tiny-skia = "0.12"
-fontdb = "0.23"
+fontdb = "0.24"
 
 # Minimal PNG/JPEG decode+crop+encode for the guest-image sync-in: iHOTEL saves
 # the landscape Thai-ID card on a tall white canvas (703×996, card at the top),

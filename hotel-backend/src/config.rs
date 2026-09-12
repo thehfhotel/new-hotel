@@ -468,7 +468,7 @@ pub fn thai_id_template_path() -> String {
 /// (`THAI_ID_FONT_PATH`). Defaults to **DilleniaUPC Bold**, the exact face the
 /// reference `KPThaiNationalIDCard.exe` draws with, bundled in the backend image
 /// at `/usr/share/fonts/truetype/dillenia/DilleniaUPC-Bold.ttf` (COPY'd in
-/// `hotel-backend/Dockerfile`). resvg/rustybuzz load this file for correct Thai
+/// `hotel-backend/Dockerfile`). resvg/harfrust load this file for correct Thai
 /// complex-script shaping. `fonts-tlwg-loma-ttf` also ships in the image as a
 /// fallback (`/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf`).
 pub fn thai_id_font_path() -> String {
