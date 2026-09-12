@@ -69,3 +69,65 @@ require a major upgrade. See the companion PR
 (`chore/next-16.3-and-alerts`) for the 5 critical/high fixes actually
 applied (the 2 moderate ones are left open for a human decision, since they
 were out of this batch's required scope).
+
+## 2026-09-12 — F14: dev bumps + the two remaining moderate overrides
+
+**Why Dependabot's own npm PRs can't land here.** This repo pins CVE
+remediations in `package.json`'s `pnpm.overrides` (see `f0a5fc1` and the
+table above). When Dependabot regenerates `pnpm-lock.yaml` for a version-bump
+PR, its lockfile writer drops the top-level `overrides:` block entirely
+while leaving `package.json`'s `pnpm.overrides` untouched (this is what broke
+`#297`, described above). The mismatch between `package.json` and
+`pnpm-lock.yaml` fails `pnpm install --frozen-lockfile` with
+`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` in CI's `test-frontend` job. Every
+Dependabot PR on this repo — not just `#297` — carries the same defect,
+because Dependabot always regenerates the whole lockfile rather than
+patching just the bumped package's entries. So **every** open Dependabot npm
+PR here (`#240`, `#241`, `#243`, `#244`) is unmergeable as-is.
+
+**The by-hand recipe** (used for this batch, and the one to repeat next
+time Dependabot opens npm PRs that conflict the same way):
+
+1. Read each open Dependabot PR's diff (`gh pr view <n> --json body,title`
+   or `gh pr diff <n>`) for the exact `package.json` version bump it wants —
+   don't guess from the changelog; Dependabot's target version is
+   authoritative and its diff is a single line.
+2. Apply that same `package.json` edit by hand (same range operator
+   Dependabot used, e.g. `^1.27.0`, not a hand-picked pin).
+3. Add or tighten any `pnpm.overrides` entries needed for alerts that have
+   no Dependabot PR at all (transitive deps — Dependabot only opens PRs for
+   packages declared directly in `package.json`).
+4. Run a full `pnpm install` (not `--frozen-lockfile`) so
+   `pnpm-lock.yaml`'s `overrides:` block and every resolved entry regenerate
+   together, in sync with `package.json`.
+5. Prove `pnpm install --frozen-lockfile` passes from a clean
+   `node_modules` — this is the exact check CI's `test-frontend` job runs,
+   and it's the one Dependabot's own PRs fail.
+6. Run `npm run lint`, `npx tsc --noEmit`, and `pnpm test:components`, and
+   diff the finding/error counts against a pre-edit baseline — this repo has
+   pre-existing lint findings (26 problems as of this writing) and two
+   pre-existing `tsc` errors in test helper files; the bar is "no new
+   findings," not "zero findings."
+7. Skim the bumped packages' changelogs/release notes for renamed or
+   removed exports actually used in `components/` (grep the import list,
+   check each name still resolves) — `tsc` will also catch a removed named
+   export directly, so this is largely a fast sanity pass to confirm it
+   before treating a green `tsc` as proof.
+8. Close the superseded Dependabot PRs by hand once the manual PR merges —
+   Dependabot does not detect that its own bump landed via a different PR.
+
+This batch bumped `eslint-config-next` → `16.2.12`, `@types/node` →
+`^26.1.2` (dev-only type declarations; the Node **runtime** in CI and
+`docker-build.yml` stays on Node 20 — `@types/node` tracks the npm
+`@types/node` major independently of the runtime and this repo has no
+`engines.node` pin to reconcile), `lucide-react` → `^1.27.0`, and `recharts`
+→ `^3.9.2` (closing dependabot PRs `#244`, `#241`, `#240`, `#243`
+respectively), plus two new `pnpm.overrides` entries for the moderate alerts
+left open above: `@humanfs/node: ^0.16.8` (closes #177) and
+`baseline-browser-mapping: ^2.11.0` (closes #180). A plain `pnpm install`
+resolved these ranges to newer-than-targeted versions on the day this ran
+(`lucide-react@1.45.0`, `recharts@3.10.1`, `@types/node@26.5.1`) since
+caret ranges always resolve to the latest satisfying version at install
+time, not the exact version Dependabot's stale PR diff showed — expected
+and fine; `lint` / `tsc` / `test:components` all matched the pre-edit
+baseline exactly (no new findings).
