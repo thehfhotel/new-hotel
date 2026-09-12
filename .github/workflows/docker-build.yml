@@ -571,7 +571,11 @@ jobs:
   # No `needs:` gate (cheap grep over a 2-line diff); always runs on PRs.
   lint-no-changelog-version-edits:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches/')
+    # release-please names its branch `release-please--branches--<base>--components--<name>`
+    # (double dashes, no slash); the old prefix `release-please--branches/` never
+    # matched, so the guard rejected every release PR once those runs were allowed
+    # to execute (2026-09-12, #256).
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')
     permissions:
       contents: read
     steps:
@@ -727,7 +731,7 @@ jobs:
 
       - name: Cache Rust dependencies
         # v2 pinned to SHA. Resolved via gh api git/refs/tags/v2.
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: hotel-backend
           # `cache-on-failure: true` — preserve the partially-built target/
@@ -889,7 +893,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -962,7 +966,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1137,7 +1141,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
