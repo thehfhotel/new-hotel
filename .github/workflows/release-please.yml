@@ -9,12 +9,66 @@ permissions:
   contents: write
   pull-requests: write
 
+# WHY THIS JOB AUTHENTICATES AS A GITHUB APP AND NOT AS GITHUB_TOKEN
+#
+# A release PR pushed with GITHUB_TOKEN is authored by github-actions[bot]:
+# its pull_request runs are parked in action_required (approval policy) and
+# its branch pushes raise no run at all, so the release PR either never gets
+# CI or merges to master with zero checks and fires the unattended deploy
+# unverified (2026-09-12, #256). Events created by a GitHub App installation
+# are ordinary events. This is the same mechanism loyalty-app uses; the App is
+# `hf-release-bot` (app id in vars.RELEASE_BOT_APP_ID, private key in
+# secrets.RELEASE_BOT_PRIVATE_KEY) and must be installed on thehfhotel/new-hotel.
+#
+# FAIL LOUDLY, NEVER FALL BACK: no `|| github.token` anywhere below.
+
 jobs:
   release-please:
+    name: "Release PR / tag"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - uses: googleapis/release-please-action@v5
+      - name: Guard — hf-release-bot App credentials must be visible to this job
+        env:
+          RELEASE_BOT_APP_ID: ${{ vars.RELEASE_BOT_APP_ID }}
+          RELEASE_BOT_PRIVATE_KEY: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${RELEASE_BOT_APP_ID:-}" ] || missing="${missing} vars.RELEASE_BOT_APP_ID (Settings -> Secrets and variables -> Actions -> Variables)"
+          [ -n "${RELEASE_BOT_PRIVATE_KEY:-}" ] || missing="${missing} secrets.RELEASE_BOT_PRIVATE_KEY (Settings -> Secrets and variables -> Actions -> Secrets)"
+          if [ -n "$missing" ]; then
+            echo "::error title=Release Please cannot authenticate::Empty release-bot setting(s):${missing}. The hf-release-bot GitHub App must be installed on thehfhotel/new-hotel with contents=write, pull_requests=write, metadata=read. This job does not fall back to GITHUB_TOKEN on purpose (see the comment at the top of this file)."
+            exit 1
+          fi
+          echo "vars.RELEASE_BOT_APP_ID and secrets.RELEASE_BOT_PRIVATE_KEY are both non-empty."
+
+      - name: Mint hf-release-bot installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Assert an installation token was actually minted
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APP_INSTALLATION_ID: ${{ steps.app-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_TOKEN:-}" ]; then
+            echo "::error title=Release Please got an empty App token::actions/create-github-app-token produced no token. Check that hf-release-bot is installed on thehfhotel/new-hotel and that secrets.RELEASE_BOT_PRIVATE_KEY matches a key that still exists in the App settings."
+            exit 1
+          fi
+          echo "Installation token minted for app-slug '${APP_SLUG}' (installation ${APP_INSTALLATION_ID})."
+
+      - name: Run release-please
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
