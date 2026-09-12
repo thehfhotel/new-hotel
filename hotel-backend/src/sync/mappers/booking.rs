@@ -2532,10 +2532,58 @@ mod tests {
         );
     }
 
+    /// The mode-1 READ itself (PENDING-VERIFICATIONS V17): a `Book_room_type=1`
+    /// header WITH a live `HT_Book_Ds` line must capture that line's
+    /// `Book_Room_Type` verbatim — it is the ONLY record of what a parked
+    /// booking claims, so dropping it leaves canonical with an untyped claim
+    /// that `repository::channel` can only cap property-wide.
+    ///
+    /// The fixture value is `402`, the literal V17 found live on 2026-09-11
+    /// (`R014814`, one of HF Hotel's four mode-1 Ds rows): such a line CAN hold
+    /// a room NUMBER where the decompile said a type code would be. Projection
+    /// stays value-agnostic — it captures the string and leaves
+    /// `resolve_room_type_code` to decide whether it names a type or a room —
+    /// so a distinctive literal here is what makes the read observable at all.
+    ///
+    /// Mutation this catches: delete the `book_room_type_code` capture in
+    /// `project_aggregate`'s `} else if !agg.rooms.is_empty() {` branch and this
+    /// goes red with `None`.
+    #[test]
+    fn project_aggregate_mode_1_captures_the_ds_room_number_as_the_type_code() {
+        let mut header = header_row("R015403", "C21610", "จอง");
+        header
+            .cells
+            .insert("Book_room_type".into(), MockValue::I32(1));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![ds_row("R015403", "402")],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015403").expect("must project");
+        assert_eq!(
+            p.book_room_type_code.as_deref(),
+            Some("402"),
+            "the live mode-1 line's raw `Book_Room_Type` must reach the \
+             projection — verbatim, uninterpreted"
+        );
+        assert!(
+            p.rooms.is_empty(),
+            "...and reading it must NOT turn the line into a room assignment: \
+             mode 1 stays header-only, which is what keeps the 2026-06-11 \
+             re-emit loop closed"
+        );
+    }
+
     /// A `Book_room_type=1` header with NO surviving `HT_Book_Ds` rows carries
     /// no type code at all — the shape iHOTEL's §3.6 cancel-on-room leaves
     /// behind (it deletes every Ds line but keeps the header). It must project
     /// header-only with NO type, not panic and not invent one from thin air.
+    ///
+    /// This is a no-invention GUARD, not the V17 read coverage: with zero Ds
+    /// rows `None` is forced by the fixture, so it stays green even if the
+    /// mode-1 capture is deleted. The read is pinned by
+    /// `project_aggregate_mode_1_captures_the_ds_room_number_as_the_type_code`
+    /// above.
     #[test]
     fn project_aggregate_mode_1_without_ds_rows_carries_no_type_code() {
         let mut header = header_row("R015401", "C21610", "จอง");

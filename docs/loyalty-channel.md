@@ -182,8 +182,14 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   confirmed/pending bookings and non-cancelled check-ins, half-open
   `[check_in, check_out)` — the exact overlap predicate of
   `room_is_available` / `validate_booking`, plus the maintenance/active
-  gates (the channel has no human picker to exclude those). Types that
-  cannot sleep `guests` are omitted; sold-out types report
+  gates (the channel has no human picker to exclude those) — and then
+  minus **parked claims** (a live booking carrying zero `ht_booking_rooms`
+  rows): `available_count = min(max(free(type) − parked_typed(type), 0),
+  surplus)` where `surplus = max(free_total − ALL parked claims, 0)`, read
+  from the `inventory_ctes` shared CTE the picker uses too (B8a added the
+  property-wide `surplus`; B8c / migration 094 added the per-type term, and
+  a claim whose `book_room_type_id` is still NULL caps property-wide only).
+  Types that cannot sleep `guests` are omitted; sold-out types report
   `available_count: 0`. `nightly_price` = `ht_room_types.type_base_price`.
   `room_type_id` is the `type_id` SERIAL as a string (stable per property).
 

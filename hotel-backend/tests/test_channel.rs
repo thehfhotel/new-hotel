@@ -1162,8 +1162,9 @@ async fn hold_retry_after_a_crash_between_the_two_writes_replays_the_same_hold()
 /// This is the path the key store cannot serialize: after a crash there is no
 /// `ht_channel_idempotency` row to block on, so both retries enter
 /// `create_hold` for real. One wins the unique index; the other either sees
-/// the winner in the pre-check or loses the INSERT and re-selects. Both answer
-/// `Replayed` naming the SAME booking.
+/// the winner in the pre-check or loses the INSERT and re-selects — so the two
+/// answers are always exactly one `Created` and exactly one `Replayed`, naming
+/// the SAME booking, whichever way the race fell.
 #[tokio::test]
 async fn concurrent_crash_retries_serialize_on_the_booking_ext_ref_index() {
     let pool = common::create_test_pool().await;
@@ -1189,34 +1190,90 @@ async fn concurrent_crash_retries_serialize_on_the_booking_ext_ref_index() {
     let ra = ta.await.expect("task a").expect("create a");
     let rb = tb.await.expect("task b").expect("create b");
 
-    // Exactly one booking, whichever way the race fell. Both sides must name
-    // it — a side that returned a DIFFERENT book_id would mean two holds.
-    let ids: Vec<i32> = [&ra, &rb]
-        .iter()
-        .map(|o| match o {
-            HoldCreateOutcome::Created(h) | HoldCreateOutcome::Replayed(h) => h.book_id,
-            other => panic!("neither side may be refused here, got {other:?}"),
-        })
-        .collect();
+    // Order-independent — either task may win, so partition on the OUTCOME
+    // rather than on which handle it came back from. Created + Replayed is the
+    // ONLY admissible pair: two Created means two holds were minted, and two
+    // Replayed means nobody owns the hold that survived. `created` / `replayed`
+    // also pin the `replayed` flag the route turns into `Idempotency-Replayed`,
+    // so the 201 that minted the hold cannot carry the header and the one that
+    // did not cannot omit it.
+    let (winner, loser) = match (ra, rb) {
+        (c @ HoldCreateOutcome::Created(_), r @ HoldCreateOutcome::Replayed(_))
+        | (r @ HoldCreateOutcome::Replayed(_), c @ HoldCreateOutcome::Created(_)) => {
+            (created(c), replayed(r))
+        }
+        (x, y) => panic!("exactly one side must create and the other replay; got {x:?} / {y:?}"),
+    };
+
+    // Both sides name the SAME hold — a loser answering with a different
+    // booking would mean two holds however the row count came out.
     assert_eq!(
-        ids[0], ids[1],
-        "both retries must converge on ONE booking; got {ids:?}"
+        loser.book_id, winner.book_id,
+        "both retries must converge on ONE booking"
     );
+    assert_eq!(
+        loser.book_no, winner.book_no,
+        "the loser's freshly-allocated book_no must be discarded"
+    );
+
+    // The loser replays the winner's STORED row: same money, and above all the
+    // ORIGINAL deadline. It ran strictly later, so a re-quoted `now + 2 h`
+    // would land after the stored one and fail here.
+    let stored_expiry = stored_hold_expiry(&pool, winner.book_id).await;
+    assert_eq!(
+        loser.total_baht, winner.total_baht,
+        "a replay must report the stored total, never re-price the stay"
+    );
+    assert_eq!(loser.amount_due_baht, winner.amount_due_baht);
+    assert_eq!(
+        loser.hold_expires_at, stored_expiry,
+        "the replay's deadline must be the one on the winner's committed row"
+    );
+    // ...and the winner named that same instant. Compared at the column's
+    // microsecond resolution: the winner's value is the in-memory quote and
+    // still carries the sub-microsecond tail PostgreSQL drops on the way in.
+    assert_eq!(
+        (winner.hold_expires_at - stored_expiry).num_microseconds(),
+        Some(0),
+        "winner and stored row must be ONE deadline, not two"
+    );
+
+    // The database is the backstop: even if both sides had agreed on one
+    // book_id, a second INSERT under this key would show up here.
     assert_eq!(
         count_idem_bookings(&pool).await,
         1,
         "the 076 index must let exactly one hold through"
     );
-    // Whichever side lost must say so, or the route would omit
-    // `Idempotency-Replayed: true` on a response that is in fact a replay.
-    let replays = [&ra, &rb]
-        .iter()
-        .filter(|o| matches!(o, HoldCreateOutcome::Replayed(_)))
-        .count();
-    assert!(
-        replays >= 1,
-        "at least one side lost the race and must report a replay; got {ra:?} / {rb:?}"
+    // Scoped to the key itself ('loyalty' is `service::channel::LOYALTY_CHANNEL`,
+    // the left half of migration 076's partial UNIQUE index).
+    let rows_for_key: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM ht_bookings \
+          WHERE book_channel = 'loyalty' AND book_ext_ref = $1",
+    )
+    .bind(&ext_ref)
+    .fetch_one(&pool)
+    .await
+    .expect("count bookings carrying the key")
+    .get("n");
+    assert_eq!(
+        rows_for_key, 1,
+        "exactly one ht_bookings row may carry this key's book_ext_ref"
     );
+
+    // And exactly one room was consumed — the fixture's second room stays free,
+    // which is the point: a duplicate hold would sit on it until its deadline.
+    let assigned: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM ht_booking_rooms br \
+           JOIN ht_bookings b ON b.book_id = br.br_book_id \
+          WHERE b.book_no LIKE $1",
+    )
+    .bind(format!("{IDEM_BOOK_NO_PREFIX}%"))
+    .fetch_one(&pool)
+    .await
+    .expect("count assigned rooms")
+    .get("n");
+    assert_eq!(assigned, 1, "exactly one room may be held for one key");
 
     cleanup_idem(&pool).await;
 }
