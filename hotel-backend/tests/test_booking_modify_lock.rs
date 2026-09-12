@@ -64,11 +64,33 @@ const BOOK_NO: &str = "TESTB8G000001";
 /// yield for `"hf"`.
 const PROPERTY: &str = "hf";
 
-/// Comfortably longer than an uncontended modify (a handful of statements, low
-/// single-digit ms) and far inside the lock's 5 s acquire deadline, so a task
-/// still running after this can only mean it waited — and a task finished
-/// inside it can only mean it never did.
+/// How long the BLOCKED-side assertion waits before concluding the task really
+/// is parked on the lock. Comfortably longer than an uncontended modify (a
+/// handful of statements, low single-digit ms) and far inside the lock's 5 s
+/// acquire deadline. This assertion fails SAFE: a slow runner makes it more
+/// likely to still be unfinished, not less.
 const SETTLE: Duration = Duration::from_millis(400);
+
+/// Deadline for the UNBLOCKED-side assertion, which does NOT fail safe — a
+/// fixed sleep would flake on a loaded CI runner that simply had not scheduled
+/// the task yet. Polled to this ceiling instead, so the test only fails when
+/// the edit genuinely did not finish while the lock was held.
+const UNBLOCKED_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Poll `task.is_finished()` until it flips or `deadline` passes.
+async fn finished_within(
+    task: &tokio::task::JoinHandle<impl Send + 'static>,
+    deadline: Duration,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        if task.is_finished() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.is_finished()
+}
 
 fn d(s: &str) -> NaiveDate {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("test date")
@@ -365,8 +387,7 @@ async fn a_room_moving_edit_waits_for_the_property_lock_and_a_notes_only_edit_do
         tokio::spawn(async move { svc.modify(notes_only).await })
     };
 
-    tokio::time::sleep(SETTLE).await;
-    let ran_unlocked = notes_task.is_finished();
+    let ran_unlocked = finished_within(&notes_task, UNBLOCKED_DEADLINE).await;
 
     gate.release().await.expect("release the second gate");
 

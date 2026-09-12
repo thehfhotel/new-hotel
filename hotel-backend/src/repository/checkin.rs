@@ -16,6 +16,42 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::routes::new_checkins::NewCheckInsQuery;
 
+/// How long [`CheckInRepository::lock_booking_for_check_in`] waits for the
+/// booking row before giving up (B7b, review F3).
+///
+/// The wait it is bounding is NOT another check-in — that one is a handful of
+/// statements and clears in milliseconds. It is the pathological case: an
+/// unrelated long transaction holding `ht_bookings` (a CT sync tick applying a
+/// whole table, a maintenance script) parks the desk's check-in behind itself
+/// for as long as it runs. Without a bound the receptionist watches a spinner
+/// until the HTTP client gives up and she retries — which queues a SECOND
+/// waiter behind the same holder.
+///
+/// Three seconds: comfortably longer than any legitimate contender, short
+/// enough that the desk gets a retryable answer instead of a hang. Deliberately
+/// under the inventory lock's 5 s `ACQUIRE_TIMEOUT`, because a row lock behind a
+/// bulk tick is the less recoverable of the two waits.
+///
+/// Surfaces as SQLSTATE `55P03` (`lock_not_available`), which
+/// `service::checkin::map_booking_lock_error` turns into `ServiceError::Busy`
+/// → `503` + `Retry-After`. Never a 500: nothing was written and the identical
+/// request will normally succeed.
+const BOOKING_LOCK_TIMEOUT_MS: i32 = 3_000;
+
+/// `SET LOCAL lock_timeout` via `set_config`, which — unlike `SET` — accepts a
+/// bind parameter. `is_local = true` ties the setting to the caller's
+/// transaction, so it can never leak onto the pooled connection.
+async fn set_local_lock_timeout(
+    tx: &mut Transaction<'_, Postgres>,
+    value: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT set_config('lock_timeout', $1, true)")
+        .bind(value)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// What [`CheckInRepository::lock_booking_for_check_in`] read while holding the
 /// booking row — the two facts the booking-level double-check-in guard (B7b)
 /// decides on.
@@ -200,16 +236,38 @@ pub trait CheckInRepository: Send + Sync {
     /// Lock the booking row and report its open check-ins + assigned rooms
     /// (B7b — the booking-level double-check-in guard).
     ///
-    /// Takes `SELECT … FOR UPDATE` on `ht_bookings` FIRST, then reads, so two
-    /// concurrent `check_in_to_booking` calls for one booking cannot both see
-    /// "no open stay" and both insert. A read alone would not exclude: there
-    /// is no row yet to lock in `ht_checkins`, so the first writer's INSERT is
-    /// invisible to the second until it commits.
+    /// Takes `SELECT … FOR NO KEY UPDATE` on `ht_bookings` FIRST, then reads,
+    /// so two concurrent `check_in_to_booking` calls for one booking cannot
+    /// both see "no open stay" and both insert. A read alone would not exclude:
+    /// there is no row yet to lock in `ht_checkins`, so the first writer's
+    /// INSERT is invisible to the second until it commits.
+    ///
+    /// **`FOR NO KEY UPDATE`, emphatically not `FOR UPDATE`.** `ht_bookings` is
+    /// the parent of five FK children — `ht_booking_rooms`, `ht_checkins`,
+    /// `ht_room_calendar`, `ht_booking_products` and the legacy sync mapping —
+    /// and every insert into any of them takes `FOR KEY SHARE` on the parent
+    /// booking row. `FOR KEY SHARE` conflicts with `FOR UPDATE` and is
+    /// compatible with `FOR NO KEY UPDATE`. Taking the stronger lock would
+    /// therefore have made this guard block, and be blocked by, every child
+    /// insert against the same booking — including the CT sync tick's — for a
+    /// guard that touches no key column at all. `FOR NO KEY UPDATE` still
+    /// excludes the only thing that matters here (another `FOR NO KEY UPDATE`
+    /// or `FOR UPDATE`), and it is the exact level the `UPDATE` in
+    /// `set_booking_checkedin` takes a few statements later — so no new
+    /// lock strength is introduced anywhere in this transaction.
+    ///
+    /// Bounded by [`BOOKING_LOCK_TIMEOUT_MS`] (`SET LOCAL`, restored right
+    /// after the SELECT), so a wait behind an unrelated long holder becomes a
+    /// retryable `503` rather than a hung desk request.
     ///
     /// Runs on the caller's TRANSACTION, not the pool — the lock is only worth
     /// anything if it is still held when the INSERT lands. The same
     /// transaction already updates this booking row (`set_booking_checkedin`),
     /// so this takes a lock it was going to take anyway, only earlier.
+    ///
+    /// **Lock order.** This is the FIRST lock the check-in transaction takes,
+    /// and it is a booking row. See the "Lock order" section of
+    /// `service::checkin`'s module doc — bookings before rooms, everywhere.
     ///
     /// A missing booking yields [`BookingCheckInState::default`]; the caller's
     /// own existence check (`get_booking_customer_id`) is what 404s.
@@ -625,18 +683,39 @@ impl CheckInRepository for PgCheckInRepository {
         // Runtime queries (not the `query!` macro), like `count_booking_rooms`
         // above: guard-only reads that need no `.sqlx` offline-cache entry.
 
-        // 1. Serialise on the booking row. `fetch_optional` — a missing
-        //    booking is the caller's 404 to report, not ours.
-        let locked: Option<i32> =
-            sqlx::query_scalar("SELECT book_id FROM ht_bookings WHERE book_id = $1 FOR UPDATE")
-                .bind(booking_id)
-                .fetch_optional(&mut **tx)
+        // 1. Bound the wait. Read the inherited value first so the restore
+        //    below puts back whatever the server or role configured, rather
+        //    than assuming the shipped default of 0 (disabled) — silently
+        //    REMOVING a configured lock_timeout for the rest of the check-in
+        //    transaction would be a worse bug than the one this fixes.
+        let prior_lock_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+                .fetch_one(&mut **tx)
                 .await?;
+        set_local_lock_timeout(tx, &BOOKING_LOCK_TIMEOUT_MS.to_string()).await?;
+
+        // 2. Serialise on the booking row. `fetch_optional` — a missing
+        //    booking is the caller's 404 to report, not ours.
+        let locked = sqlx::query_scalar::<_, i32>(
+            "SELECT book_id FROM ht_bookings WHERE book_id = $1 FOR NO KEY UPDATE",
+        )
+        .bind(booking_id)
+        .fetch_optional(&mut **tx)
+        .await;
+
+        // On error the transaction is already aborted, so there is nothing to
+        // restore — the `SET LOCAL` dies with the rollback the caller's `?`
+        // triggers. Returning here keeps the timeout's 55P03 intact for
+        // `map_booking_lock_error` instead of masking it with a follow-up
+        // statement's "current transaction is aborted".
+        let locked: Option<i32> = locked?;
+        set_local_lock_timeout(tx, &prior_lock_timeout).await?;
+
         if locked.is_none() {
             return Ok(BookingCheckInState::default());
         }
 
-        // 2. Open stays on this booking. 'active' is the same literal
+        // 3. Open stays on this booking. 'active' is the same literal
         //    `count_active_for_room` keys on (`CheckInStatus::as_str`);
         //    'checkedout' and 'cancelled' are both closed and must NOT block a
         //    re-check-in.

@@ -3,6 +3,8 @@
 //! - GET /api/new/checkins - List check-ins from HT_CheckIns
 //! - GET /api/new/checkins/:id - Get single check-in
 //! - POST /api/new/checkins - Create check-in (walk-in or from booking)
+//!   (MOUNTED at `POST /api/checkins` — see `main.rs`; the `new_` prefix is the
+//!   module's, not the route's. External contracts must name the mounted path.)
 //! - PUT /api/new/checkins/:id/checkout - Process check-out
 //! - PUT /api/new/checkins/:id/extend - Extend stay (Track G1 / T4 HIGH-2)
 //!
@@ -1233,11 +1235,14 @@ fn money_from_baht_f64(baht: f64) -> Money {
 /// Translate the service's `Conflict` outcome (room already occupied) to
 /// the route's prior 400 wording so the wire contract is preserved.
 ///
-/// The `ConflictWithReason` arm is NOT decoration. This mapper rewrites every
-/// `Conflict` to one fixed sentence, so B7b's booking-level refusal — a
-/// different cause, carrying the open check-in's id — would otherwise reach
-/// reception as "Room is currently occupied" (400) with the id thrown away.
-/// It passes straight through to a 409 + `reason` + `conflictingId` instead.
+/// The `ConflictWithReason` arm is EXPLICIT, not load-bearing: it is a distinct
+/// variant, so `other => other.into()` below already renders it as the 409.
+/// It is spelled out because the arm above rewrites every `Conflict` to one
+/// fixed sentence ("Room is currently occupied"), and the next person adding a
+/// refusal here will pattern-match on that arm. Naming B7b's separately says
+/// out loud that it must NOT be folded in — the cause differs and the id would
+/// be thrown away. `map_create_checkin_error_passes_the_b7b_refusal_through`
+/// pins it.
 fn map_create_checkin_error(err: ServiceError) -> ApiError {
     match err {
         err @ ServiceError::ConflictWithReason { .. } => err.into(),
@@ -2697,6 +2702,37 @@ mod tests {
         assert_eq!(cmd.total_amount, Some(1240.0));
         assert_eq!(cmd.pay_total, 240.0);
         assert_eq!(cmd.balance, 1000.0);
+    }
+
+    /// B7b — the mapper itself, not `From<ServiceError>`. Nothing else covers
+    /// `map_create_checkin_error`, and the failure it guards against is a
+    /// future edit folding the booking-level refusal into the `Conflict` arm
+    /// above it, which would answer 400 "Room is currently occupied" and drop
+    /// the folio id the desk needs.
+    #[test]
+    fn map_create_checkin_error_passes_the_b7b_refusal_through() {
+        let mapped = map_create_checkin_error(ServiceError::ConflictWithReason {
+            reason: crate::error::BOOKING_ALREADY_CHECKED_IN_REASON,
+            message: "booking 812 is already checked in (check-in 4242)".to_string(),
+            conflicting_id: Some(4242),
+        });
+        match mapped {
+            ApiError::ConflictWithReason {
+                reason,
+                conflicting_id,
+                ..
+            } => {
+                assert_eq!(reason, "booking_already_checked_in");
+                assert_eq!(conflicting_id, Some(4242));
+            }
+            other => panic!("expected the 409 to survive the mapper, got {other:?}"),
+        }
+
+        // …while the room guard keeps its existing 400 wording verbatim.
+        match map_create_checkin_error(ServiceError::conflict("room 7 already has an active check-in")) {
+            ApiError::BadRequest(msg) => assert_eq!(msg, "Room is currently occupied"),
+            other => panic!("the room-occupied conflict must stay a 400, got {other:?}"),
+        }
     }
 
     /// Flag OFF is byte-for-byte the pre-079 behaviour: the client basis is

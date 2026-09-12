@@ -13,6 +13,41 @@
 //! 3. Enqueues the matching [`WritebackIntent`] in the outbox.
 //! 4. Publishes a [`DomainEvent`] on the bus.
 //! 5. Commits — all four effects atomic.
+//!
+//! # Lock order — **bookings before rooms**
+//!
+//! Every method here holds several row locks at once, and in PostgreSQL a plain
+//! `UPDATE` takes the same exclusive row lock as `SELECT … FOR UPDATE`. So the
+//! ORDER in which these statements appear IS a lock order, and two transactions
+//! that take the same two rows in opposite orders deadlock (`40P01`) — which
+//! reaches the desk as a 500 with the loser's outbox intent rolled back.
+//!
+//! The canonical order for this repo is:
+//!
+//! > **`ht_bookings` → `ht_checkins` / `ht_checkin_rooms` → `ht_rooms_new`**
+//!
+//! | path | booking row | room row |
+//! |---|---|---|
+//! | [`CheckInService::check_in_to_booking`] | `lock_booking_for_check_in` (B7b guard), then `set_booking_checkedin` | `mark_room_occupied`, after |
+//! | [`CheckInService::check_out`], whole stay | `set_booking_completed` | `mark_room_available_dirty`, after |
+//! | [`CheckInService::check_out`], per-room | `set_booking_completed` (header-completion block) | `mark_room_available_dirty` loop, after |
+//! | `service::housekeeping::lock_room_clean`, `service::hk_reports`'s `lock_room` | — | room only, so they can never close a cycle |
+//! | `repository::channel`'s `lock_channel_booking`, `BookingService::cancel` | booking only | — |
+//!
+//! Checkout used to run room-then-booking, which was harmless while check-in
+//! took no booking lock. B7b's guard made check-in booking-first, and that
+//! turned the pair into a real cycle: a maid marking room R clean parks the
+//! desk's check-in at `mark_room_occupied` **while it holds booking B**, and a
+//! concurrent checkout of the previous stay on B in R holds R and wants B.
+//! Reordering CHECKOUT (not the guard) is what removes it — both writes are
+//! unconditional in the same transaction, so the swap changes no behaviour.
+//!
+//! **Anything new that locks both must take the booking first.** The one known
+//! exception is `bin/migrate_legacy.rs`, which inserts `ht_rooms_new` before
+//! `ht_bookings` inside a single transaction spanning the whole dataset. It is
+//! an offline one-shot import, never run alongside live reception traffic, so
+//! it is recorded here rather than reordered — but if it ever becomes something
+//! that runs against a live site, it has to flip.
 
 use std::sync::Arc;
 
@@ -448,7 +483,8 @@ impl CheckInService {
         let booking_state = self
             .repo
             .lock_booking_for_check_in(&mut tx, cmd.booking_id)
-            .await?;
+            .await
+            .map_err(map_booking_lock_error)?;
         reject_double_checkin(cmd.booking_id, &booking_state)?;
 
         let cin_id = self
@@ -1287,11 +1323,14 @@ impl CheckInService {
                 )));
             }
 
-            for (_, room_id, _, _) in &selected {
-                self.repo
-                    .mark_room_available_dirty(&mut tx, *room_id)
-                    .await?;
-            }
+            // Lock order: BOOKING before ROOM — the header-completion block
+            // (which is what writes `ht_bookings`) runs BEFORE the room loop.
+            //
+            // Nothing here depends on the rooms having been flipped: the
+            // `remaining_active` count reads `ht_checkin_rooms.cr_room_status`,
+            // which the UPDATE above already set, and `mark_room_available_dirty`
+            // touches only `ht_rooms_new`. So moving the block up is a pure
+            // reordering. See the "Lock order" section of this module's doc.
 
             // Header completes ONLY when no room is still in-house.
             let remaining_active: i64 = sqlx::query_scalar(
@@ -1319,6 +1358,12 @@ impl CheckInService {
                 if let Some(booking_id) = status.cin_book_id {
                     self.repo.set_booking_completed(&mut tx, booking_id).await?;
                 }
+            }
+
+            for (_, room_id, _, _) in &selected {
+                self.repo
+                    .mark_room_available_dirty(&mut tx, *room_id)
+                    .await?;
             }
 
             // One CheckOut intent per room: folio totals stay whole-stay (so
@@ -1386,13 +1431,19 @@ impl CheckInService {
             )
             .await?;
 
-        self.repo
-            .mark_room_available_dirty(&mut tx, status.cin_room_id)
-            .await?;
-
+        // Lock order: BOOKING before ROOM. Both are plain UPDATEs, which take
+        // the same exclusive row lock `SELECT … FOR UPDATE` does, so their
+        // ORDER is a lock order. Swapping these two lines is the whole of the
+        // fix — no condition, no behaviour, no extra statement changes. See the
+        // "Lock order" section of this module's doc for why the direction has
+        // to match `check_in_to_booking`'s.
         if let Some(booking_id) = status.cin_book_id {
             self.repo.set_booking_completed(&mut tx, booking_id).await?;
         }
+
+        self.repo
+            .mark_room_available_dirty(&mut tx, status.cin_room_id)
+            .await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
         // Audit H1: thread real revenue + nights + balance into the intent
@@ -1564,6 +1615,37 @@ fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
         )));
     }
     Ok(())
+}
+
+/// `lock_timeout` on the B7b booking-row guard is CONTENTION, not a fault.
+///
+/// PostgreSQL raises SQLSTATE `55P03` (`lock_not_available`) when the
+/// `SET LOCAL lock_timeout` in `lock_booking_for_check_in` expires — someone
+/// else (realistically a CT sync table-tick, which holds one PG transaction
+/// across N MSSQL round trips) is holding the booking row. Nothing was written
+/// and the identical request will normally succeed, so it maps to
+/// [`ServiceError::Busy`] → `503` + `Retry-After`, never to the `500` that
+/// `From<sqlx::Error>` would produce.
+///
+/// It reuses the desk router's existing `inventory_lock_timeout` reason code
+/// rather than inventing a second one. That is deliberate and follows
+/// `crate::error::BUSY_REASON`'s own argument: to a caller the two are one
+/// condition — transient write contention, nothing written, retry the identical
+/// request — and a distinction it cannot act on differently is not worth a
+/// second code.
+fn map_booking_lock_error(err: sqlx::Error) -> ServiceError {
+    if let sqlx::Error::Database(ref db) = err {
+        if db.code().as_deref() == Some("55P03") {
+            tracing::warn!(
+                detail = %db,
+                "booking-row guard timed out waiting on ht_bookings; answering 503"
+            );
+            return ServiceError::busy(
+                "this booking is being updated right now; please retry in a moment",
+            );
+        }
+    }
+    ServiceError::Repository(err)
 }
 
 /// Guard: one booking may not carry more OPEN check-ins than it has assigned

@@ -104,7 +104,8 @@ pub const BUSY_REASON: &str = "inventory_lock_timeout";
 
 /// Machine `reason` for the booking-level double-check-in refusal (B7b).
 ///
-/// `POST /api/new/checkins` with a `booking_id` whose booking already has as
+/// `POST /api/checkins` (the mounted path; `routes::new_checkins` is the
+/// module name) with a `booking_id` whose booking already has as
 /// many OPEN check-ins as it has assigned rooms. Emitted as
 /// [`ApiError::ConflictWithReason`] → **409**, with `conflictingId` set to the
 /// open check-in's `cin_id`.

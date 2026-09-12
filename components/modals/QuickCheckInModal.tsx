@@ -5,6 +5,10 @@ import { X, Search, Loader2, User, Calendar, DollarSign, FileText, CheckCircle2 
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
+import {
+  ALREADY_CHECKED_IN_MESSAGE,
+  parseAlreadyCheckedIn,
+} from '@/lib/v2/checkin-from-booking'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import PrintButton from '@/components/ui/PrintButton'
 import RegistrationSlipTemplate, {
@@ -208,6 +212,15 @@ export default function QuickCheckInModal({
       const data = await res.json()
 
       if (!res.ok || !data.success) {
+        // B7b. This modal is walk-in only today (no `bookingId` in the body
+        // above), so the backend cannot currently reach the booking-level
+        // refusal from here — the branch is kept because the NEXT thing to
+        // happen to this form is gaining a booking link, and without it the
+        // refusal would print its internal English sentence, row ids and all,
+        // to Thai-speaking reception through the `data.error` fallback below.
+        if (parseAlreadyCheckedIn(res.status, data)) {
+          throw new Error(ALREADY_CHECKED_IN_MESSAGE)
+        }
         throw new Error(data.error || data.message || 'เกิดข้อผิดพลาดในการเช็คอิน')
       }
 

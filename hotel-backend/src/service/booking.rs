@@ -635,12 +635,26 @@ impl BookingService {
         // owns a connection of its own and must hold the lock across the whole
         // write, not be nested inside it.
         //
-        // Residual, accepted: two concurrent edits OF THE SAME BOOKING could
-        // each read a prior set that the other then changes, so the loser might
-        // skip the lock for an edit that has become room-moving. That is a
-        // desk-vs-desk race on one reservation (not the channel double-sell
-        // this lock exists for), and the booking row's own UPDATE serialises
-        // the writes themselves.
+        // Residual, accepted and NOT understated: this read and the in-tx
+        // `writeback_state` read below are two different snapshots of the same
+        // fact. Under a concurrent edit OF THE SAME BOOKING they can disagree,
+        // and the case that disagrees includes the headline one — if a rival
+        // edit clears the rooms between the two reads, this read sees "rooms
+        // unchanged" and skips the lock while `writeback_state` then sees 0
+        // prior rooms and PROMOTES, emitting the byte-parity `CreateBooking`
+        // unlocked. That is the exact write B8g exists to serialise.
+        //
+        // Why it is not fixed here: the sound fix is to take both reads AFTER
+        // `update_booking` has locked the booking row, which moves the
+        // promote-vs-modify decision onto a different snapshot — a change to
+        // the legacy write-back leg, not to a lock, and it deserves its own
+        // review rather than riding along in this one. The exposure needs two
+        // concurrent edits of ONE booking within a millisecond window, both
+        // from the desk (`update_booking` is the only production caller, and
+        // there is no OTA PUT); the channel never edits. The reviewer's
+        // suggested alternative — lock whenever `rooms` is non-empty — was NOT
+        // taken because it locks every notes-only save of a roomed booking,
+        // which is precisely the over-blocking B8g was asked to avoid.
         let inventory_lock = match cmd.inventory_lock.as_deref() {
             Some(property) => {
                 let prior_rooms = self.repo.booking_room_ids(&self.pg, cmd.book_id).await?;

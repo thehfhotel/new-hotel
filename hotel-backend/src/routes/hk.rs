@@ -3746,7 +3746,8 @@ pub async fn delete_report_photo(
 ///
 /// A second submission while one is still `submitted` for this room+day is
 /// refused as a CONFLICT — which this repo renders 400, not 409
-/// (`ApiError::Conflict` is reserved for ship-dark flags; see
+/// (`ApiError::Conflict` is reserved for ship-dark flags, and the one domain
+/// 409 is the opt-in `ApiError::ConflictWithReason`; see
 /// `service::hk_reports`'s module header).
 pub async fn submit_report(
     State(state): State<AppState>,

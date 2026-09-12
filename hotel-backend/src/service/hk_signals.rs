@@ -44,7 +44,12 @@
 //! `From<ServiceError> for ApiError` maps to **400** (see `service::error`).
 //! That mapping is shared with booking-cancel, payment-void and the
 //! `writeback_jobs` idempotency race, and `ApiError::Conflict` (409) is
-//! reserved here for a ship-dark FLAG refusing a request. Answering 409 for
+//! reserved here for a ship-dark FLAG refusing a request. (Since B7b there is
+//! ONE domain 409 — `ApiError::ConflictWithReason`, a separate variant that
+//! carries a machine `reason` + the conflicting row's id. It is an opt-IN
+//! carve-out for a refusal the caller must act on, not a change to this
+//! convention: plain `ServiceError::Conflict` still renders 400 everywhere.)
+//! Answering 409 for
 //! room signals alone would have meant either a second mapping or changing five
 //! shipped surfaces, so signals follow the house convention: **400 with a
 //! message naming the status it is already in.** Role refusals are the one

@@ -479,7 +479,8 @@ The desk/OTA router carries the same `inventory_lock_timeout` code on its own
 `ApiError::Busy` body (`crate::error::BUSY_REASON` is the single definition),
 so the two surfaces describe that one condition identically.
 
-It also carries one `reason` of its own, on `POST /api/new/checkins` (B7b):
+It also carries one `reason` of its own, on `POST /api/checkins` (B7b — the
+mounted path; the handler lives in `routes::new_checkins`):
 
 | `reason` | status | when |
 |---|---|---|

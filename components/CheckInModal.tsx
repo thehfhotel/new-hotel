@@ -8,6 +8,12 @@ import { consumeCheckInPrefill, type CheckInPrefill } from '@/lib/checkin-prefil
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import PrintButton from '@/components/ui/PrintButton'
 import AppDepositNotice from '@/components/v2/AppDepositNotice'
+import Link from 'next/link'
+import {
+  ALREADY_CHECKED_IN_MESSAGE,
+  folioHref,
+  parseAlreadyCheckedIn,
+} from '@/lib/v2/checkin-from-booking'
 import RegistrationSlipTemplate, {
   RegistrationSlipData,
 } from '@/components/documents/RegistrationSlipTemplate'
@@ -125,6 +131,12 @@ export default function CheckInModal({ room, onClose, onSuccess, booking = null 
   )
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * B7b: the backend refused because this booking already has an open stay.
+   * Held separately from `error` because the useful part is the LINK — the
+   * folio that already exists — which a plain error string cannot carry.
+   */
+  const [alreadyCheckedInId, setAlreadyCheckedInId] = useState<number | null>(null)
   // After a successful check-in we switch the modal to a "print the
   // registration slip" panel instead of closing immediately.
   const [created, setCreated] = useState<{ cinNo: string; id: number } | null>(null)
@@ -247,6 +259,7 @@ export default function CheckInModal({ room, onClose, onSuccess, booking = null 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
+    setAlreadyCheckedInId(null)
 
     if (!fromBooking && !firstName.trim()) {
       setError('กรุณากรอกชื่อลูกค้า')
@@ -332,6 +345,17 @@ export default function CheckInModal({ room, onClose, onSuccess, booking = null 
       })
       const checkinData = await checkinRes.json()
       if (!checkinRes.ok || !checkinData.success) {
+        // B7b: another desk (or iHOTEL) checked this booking in while the form
+        // was open. The proactive `เช็คอินแล้ว` state could not know — it is
+        // computed before the receptionist starts typing — so this is the only
+        // place the desk learns it, and it must arrive in Thai WITH the folio
+        // she should open instead. `checkinData.error` is an internal English
+        // sentence carrying row ids; it never reaches her.
+        const refusal = parseAlreadyCheckedIn(checkinRes.status, checkinData)
+        if (refusal) {
+          setAlreadyCheckedInId(refusal.checkInId)
+          throw new Error(ALREADY_CHECKED_IN_MESSAGE)
+        }
         throw new Error(checkinData.message || 'เช็คอินไม่สำเร็จ')
       }
 
@@ -635,9 +659,23 @@ export default function CheckInModal({ room, onClose, onSuccess, booking = null 
           </div>
 
           {error && (
-            <div className="flex items-start p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+            <div
+              data-testid="checkin-error"
+              className="flex items-start p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700"
+            >
               <AlertCircle size={16} className="mr-2 shrink-0 mt-0.5" />
-              {error}
+              <span>
+                {error}
+                {alreadyCheckedInId !== null && (
+                  <Link
+                    href={folioHref(alreadyCheckedInId)}
+                    data-testid="checkin-existing-folio-link"
+                    className="ml-2 font-medium underline underline-offset-2"
+                  >
+                    เปิดใบแจ้งหนี้
+                  </Link>
+                )}
+              </span>
             </div>
           )}
 
