@@ -16,6 +16,21 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::routes::new_checkins::NewCheckInsQuery;
 
+/// What [`CheckInRepository::lock_booking_for_check_in`] read while holding the
+/// booking row — the two facts the booking-level double-check-in guard (B7b)
+/// decides on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookingCheckInState {
+    /// `cin_id` of every check-in on this booking that is still OPEN
+    /// (`cin_status = 'active'`), oldest first. Empty for a booking nobody has
+    /// checked in yet.
+    pub open_check_in_ids: Vec<i32>,
+    /// Rooms assigned to the booking (`ht_booking_rooms`) — the ceiling on how
+    /// many stays the booking may legitimately carry at once. `0` for a parked
+    /// (roomless) booking.
+    pub assigned_room_count: i64,
+}
+
 /// Result of `list_with_count` — one check-in with denormalized customer/room/booking joins.
 #[derive(Debug, Clone)]
 pub struct CheckInListRow {
@@ -181,6 +196,28 @@ pub trait CheckInRepository: Send + Sync {
         pool: &PgPool,
         booking_id: i32,
     ) -> Result<i64, sqlx::Error>;
+
+    /// Lock the booking row and report its open check-ins + assigned rooms
+    /// (B7b — the booking-level double-check-in guard).
+    ///
+    /// Takes `SELECT … FOR UPDATE` on `ht_bookings` FIRST, then reads, so two
+    /// concurrent `check_in_to_booking` calls for one booking cannot both see
+    /// "no open stay" and both insert. A read alone would not exclude: there
+    /// is no row yet to lock in `ht_checkins`, so the first writer's INSERT is
+    /// invisible to the second until it commits.
+    ///
+    /// Runs on the caller's TRANSACTION, not the pool — the lock is only worth
+    /// anything if it is still held when the INSERT lands. The same
+    /// transaction already updates this booking row (`set_booking_checkedin`),
+    /// so this takes a lock it was going to take anyway, only earlier.
+    ///
+    /// A missing booking yields [`BookingCheckInState::default`]; the caller's
+    /// own existence check (`get_booking_customer_id`) is what 404s.
+    async fn lock_booking_for_check_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        booking_id: i32,
+    ) -> Result<BookingCheckInState, sqlx::Error>;
 
     /// Latest `cin_no` for today (for sequence generation).
     async fn latest_cin_no_today(
@@ -578,6 +615,49 @@ impl CheckInRepository for PgCheckInRepository {
         .bind(booking_id)
         .fetch_one(pool)
         .await
+    }
+
+    async fn lock_booking_for_check_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        booking_id: i32,
+    ) -> Result<BookingCheckInState, sqlx::Error> {
+        // Runtime queries (not the `query!` macro), like `count_booking_rooms`
+        // above: guard-only reads that need no `.sqlx` offline-cache entry.
+
+        // 1. Serialise on the booking row. `fetch_optional` — a missing
+        //    booking is the caller's 404 to report, not ours.
+        let locked: Option<i32> =
+            sqlx::query_scalar("SELECT book_id FROM ht_bookings WHERE book_id = $1 FOR UPDATE")
+                .bind(booking_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if locked.is_none() {
+            return Ok(BookingCheckInState::default());
+        }
+
+        // 2. Open stays on this booking. 'active' is the same literal
+        //    `count_active_for_room` keys on (`CheckInStatus::as_str`);
+        //    'checkedout' and 'cancelled' are both closed and must NOT block a
+        //    re-check-in.
+        let open_check_in_ids: Vec<i32> = sqlx::query_scalar(
+            "SELECT cin_id FROM ht_checkins \
+              WHERE cin_book_id = $1 AND cin_status = 'active' ORDER BY cin_id",
+        )
+        .bind(booking_id)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let assigned_room_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ht_booking_rooms WHERE br_book_id = $1")
+                .bind(booking_id)
+                .fetch_one(&mut **tx)
+                .await?;
+
+        Ok(BookingCheckInState {
+            open_check_in_ids,
+            assigned_room_count,
+        })
     }
 
     async fn latest_cin_no_today(

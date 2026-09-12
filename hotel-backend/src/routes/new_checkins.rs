@@ -1232,8 +1232,15 @@ fn money_from_baht_f64(baht: f64) -> Money {
 
 /// Translate the service's `Conflict` outcome (room already occupied) to
 /// the route's prior 400 wording so the wire contract is preserved.
+///
+/// The `ConflictWithReason` arm is NOT decoration. This mapper rewrites every
+/// `Conflict` to one fixed sentence, so B7b's booking-level refusal — a
+/// different cause, carrying the open check-in's id — would otherwise reach
+/// reception as "Room is currently occupied" (400) with the id thrown away.
+/// It passes straight through to a 409 + `reason` + `conflictingId` instead.
 fn map_create_checkin_error(err: ServiceError) -> ApiError {
     match err {
+        err @ ServiceError::ConflictWithReason { .. } => err.into(),
         ServiceError::Conflict(_) => ApiError::BadRequest("Room is currently occupied".to_string()),
         other => other.into(),
     }

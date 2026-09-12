@@ -59,6 +59,32 @@ pub enum ServiceError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A precondition failure the CALLER can act on, carrying a stable machine
+    /// `reason` and the id of the row that already holds the claim.
+    ///
+    /// Separate from [`Self::Conflict`] for two reasons, both load-bearing:
+    ///
+    /// * **Status.** `Conflict` is flattened to `ApiError::BadRequest` (400)
+    ///   by the mapping below — a deliberate, documented legacy of the five
+    ///   surfaces that already answered that way. This variant maps to
+    ///   `ApiError::ConflictWithReason` → **409**, which is the honest code
+    ///   for "the state already satisfies/blocks this".
+    /// * **Routability.** Route-level mappers collapse *every*
+    ///   `ServiceError::Conflict` into one fixed sentence
+    ///   (`map_create_checkin_error` → "Room is currently occupied"). A new
+    ///   refusal emitted as `Conflict` would therefore reach reception
+    ///   describing the wrong cause. A distinct variant cannot be swallowed
+    ///   by those mappers by accident.
+    ///
+    /// `reason` is a wire contract (see [`crate::error`] for the constants);
+    /// `conflicting_id` is the canonical id the caller should look at next.
+    #[error("conflict ({reason}): {message}")]
+    ConflictWithReason {
+        reason: &'static str,
+        message: String,
+        conflicting_id: Option<i32>,
+    },
+
     /// Underlying repository / database failure.
     #[error("repository error: {0}")]
     Repository(#[from] sqlx::Error),
@@ -203,6 +229,17 @@ impl From<ServiceError> for ApiError {
             // status codes as a side effect. `service::hk_signals` documents
             // the choice at its own boundary.
             ServiceError::Conflict(msg) => ApiError::BadRequest(msg),
+            // 409, not 400 — the variant exists precisely to opt OUT of the
+            // flattening above. See `ServiceError::ConflictWithReason`.
+            ServiceError::ConflictWithReason {
+                reason,
+                message,
+                conflicting_id,
+            } => ApiError::ConflictWithReason {
+                reason,
+                message,
+                conflicting_id,
+            },
             // 503 + Retry-After, NOT 400: see the variant's own doc. This is
             // the arm that keeps a transient lock wait from looking like a
             // malformed request to the desk form and the OTA bridge.
