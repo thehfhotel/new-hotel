@@ -48,6 +48,38 @@
 //! an offline one-shot import, never run alongside live reception traffic, so
 //! it is recorded here rather than reordered — but if it ever becomes something
 //! that runs against a live site, it has to flip.
+//!
+//! ## Where the booking-inventory ADVISORY lock sits (B8h)
+//!
+//! `repository::inventory_lock` is a property-wide advisory lock held on its
+//! own connection, so it is not part of the row order above — but it is a lock,
+//! and two orders exist on purpose:
+//!
+//! | path | order |
+//! |---|---|
+//! | `service::channel::create_hold`, `service::booking::create` | advisory **then** rows |
+//! | `service::booking::modify` (B8h) | booking row **then** advisory |
+//!
+//! That is an inversion, and it is sound only because of a narrow structural
+//! fact: **no holder of the advisory lock ever locks a pre-existing
+//! `ht_bookings` row.** `create` writes only the row it just inserted; the
+//! channel's floor check, `pick_free_room` and ext-ref lookups are bare
+//! SELECTs; and `lock_channel_booking`'s `FOR UPDATE` (`confirm_payment`,
+//! `release`, the hold sweeper) runs with no advisory lock held. So the edge
+//! "advisory holder waits for a booking row a `modify` holds" does not exist,
+//! and the cycle cannot close. Two properties bound the residue: `acquire`
+//! polls `pg_try_advisory_xact_lock` and releases its connection between
+//! attempts (PostgreSQL records no wait edge, so the worst case is a bounded
+//! 5 s wait ending in a retryable 503, never an undetected hang), and the row
+//! lock held while waiting is itself bounded at 3 s by
+//! `repository::row_lock::BOOKING_LOCK_TIMEOUT_MS`, deliberately under that
+//! ceiling.
+//!
+//! ⚠️ **This is the invariant to protect.** The moment anything takes the
+//! advisory lock and then locks a pre-existing booking row — widening the
+//! inventory lock over check-in, `change_room` or `extend_stay` is the live
+//! candidate, and all three lock booking rows — the cycle closes and `modify`
+//! must go back to taking the advisory lock before its row lock.
 
 use std::sync::Arc;
 
@@ -1617,15 +1649,19 @@ fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
     Ok(())
 }
 
-/// `lock_timeout` on the B7b booking-row guard is CONTENTION, not a fault.
+/// `lock_timeout` on an `ht_bookings` row guard is CONTENTION, not a fault.
 ///
 /// PostgreSQL raises SQLSTATE `55P03` (`lock_not_available`) when the
-/// `SET LOCAL lock_timeout` in `lock_booking_for_check_in` expires — someone
-/// else (realistically a CT sync table-tick, which holds one PG transaction
-/// across N MSSQL round trips) is holding the booking row. Nothing was written
-/// and the identical request will normally succeed, so it maps to
+/// `SET LOCAL lock_timeout` around a booking-row guard expires — someone else
+/// (realistically a CT sync table-tick, which holds one PG transaction across N
+/// MSSQL round trips) is holding the booking row. Nothing was written and the
+/// identical request will normally succeed, so it maps to
 /// [`ServiceError::Busy`] → `503` + `Retry-After`, never to the `500` that
 /// `From<sqlx::Error>` would produce.
+///
+/// Shared by both guards on this table — B7b's `lock_booking_for_check_in` here
+/// and B8h's `lock_booking_for_modify` in `service::booking` — so a stalled
+/// booking row answers the desk identically whichever save it was.
 ///
 /// It reuses the desk router's existing `inventory_lock_timeout` reason code
 /// rather than inventing a second one. That is deliberate and follows
@@ -1633,7 +1669,7 @@ fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
 /// condition — transient write contention, nothing written, retry the identical
 /// request — and a distinction it cannot act on differently is not worth a
 /// second code.
-fn map_booking_lock_error(err: sqlx::Error) -> ServiceError {
+pub(crate) fn map_booking_lock_error(err: sqlx::Error) -> ServiceError {
     if let sqlx::Error::Database(ref db) = err {
         if db.code().as_deref() == Some("55P03") {
             tracing::warn!(

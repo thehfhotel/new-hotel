@@ -16,6 +16,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::routes::new_bookings::NewBookingsQuery;
 
+// Shared with `repository::checkin`'s B7b guard: one `lock_timeout` bound for
+// every `ht_bookings` row guard, and the `SET LOCAL` helper that applies it.
+use super::row_lock::{set_local_lock_timeout, BOOKING_LOCK_TIMEOUT_MS};
+
 /// Result of `list_with_count` — one row per booking, with denormalized
 /// customer name and room count.
 #[derive(Debug, Clone)]
@@ -124,6 +128,30 @@ pub struct BookingProductAssignment {
     pub aggregate_id: uuid::Uuid,
 }
 
+/// What [`BookingRepository::lock_booking_for_modify`] read while holding the
+/// booking row — every fact `service::booking::modify` decides on, from ONE
+/// snapshot (B8h, #325 review finding F6).
+///
+/// Before B8h these two facts came from two reads at two different times: the
+/// room set on the pool BEFORE the transaction (to decide whether to take the
+/// per-property inventory lock) and `legacy_book_id` + a room COUNT inside the
+/// transaction but BEFORE the row was locked (to decide the legacy write-back
+/// leg). A concurrent edit of the same booking could land between them, which
+/// let the room-consuming legacy `CreateBooking` promote run with no inventory
+/// lock held.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookingModifyState {
+    /// `ht_bookings.legacy_book_id` — the iHOTEL `R\d{6}` id, `NULL` until the
+    /// create write-back back-populates it. Non-empty means "already mirrored",
+    /// which is what makes an edit a `ModifyBooking` rather than a promote.
+    pub legacy_book_id: Option<String>,
+    /// The `br_room_id`s currently assigned, ascending. Its LENGTH is the prior
+    /// room count the promote decision keys on; the SET is what
+    /// `service::booking::room_set_changed` compares the requested rooms
+    /// against. One read serving both is the point of this type.
+    pub room_ids: Vec<i32>,
+}
+
 /// PostgreSQL data operations for the booking aggregate.
 #[async_trait]
 pub trait BookingRepository: Send + Sync {
@@ -196,17 +224,44 @@ pub trait BookingRepository: Send + Sync {
         fingerprint: Option<&str>,
     ) -> Result<(), sqlx::Error>;
 
-    /// Read the two facts the modify path needs to choose its legacy write-back
-    /// leg: whether the booking has already been mirrored to iHOTEL
-    /// (`legacy_book_id`) and how many rooms it has RIGHT NOW (before the modify
-    /// deletes/re-inserts them). Returns `None` when the booking doesn't exist.
-    /// Used to promote a parked (roomless, never-mirrored) booking to a real
-    /// `CreateBooking` when its first room is assigned.
-    async fn writeback_state(
+    /// Lock the booking row and read, from behind that lock, every fact
+    /// `service::booking::modify` decides on (B8h — #325 review finding F6).
+    ///
+    /// Takes `SELECT … FOR NO KEY UPDATE` on `ht_bookings` FIRST, then reads
+    /// `legacy_book_id` and the assigned room ids, so ONE snapshot answers both
+    /// of the edit path's questions: does this edit MOVE inventory (and so need
+    /// the per-property inventory lock), and does it PROMOTE a parked booking
+    /// to a byte-parity legacy `CreateBooking`. Before B8h those two were read
+    /// from two different snapshots — a pool read before the transaction and an
+    /// in-transaction read before the row was locked — and a concurrent edit of
+    /// the same booking could make them disagree, which is how the promote
+    /// could run with no inventory lock held.
+    ///
+    /// **`FOR NO KEY UPDATE`, emphatically not `FOR UPDATE`** — same argument as
+    /// [`CheckInRepository::lock_booking_for_check_in`](crate::repository::CheckInRepository::lock_booking_for_check_in):
+    /// `ht_bookings` is the parent of five FK children whose inserts take
+    /// `FOR KEY SHARE` on the parent row, `FOR UPDATE` conflicts with that and
+    /// `FOR NO KEY UPDATE` does not. It is also the exact level the `UPDATE` in
+    /// [`Self::update_booking`] takes a few statements later in this same
+    /// transaction, so the guard introduces NO new blocking relationship — it
+    /// only takes, earlier, a lock the transaction was always going to take.
+    ///
+    /// **Lock order.** This is the FIRST lock the modify transaction takes, and
+    /// it is a booking row — bookings → check-ins → rooms, per the "Lock order"
+    /// section of `service::checkin`'s module doc.
+    ///
+    /// Bounded by `row_lock::BOOKING_LOCK_TIMEOUT_MS` (`SET LOCAL`, restored
+    /// right after the SELECT), so a wait behind an unrelated long holder (a CT
+    /// sync tick) becomes a retryable `503` instead of a hung desk save — which
+    /// matters more here than in check-in, because the caller may already be
+    /// holding the property-wide inventory lock while it waits.
+    ///
+    /// `None` when the booking row does not exist; the caller reports the 404.
+    async fn lock_booking_for_modify(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
-    ) -> Result<Option<(Option<String>, i64)>, sqlx::Error>;
+    ) -> Result<Option<BookingModifyState>, sqlx::Error>;
 
     /// Insert one row into `ht_booking_rooms`.
     async fn insert_booking_room(
@@ -240,16 +295,6 @@ pub trait BookingRepository: Send + Sync {
         book_id: i32,
         write: BookingWrite<'_>,
     ) -> Result<u64, sqlx::Error>;
-
-    /// The `br_room_id`s currently assigned to a booking, ascending (B8g).
-    ///
-    /// Deliberately NOT [`Self::list_rooms`]: that one joins rooms + types to
-    /// render a booking, and the modify path needs one thing only — whether
-    /// this edit MOVES inventory, i.e. whether the requested room set differs
-    /// from the committed one. Read on the pool before the transaction opens,
-    /// because the answer decides whether the per-property inventory lock is
-    /// taken at all (and the lock must be held BEFORE the write starts).
-    async fn booking_room_ids(&self, pool: &PgPool, book_id: i32) -> Result<Vec<i32>, sqlx::Error>;
 
     /// Delete all `ht_booking_rooms` rows for a booking (used before re-inserting).
     async fn delete_booking_rooms(
@@ -737,23 +782,61 @@ impl BookingRepository for PgBookingRepository {
         Ok(row)
     }
 
-    async fn writeback_state(
+    async fn lock_booking_for_modify(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
-    ) -> Result<Option<(Option<String>, i64)>, sqlx::Error> {
-        // Runtime query (not `query!`) — keeps the crate buildable without a
-        // live PG. `legacy_book_id` is NULL until the create write-back
-        // back-populates it; the correlated COUNT is the current room count.
-        let row: Option<(Option<String>, i64)> = sqlx::query_as(
-            "SELECT b.legacy_book_id, \
-                    (SELECT COUNT(*) FROM ht_booking_rooms br WHERE br.br_book_id = b.book_id) \
-             FROM ht_bookings b WHERE b.book_id = $1",
+    ) -> Result<Option<BookingModifyState>, sqlx::Error> {
+        // Runtime queries (not the `query!` macro): guard-only reads that need
+        // no `.sqlx` offline-cache entry.
+
+        // 1. Bound the wait, restoring whatever the server or role configured
+        //    rather than assuming the shipped default of 0 (disabled). Same
+        //    discipline as the B7b check-in guard, which is why the constant
+        //    and the setter are shared (`repository::row_lock`).
+        let prior_lock_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+                .fetch_one(&mut **tx)
+                .await?;
+        set_local_lock_timeout(tx, &BOOKING_LOCK_TIMEOUT_MS.to_string()).await?;
+
+        // 2. Serialise on the booking row and read `legacy_book_id` in the same
+        //    statement. `fetch_optional` — a missing booking is the caller's
+        //    404 to report, not ours.
+        let locked = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT legacy_book_id FROM ht_bookings WHERE book_id = $1 FOR NO KEY UPDATE",
         )
         .bind(book_id)
         .fetch_optional(&mut **tx)
+        .await;
+
+        // On error the transaction is already aborted, so there is nothing to
+        // restore — the `SET LOCAL` dies with the rollback the caller's `?`
+        // triggers. Returning here keeps the timeout's 55P03 intact for
+        // `map_booking_lock_error` instead of masking it with a follow-up
+        // statement's "current transaction is aborted".
+        let locked: Option<Option<String>> = locked?;
+        set_local_lock_timeout(tx, &prior_lock_timeout).await?;
+
+        let Some(legacy_book_id) = locked else {
+            return Ok(None);
+        };
+
+        // 3. The room set, read behind the row lock. Its LENGTH is the prior
+        //    room count the promote decision keys on, and the SET is what
+        //    `room_set_changed` compares the requested rooms against — one
+        //    read serving both, so the two can no longer disagree.
+        let room_ids: Vec<i32> = sqlx::query_scalar(
+            "SELECT br_room_id FROM ht_booking_rooms WHERE br_book_id = $1 ORDER BY br_room_id",
+        )
+        .bind(book_id)
+        .fetch_all(&mut **tx)
         .await?;
-        Ok(row)
+
+        Ok(Some(BookingModifyState {
+            legacy_book_id,
+            room_ids,
+        }))
     }
 
     async fn set_booking_provenance(
@@ -876,17 +959,6 @@ impl BookingRepository for PgBookingRepository {
         .await?;
 
         Ok(result.rows_affected())
-    }
-
-    async fn booking_room_ids(&self, pool: &PgPool, book_id: i32) -> Result<Vec<i32>, sqlx::Error> {
-        // Runtime query (not the `query!` macro) so this decision-only read
-        // needs no `.sqlx` offline-cache entry.
-        sqlx::query_scalar::<_, i32>(
-            "SELECT br_room_id FROM ht_booking_rooms WHERE br_book_id = $1 ORDER BY br_room_id",
-        )
-        .bind(book_id)
-        .fetch_all(pool)
-        .await
     }
 
     async fn delete_booking_rooms(

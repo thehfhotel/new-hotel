@@ -39,6 +39,9 @@ pub mod inventory;
 pub mod inventory_lock;
 pub mod payment;
 pub mod room;
+// Shared discipline for the `ht_bookings` row guards (B7b's check-in guard and
+// B8h's modify snapshot): one `lock_timeout` bound, one `SET LOCAL` helper.
+pub mod row_lock;
 pub mod session;
 pub mod settings;
 pub mod user;

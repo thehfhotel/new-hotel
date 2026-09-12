@@ -16,41 +16,11 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::routes::new_checkins::NewCheckInsQuery;
 
-/// How long [`CheckInRepository::lock_booking_for_check_in`] waits for the
-/// booking row before giving up (B7b, review F3).
-///
-/// The wait it is bounding is NOT another check-in — that one is a handful of
-/// statements and clears in milliseconds. It is the pathological case: an
-/// unrelated long transaction holding `ht_bookings` (a CT sync tick applying a
-/// whole table, a maintenance script) parks the desk's check-in behind itself
-/// for as long as it runs. Without a bound the receptionist watches a spinner
-/// until the HTTP client gives up and she retries — which queues a SECOND
-/// waiter behind the same holder.
-///
-/// Three seconds: comfortably longer than any legitimate contender, short
-/// enough that the desk gets a retryable answer instead of a hang. Deliberately
-/// under the inventory lock's 5 s `ACQUIRE_TIMEOUT`, because a row lock behind a
-/// bulk tick is the less recoverable of the two waits.
-///
-/// Surfaces as SQLSTATE `55P03` (`lock_not_available`), which
-/// `service::checkin::map_booking_lock_error` turns into `ServiceError::Busy`
-/// → `503` + `Retry-After`. Never a 500: nothing was written and the identical
-/// request will normally succeed.
-const BOOKING_LOCK_TIMEOUT_MS: i32 = 3_000;
-
-/// `SET LOCAL lock_timeout` via `set_config`, which — unlike `SET` — accepts a
-/// bind parameter. `is_local = true` ties the setting to the caller's
-/// transaction, so it can never leak onto the pooled connection.
-async fn set_local_lock_timeout(
-    tx: &mut Transaction<'_, Postgres>,
-    value: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT set_config('lock_timeout', $1, true)")
-        .bind(value)
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(())
-}
+// The `ht_bookings` row guard's shared discipline (B7b, review F3) — the
+// `lock_timeout` bound and the `SET LOCAL` helper that applies it. Shared with
+// `repository::booking`'s B8h modify guard so both row guards on this table
+// agree on one bound; `repository::row_lock` carries the reasoning.
+use super::row_lock::{set_local_lock_timeout, BOOKING_LOCK_TIMEOUT_MS};
 
 /// What [`CheckInRepository::lock_booking_for_check_in`] read while holding the
 /// booking row — the two facts the booking-level double-check-in guard (B7b)
