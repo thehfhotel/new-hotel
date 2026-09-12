@@ -71,10 +71,17 @@
 //! and the cycle cannot close. Two properties bound the residue: `acquire`
 //! polls `pg_try_advisory_xact_lock` and releases its connection between
 //! attempts (PostgreSQL records no wait edge, so the worst case is a bounded
-//! 5 s wait ending in a retryable 503, never an undetected hang), and the row
-//! lock held while waiting is itself bounded at 3 s by
-//! `repository::row_lock::BOOKING_LOCK_TIMEOUT_MS`, deliberately under that
-//! ceiling.
+//! 5 s wait ending in a retryable 503, never an undetected hang), and every
+//! contender queued behind the booking row `modify` holds meanwhile gets the
+//! 3 s `repository::row_lock::BOOKING_LOCK_TIMEOUT_MS` cap and a retryable 503
+//! rather than a hang, so the wait does not cascade.
+//!
+//! Be precise about what that 3 s bounds: waiting to TAKE a booking row, never
+//! how long one is HELD. `modify` holds its row for the whole advisory poll, so
+//! the worst-case hold is ~10 s — `InventoryLock::acquire`'s 5 s
+//! `ACQUIRE_TIMEOUT` plus up to another `db::pg_pool::PG_ACQUIRE_TIMEOUT` (5 s)
+//! if its last `pool.begin()` starts just under the deadline on a saturated
+//! pool — after which it answers Busy and rolls back.
 //!
 //! ⚠️ **This is the invariant to protect.** The moment anything takes the
 //! advisory lock and then locks a pre-existing booking row — widening the

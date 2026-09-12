@@ -37,9 +37,19 @@ use sqlx::{Postgres, Transaction};
 /// enough that the desk gets a retryable answer instead of a hang. Deliberately
 /// under the inventory lock's 5 s `ACQUIRE_TIMEOUT`
 /// (`repository::inventory_lock`), because a row lock behind a bulk tick is the
-/// less recoverable of the two waits — and in the B8h edit path the property
-/// inventory lock may already be HELD while this row lock is waited on, so this
-/// bound is what keeps a stalled booking row from pinning a property-wide lock.
+/// less recoverable of the two waits.
+///
+/// **It bounds the WAIT, not the HOLD.** This caps how long a guard waits to
+/// TAKE a booking row; once taken, the row stays locked until the caller's
+/// transaction ends, and nothing here caps that. In the B8h edit path the hold
+/// is the longer half: `service::booking::modify` holds this row while it
+/// acquires the property inventory lock, so the worst-case HOLD is ~10 s —
+/// `InventoryLock::acquire`'s 5 s `ACQUIRE_TIMEOUT`, plus up to another
+/// `db::pg_pool::PG_ACQUIRE_TIMEOUT` (5 s) if its final `pool.begin()` starts
+/// just under that deadline on a saturated pool — after which it answers Busy
+/// and rolls back. What this constant does give is that every contender queued
+/// behind that row gets its own 3 s cap and a retryable 503, so a long hold
+/// does not cascade into a queue of hung desk requests.
 ///
 /// Surfaces as SQLSTATE `55P03` (`lock_not_available`), which
 /// `service::checkin::map_booking_lock_error` turns into `ServiceError::Busy`

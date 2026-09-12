@@ -683,8 +683,15 @@ impl BookingService {
         //     connection between attempts, so PostgreSQL never records a wait
         //     edge for it: the worst case is a bounded 5 s wait ending in a
         //     retryable 503, never an undetectable hang;
-        //   * the row lock we hold while waiting is bounded at 3 s by
-        //     `lock_booking_for_modify`, under that 5 s ceiling.
+        //   * the 3 s `lock_timeout` in `lock_booking_for_modify` bounds how
+        //     long we WAIT for the booking row, NOT how long we hold it — the
+        //     row stays locked for the rest of this transaction, the advisory
+        //     acquire below included, so the worst-case HOLD is ~10 s (the 5 s
+        //     `ACQUIRE_TIMEOUT`, plus up to another `PG_ACQUIRE_TIMEOUT` if the
+        //     last `pool.begin()` starts just under that deadline on a
+        //     saturated pool) before it gives up with Busy and rolls back.
+        //     What the 3 s does buy is that everything queued behind this
+        //     booking row meanwhile gets a retryable 503 rather than a hang.
         //
         // ⚠️ That reasoning is narrow, and the "Lock order" section of
         // `service::checkin`'s module doc now records it: ANY future path that
