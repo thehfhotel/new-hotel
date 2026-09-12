@@ -61,7 +61,7 @@ pub use booking::{
 };
 pub use channel::{
     hold_ext_ref, ChannelService, ConfirmOutcome, CreateHoldCommand, HoldCreateOutcome,
-    HoldOutcome, PaymentPlan, ReleaseOutcome,
+    HoldOutcome, PaymentPlan, ReleaseCause, ReleaseOutcome,
 };
 pub use channel_idempotency::{
     caller_identity, fingerprint_of, normalize_key, ChannelIdempotency, Reservation, Reserved,

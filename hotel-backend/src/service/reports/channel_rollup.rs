@@ -273,6 +273,9 @@ pub struct ChannelSourceRow {
     pub bookings: i64,
     /// Subset of `bookings` with `book_status = 'cancelled'`.
     pub cancelled: i64,
+    /// Subset of `cancelled` whose `book_hold_auto_released_at` is set —
+    /// loyalty holds the sweep auto-released on the clock (migration 096, B13).
+    pub holds_auto_released: i64,
     /// `book_nights × rooms`, summed over NON-cancelled bookings only.
     pub room_nights: i64,
     /// `book_total_amount`, summed over NON-cancelled bookings only.
@@ -287,6 +290,26 @@ pub struct ChannelTotals {
     pub bookings: i64,
     /// How many of `bookings` were cancelled.
     pub cancelled: i64,
+    /// How many of `cancelled` were loyalty holds the expiry sweep
+    /// AUTO-RELEASED because their payment window lapsed —
+    /// `book_hold_auto_released_at IS NOT NULL` (migration 096, B13). A strict
+    /// SUBSET of `cancelled` — structurally, because the aggregate repeats
+    /// `cancelled`'s own predicate rather than relying on the marker implying
+    /// it (a stamped hold can be revived from the legacy side, which would
+    /// otherwise let this exceed `cancelled`). Counted over the same rows on
+    /// the same `book_checkin` basis, so `holdsExpired / bookings` in the
+    /// `app` bucket is the expired-hold rate B13 must read before taking a
+    /// `HOLD_TTL` decision. Structurally `0` in every non-`app` bucket, because only a
+    /// loyalty hold has a payment window to lapse.
+    ///
+    /// **The wire name is deliberately NOT the field name.** The column and
+    /// this field are named for the mechanism (an auto-release, so they cannot
+    /// be typo-confused with `book_hold_expires_at` and stay accurate if
+    /// `HOLD_TTL`'s rules change); `holdsExpired` is the business question the
+    /// number answers, and it is the name loyalty-app's friction card reads.
+    /// The explicit `rename` pins the two together so neither can drift.
+    #[serde(rename = "holdsExpired")]
+    pub holds_auto_released: i64,
     /// Room-nights on non-cancelled bookings: `book_nights × rooms booked`.
     pub room_nights: i64,
     /// `book_total_amount` on non-cancelled bookings, in baht.
@@ -297,6 +320,7 @@ impl ChannelTotals {
     fn add(&mut self, row: &ChannelSourceRow) {
         self.bookings += row.bookings;
         self.cancelled += row.cancelled;
+        self.holds_auto_released += row.holds_auto_released;
         self.room_nights += row.room_nights;
         self.gross_revenue += row.gross_revenue;
     }
@@ -420,6 +444,46 @@ pub async fn load_channel_rollup(
     // it (`sync::mappers::booking::legacy_status_to_pg`). `IS DISTINCT FROM`
     // rather than `<>` because `book_status` is nullable — a NULL status must
     // count as sellable, not vanish from both sides of the split.
+    //
+    // `holds_auto_released` (B13, reported as `holdsExpired`) counts
+    // `book_hold_auto_released_at IS NOT NULL` — the typed marker migration 096
+    // added, stamped only by the expiry sweep. Two deliberate choices:
+    //
+    //   * **Typed, not textual.** The obvious alternative was to match
+    //     `book_cancel_reason`. That is wrong today: the sweep writes "loyalty
+    //     hold expired (auto-release)" and the channel's own release endpoint
+    //     writes "loyalty payment window lapsed (channel release)". Both read
+    //     as "the payment window ran out", but only the first is an expiry
+    //     whose TTL we control — the endpoint fires when the loyalty app hands
+    //     the room back, a guest abandonment. A prose match would silently
+    //     count those as TTL expiries, inflating the exact rate B13 exists to
+    //     read, and would be one rename away from silently returning 0 with no
+    //     compile error.
+    //   * **The `status = 'cancelled'` arm makes the subset STRUCTURAL, not
+    //     merely conventional.** The marker is only ever written alongside a
+    //     cancellation, so it looks redundant — but a stamped row can be
+    //     REVIVED from the legacy side afterwards: `sync::mappers::booking`
+    //     writes `book_status` unconditionally, and iHOTEL's `จอง` maps back
+    //     to `confirmed`. A receptionist reinstating a lapsed hold in iHOTEL
+    //     would then leave a row that is stamped but no longer cancelled, and
+    //     without this arm `holdsExpired` could exceed `cancelled` — breaking
+    //     the one invariant the metric is read through. Repeating the exact
+    //     predicate `cancelled` uses (the CTE's normalised `status`, not the
+    //     raw column) is what guarantees containment by construction.
+    //   * **Same window basis as `cancelled`, on purpose.** Every figure here
+    //     is attributed by `book_checkin` (arrival), so a hold that expired in
+    //     January for a March stay lands in March. An expiry-time basis
+    //     (`book_cancelled_at`) would read more naturally on its own, but it
+    //     would break the invariant that makes this number useful: counted
+    //     this way it is a strict SUBSET of `cancelled`, over the same rows,
+    //     so `holdsExpired / bookings` within the `app` bucket is
+    //     a real rate with a matching numerator and denominator. Split the
+    //     bases and the ratio silently compares two different populations.
+    //     See `docs/channel-rollup.md`.
+    //
+    // No status guard is needed (unlike `book_hold_expires_at`, which is left
+    // behind on confirmation): the marker is written only by the release that
+    // cancels, so it is NULL on every confirmed booking.
     let rows = sqlx::query(
         r#"
         WITH scoped AS (
@@ -427,6 +491,7 @@ pub async fn load_channel_rollup(
                 NULLIF(BTRIM(LOWER(b.book_channel)), '') AS channel,
                 NULLIF(BTRIM(LOWER(b.book_source)), '')  AS source,
                 NULLIF(BTRIM(LOWER(b.book_status)), '')  AS status,
+                b.book_hold_auto_released_at             AS auto_released_at,
                 b.book_nights                            AS nights,
                 COALESCE(b.book_total_amount, 0)         AS gross,
                 GREATEST(
@@ -442,6 +507,9 @@ pub async fn load_channel_rollup(
             source,
             COUNT(*)::bigint AS bookings,
             COUNT(*) FILTER (WHERE status = 'cancelled')::bigint AS cancelled,
+            COUNT(*) FILTER (
+                WHERE auto_released_at IS NOT NULL AND status = 'cancelled'
+            )::bigint AS holds_auto_released,
             COALESCE(
                 SUM(nights * rooms) FILTER (WHERE status IS DISTINCT FROM 'cancelled'), 0
             )::bigint AS room_nights,
@@ -464,6 +532,7 @@ pub async fn load_channel_rollup(
             source: row.try_get::<Option<String>, _>("source").unwrap_or(None),
             bookings: row.try_get::<i64, _>("bookings").unwrap_or(0),
             cancelled: row.try_get::<i64, _>("cancelled").unwrap_or(0),
+            holds_auto_released: row.try_get::<i64, _>("holds_auto_released").unwrap_or(0),
             room_nights: row.try_get::<i64, _>("room_nights").unwrap_or(0),
             gross_revenue: row.try_get::<f64, _>("gross_revenue").unwrap_or(0.0),
         })
@@ -480,6 +549,7 @@ mod tests {
             source: source.map(str::to_string),
             bookings,
             cancelled: 0,
+            holds_auto_released: 0,
             room_nights: bookings * 2,
             gross_revenue: bookings as f64 * 1000.0,
         }
@@ -664,6 +734,7 @@ mod tests {
             source: None,
             bookings: 10,
             cancelled: 3,
+            holds_auto_released: 0,
             room_nights: 14, // already excludes the 3 cancelled
             gross_revenue: 7000.0,
         }];
@@ -683,6 +754,7 @@ mod tests {
                 source: Some("walk-in".to_string()),
                 bookings: 1,
                 cancelled: 0,
+                holds_auto_released: 0,
                 room_nights: 1,
                 gross_revenue: 0.0,
             },
@@ -691,6 +763,7 @@ mod tests {
                 source: None,
                 bookings: 1,
                 cancelled: 0,
+                holds_auto_released: 0,
                 room_nights: 2,
                 gross_revenue: 0.0,
             },

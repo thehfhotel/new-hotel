@@ -719,10 +719,24 @@ pub async fn confirm_booking_payment(
 /// an expiry sweep can never cancel a hold that a racing payment-verified
 /// just confirmed. Also stamps the cancel metadata columns. Returns rows
 /// affected (0 ⇒ the guard lost — caller re-reads and maps the outcome).
+///
+/// `auto_released` stamps `book_hold_auto_released_at` (migration 096, B13) —
+/// the TYPED marker that this hold died of the clock rather than because
+/// somebody asked. It is set **in this same statement**, so the marker and the
+/// cancellation commit together and can never disagree; a crash cannot leave a
+/// cancelled hold that lost its provenance. Pass `true` from the expiry sweep
+/// and `false` from every other caller; `service::channel::ReleaseCause` is
+/// what decides, so no call site has to remember a bare boolean.
+///
+/// The `ELSE NULL` arm is deliberate rather than a no-op: the guard restricts
+/// this to `pending` rows, which never carry a marker yet, so writing NULL
+/// changes nothing — but it keeps the statement TOTAL. A future path that
+/// re-opened a hold could not leave a stale marker behind.
 pub async fn release_hold(
     tx: &mut Transaction<'_, Postgres>,
     book_id: i32,
     reason: &str,
+    auto_released: bool,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query!(
         r#"
@@ -730,12 +744,14 @@ pub async fn release_hold(
            SET book_status = 'cancelled',
                book_cancelled_at = NOW(),
                book_cancel_reason = $2,
+               book_hold_auto_released_at = CASE WHEN $3 THEN NOW() ELSE NULL END,
                updated_at = NOW()
          WHERE book_id = $1
            AND book_status = 'pending'
         "#,
         book_id,
-        reason
+        reason,
+        auto_released
     )
     .execute(&mut **tx)
     .await?;

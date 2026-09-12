@@ -217,6 +217,15 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     -- bookings (book_channel='loyalty', book_status='pending'). PG-canonical
     -- only; the scheduler sweep cancels holds past this instant.
     book_hold_expires_at TIMESTAMPTZ,
+    -- Migration 096 (B13) — the instant the scheduler sweep AUTO-RELEASED a
+    -- loyalty hold whose payment window lapsed, stamped in the same UPDATE
+    -- that cancels it. The line above is the FUTURE deadline and needs a
+    -- 'pending' guard to mean anything; this one is NULL unless the clock
+    -- killed the hold, so `IS NOT NULL` is the guard-free predicate the
+    -- channel rollup reports as holdsExpired. A release the loyalty app asked
+    -- for leaves it NULL. Named for the event, not the verdict, so it cannot
+    -- be typo-confused with book_hold_expires_at. PG-canonical only.
+    book_hold_auto_released_at TIMESTAMPTZ,
     -- Migration 094 (issue #304 B8c) — the room type this booking claims. The
     -- load-bearing case is a PARKED (roomless) booking, which otherwise records
     -- no type anywhere and can only be subtracted from availability
@@ -3276,6 +3285,20 @@ ON CONFLICT (version) DO NOTHING;
 -- migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('095', '095_ht_bookings_ext_ref_fingerprint.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 096 — ht_bookings.book_hold_auto_released_at (B13): the instant
+-- the scheduler sweep auto-released a loyalty hold whose payment window
+-- lapsed, inlined into the ht_bookings block above. Makes the event TYPED, so
+-- the expired-hold rate B13 must read is countable without string-matching
+-- book_cancel_reason — a match that is wrong today, because the channel's own
+-- release endpoint writes a reason that also says the payment window lapsed,
+-- and that path is a guest abandonment rather than a TTL expiry.
+-- PG-canonical only: no legacy counterpart, no sync mapper, no writeback, no
+-- dark flag. This seed row records the migration as applied so the drift check
+-- sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('096', '096_ht_bookings_hold_auto_released_at.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

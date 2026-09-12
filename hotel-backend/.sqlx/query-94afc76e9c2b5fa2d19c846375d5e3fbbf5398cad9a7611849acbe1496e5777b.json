@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE ht_bookings\n           SET book_status = 'cancelled',\n               book_cancelled_at = NOW(),\n               book_cancel_reason = $2,\n               book_hold_auto_released_at = CASE WHEN $3 THEN NOW() ELSE NULL END,\n               updated_at = NOW()\n         WHERE book_id = $1\n           AND book_status = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Varchar",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "94afc76e9c2b5fa2d19c846375d5e3fbbf5398cad9a7611849acbe1496e5777b"
+}
