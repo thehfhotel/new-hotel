@@ -21,8 +21,9 @@ LINE pushes — the maids are literally on LINE, and HF ID already holds every m
 user id and a working staff-OA push path (used by rich-menu provisioning).
 
 The load-bearing constraint is that **LINE meters exactly one thing: messages the OA
-sends, counted per recipient.** The Thai free tier is small (~200/month floor as of 2026 —
-verify in OA Manager; the next tier is ฿1,200/month). Everything else this estate uses
+sends, counted per recipient.** The Thai free tier is small (300/month — verified 2026-09-05 via
+`GET /v2/bot/message/quota` on the staff OA; the next tier is เบสิก ฿1,280/month;
+hf-erp ADR 0007 has the sources). Everything else this estate uses
 LINE for — the rich menu, opening `/hk` in the LINE browser, silent HF ID login, menu
 provisioning — consumes zero messages, forever. Chat-over-LINE at even modest volume
 (~30 messages/day × ~3 recipients ≈ 2,700/month) is 13× the free tier from week one;
@@ -62,7 +63,7 @@ moderation surface, and its content is invisible to the room board.
   is invisible to the push. Accepted deliberately (option "on-duty, no fallback") — the
   failure mode is today's behavior (the desk phones), not a new one.
 - Escalation volume is the health metric: sustained escalations mean maids aren't acking
-  in-app. The remedies are operational (acking habits), commercial (฿1,200/month tier), or
+  in-app. The remedies are operational (acking habits), commercial (เบสิก ฿1,280/month tier), or
   a later Web Push build (`/hk` as a subscribing PWA) — none change this architecture.
 - Anyone tempted to add a free-text field or a per-message LINE push should read the
   Context section first: both were considered and rejected, not overlooked. The canned
