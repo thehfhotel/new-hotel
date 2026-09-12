@@ -5,8 +5,8 @@ The canonical one-line ledger entry is the **V18** row in
 (§Code-gated); this file is its long form. Docs only — nothing here changes behaviour.
 
 **Correction carried from V17:** the column is on **`HT_Book_Ds`**, not `HT_Book_H` — the
-header has no `Book_Room_Num` at all. It is `float` (`docs/legacy-app/SCHEMA.sql:99`;
-`COMPAT_CHEATSHEET.md` §`HT_Book_Ds` "Schema (11 columns)").
+header has no `Book_Room_Num` at all. It is `float` (`docs/legacy-app/SCHEMA.sql`;
+`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Table: `HT_Book_Ds` (A)").
 
 ## 1. The question
 
@@ -25,15 +25,15 @@ room iHOTEL has already promised away. V17's live read already found the shape: 
 ## 2. What the CT mapper assumes today
 
 * **Fetched, then never read.** `BOOK_DS_PROJECTION`
-  (`hotel-backend/src/sync/parent_loader.rs:124-135`) lists `"Book_Room_Num"` (line 132),
+  (`hotel-backend/src/sync/parent_loader.rs:124-135`) lists `"Book_Room_Num"`,
   so it arrives from MSSQL on every `HT_Book_Ds` row — but
   `hotel-backend/src/sync/mappers/booking.rs` has **zero read sites** for it (a
   case-insensitive grep matches only the test name
-  `project_aggregate_missing_book_room_type_defaults_to_room_numbers`, line 1875).
-  `BOOK_H_PROJECTION` (lines 99-118) does not list it, consistent with the header having
+  `project_aggregate_missing_book_room_type_defaults_to_room_numbers`).
+  `BOOK_H_PROJECTION` does not list it, consistent with the header having
   no such column.
 * **The mode branch.** `apply_booking_aggregate` (`booking.rs:493`) → `project_aggregate`
-  (`booking.rs:661`), lines 709-754: when `Book_room_type != 1` each live Ds line's
+  (`booking.rs:661`): when `Book_room_type != 1` each live Ds line's
   (misleadingly named) `Book_Room_Type` string is taken as a **room number**; when it **is**
   1, `rooms` stays empty (header-only → parked) and the first live line's `Book_Room_Type`
   becomes `book_room_type_code`, resolved by `resolve_room_type_code` (`booking.rs:1484`) —
@@ -43,9 +43,9 @@ room iHOTEL has already promised away. V17's live read already found the shape: 
   `:1270` / `update_existing` `:1222`), and zero `ht_booking_rooms` rows when parked
   (`replace_rooms` `:1510`).
 * **Where "one header = one claim" actually lives:** `hotel-backend/src/repository/channel.rs`.
-  `PARKED_CLAIM_PREDICATE` (lines 232-243) selects live, date-overlapping bookings with
+  `PARKED_CLAIM_PREDICATE` selects live, date-overlapping bookings with
   `NOT EXISTS (SELECT 1 FROM ht_booking_rooms br WHERE br.br_book_id = b.book_id)`, and
-  `inventory_ctes()` (lines 278-329) counts them by **row cardinality**:
+  `inventory_ctes()` counts them by **row cardinality**:
 
   ```sql
   parked_claims AS (
@@ -64,7 +64,7 @@ room iHOTEL has already promised away. V17's live read already found the shape: 
   on the read path.
 * Symmetric outbound assumption: `writeback/recipes/booking_create.rs:204` writes
   `Book_Room_Num` as a hardcoded `1` ("single-room assumption undocumented",
-  `docs/legacy-spike/writeback-audit-2026-05-12.md:250`) — correct for us, but it means the
+  `docs/legacy-spike/writeback-audit-2026-05-12.md` §"LOW (~25 items)") — correct for us, but it means the
   >1 case has never been exercised from either side.
 
 ## 3. Which legacy rows would disprove it
@@ -84,7 +84,7 @@ For a mode-1 (`HT_Book_H.Book_room_type = 1`) row:
 summary runs `select book_room_type, sum(book_room_num) as num from View_Book_Ds2 where
 book_status='จอง' … group by book_room_type` — captured live in
 `docs/legacy-spike/raw/checkout2-20260424-101023/07-events.txt:24` and documented as query
-#3 of `LoadRooms` in `docs/legacy-app/ROOM_GRID_REFRESH.md:121`. The legacy app **SUMs**
+#3 of `LoadRooms` in `docs/legacy-app/ROOM_GRID_REFRESH.md` §"4. What a refresh actually costs". The legacy app **SUMs**
 the column and groups it by type; nobody sums room numbers. Strong, but inferred from
 aggregate behaviour — hence the probe.
 
