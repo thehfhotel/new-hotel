@@ -40,7 +40,20 @@
 //! — so each scenario MEASURES the surplus via
 //! `channel_repo::inventory_snapshot` and then drains it to a known value,
 //! instead of assuming a room count. The per-type counts ARE absolute: the
-//! two fixture types are unique to this file.
+//! two fixture types under test are unique to this file.
+//!
+//! ## Why the fixture seeds SLACK rooms
+//!
+//! A scenario that wants the PER-TYPE term to be what blocks a sale only
+//! means something while `surplus >= 1` — otherwise the property-wide cap
+//! zeroes every type on its own and the assertion passes no matter what the
+//! per-type term does. A developer's machine has slack for free; CI seeds
+//! ZERO rooms beyond this file's own, so the fixture has to supply it. Type C
+//! (`ROOMS_SLACK`) exists only to keep the property from being oversubscribed
+//! — nothing asserts on it, and no scenario reads its availability. Every
+//! scenario that leans on slack states the premise as an explicit
+//! `surplus >= 1` assertion, so removing those rooms fails the guard instead
+//! of silently making the test unfalsifiable.
 //!
 //! ## Why one test function
 //!
@@ -64,6 +77,12 @@ const TYPE_NAME_B: &str = "TEST_parked_type_b";
 const ROOM_A1: &str = "TPK01";
 const ROOM_A2: &str = "TPK02";
 const ROOM_B1: &str = "TPK03";
+/// Type C is never asserted on. Its rooms exist so the property keeps slack
+/// (`surplus >= 1`) in the scenarios whose whole point is the PER-TYPE term —
+/// on CI, where the only rooms in the database are the ones this file seeds.
+const TYPE_CODE_C: &str = "TSTPKC";
+const TYPE_NAME_C: &str = "TEST_parked_type_c";
+const ROOMS_SLACK: [&str; 3] = ["TPK04", "TPK05", "TPK06"];
 const GUEST_FIRST: &str = "TEST_parked_guest";
 const BOOK_NO_PREFIX: &str = "TESTPK";
 
@@ -320,16 +339,20 @@ async fn cleanup(pool: &PgPool) {
         .execute(pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no IN ($1, $2, $3)")
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no IN ($1, $2, $3, $4, $5, $6)")
         .bind(ROOM_A1)
         .bind(ROOM_A2)
         .bind(ROOM_B1)
+        .bind(ROOMS_SLACK[0])
+        .bind(ROOMS_SLACK[1])
+        .bind(ROOMS_SLACK[2])
         .execute(pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM ht_room_types WHERE type_code IN ($1, $2)")
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code IN ($1, $2, $3)")
         .bind(TYPE_CODE_A)
         .bind(TYPE_CODE_B)
+        .bind(TYPE_CODE_C)
         .execute(pool)
         .await
         .ok();
@@ -348,6 +371,12 @@ async fn parked_bookings_consume_channel_inventory() {
     let room_a1 = seed_room(&pool, ROOM_A1, type_a).await;
     let room_a2 = seed_room(&pool, ROOM_A2, type_a).await;
     let _room_b1 = seed_room(&pool, ROOM_B1, type_b).await;
+    // Slack, not subject matter: three free rooms of a type no assertion
+    // names, so the property-wide cap is never what zeroes type A or type B.
+    let type_c = seed_type(&pool, TYPE_CODE_C, TYPE_NAME_C).await;
+    for room_no in ROOMS_SLACK {
+        seed_room(&pool, room_no, type_c).await;
+    }
     let cust = seed_customer(&pool).await;
 
     // Monotonic book_no suffix — book_no is UNIQUE across the whole table.
@@ -616,10 +645,18 @@ async fn parked_bookings_consume_channel_inventory() {
     //
     // The scenario a single-type test cannot distinguish: one live parked
     // claim on A and one on B, in the same window, with the property still
-    // holding slack. Each type must lose exactly its OWN claim — an
-    // implementation that grouped wrongly (or summed all typed claims against
-    // every type) would zero both, and one that ignored the grouping would
-    // zero neither.
+    // holding slack. Each type must lose exactly its OWN claim.
+    //
+    // THE SLACK IS THE WHOLE TEST. Three live claims stand against this
+    // window, so without the type-C rooms the property would be
+    // oversubscribed (`surplus == 0`) and BOTH zeros below would be handed
+    // down by the property-wide cap — true under #304, true with the per-type
+    // term deleted, true under any implementation at all. The
+    // `mixed.surplus >= 1` assertion states that premise so the scenario
+    // cannot quietly decay back into a tautology; with it holding, the only
+    // thing that can zero A and B is the per-type subtraction. (The
+    // complementary mutation — summing ALL typed claims against EVERY type —
+    // is what scenario 7 catches, where B must stay at 1.)
     //
     // The bookkeeping assertions below are meaningful here for the same
     // reason: the two columns are fed by rows that are NOT all the same kind,
@@ -648,11 +685,18 @@ async fn parked_bookings_consume_channel_inventory() {
         mixed.parked_claims_untyped, 1,
         "exactly the one that does not: {mixed:?}"
     );
+    assert!(
+        mixed.surplus >= 1,
+        "the property must still have slack, or the property-wide cap — not \
+         the per-type term — is what zeroes A and B, and neither assertion \
+         below could ever go red: {mixed:?}"
+    );
 
     assert_eq!(
         assert_counter_and_picker_agree(&pool, type_a, w8.0, w8.1, "A, own claim").await,
         0,
-        "A loses its last room to the claim that names A"
+        "A loses its last room to the claim that names A, not to the \
+         property-wide cap — surplus is still positive"
     );
     assert_eq!(
         assert_counter_and_picker_agree(&pool, type_b, w8.0, w8.1, "B, own claim").await,
