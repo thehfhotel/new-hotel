@@ -250,6 +250,68 @@ pub async fn init_scheduler(
             "[Scheduler] - Loyalty hold expiry sweep: every 5 minutes"
         );
 
+        // Track F5 — loyalty-channel writeback-leg stall tripwire
+        // (docs/runbooks/writeback-leg-degraded.md). A hold is worth nothing
+        // to reception until its writeback reaches iHOTEL's room board as
+        // `จอง`; when the leg is down the hold commits in PG, dies at its 2h
+        // TTL, and no pre-existing alert is fast enough to mention it (the
+        // level digest needs 4h, the burst alert 50 rows/hr, the queue-depth
+        // janitor 500 pending jobs).
+        //
+        // REGISTERED HERE, NOT IN THE WRITEBACK WORKER, ON PURPOSE: the
+        // failure mode is "the worker is not draining the queue", whose most
+        // likely cause is that the worker container itself is down. A
+        // detector inside that worker shares its fate and goes silent in
+        // exactly the case it exists for. The scheduler is a different
+        // container, reads only canonical PG, and therefore keeps reporting
+        // while the legacy leg is unreachable.
+        //
+        // Registered unconditionally, like the sweep above: the query costs
+        // an empty partial-index scan while the channel is dark, and holds
+        // outstanding at the moment an operator turns the channel OFF are
+        // precisely the ones that must not go unwatched. Every 2 minutes at
+        // :30 so the tick never lands on the sweep's or the reconcile's
+        // boundary; worst-case detection is the threshold + 2 minutes.
+        // Covers both sites from the one process where both canonical pools
+        // are co-resident.
+        let stall_pg = pg.clone();
+        let stall_ville = ville_pg_pool.clone();
+        let stall_slack: Option<SlackClient> = if slack_config.is_configured() {
+            Some(SlackClient::new(slack_config.clone()))
+        } else {
+            None
+        };
+        let stall_site = site.id.clone();
+        let stall_job = Job::new_async("30 */2 * * * *", move |_uuid, _l| {
+            let pg = stall_pg.clone();
+            let ville = stall_ville.clone();
+            let slack = stall_slack.clone();
+            let site_id = stall_site.clone();
+            Box::pin(async move {
+                sync::check_loyalty_writeback_stall_and_alert(&pg, slack.as_ref(), &site_id).await;
+                // Guard against an unexpected hfville-primary config
+                // double-alerting on the same DB (mirrors the sweep above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        sync::check_loyalty_writeback_stall_and_alert(
+                            vp,
+                            slack.as_ref(),
+                            "hfville",
+                        )
+                        .await;
+                    }
+                }
+            })
+        })?;
+        scheduler.add(stall_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty writeback-leg stall tripwire: every 2 minutes (pure-PG; \
+             survives a writeback-worker outage)"
+        );
+
+
         // Room-signal escalation valve (ADR 0008). Every 30 seconds: a
         // ขอเช็คห้อง still unacked after 2 minutes is POSTed to HF ID, which
         // LINE-pushes the ON-DUTY maids of that branch once. This is the ONLY
@@ -501,7 +563,17 @@ fn channel_service_for_pool(pg: &PgPool) -> ChannelService {
         events,
         pg.clone(),
     ));
-    ChannelService::new(pg.clone(), bookings, customers, customers_repo)
+    ChannelService::new(
+        pg.clone(),
+        bookings,
+        customers,
+        customers_repo,
+        // B8e / L2. The sweep only RELEASES holds, so the floor is never
+        // consulted on this path — pass the configured value anyway rather
+        // than a literal, so a future sweep-side create cannot inherit a
+        // silently disabled guard.
+        crate::config::loyalty_last_room_floor(),
+    )
 }
 
 /// Apply the task #69 site-id prefix to a Block-Kit Slack message in

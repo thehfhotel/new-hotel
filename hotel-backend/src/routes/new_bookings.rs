@@ -29,7 +29,7 @@ use crate::outbox::intent::BookingChanges;
 use crate::repository::booking::{BookingDetailRow, BookingListRow, BookingRoomRow};
 use crate::service::{
     BookingProductCommand, BookingRoomCommand, BookingWritebackContext, CancelBookingCommand,
-    CreateBookingCommand, ModifyBookingCommand,
+    CreateBookingCommand, ModifyBookingCommand, RoomTypeEdit,
 };
 
 /// Booking status enum
@@ -113,6 +113,18 @@ pub struct NewBooking {
     pub children: Option<i32>,
     pub status: String,
     pub source: Option<String>,
+    /// Provenance channel from `ht_bookings.book_channel` — serialised as
+    /// `bookChannel`. `Some("loyalty")` for a booking made in the guest app
+    /// (`service::channel::LOYALTY_CHANNEL`), an OTA slug (`"bookingcom"`,
+    /// `"agoda"`, …) for an OTA-Desk write-back, `None` for walk-in / phone /
+    /// manual desk bookings.
+    ///
+    /// READ-ONLY on this DTO: it is set by the create path
+    /// (`CreateBookingCommand::book_channel`) and never by an update, so
+    /// serialising it here adds no write surface. Always present on the wire
+    /// (`null` when absent) so the desk UI can branch on it without an
+    /// `undefined` check — see the reservations channel chip.
+    pub book_channel: Option<String>,
     pub total_amount: Option<f64>,
     pub deposit_amount: Option<f64>,
     pub notes: Option<String>,
@@ -136,6 +148,7 @@ impl NewBooking {
             children: row.book_children,
             status: row.book_status,
             source: row.book_source,
+            book_channel: row.book_channel,
             total_amount: row.book_total_amount,
             deposit_amount: row.book_deposit_amount,
             notes: row.book_notes,
@@ -159,6 +172,7 @@ impl NewBooking {
             children: row.book_children,
             status: row.book_status.unwrap_or_else(|| "pending".to_string()),
             source: row.book_source,
+            book_channel: row.book_channel,
             total_amount: row.book_total_amount,
             deposit_amount: row.book_deposit_amount,
             notes: row.book_notes,
@@ -204,8 +218,12 @@ pub struct NewBookingsQuery {
     pub branch: Option<Branch>,
 }
 
-fn default_page() -> i32 { 1 }
-fn default_limit() -> i32 { 20 }
+fn default_page() -> i32 {
+    1
+}
+fn default_limit() -> i32 {
+    20
+}
 
 /// Response for bookings list
 #[derive(Debug, Serialize)]
@@ -256,6 +274,22 @@ pub struct BookingProductRequest {
     pub note: Option<String>,
 }
 
+/// serde shim that keeps "field absent" distinguishable from "field is
+/// explicitly `null`" — `Option<Option<T>>` where the OUTER option is
+/// presence and the inner one is the JSON value.
+///
+/// serde's derive treats a bare `Option<T>` field as absent-or-null collapsed
+/// onto `None`, which is exactly the ambiguity that made an edit of a parked
+/// booking clear its room type. Pairs with
+/// `#[serde(default, deserialize_with = "double_option")]`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// Request body for creating/updating booking
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -274,6 +308,32 @@ pub struct CreateUpdateBookingRequest {
     /// waitlist / unassigned reservation; a room is assigned later via edit.
     #[serde(default)]
     pub rooms: Vec<BookingRoomRequest>,
+    /// `roomTypeId` — the room type this booking claims (migration 094 / issue
+    /// #304 B8c). Optional and absent for every pre-existing caller.
+    ///
+    /// It matters most on a PARKED (roomless) booking: with `rooms` empty this
+    /// is the ONLY record of what the reservation wants, and it is what lets
+    /// `repository::channel` subtract the parked claim from that TYPE instead
+    /// of merely capping the whole property. With `rooms` present the service
+    /// enforces AGREEMENT with the first assigned room's type (400 on a
+    /// conflict) or DERIVES it, so the stored value can never contradict the
+    /// stored room.
+    ///
+    /// TRI-STATE on the UPDATE path (`Option<Option<i32>>` via
+    /// [`double_option`]), and the nesting is load-bearing rather than
+    /// decorative:
+    ///
+    /// * **absent** ⇒ `None` ⇒ keep whatever is stored. Both desk savers omit
+    ///   this field and send `rooms: []` when editing a parked booking, so
+    ///   without the distinction every ordinary edit (renaming a note,
+    ///   shifting a date) silently wiped the attribution.
+    /// * **`"roomTypeId": null`** ⇒ `Some(None)` ⇒ clear it deliberately.
+    /// * **`"roomTypeId": 7`** ⇒ `Some(Some(7))` ⇒ set it.
+    ///
+    /// On CREATE the distinction is immaterial (a new row starts NULL), so the
+    /// create path flattens it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub room_type_id: Option<Option<i32>>,
     /// Pre-ordered products. Optional; defaults to empty.
     #[serde(default)]
     pub products: Vec<BookingProductRequest>,
@@ -310,10 +370,23 @@ pub async fn list_bookings(
     // (hotelville's canonical ht_bookings is populated), All unions both —
     // mirroring routes/rooms.rs::list_rooms.
     let (rows, total) = match params.branch.unwrap_or_default() {
-        Branch::Hfhotel => state.bookings.list_with_count(&state.new_pool, &params).await?,
-        Branch::Hfville => state.bookings.list_with_count(state.ville_pool()?, &params).await?,
+        Branch::Hfhotel => {
+            state
+                .bookings
+                .list_with_count(&state.new_pool, &params)
+                .await?
+        }
+        Branch::Hfville => {
+            state
+                .bookings
+                .list_with_count(state.ville_pool()?, &params)
+                .await?
+        }
         Branch::All => {
-            let (mut r, mut t) = state.bookings.list_with_count(&state.new_pool, &params).await?;
+            let (mut r, mut t) = state
+                .bookings
+                .list_with_count(&state.new_pool, &params)
+                .await?;
             if let Ok(vp) = state.ville_pool() {
                 let (vr, vt) = state.bookings.list_with_count(vp, &params).await?;
                 r.extend(vr);
@@ -344,7 +417,10 @@ pub async fn get_booking(
         .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
     let room_rows = state.bookings.list_rooms(&state.new_pool, book_id).await?;
-    let rooms: Vec<NewBookingRoom> = room_rows.into_iter().map(NewBookingRoom::from_row).collect();
+    let rooms: Vec<NewBookingRoom> = room_rows
+        .into_iter()
+        .map(NewBookingRoom::from_row)
+        .collect();
     let room_count = rooms.len();
 
     let booking = NewBooking::from_detail_row(detail, room_count);
@@ -426,10 +502,28 @@ pub async fn create_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
-        products: body.products.iter().map(product_request_to_command).collect(),
+        // Create has no "keep" semantics — a fresh row starts NULL, so absent
+        // and explicit-null are the same request.
+        room_type_id: body.room_type_id.flatten(),
+        products: body
+            .products
+            .iter()
+            .map(product_request_to_command)
+            .collect(),
         writeback_context,
         book_channel: body.book_channel.clone(),
         book_ext_ref: body.book_ext_ref.clone(),
+        // OTA/desk creates supply a channel-native booking id, not a request
+        // key, so there is no request fingerprint to bind (migration 095).
+        // Only the loyalty channel sets this.
+        book_ext_ref_fingerprint: None,
+        // B8e / L3 — the desk create takes the property's booking-inventory
+        // lock for the whole transaction, which is what stops a loyalty hold
+        // from picking a room between this handler's availability read and
+        // its INSERT. Taken unconditionally, ROOMLESS creates included: a
+        // parked (roomless) booking is a live claim on the property's surplus
+        // (B8a), so it moves channel inventory even though it names no room.
+        inventory_lock: Some(branch_property(query.branch).to_string()),
         // Manual / OTA-desk creates are never payment-holds (migration 086);
         // only the loyalty channel (`routes::channel`) sets a deadline.
         hold_expires_at: None,
@@ -505,6 +599,7 @@ pub async fn update_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
+        room_type_id: RoomTypeEdit::from_wire(body.room_type_id),
         // TODO: diff against the loaded prior row to populate per-field changes.
         changes: BookingChanges {
             new_stay: Some(DateRange::new(
@@ -525,6 +620,14 @@ pub async fn update_booking(
             customer_resave: None,
         },
         promote_context,
+        // B8g — the same property lock the desk CREATE takes, but only when
+        // this edit actually moves inventory (assigns, swaps or clears rooms);
+        // the service skips it for a notes-only save. Without it the edit flow
+        // was the one desk path that could hand a loyalty hold's freshly picked
+        // room to a walk-in, since `pick_free_room` excludes nothing it cannot
+        // see committed. Same `branch_property` mapping as create, so both
+        // handlers land on one key per property.
+        inventory_lock: Some(branch_property(query.branch).to_string()),
         // TODO: load prior snapshot from repo for richer event payload.
         before_snapshot: None,
         after_snapshot: snapshot,
@@ -640,6 +743,19 @@ pub struct ValidateBookingResponse {
 /// `[check_in, check_out)` range (`YYYY-MM-DD`). `exclude_booking_id` skips a
 /// booking being edited. Booking overlap mirrors `live_room_flags`; check-in
 /// overlap mirrors `calendar.rs`.
+/// The property label this branch's booking-inventory lock is scoped by
+/// (B8e / L3) — the same `hf` / `hfville` ids the channel contract uses, so a
+/// desk create and a channel hold for one property take ONE lock.
+///
+/// Mirrors [`AppState::write_pool`]'s own branch mapping exactly: `All`
+/// resolves to the HF Hotel pool, so it must resolve to the HF Hotel lock.
+pub(crate) fn branch_property(branch: Option<Branch>) -> &'static str {
+    match branch.unwrap_or_default() {
+        Branch::Hfville => "hfville",
+        Branch::Hfhotel | Branch::All => "hf",
+    }
+}
+
 async fn room_is_available(
     pool: &crate::db::PgPool,
     room_id: i32,
@@ -721,14 +837,17 @@ pub async fn validate_booking(
     // is an availability failure (cannot book a room that doesn't exist).
     let room_id = match body.room_id {
         Some(id) => Some(id),
-        None => match body.room_no.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(room_no) => {
-                sqlx::query("SELECT room_id FROM ht_rooms_new WHERE room_no = $1")
-                    .bind(room_no)
-                    .fetch_optional(pool)
-                    .await?
-                    .map(|r| r.get::<i32, _>("room_id"))
-            }
+        None => match body
+            .room_no
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(room_no) => sqlx::query("SELECT room_id FROM ht_rooms_new WHERE room_no = $1")
+                .bind(room_no)
+                .fetch_optional(pool)
+                .await?
+                .map(|r| r.get::<i32, _>("room_id")),
             None => None,
         },
     };
@@ -879,7 +998,11 @@ async fn build_writeback_context(
                 .unwrap_or(0.0);
             (room_no, room_type, price)
         }
-        None => (String::new(), String::new(), body.total_amount.unwrap_or(0.0)),
+        None => (
+            String::new(),
+            String::new(),
+            body.total_amount.unwrap_or(0.0),
+        ),
     };
 
     // Deposit (`เงินมัดจำ`) is optional on the form — None / 0 means no
@@ -932,7 +1055,10 @@ fn build_snapshot_inputs(
         stay_start: naive_date_to_utc(check_in),
         stay_end: naive_date_to_utc(check_out),
         room_no: None,
-        price: body.total_amount.map(money_from_baht_f64).unwrap_or(Money::ZERO),
+        price: body
+            .total_amount
+            .map(money_from_baht_f64)
+            .unwrap_or(Money::ZERO),
     }
 }
 
@@ -953,10 +1079,154 @@ fn money_from_baht_f64(baht: f64) -> Money {
 /// preserved verbatim.
 fn map_cancel_error(err: crate::service::ServiceError) -> ApiError {
     match err {
-        crate::service::ServiceError::Conflict(_)
-        | crate::service::ServiceError::NotFound(_) => {
+        crate::service::ServiceError::Conflict(_) | crate::service::ServiceError::NotFound(_) => {
             ApiError::BadRequest("Booking not found or cannot be cancelled".to_string())
         }
         other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::channel::LOYALTY_CHANNEL;
+
+    fn list_row(book_channel: Option<&str>) -> BookingListRow {
+        BookingListRow {
+            book_id: 1,
+            book_no: "B000001".to_string(),
+            legacy_book_id: None,
+            book_cust_id: 7,
+            customer_name: Some("สมชาย ใจดี".to_string()),
+            book_checkin: None,
+            book_checkout: None,
+            book_nights: Some(1),
+            book_adults: Some(2),
+            book_children: Some(0),
+            book_status: "confirmed".to_string(),
+            book_source: Some("loyalty".to_string()),
+            book_channel: book_channel.map(str::to_string),
+            book_total_amount: Some(1200.0),
+            book_deposit_amount: Some(600.0),
+            book_notes: None,
+            room_count: 1,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn detail_row(book_channel: Option<&str>) -> BookingDetailRow {
+        BookingDetailRow {
+            book_id: 1,
+            book_no: "B000001".to_string(),
+            legacy_book_id: None,
+            book_cust_id: 7,
+            customer_name: Some("สมชาย ใจดี".to_string()),
+            book_checkin: NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(),
+            book_checkout: NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
+            book_nights: Some(1),
+            book_adults: Some(2),
+            book_children: Some(0),
+            book_status: Some("confirmed".to_string()),
+            book_source: Some("loyalty".to_string()),
+            book_channel: book_channel.map(str::to_string),
+            book_total_amount: Some(1200.0),
+            book_deposit_amount: Some(600.0),
+            book_notes: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// The reservations LIST endpoint carries the channel as camelCase
+    /// `bookChannel`, using the canonical `'loyalty'` literal verbatim (the
+    /// desk chip matches on it).
+    #[test]
+    fn list_dto_serialises_book_channel_as_camel_case() {
+        let dto = NewBooking::from_list_row(list_row(Some(LOYALTY_CHANNEL)));
+        let json = serde_json::to_value(&dto).expect("NewBooking serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+        assert!(
+            json.get("book_channel").is_none(),
+            "snake_case key must not leak onto the wire: {json}"
+        );
+    }
+
+    /// The reservations DETAIL endpoint carries the same field.
+    #[test]
+    fn detail_dto_serialises_book_channel() {
+        let dto = NewBooking::from_detail_row(detail_row(Some("bookingcom")), 1);
+        let json = serde_json::to_value(&dto).expect("NewBooking serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("bookingcom"));
+    }
+
+    /// Walk-in / phone bookings have no channel. The key must still be PRESENT
+    /// as `null` (not skipped) so the frontend can branch on it without an
+    /// `undefined` check — this is what makes the chip null-safe.
+    #[test]
+    fn absent_book_channel_serialises_as_explicit_null() {
+        for json in [
+            serde_json::to_value(NewBooking::from_list_row(list_row(None))).unwrap(),
+            serde_json::to_value(NewBooking::from_detail_row(detail_row(None), 1)).unwrap(),
+        ] {
+            assert!(
+                json.as_object().unwrap().contains_key("bookChannel"),
+                "bookChannel must be present even when NULL: {json}"
+            );
+            assert_eq!(json["bookChannel"], serde_json::Value::Null);
+        }
+    }
+
+    /// `NewBookingDetail` flattens `NewBooking`, so the detail response body
+    /// (booking + rooms) carries `bookChannel` at the top level too.
+    #[test]
+    fn flattened_detail_response_carries_book_channel() {
+        let detail = NewBookingDetail {
+            booking: NewBooking::from_detail_row(detail_row(Some(LOYALTY_CHANNEL)), 0),
+            rooms: vec![],
+        };
+        let json = serde_json::to_value(&detail).expect("NewBookingDetail serialises");
+
+        assert_eq!(json["bookChannel"], serde_json::json!("loyalty"));
+    }
+}
+
+#[cfg(test)]
+mod inventory_lock_scope_tests {
+    use super::*;
+
+    /// B8e / L3 — the desk router and the channel router must derive the SAME
+    /// property label, or they take two different advisory locks and stop
+    /// excluding each other while every test still passes in isolation.
+    ///
+    /// This is the assertion that would have caught a `"hfhotel"` here against
+    /// the channel contract's `"hf"`: nothing else in the suite compares the
+    /// two routers' strings, and the failure mode is silent (both paths lock,
+    /// neither blocks the other, the double-sell returns).
+    #[test]
+    fn desk_and_channel_agree_on_the_property_lock_scope() {
+        let channel_hf = crate::routes::channel::parse_property("hf")
+            .map(|(_, property)| property)
+            .expect("'hf' is a valid contract property");
+        let channel_ville = crate::routes::channel::parse_property("hfville")
+            .map(|(_, property)| property)
+            .expect("'hfville' is a valid contract property");
+
+        assert_eq!(branch_property(Some(Branch::Hfhotel)), channel_hf);
+        assert_eq!(branch_property(Some(Branch::Hfville)), channel_ville);
+
+        // `write_pool` sends BOTH the default (no `?branch=`) and `All` to the
+        // HF Hotel pool, so both must lock on the HF Hotel key — a desk save
+        // with no branch parameter is the common case.
+        assert_eq!(branch_property(None), channel_hf);
+        assert_eq!(branch_property(Some(Branch::All)), channel_hf);
+
+        assert_ne!(
+            branch_property(Some(Branch::Hfhotel)),
+            branch_property(Some(Branch::Hfville)),
+            "the two properties must not share one inventory lock"
+        );
     }
 }

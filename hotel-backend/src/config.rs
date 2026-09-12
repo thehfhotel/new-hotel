@@ -468,7 +468,7 @@ pub fn thai_id_template_path() -> String {
 /// (`THAI_ID_FONT_PATH`). Defaults to **DilleniaUPC Bold**, the exact face the
 /// reference `KPThaiNationalIDCard.exe` draws with, bundled in the backend image
 /// at `/usr/share/fonts/truetype/dillenia/DilleniaUPC-Bold.ttf` (COPY'd in
-/// `hotel-backend/Dockerfile`). resvg/rustybuzz load this file for correct Thai
+/// `hotel-backend/Dockerfile`). resvg/harfrust load this file for correct Thai
 /// complex-script shaping. `fonts-tlwg-loma-ttf` also ships in the image as a
 /// fallback (`/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf`).
 pub fn thai_id_font_path() -> String {
@@ -573,6 +573,67 @@ fn optional_env(var_name: &str) -> Option<String> {
     match std::env::var(var_name) {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
+    }
+}
+
+/// `BOOKING_INVENTORY_LOCK_ENABLED` (B8e / L3) — kill switch for the
+/// per-property booking-inventory advisory lock that serialises
+/// pick → create (`repository::inventory_lock`).
+///
+/// **Default ON**, unlike every other flag in this file: the flags below ship
+/// dark because they OPEN a legacy write, whereas this one CLOSES a
+/// double-sell window and turning it off re-opens the B8 §2.1/§2.3 race
+/// (two holds, or a hold and a desk booking, both taking the last room).
+/// It exists so an operator can un-serialise booking creates without a
+/// rollback deploy if the lock itself ever becomes the problem — an incident
+/// tool, not a tuning knob.
+///
+/// Only an explicit `false` / `0` disables it; unset, blank and garbage all
+/// keep the guard on, which is the same "a deploy typo must not silently
+/// remove a guard" rule as [`loyalty_last_room_floor`].
+pub fn booking_inventory_lock_enabled() -> bool {
+    match std::env::var("BOOKING_INVENTORY_LOCK_ENABLED") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "false" || normalized == "0")
+        }
+        Err(_) => true,
+    }
+}
+
+/// `LOYALTY_CHANNEL_LAST_ROOM_FLOOR` (B8e / L2) — how many sellable rooms the
+/// property keeps back for the FRONT DESK.
+///
+/// When the channel's own property-wide surplus for the requested nights
+/// (`repository::channel::inventory_snapshot().surplus`) is at or below this
+/// number, `service::channel::create_hold` refuses the hold with a distinct
+/// 409 reason and the loyalty app shows call-the-desk copy. Reception is not
+/// gated: the desk can still book the room the channel just declined.
+///
+/// The CODE default is **1** (guard on) so an unset or garbled value can
+/// never silently remove an inventory guard — a typo in the deploy env must
+/// not disable it (contrast [`flag_enabled`], where an unparseable value
+/// reads as off because there the closed state IS off).
+///
+/// The DEPLOYED default is **0** (guard off) — `docker-compose.yml` ships
+/// `${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-0}` deliberately, because the refusal
+/// is only useful once loyalty-app renders call-the-desk copy for
+/// `reason: "last_room_held_for_desk"`; until it does, a floored hold reaches
+/// the guest as an unexplained failure. Flip the compose default to 1 after
+/// that lands — see `docs/loyalty-channel.md`. `0` disables the guard.
+///
+/// Not an allotment — loyalty-app ADR-0003 rejects those and this is not one:
+/// it caps nothing while the property has slack, it only reserves the tail.
+pub fn loyalty_last_room_floor() -> i64 {
+    const DEFAULT_FLOOR: i64 = 1;
+    match std::env::var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .unwrap_or(DEFAULT_FLOOR),
+        Err(_) => DEFAULT_FLOOR,
     }
 }
 
@@ -863,7 +924,11 @@ fn parse_escalation_cap(raw: Option<&str>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+
+    /// Shared with `secrets::tests` — one process-wide lock for every
+    /// env-mutating unit test in the crate (see its doc comment for why two
+    /// private mutexes did not serialise).
+    use crate::secrets::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// The escalation cap is a rate limiter on METERED spend, so every odd
     /// input must fail toward "fewer messages", never toward "no limit" and
@@ -964,12 +1029,6 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed.contains("mark_room_clean"));
     }
-
-    /// Serialise env-mutating tests. `std::env::set_var` mutates
-    /// process-wide state — running these in parallel under
-    /// `cargo test` (which uses one process) would cause flakes when
-    /// one test clears `DB_PASSWORD` while another asserts it parses.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Snapshot the env vars we touch, restore them on drop. Lets each
     /// test mutate freely without leaking state to siblings.
@@ -1279,6 +1338,269 @@ mod tests {
         env::set_var("VILLE_MSSQL_PASSWORD", "ville-sa");
         let cfg = VilleLegacyDbConfig::from_env().expect("resolves");
         assert_eq!(cfg.password, "ville-sa");
+    }
+
+    /// Every env var the loyalty integration reads. Declared in
+    /// `docker-compose.yml` / `docker-build.yml` blank-or-false, so these tests
+    /// pin what "declared but dark" must mean at runtime.
+    const LOYALTY_VARS: &[&str] = &[
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The whole point of the B3 dark declaration: putting the keys into the
+    /// deploy manifests must NOT enable anything. Unset, blank, whitespace and
+    /// every non-`true`/`1` literal a hand-edited `.env` might carry all leave
+    /// the inbound channel off.
+    #[test]
+    fn loyalty_channel_stays_dark_when_the_flag_is_unset_or_blank() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        // A provisioned token must never be enough on its own.
+        env::set_var("LOYALTY_CHANNEL_TOKEN", "a-real-looking-channel-token");
+
+        // 1. Key absent entirely (pre-B3 production, and any local `.env`).
+        assert!(
+            !LoyaltyConfig::from_env().channel_enabled,
+            "unset LOYALTY_CHANNEL_ENABLED must leave the channel dark"
+        );
+
+        // 2. Key present but empty — what `${LOYALTY_CHANNEL_ENABLED:-}` or an
+        //    unset GH variable rendered into `.env` looks like.
+        for blank in ["", "   ", "\t"] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", blank);
+            assert!(
+                !LoyaltyConfig::from_env().channel_enabled,
+                "blank LOYALTY_CHANNEL_ENABLED ({blank:?}) must leave the channel dark"
+            );
+        }
+
+        // 3. Anything that is not `true`/`1` is off, including near-misses.
+        for falsey in [
+            "false", "FALSE", "0", "off", "no", "yes", "enabled", "True ",
+        ] {
+            env::set_var("LOYALTY_CHANNEL_ENABLED", falsey);
+            let enabled = LoyaltyConfig::from_env().channel_enabled;
+            let expected = falsey.trim().eq_ignore_ascii_case("true");
+            assert_eq!(
+                enabled, expected,
+                "LOYALTY_CHANNEL_ENABLED={falsey:?} must parse as {expected}"
+            );
+        }
+    }
+
+    /// Flag on but the token file empty (an unset GH secret still yields an
+    /// EMPTY `/run/secrets/loyalty_channel_token`, which the hydrator skips) —
+    /// the gate must still have nothing to accept.
+    #[test]
+    fn loyalty_channel_token_blank_reads_as_unprovisioned() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        for blank in ["", "  "] {
+            env::set_var("LOYALTY_CHANNEL_TOKEN", blank);
+            assert!(
+                LoyaltyConfig::from_env().channel_token.is_none(),
+                "blank LOYALTY_CHANNEL_TOKEN ({blank:?}) must read as unprovisioned"
+            );
+        }
+    }
+
+    /// Accrual needs BOTH halves. Declaring `LOYALTY_APP_URL` blank in the
+    /// deploy manifest must not half-arm the checkout stay hook.
+    #[test]
+    fn loyalty_stay_hook_needs_both_url_and_token() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(LOYALTY_VARS);
+
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "both unset ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "URL alone ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "");
+        env::set_var("LOYALTY_SERVICE_TOKEN", "a-real-looking-service-token");
+        assert!(
+            !LoyaltyConfig::from_env().stay_hook_configured(),
+            "blank URL + token ⇒ no accrual"
+        );
+
+        env::set_var("LOYALTY_APP_URL", "https://loyalty.example.test");
+        assert!(
+            LoyaltyConfig::from_env().stay_hook_configured(),
+            "both set ⇒ accrual live (the ONLY two settings that do it)"
+        );
+    }
+
+    /// Every env var `hydrate_env_from_secret_files` can write, so the guard
+    /// restores the process to its prior state even if a stray secret file is
+    /// picked up. `SECRETS_DIR` is included because this test re-points it.
+    const SECRET_HYDRATION_VARS: &[&str] = &[
+        "SECRETS_DIR",
+        "DB_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "VILLE_DB_PASSWORD",
+        "NEW_DB_PASSWORD",
+        "SLACK_WEBHOOK_URL",
+        "DATABASE_URL",
+        "POSTGRES_USER",
+        "POSTGRES_DB",
+        "READER_RESOLVE_SECRET",
+        "OTA_BRIDGE_TOKEN",
+        "OTA_BRIDGE_TOKEN_PREVIOUS",
+        "HFID_RESOLVE_SECRET",
+        "LOYALTY_CHANNEL_ENABLED",
+        "LOYALTY_CHANNEL_TOKEN",
+        "LOYALTY_APP_URL",
+        "LOYALTY_SERVICE_TOKEN",
+    ];
+
+    /// The compose `secrets:` mount (docs/loyalty-channel.md → *Provisioning*
+    /// step 2) must be safe to declare while the two GH secrets are still
+    /// unset. Two shapes have to boot with the channel dark:
+    ///
+    /// * **no file at all** — every local dev box, and any deploy predating the
+    ///   payload keys;
+    /// * **a mounted but EMPTY file** — what production actually has today,
+    ///   because `run-deploy.sh` writes a file for every `.secrets` key
+    ///   including empty values.
+    ///
+    /// In both, hydration must be a no-op for these two vars (never a panic,
+    /// B8e / L3 — the inventory-lock kill switch is DEFAULT ON, and only an
+    /// explicit false/0 turns it off.
+    ///
+    /// The polarity is the opposite of every ship-dark flag in this file and
+    /// that is the point: those gate a legacy WRITE (closed = off), this one
+    /// gates a double-sell GUARD (closed = on). A future refactor that routes
+    /// it through `flag_enabled` for consistency would silently un-serialise
+    /// every booking create, so the asymmetry is pinned here.
+    #[test]
+    fn inventory_lock_is_on_unless_explicitly_disabled() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["BOOKING_INVENTORY_LOCK_ENABLED"]);
+
+        assert!(
+            booking_inventory_lock_enabled(),
+            "unset must keep the lock on"
+        );
+
+        for on in ["true", "1", "", "   ", "yes", "garbage"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", on);
+            assert!(
+                booking_inventory_lock_enabled(),
+                "'{on}' must not disable the serialisation guard"
+            );
+        }
+
+        for off in ["false", "0", " FALSE ", "False"] {
+            env::set_var("BOOKING_INVENTORY_LOCK_ENABLED", off);
+            assert!(
+                !booking_inventory_lock_enabled(),
+                "'{off}' is the explicit kill switch"
+            );
+        }
+    }
+
+    /// B8e / L2 — the last-room floor defaults to ON, and only an explicit,
+    /// parseable, non-negative number moves it.
+    ///
+    /// The asymmetry with [`flag_enabled`] is the point and is asserted here:
+    /// a garbled value there reads as OFF (the closed state), a garbled value
+    /// here reads as the DEFAULT (1, the closed state). Both fail safe; they
+    /// just fail safe in opposite directions, and a future edit that "makes
+    /// them consistent" would silently remove a guard.
+    #[test]
+    fn last_room_floor_defaults_to_one_and_only_a_real_number_moves_it() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["LOYALTY_CHANNEL_LAST_ROOM_FLOOR"]);
+
+        assert_eq!(loyalty_last_room_floor(), 1, "unset must keep the guard on");
+
+        for garbage in ["", "   ", "one", "true", "1.5", "-1"] {
+            env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", garbage);
+            assert_eq!(
+                loyalty_last_room_floor(),
+                1,
+                "'{garbage}' must fall back to the default, never silently disable the guard"
+            );
+        }
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", "0");
+        assert_eq!(loyalty_last_room_floor(), 0, "0 is the explicit opt-out");
+
+        env::set_var("LOYALTY_CHANNEL_LAST_ROOM_FLOOR", " 3 ");
+        assert_eq!(loyalty_last_room_floor(), 3, "surrounding space is trimmed");
+    }
+
+    /// never an empty-string "token" that the constant-time compare would then
+    /// accept), and `LoyaltyConfig` must report the channel dark and the stay
+    /// hook off — including with the flag forced on, which is the state the
+    /// go-live flip lands in if the secret was never minted.
+    #[test]
+    fn loyalty_tokens_stay_unprovisioned_when_the_secret_file_is_missing_or_empty() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(SECRET_HYDRATION_VARS);
+
+        // RAII — the dir is removed even if an assertion below fails.
+        let dir = crate::secrets::SecretsDir::new("hotel-backend-loyalty-secrets");
+        env::set_var("SECRETS_DIR", &dir.path);
+
+        // 1. Nothing mounted.
+        crate::secrets::hydrate_env_from_secret_files();
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "a missing secret file must leave LOYALTY_CHANNEL_TOKEN unset"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(!cfg.channel_enabled, "missing token file ⇒ channel dark");
+        assert!(cfg.channel_token.is_none(), "no token to accept");
+        assert!(!cfg.stay_hook_configured(), "missing token file ⇒ no accrual");
+
+        // 2. Mounted but empty — the unset-GH-secret shape, i.e. what
+        //    production actually has today. Assert at the ENV layer first:
+        //    `optional_env` would map an empty string to `None` anyway, so the
+        //    LoyaltyConfig assertions alone cannot observe the hydrator
+        //    dropping its `trimmed.is_empty()` guard.
+        for name in ["loyalty_channel_token", "loyalty_service_token"] {
+            dir.write(name, "");
+        }
+        let hydrated = crate::secrets::hydrate_env_from_secret_files();
+        assert_eq!(hydrated, 0, "an empty secret file must hydrate nothing");
+        assert!(
+            env::var("LOYALTY_CHANNEL_TOKEN").is_err(),
+            "an empty secret file must leave LOYALTY_CHANNEL_TOKEN unset — never an empty-string bearer"
+        );
+        assert!(
+            env::var("LOYALTY_SERVICE_TOKEN").is_err(),
+            "same for the outbound bearer"
+        );
+        let cfg = LoyaltyConfig::from_env();
+        assert!(
+            cfg.channel_token.is_none(),
+            "an empty secret file must read as unprovisioned, not as an empty bearer"
+        );
+        assert!(cfg.service_token.is_none(), "same for the outbound bearer");
+        assert!(!cfg.stay_hook_configured(), "empty token file ⇒ no accrual");
+
+        // 3. Flag flipped on with the secret still unminted: the channel must
+        //    have nothing to accept (middleware::channel_token renders 503).
+        env::set_var("LOYALTY_CHANNEL_ENABLED", "true");
+        let cfg = LoyaltyConfig::from_env();
+        assert!(cfg.channel_enabled);
+        assert!(
+            cfg.channel_token.is_none(),
+            "flag on + no token file must still be closed — the flip alone opens nothing"
+        );
     }
 
     /// Overrides are honoured — the deploy topology can move without a code

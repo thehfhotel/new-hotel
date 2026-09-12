@@ -106,7 +106,7 @@ jobs:
       deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Check for changes
         # v4.0.1 pinned to commit SHA. Bumped 2026-04-30 from v3 to clear
@@ -125,7 +125,7 @@ jobs:
         # If you add a new top-level path, decide which filter it belongs
         # under and add it. Catch-all globs (`**` at the root) are deliberately
         # NOT used here — explicit lists make the test/build matrix legible.
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           filters: |
@@ -238,7 +238,7 @@ jobs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
         with:
           # Need HEAD and HEAD~1 locally to compute the diff. fetch-depth: 2
           # is the minimum: 1 commit gives us no parent to diff against.
@@ -325,7 +325,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Self-test the check script
         run: ./scripts/check-cardinality-map.sh --self-test
@@ -374,7 +374,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Self-test the check script
         run: ./scripts/check-write-pool-routing.sh --self-test
@@ -452,7 +452,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Verify every binary main() calls hydrate_env_from_secret_files
         run: |
@@ -470,6 +470,82 @@ jobs:
             exit 1
           fi
           echo "OK: all $(echo $BIN_FILES | wc -w) binaries call the hydrator"
+
+  # ADR-0004 tripwire, made load-bearing (PR #296 review).
+  #
+  # ADR 0004 says operational flag state lives in docker-compose.yml defaults
+  # and those keys are deliberately ABSENT from this workflow — because
+  # run-deploy.sh materialises .env WHOLESALE from the deploy payload, so any
+  # key this workflow ships makes the matching `${X:-default}` in compose
+  # unreachable. Until now the only guards were two comments, and the sibling
+  # invariant for the keys that DO ride both files ("the workflow fallback and
+  # the compose default are the same literal") was enforced by nothing at all.
+  # Drift there is invisible: CI stays green, and the compose diff that looks
+  # like a shipped flip is a no-op in production.
+  #
+  # ADR 0004 rejected a CI drift check that needed `gh` API access to compare a
+  # live repo variable. This is not that: it is pure text over two committed
+  # files, no network, no credentials, ~1s.
+  lint-deploy-flag-ownership:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+
+      - name: Compose-owned keys stay out of the workflow; shared keys agree
+        run: |
+          set -euo pipefail
+          WF=.github/workflows/docker-build.yml
+          CF=docker-compose.yml
+
+          # ADR-0004 compose-owned keys (and their HFVILLE_ siblings) must not
+          # appear here as `vars.X || '...'`.
+          OWNED="RECONCILE_FORCE_CONVERGE_ENABLED RECONCILE_REINGEST_MISSING_PG_ENABLED WORKER_RECONCILE_ENABLED SYNC_PER_TABLE_WATERMARK OTA_BRIDGE_ENABLED OTA_BRIDGE_ENFORCE LOYALTY_CHANNEL_ENABLED"
+          bad=0
+          for k in $OWNED; do
+            for name in "$k" "HFVILLE_$k"; do
+              if grep -qE "vars\.${name}[[:space:]]*\|\|" "$WF"; then
+                echo "::error file=$WF::$name is ADR-0004 compose-owned (docs/adr/0004-flag-state-in-compose.md) but appears here as a repo variable — that makes its docker-compose.yml default unreachable and silently reverts the committed value on the next deploy. Remove it."
+                bad=1
+              fi
+            done
+          done
+
+          # Every key that rides BOTH files must carry the SAME literal on each
+          # side, or an unset repo variable stops being a no-op.
+          #
+          # RUST_LOG is the one legitimate divergence: each one-shot job service
+          # in compose carries its own per-binary filter, so a single workflow
+          # fallback cannot equal all of them. Add a key here only with a reason.
+          DIVERGENT_OK=" RUST_LOG "
+
+          # `\\$` (not `\$`): bash collapses it to a literal `$` for ERE, and the
+          # doubled backslash is also what keeps this out of GitHub Actions'
+          # own expression scanner (which evaluates a literal dollar-brace-brace
+          # anywhere in this file, comments included).
+          grep -oE "^[[:space:]]+[A-Z0-9_]+:[[:space:]]+\\$\{\{[[:space:]]*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'[^']*'" "$WF" \
+            | sed -E "s/^[[:space:]]*([A-Z0-9_]+):.*vars\.[A-Z0-9_]+[[:space:]]*\|\|[[:space:]]*'([^']*)'.*/\1\t\2/" \
+            | sort -u > /tmp/wf_pairs.tsv || true
+
+          checked=0
+          while IFS=$'\t' read -r key lit; do
+            [ -z "$key" ] && continue
+            case "$DIVERGENT_OK" in *" $key "*) continue ;; esac
+            defaults=$(grep -oE "[-[:space:]]${key}=\\$\{${key}:-[^}]*\}" "$CF" | sed -E "s/.*:-([^}]*)\}/\1/" | sort -u || true)
+            [ -z "$defaults" ] && continue
+            checked=$((checked + 1))
+            while IFS= read -r d; do
+              if [ "$d" != "$lit" ]; then
+                echo "::error file=$CF::$key: the workflow fallback is '$lit' but the docker-compose default is '$d'. run-deploy.sh writes .env wholesale, so the compose default here is dead and editing it is a no-op in production. Make the two literals identical (or move the key to the compose-owned set)."
+                bad=1
+              fi
+            done <<< "$defaults"
+          done < /tmp/wf_pairs.tsv
+
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "OK: $checked shared workflow/compose keys agree; no compose-owned key leaked into the workflow"
 
   # Track J7 guard (audit-2026-05-14 follow-on to PR #102).
   #
@@ -495,12 +571,16 @@ jobs:
   # No `needs:` gate (cheap grep over a 2-line diff); always runs on PRs.
   lint-no-changelog-version-edits:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches/')
+    # release-please names its branch `release-please--branches--<base>--components--<name>`
+    # (double dashes, no slash); the old prefix `release-please--branches/` never
+    # matched, so the guard rejected every release PR once those runs were allowed
+    # to execute (2026-09-12, #256).
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')
     permissions:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
         with:
           # PR events default to a refs/pull/N/merge checkout with depth=1.
           # We need the base ref locally so `git diff origin/<base>...HEAD`
@@ -537,16 +617,16 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Setup pnpm
         # v4 pinned to SHA. Resolved via gh api git/refs/tags/v4.
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271  # v6.0.9
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
         with:
           version: 10
 
       - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: '20'
           cache: 'pnpm'
@@ -590,7 +670,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       # Install mold (NOT in the github-hosted ubuntu-latest image; required by
       # hotel-backend/.cargo/config.toml's `-fuse-ld=mold` pin). clang and
@@ -651,7 +731,7 @@ jobs:
 
       - name: Cache Rust dependencies
         # v2 pinned to SHA. Resolved via gh api git/refs/tags/v2.
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: hotel-backend
           # `cache-on-failure: true` — preserve the partially-built target/
@@ -728,7 +808,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       # postgresql-client ships on ubuntu-latest; this step is belt-and-suspenders
       # in case the image rotates a future major that drops it. `apt install -y`
@@ -807,13 +887,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -880,13 +960,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -916,6 +996,14 @@ jobs:
           # `scope: backend` per Batch D — isolates GHA cache namespace.
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+          # Baked into the image as ENV GIT_SHA and surfaced by /health as
+          # `revision`, so a live probe proves WHICH COMMIT is serving
+          # instead of inferring it from the promote job's ghcr digest.
+          # The ARG is declared last in hotel-backend/Dockerfile, so this
+          # per-commit value invalidates only the final ENV layer — the
+          # cargo-chef cook + build layers above it still cache-hit.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
 
   # ===========================================================================
   # promote — the single writer of :latest  (incident 2026-08-31)
@@ -1050,10 +1138,10 @@ jobs:
       (needs.build-backend.result == 'success' || needs.build-backend.result == 'skipped')
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0  # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -1206,7 +1294,7 @@ jobs:
       (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || inputs.force_deploy || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v5.0.0
 
       - name: Cache cloudflared binary
         id: cf-cache
@@ -1339,6 +1427,42 @@ jobs:
           # the hydrator skips empty), whereas a compose `secrets:` entry
           # pointing at a MISSING file aborts the entire stack start.
           HFID_RESOLVE_SECRET:     ${{ secrets.HFID_RESOLVE_SECRET }}
+          # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+          # Declared here blank so the go-live (board items B4/B12) is a VALUE
+          # change — `gh variable set` / `gh secret set` + redeploy — rather
+          # than a code change.
+          #
+          # LOYALTY_CHANNEL_ENABLED is deliberately NOT here: it is an
+          # operational flag guarding a legacy write (a channel hold lands in
+          # the shared legacy DB as a normal จอง the moment it is created,
+          # coexistence invariant #6), which is the ADR-0004 compose-owned
+          # shape exactly as OTA_BRIDGE_ENABLED is. Its state lives in the
+          # docker-compose.yml default and the flip is a one-line reviewable
+          # diff there. See the NOTE further down; `lint-deploy-flag-ownership`
+          # fails CI if anyone adds it back.
+          #
+          # LOYALTY_APP_URL is a per-environment base URL, not a flag and not a
+          # credential — that is the category ADR 0004 explicitly leaves on the
+          # variable path (ROUND_WRITEBACK_ENABLED / HFID_LOCATION_URL family).
+          # The fallback below reproduces docker-compose.yml's own default
+          # EXACTLY, so an unset repo variable is a no-op — `lint-deploy-flag-
+          # ownership` asserts the two literals stay equal.
+          LOYALTY_APP_URL:         ${{ vars.LOYALTY_APP_URL || '' }}
+          # The two loyalty bearers are SECRETS: delivered via the payload's
+          # `secrets:` block ONLY, never as an `env:` entry in the container.
+          # `LOYALTY_CHANNEL_TOKEN` is the inbound bearer the loyalty app
+          # presents on /api/channel/*; `LOYALTY_SERVICE_TOKEN` is the outbound
+          # bearer this PMS presents on the stay hook and MUST hold the same
+          # string as the loyalty app's own service token.
+          #
+          # These land one deploy BEFORE the compose `secrets:` declaration, for
+          # the reason spelled out on OTA_BRIDGE_TOKEN above: run-deploy.sh
+          # writes a file for every `.secrets` key including empty values
+          # (harmless — the hydrator skips empty and both gates stay closed),
+          # whereas a compose `secrets:` entry pointing at a MISSING file aborts
+          # the ENTIRE stack start.
+          LOYALTY_CHANNEL_TOKEN:   ${{ secrets.LOYALTY_CHANNEL_TOKEN }}
+          LOYALTY_SERVICE_TOKEN:   ${{ secrets.LOYALTY_SERVICE_TOKEN }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1370,7 +1494,8 @@ jobs:
           # (RECONCILE_FORCE_CONVERGE_ENABLED, RECONCILE_REINGEST_MISSING_PG_ENABLED,
           # WORKER_RECONCILE_ENABLED, SYNC_PER_TABLE_WATERMARK, and their
           # HFVILLE_ siblings) — AND the OTA booking-bridge flags
-          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md) — are
+          # OTA_BRIDGE_ENABLED / OTA_BRIDGE_ENFORCE (docs/ota-bridge.md), AND
+          # LOYALTY_CHANNEL_ENABLED (docs/loyalty-channel.md) — are
           # deliberately NOT listed here. Their state
           # lives in docker-compose.yml defaults, which is the single source of
           # truth. Adding any of them back would make those defaults
@@ -1408,6 +1533,25 @@ jobs:
           # quiet-mode is needed (e.g. major version cutovers); unset
           # restores the debug-pinned default.
           RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info' }}
+          # Post-deploy bake assertion (NOT a container env var — it rides the
+          # payload's TOP LEVEL, so it never lands in the materialised .env).
+          # run-deploy.sh probes /health inside the backend container and
+          # compares `.revision` to this value, hard-failing on a mismatch.
+          # Without it the whole `revision` feature can rot silently: every
+          # unit test passes with a value of "unknown" (nothing in CI can bake
+          # a SHA), so deleting the `build-args` block below, or moving the
+          # Dockerfile ARG above a COPY in a refactor, would leave every gate
+          # green and /health reporting "unknown" forever.
+          #
+          # EMPTY unless `build-backend` actually RAN AND SUCCEEDED — that is
+          # load-bearing, not defensive padding. `build-backend` is
+          # path-filtered (`needs.changes.outputs.backend == 'true'` plus the
+          # should-deploy skip), so on a frontend-only or release-please push
+          # the promoted backend image legitimately carries an OLDER sha than
+          # this run's. Asserting unconditionally would fire on every such
+          # deploy, and a check that cries wolf gets disabled. Empty =>
+          # run-deploy.sh logs the observed revision and asserts nothing.
+          EXPECTED_BACKEND_REVISION: ${{ needs.build-backend.result == 'success' && github.sha || '' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -1465,8 +1609,15 @@ jobs:
           # 2026-05-18 — sync_checkins broke silently for 2+ days). Keep
           # in sync with the vars.RUST_LOG default in the `env:` block
           # above.
+          # `expected_backend_revision` is a TOP-LEVEL payload key, not an
+          # `env` entry: run-deploy.sh materialises .env wholesale from the
+          # `env` block, and this value is a per-run deploy assertion, not
+          # container configuration. Older deploy scripts simply ignore the
+          # key, so this is additive — the assertion goes live one deploy
+          # later, when /srv/run-deploy.sh has self-updated from the tarball.
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
+            --arg expected_backend_revision "${EXPECTED_BACKEND_REVISION:-}" \
             --rawfile deploy_payload_b64 /tmp/deploy.b64 \
             --arg ghcr_user           "$GHCR_USER" \
             --arg ghcr_token          "$GHCR_TOKEN" \
@@ -1490,6 +1641,9 @@ jobs:
             --arg HFID_LOCATION_URL               "${HFID_LOCATION_URL:-}" \
             --arg HFID_ESCALATE_URL               "${HFID_ESCALATE_URL:-}" \
             --arg HFID_RESOLVE_SECRET             "${HFID_RESOLVE_SECRET:-}" \
+            --arg LOYALTY_APP_URL         "${LOYALTY_APP_URL:-}" \
+            --arg LOYALTY_CHANNEL_TOKEN   "${LOYALTY_CHANNEL_TOKEN:-}" \
+            --arg LOYALTY_SERVICE_TOKEN   "${LOYALTY_SERVICE_TOKEN:-}" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1508,6 +1662,7 @@ jobs:
             --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
+              expected_backend_revision: $expected_backend_revision,
               deploy_payload_b64: $deploy_payload_b64,
               ghcr: { user: $ghcr_user, token: $ghcr_token },
               env: {
@@ -1527,6 +1682,7 @@ jobs:
                 HK_LOCATION_ENFORCEMENT_ENABLED: $HK_LOCATION_ENFORCEMENT_ENABLED,
                 HFID_LOCATION_URL:            $HFID_LOCATION_URL,
                 HFID_ESCALATE_URL:            $HFID_ESCALATE_URL,
+                LOYALTY_APP_URL:              $LOYALTY_APP_URL,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
@@ -1552,6 +1708,8 @@ jobs:
                 ota_bridge_token:          $OTA_BRIDGE_TOKEN,
                 ota_bridge_token_previous: $OTA_BRIDGE_TOKEN_PREVIOUS,
                 hfid_resolve_secret:       $HFID_RESOLVE_SECRET,
+                loyalty_channel_token:     $LOYALTY_CHANNEL_TOKEN,
+                loyalty_service_token:     $LOYALTY_SERVICE_TOKEN,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

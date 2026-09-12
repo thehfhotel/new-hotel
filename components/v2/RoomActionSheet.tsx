@@ -71,6 +71,7 @@ export default function RoomActionSheet({
   onAction,
   busy,
   readOnly,
+  notice,
 }: {
   room: RoomItem
   onClose: () => void
@@ -79,6 +80,9 @@ export default function RoomActionSheet({
   /** When true (non-HF-Hotel branch), show room info but no mutating actions —
    *  writes would otherwise misroute to the HF Hotel pool. */
   readOnly?: boolean
+  /** Task B7a — an inline message from the caller (e.g. "no booking on this
+   *  room today"), shown instead of failing silently after a tapped action. */
+  notice?: string | null
 }) {
   const view = roomStatusView(room.status, { isClean: room.isClean, isMaintenance: room.isMaintenance })
 
@@ -129,6 +133,16 @@ export default function RoomActionSheet({
             </div>
           )}
 
+          {notice && (
+            <div
+              data-testid="room-action-notice"
+              className="v2-inset px-4 py-3 text-[13px]"
+              style={{ color: 'var(--v2-wine-600)' }}
+            >
+              {notice}
+            </div>
+          )}
+
           {readOnly ? (
             <div className="v2-inset px-4 py-3 text-[13px]" style={{ color: 'var(--v2-ink-3)' }}>
               โหมดดูอย่างเดียว — จัดการห้องพักผ่าน iHOTEL / หน้าจอเดิม
@@ -139,6 +153,24 @@ export default function RoomActionSheet({
                 housekeeping clean flag, so neither do we. */}
             {room.status === 'available' && (
               <ActionButton variant="primary" icon={<LogIn size={17} />} label="เช็คอิน" onClick={() => onAction('checkin')} />
+            )}
+
+            {/* Booked → the arriving guest. Task B7a: this action was missing
+                entirely, so the one room state where a reservation exists was
+                the one state with no way to check it in from this app — the
+                desk had to go to iHOTEL or fall back to a walk-in, which loses
+                the booking link the B7 deposit signposts depend on. The caller
+                resolves WHICH booking sits on this room today (the same
+                predicate `/api/rooms` used to paint the room จองแล้ว) before
+                opening the modal. */}
+            {room.status === 'booked' && (
+              <ActionButton
+                variant="primary"
+                icon={<LogIn size={17} />}
+                label="เช็คอิน (จากการจอง)"
+                disabled={busy}
+                onClick={() => onAction('checkin')}
+              />
             )}
 
             {/* Occupied → stay lifecycle */}

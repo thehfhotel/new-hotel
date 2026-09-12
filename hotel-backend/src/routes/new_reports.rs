@@ -5,6 +5,17 @@
 //! - GET /api/reports/revenue-by-room-type - Revenue breakdown by room type
 //! - GET /api/reports/vat-summary - Output-tax (VAT) period summary
 //! - GET /api/reports/sales-by-customer - Revenue grouped by customer
+//! - GET /api/reports/channel-rollup - Bookings / room-nights / revenue by
+//!   booking channel (direct-booking program D3, `docs/channel-rollup.md`)
+//! - GET /api/reports/loyalty-reconcile - The morning reconciliation reception
+//!   runs at shift open: app bookings PostgreSQL and iHOTEL disagree about
+//!   (direct-booking program B8f, `docs/runbooks/loyalty-morning-reconcile.md`)
+//!
+//! The first five are **check-in centric** (`ht_checkins`, sharing
+//! [`CHECKIN_REVENUE_EXPR`]). The channel rollup is **booking centric**
+//! (`ht_bookings`), because the channel and the cancellations only exist
+//! there — see `service::reports::channel_rollup` for why the joins are not
+//! shared and what that means for comparing the two.
 //!
 //! All handlers are branch-aware: HF Ville reads its own logical PG database
 //! (`ville_pool`); HF Hotel (and the `all` dashboard view) read `new_pool`.
@@ -15,11 +26,18 @@ use axum::{
     extract::{Query, State},
     Json,
 };
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
+use crate::service::reports::channel_rollup::{
+    load_channel_rollup, rollup, ChannelRollup, DEFAULT_RANGE_DAYS, MAX_RANGE_DAYS,
+};
+use crate::service::reports::loyalty_reconcile::{
+    load_loyalty_reconcile, stall_threshold_minutes, LoyaltyReconcile, DEPOSIT_HORIZON_DAYS,
+};
 
 /// SQL fragment computing a check-in's attributed revenue: the recorded folio
 /// total when present, otherwise `rate × nights` derived from the stay dates.
@@ -660,6 +678,198 @@ pub async fn get_sales_by_customer(
     }))
 }
 
+/// Query parameters for the channel rollup.
+///
+/// Both dates are optional, unlike every other report here: the rollup is a
+/// dashboard glance, and `GET /api/reports/channel-rollup` with no arguments
+/// should answer "the last 30 days" rather than 400.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRollupQuery {
+    /// Inclusive window start, `YYYY-MM-DD`, on the booking's **check-in
+    /// (arrival) date**. Defaults to `to - 29 days`.
+    pub from: Option<String>,
+    /// Inclusive window end, `YYYY-MM-DD`. Defaults to today in Bangkok.
+    pub to: Option<String>,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'. Site data lives in
+    /// separate logical PG databases, so the pool selection is the site filter.
+    pub branch: Option<Branch>,
+}
+
+/// Response for the channel rollup.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelRollupResponse {
+    pub success: bool,
+    /// Echo of the resolved window, so a caller that omitted the dates knows
+    /// what it actually got.
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    #[serde(flatten)]
+    pub rollup: ChannelRollup,
+}
+
+/// Today in Bangkok (GMT+7).
+///
+/// The window is a business-day window, so it has to roll at Thai midnight,
+/// not UTC midnight — otherwise "last 30 days" silently means "yesterday" for
+/// the first seven hours of every Thai day. Same reasoning as
+/// `scheduler::notification_state::now_thai_local`.
+fn today_bangkok() -> NaiveDate {
+    chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).expect("GMT+7 is in range"))
+        .date_naive()
+}
+
+/// Parse an optional `YYYY-MM-DD` query parameter. Absent or blank → `None`;
+/// present but malformed → `400`.
+fn parse_optional_date(raw: Option<&String>, field: &str) -> ApiResult<Option<NaiveDate>> {
+    let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|e| ApiError::BadRequest(format!("invalid `{field}` date `{raw}`: {e}")))
+}
+
+/// Resolve `from`/`to` into a validated inclusive window.
+///
+/// Rules: either end may be omitted and is filled from the other (or from
+/// today); `from` must not be after `to`; the window is capped at
+/// [`MAX_RANGE_DAYS`] so a dashboard refresh cannot scan the whole booking
+/// history. Extracted from the handler so it is unit-testable without a pool.
+fn resolve_window(
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+    today: NaiveDate,
+) -> ApiResult<(NaiveDate, NaiveDate)> {
+    let to = to.unwrap_or(today);
+    let from = from.unwrap_or_else(|| to - chrono::Duration::days(DEFAULT_RANGE_DAYS - 1));
+
+    if from > to {
+        return Err(ApiError::BadRequest(format!(
+            "`from` ({from}) is after `to` ({to})"
+        )));
+    }
+
+    let span = (to - from).num_days() + 1;
+    if span > MAX_RANGE_DAYS {
+        return Err(ApiError::BadRequest(format!(
+            "date range is {span} days; the maximum is {MAX_RANGE_DAYS}"
+        )));
+    }
+
+    Ok((from, to))
+}
+
+/// GET /api/reports/channel-rollup — bookings, room-nights, gross revenue and
+/// cancellations bucketed by booking channel (direct-booking program D3).
+///
+/// `?from=YYYY-MM-DD&to=YYYY-MM-DD&branch=hfhotel|hfville`, attributed by
+/// **check-in (arrival) date**, defaulting to the last 30 days and capped at
+/// 366. See `docs/channel-rollup.md` for the bucket rules and for why
+/// `roomNights` here is not the same number as `/api/reports/occupancy`'s
+/// `occupiedNights`.
+pub async fn get_channel_rollup(
+    State(state): State<AppState>,
+    Query(params): Query<ChannelRollupQuery>,
+) -> ApiResult<Json<ChannelRollupResponse>> {
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel (the report
+    // is single-site; cross-site aggregation is out of scope here).
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let (from, to) = resolve_window(
+        parse_optional_date(params.from.as_ref(), "from")?,
+        parse_optional_date(params.to.as_ref(), "to")?,
+        today_bangkok(),
+    )?;
+
+    let rows = load_channel_rollup(pool, from, to).await?;
+
+    Ok(Json(ChannelRollupResponse {
+        success: true,
+        from,
+        to,
+        rollup: rollup(&rows),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Direct-booking program B8f — the morning reconciliation (checklist L6)
+// ---------------------------------------------------------------------------
+
+/// Query for `GET /api/reports/loyalty-reconcile`.
+#[derive(Debug, Deserialize)]
+pub struct LoyaltyReconcileQuery {
+    /// `YYYY-MM-DD`. Absent → **today in Asia/Bangkok**: a shift opens on a
+    /// Thai business day, not a UTC one, so a UTC default would hand the
+    /// 07:00 desk yesterday's list for the first seven hours of every day.
+    pub date: Option<String>,
+    pub branch: Option<Branch>,
+}
+
+/// Response for the morning reconciliation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoyaltyReconcileResponse {
+    pub success: bool,
+    /// Echo of the resolved date, so a caller that omitted it knows which
+    /// business day it actually got.
+    pub date: NaiveDate,
+    /// Last date covered by the deposit look-ahead and the in-house scan
+    /// (`date + DEPOSIT_HORIZON_DAYS`).
+    pub through: NaiveDate,
+    /// The writeback age threshold in force, shared with the Track F5 alert.
+    /// Echoed so the desk can see why a two-minute-old job is not listed.
+    pub stall_threshold_minutes: i32,
+    #[serde(flatten)]
+    pub reconcile: LoyaltyReconcile,
+}
+
+/// GET /api/reports/loyalty-reconcile — the five-minute morning read reception
+/// runs at shift open (direct-booking program B8f, checklist **L6**).
+///
+/// `?date=YYYY-MM-DD&branch=hfhotel|hfville`, defaulting to today in Bangkok.
+/// Returns every `book_channel='loyalty'` row that PostgreSQL and iHOTEL
+/// disagree about, in blast-radius order, with the counts summary the desk
+/// reads first. See `docs/runbooks/loyalty-morning-reconcile.md` for the desk
+/// routine and the equivalent read-only SQL for when this route is down.
+///
+/// **A PRE-FLIP control**: it must work while the channel is still dark, which
+/// it does — every query is a partial-index scan matching nothing until the
+/// first app booking exists.
+///
+/// Read-only and PG-only (no MSSQL, no outbox, no writeback), same auth and
+/// the same branch-aware pool selection as the other `/api/reports/*` routes.
+pub async fn get_loyalty_reconcile(
+    State(state): State<AppState>,
+    Query(params): Query<LoyaltyReconcileQuery>,
+) -> ApiResult<Json<LoyaltyReconcileResponse>> {
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel; the report is
+    // per-desk (one shift opens at one property) so cross-site aggregation
+    // would produce a list nobody is responsible for working.
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let date = parse_optional_date(params.date.as_ref(), "date")?.unwrap_or_else(today_bangkok);
+    let threshold = stall_threshold_minutes();
+
+    let reconcile = load_loyalty_reconcile(pool, date, DEPOSIT_HORIZON_DAYS, threshold).await?;
+
+    Ok(Json(LoyaltyReconcileResponse {
+        success: true,
+        date,
+        through: date + chrono::Duration::days(DEPOSIT_HORIZON_DAYS),
+        stall_threshold_minutes: threshold,
+        reconcile,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +915,84 @@ mod tests {
         let (data, gross, before, vat) = aggregate_vat_periods(vec![], 7);
         assert!(data.is_empty());
         assert_eq!((gross, before, vat), (0.0, 0.0, 0.0));
+    }
+
+    // ---- channel rollup window resolution ------------------------------
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    /// No dates at all → the last 30 days ending today, inclusive of both
+    /// ends (30 days, not 31).
+    #[test]
+    fn resolve_window_defaults_to_the_last_30_days() {
+        let today = d("2026-09-10");
+        let (from, to) = resolve_window(None, None, today).unwrap();
+        assert_eq!(to, today);
+        assert_eq!(from, d("2026-08-12"));
+        assert_eq!((to - from).num_days() + 1, 30);
+    }
+
+    /// A lone `from` runs to today; a lone `to` gets the 30-day lead-in.
+    #[test]
+    fn resolve_window_fills_in_the_missing_end() {
+        let today = d("2026-09-10");
+        let (from, to) = resolve_window(Some(d("2026-09-01")), None, today).unwrap();
+        assert_eq!((from, to), (d("2026-09-01"), today));
+
+        let (from, to) = resolve_window(None, Some(d("2026-06-30")), today).unwrap();
+        assert_eq!((from, to), (d("2026-06-01"), d("2026-06-30")));
+    }
+
+    #[test]
+    fn resolve_window_rejects_a_reversed_range() {
+        let err = resolve_window(
+            Some(d("2026-09-10")),
+            Some(d("2026-09-01")),
+            d("2026-09-10"),
+        )
+        .unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => assert!(msg.contains("after")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// 366 days inclusive is allowed (a leap year); 367 is not.
+    #[test]
+    fn resolve_window_caps_the_range_at_366_days() {
+        let today = d("2026-09-10");
+        let to = d("2026-12-31");
+
+        let ok = to - chrono::Duration::days(MAX_RANGE_DAYS - 1);
+        assert!(resolve_window(Some(ok), Some(to), today).is_ok());
+
+        let too_far = to - chrono::Duration::days(MAX_RANGE_DAYS);
+        match resolve_window(Some(too_far), Some(to), today).unwrap_err() {
+            ApiError::BadRequest(msg) => assert!(msg.contains("367"), "got {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_optional_date_treats_blank_as_absent() {
+        assert_eq!(parse_optional_date(None, "from").unwrap(), None);
+        assert_eq!(
+            parse_optional_date(Some(&"   ".to_string()), "from").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_date(Some(&"2026-09-01".to_string()), "from").unwrap(),
+            Some(d("2026-09-01"))
+        );
+    }
+
+    #[test]
+    fn parse_optional_date_rejects_a_malformed_date() {
+        match parse_optional_date(Some(&"2026/09/01".to_string()), "to").unwrap_err() {
+            ApiError::BadRequest(msg) => assert!(msg.contains("`to`")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }

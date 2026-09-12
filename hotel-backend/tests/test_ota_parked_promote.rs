@@ -30,11 +30,14 @@ use uuid::Uuid;
 use hotel_backend::domain::booking::BookingState;
 use hotel_backend::domain::shared::{DateRange, Money};
 use hotel_backend::outbox::intent::BookingChanges;
-use hotel_backend::outbox::{generate_idempotency_key, EventBus, EventSource, OutboxRepository, WritebackIntent};
+use hotel_backend::outbox::{
+    generate_idempotency_key, EventBus, EventSource, OutboxRepository, WritebackIntent,
+};
 use hotel_backend::repository::PgBookingRepository;
 use hotel_backend::service::{
     aggregate_uuid, AggregateKind, BookingRoomCommand, BookingService, BookingSnapshotInputs,
-    BookingWritebackContext, CreateBookingCommand, ModifyBookingCommand,
+    BookingWritebackContext, CreateBookingCommand, ModifyBookingCommand, RoomTypeEdit,
+    ServiceError,
 };
 
 const CI: NaiveDate = date(2026, 8, 10);
@@ -167,19 +170,427 @@ async fn cleanup(pool: &sqlx::PgPool, agg: Uuid, book_id: i32, room_id: i32, cus
 }
 
 async fn writeback_intents(pool: &sqlx::PgPool, agg: Uuid) -> Vec<(String, Uuid)> {
-    sqlx::query("SELECT intent, idempotency_key FROM writeback_jobs WHERE aggregate_id = $1 ORDER BY id")
-        .bind(agg)
-        .fetch_all(pool)
+    sqlx::query(
+        "SELECT intent, idempotency_key FROM writeback_jobs WHERE aggregate_id = $1 ORDER BY id",
+    )
+    .bind(agg)
+    .fetch_all(pool)
+    .await
+    .expect("query writeback_jobs")
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>("intent").unwrap(),
+            r.try_get::<Uuid, _>("idempotency_key").unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// B8c / issue #304 / migration 094 — the desk & OTA create path records the
+/// room type a booking claims, and the recorded value can never contradict the
+/// recorded room.
+///
+/// Four shapes, one body (shared fixtures; CI runs `--test-threads=1`):
+///   (a) PARKED create + `roomTypeId`  → stored as sent (the case the whole
+///       feature exists for: a roomless booking has nowhere else to put it)
+///   (b) roomed create, `roomTypeId` omitted → DERIVED from the assigned room
+///   (c) roomed create, `roomTypeId` contradicting the room → refused (400),
+///       and nothing is committed
+///   (d) the promote edit (parked booking gains its first room) re-derives
+#[tokio::test]
+async fn desk_create_records_the_claimed_room_type() {
+    let pool = common::create_test_pool().await;
+    let (cust_id, room_id, room_no) = create_fixtures(&pool, "03").await;
+
+    // Two types: the room's real one, and a decoy for the disagreement case.
+    let type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ('TEST-OP3A', 'TEST_ota_promote_type_a', 1200.00, 2) \
+         ON CONFLICT (type_code) DO UPDATE SET type_name = EXCLUDED.type_name \
+         RETURNING type_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed type A")
+    .try_get("type_id")
+    .unwrap();
+    let decoy_type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ('TEST-OP3B', 'TEST_ota_promote_type_b', 900.00, 2) \
+         ON CONFLICT (type_code) DO UPDATE SET type_name = EXCLUDED.type_name \
+         RETURNING type_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed type B")
+    .try_get("type_id")
+    .unwrap();
+    sqlx::query("UPDATE ht_rooms_new SET room_type_id = $1 WHERE room_id = $2")
+        .bind(type_id)
+        .bind(room_id)
+        .execute(&pool)
         .await
-        .expect("query writeback_jobs")
-        .into_iter()
-        .map(|r| {
-            (
-                r.try_get::<String, _>("intent").unwrap(),
-                r.try_get::<Uuid, _>("idempotency_key").unwrap(),
-            )
+        .expect("type the fixture room");
+
+    let svc = service(&pool);
+
+    async fn stored_type(pool: &sqlx::PgPool, book_id: i32) -> Option<i32> {
+        sqlx::query("SELECT book_room_type_id FROM ht_bookings WHERE book_id = $1")
+            .bind(book_id)
+            .fetch_one(pool)
+            .await
+            .expect("read booking")
+            .try_get::<Option<i32>, _>("book_room_type_id")
+            .unwrap()
+    }
+
+    fn create_cmd(
+        book_no: &str,
+        cust_id: i32,
+        rooms: Vec<BookingRoomCommand>,
+        room_type_id: Option<i32>,
+        room_no: &str,
+    ) -> CreateBookingCommand {
+        CreateBookingCommand {
+            book_no: book_no.to_string(),
+            book_channel: None,
+            book_ext_ref: None,
+            book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
+            hold_expires_at: None,
+            customer_id: cust_id,
+            check_in: CI,
+            check_out: CO,
+            adults: 2,
+            children: 0,
+            status: "pending".to_string(),
+            source_label: Some("ota".to_string()),
+            total_amount: Some(2400.0),
+            deposit_amount: None,
+            notes: None,
+            rooms,
+            room_type_id,
+            products: vec![],
+            writeback_context: wb_context(cust_id, room_no),
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        }
+    }
+
+    // --- (a) parked create carrying the type ------------------------------
+    //
+    // Parked on the DECOY type on purpose: the room assigned in (d) belongs to
+    // `type_id`, so the promote has to MOVE the attribution. Parking it on the
+    // room's own type would make (d) pass against a service that never
+    // re-derived at all.
+    let parked = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03A",
+            cust_id,
+            vec![],
+            Some(decoy_type_id),
+            "",
+        ))
+        .await
+        .expect("parked create with a declared type");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        Some(decoy_type_id),
+        "(a) a PARKED booking must record the type it claims — it is the only \
+         place the claim exists, and what lets the channel subtract per type"
+    );
+
+    // --- (b) roomed create, type omitted → derived ------------------------
+    let derived = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03B",
+            cust_id,
+            vec![BookingRoomCommand {
+                room_id,
+                price_per_night: Some(1200.0),
+            }],
+            None,
+            &room_no,
+        ))
+        .await
+        .expect("roomed create without a declared type");
+    assert_eq!(
+        stored_type(&pool, derived.book_id).await,
+        Some(type_id),
+        "(b) an omitted roomTypeId is DERIVED from the assigned room"
+    );
+
+    // --- (c) roomed create, type disagrees → refused ----------------------
+    let refused = svc
+        .create(create_cmd(
+            "TEST-OTA-PARK-03C",
+            cust_id,
+            vec![BookingRoomCommand {
+                room_id,
+                price_per_night: Some(1200.0),
+            }],
+            Some(decoy_type_id),
+            &room_no,
+        ))
+        .await;
+    // `ServiceError::Validation` specifically — `routes::new_bookings` maps it
+    // to 400. A bare `is_err()` would also pass on a 500 from the FK, which is
+    // the failure mode the existence check exists to prevent.
+    match refused {
+        Err(ServiceError::Validation(msg)) => {
+            assert!(
+                msg.contains("disagrees"),
+                "(c) the 400 must say WHICH facts disagree; got: {msg}"
+            );
+        }
+        other => panic!(
+            "(c) a roomTypeId contradicting the assigned room must be a \
+             validation error (400), got {other:?}"
+        ),
+    }
+    let orphan: i64 = sqlx::query("SELECT COUNT(*) AS n FROM ht_bookings WHERE book_no = $1")
+        .bind("TEST-OTA-PARK-03C")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .try_get("n")
+        .unwrap();
+    assert_eq!(orphan, 0, "(c) the refused create must commit nothing");
+
+    // --- (d) promote: the parked booking gains its first room -------------
+    svc.modify(ModifyBookingCommand {
+        book_id: parked.book_id,
+        customer_id: cust_id,
+        check_in: CI,
+        check_out: CO,
+        adults: 2,
+        children: 0,
+        status: "pending".to_string(),
+        source_label: Some("ota".to_string()),
+        total_amount: Some(2400.0),
+        deposit_amount: None,
+        notes: None,
+        rooms: vec![BookingRoomCommand {
+            room_id,
+            price_per_night: Some(1200.0),
+        }],
+        // Still omitted (`Keep`) — with a room now assigned the service
+        // re-derives from that room, which is what MOVES the stored type off
+        // the decoy it was parked on.
+        room_type_id: RoomTypeEdit::Keep,
+        changes: empty_changes(),
+        promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
+        before_snapshot: None,
+        after_snapshot: snapshot(),
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+    })
+    .await
+    .expect("promote edit should succeed");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        Some(type_id),
+        "(d) assigning the first room must MOVE the attribution off the decoy \
+         it was parked on and onto the room's own type — the room is the \
+         authoritative fact once one exists"
+    );
+    assert_ne!(
+        stored_type(&pool, parked.book_id).await,
+        Some(decoy_type_id),
+        "(d) the decoy must not survive the promote"
+    );
+
+    for book_id in [parked.book_id, derived.book_id] {
+        cleanup(
+            &pool,
+            aggregate_uuid(AggregateKind::Booking, book_id),
+            book_id,
+            room_id,
+            cust_id,
+        )
+        .await;
+    }
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code IN ('TEST-OP3A', 'TEST-OP3B')")
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// B8c regression — an ORDINARY edit of a parked booking must not wipe its
+/// room-type attribution.
+///
+/// This is the shape the desk actually sends. Both savers omit `roomTypeId`
+/// entirely and post `rooms: []` for a booking that has no room yet, so the
+/// first cut of migration 094 — which wrote `resolve_room_type(...)`
+/// unconditionally on every modify — silently cleared `book_room_type_id` the
+/// moment anyone touched a note or a date. The parked claim then fell back to
+/// the property-wide cap, which is the pre-#304 behaviour: no error, no log,
+/// just the feature quietly undoing itself on first contact with the UI.
+///
+/// The fix is the tri-state [`RoomTypeEdit`]: absent (`Keep`) is not `Clear`.
+#[tokio::test]
+async fn ordinary_edit_of_a_parked_booking_preserves_its_room_type() {
+    let pool = common::create_test_pool().await;
+    let (cust_id, room_id, room_no) = create_fixtures(&pool, "04").await;
+
+    let type_id: i32 = sqlx::query(
+        "INSERT INTO ht_room_types (type_code, type_name, type_base_price, type_max_guests) \
+         VALUES ('TEST-OP4A', 'TEST_ota_promote_type_keep', 1100.00, 2) \
+         ON CONFLICT (type_code) DO UPDATE SET type_name = EXCLUDED.type_name \
+         RETURNING type_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed type")
+    .try_get("type_id")
+    .unwrap();
+
+    let svc = service(&pool);
+
+    async fn stored_type(pool: &sqlx::PgPool, book_id: i32) -> Option<i32> {
+        sqlx::query("SELECT book_room_type_id FROM ht_bookings WHERE book_id = $1")
+            .bind(book_id)
+            .fetch_one(pool)
+            .await
+            .expect("read booking")
+            .try_get::<Option<i32>, _>("book_room_type_id")
+            .unwrap()
+    }
+
+    fn parked_edit(
+        book_id: i32,
+        cust_id: i32,
+        notes: &str,
+        room_type_id: RoomTypeEdit,
+    ) -> ModifyBookingCommand {
+        ModifyBookingCommand {
+            book_id,
+            customer_id: cust_id,
+            check_in: CI,
+            check_out: CO,
+            adults: 2,
+            children: 0,
+            status: "pending".to_string(),
+            source_label: Some("ota".to_string()),
+            total_amount: Some(2400.0),
+            deposit_amount: None,
+            notes: Some(notes.to_string()),
+            // Still parked — the desk has not assigned a room yet.
+            rooms: vec![],
+            room_type_id,
+            changes: empty_changes(),
+            promote_context: None,
+            // B8g: the test drives the service directly, so it keeps the
+            // unlocked shape every other double uses.
+            inventory_lock: None,
+            before_snapshot: None,
+            after_snapshot: snapshot(),
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        }
+    }
+
+    let parked = svc
+        .create(CreateBookingCommand {
+            book_no: "TEST-OTA-PARK-04A".to_string(),
+            book_channel: None,
+            book_ext_ref: None,
+            book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
+            hold_expires_at: None,
+            customer_id: cust_id,
+            check_in: CI,
+            check_out: CO,
+            adults: 2,
+            children: 0,
+            status: "pending".to_string(),
+            source_label: Some("ota".to_string()),
+            total_amount: Some(2400.0),
+            deposit_amount: None,
+            notes: None,
+            rooms: vec![],
+            room_type_id: Some(type_id),
+            products: vec![],
+            writeback_context: wb_context(cust_id, ""),
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
         })
-        .collect()
+        .await
+        .expect("parked create");
+    assert_eq!(stored_type(&pool, parked.book_id).await, Some(type_id));
+
+    // --- the edit the UI actually sends: no roomTypeId, rooms: [] ---------
+    svc.modify(parked_edit(
+        parked.book_id,
+        cust_id,
+        "guest called about a late arrival",
+        RoomTypeEdit::Keep,
+    ))
+    .await
+    .expect("ordinary parked edit");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        Some(type_id),
+        "an edit that never mentions roomTypeId must LEAVE IT ALONE — this is \
+         the shape every desk save of a parked booking takes"
+    );
+
+    // A second edit must be just as harmless (the bug would have cleared it on
+    // the first, so a single-edit test could pass against a one-shot fix).
+    svc.modify(parked_edit(
+        parked.book_id,
+        cust_id,
+        "and again",
+        RoomTypeEdit::Keep,
+    ))
+    .await
+    .expect("second parked edit");
+    assert_eq!(stored_type(&pool, parked.book_id).await, Some(type_id));
+
+    // --- an EXPLICIT null still clears, which is the point of the tri-state -
+    svc.modify(parked_edit(
+        parked.book_id,
+        cust_id,
+        "type withdrawn",
+        RoomTypeEdit::Clear,
+    ))
+    .await
+    .expect("explicit clear");
+    assert_eq!(
+        stored_type(&pool, parked.book_id).await,
+        None,
+        "`\"roomTypeId\": null` is a deliberate clear and must still work — \
+         preserving on absent would be worthless if it also swallowed this"
+    );
+
+    // --- and an explicit id sets it again ---------------------------------
+    svc.modify(parked_edit(
+        parked.book_id,
+        cust_id,
+        "type restored",
+        RoomTypeEdit::Set(type_id),
+    ))
+    .await
+    .expect("explicit set");
+    assert_eq!(stored_type(&pool, parked.book_id).await, Some(type_id));
+
+    cleanup(
+        &pool,
+        aggregate_uuid(AggregateKind::Booking, parked.book_id),
+        parked.book_id,
+        room_id,
+        cust_id,
+    )
+    .await;
+    let _ = room_no;
+    sqlx::query("DELETE FROM ht_room_types WHERE type_code = 'TEST-OP4A'")
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 /// (a) roomless create → no legacy write; (b) later first-room add → exactly one
@@ -196,6 +607,10 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             book_no: "TEST-OTA-PARK-01".to_string(),
             book_channel: None,
             book_ext_ref: None,
+            book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,
@@ -208,6 +623,9 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             deposit_amount: None,
             notes: None,
             rooms: vec![], // parked — no room yet
+            // Parked create with no declared type — the #304 fallback shape
+            // (migration 094 leaves book_room_type_id NULL).
+            room_type_id: None,
             products: vec![],
             writeback_context: wb_context(cust_id, ""),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -241,8 +659,15 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
             room_id,
             price_per_night: Some(1200.0),
         }],
+        // `Keep` = the field was absent from the request. With rooms assigned
+        // the service still DERIVES from the room, so this is the ordinary
+        // desk shape.
+        room_type_id: RoomTypeEdit::Keep,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
         before_snapshot: None,
         after_snapshot: snapshot(),
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -323,6 +748,10 @@ async fn already_mirrored_booking_takes_modify_path() {
             book_no: "TEST-OTA-PARK-02".to_string(),
             book_channel: None,
             book_ext_ref: None,
+            book_ext_ref_fingerprint: None,
+            // B8e / L3: these fixtures drive the service directly and never
+            // race, so they keep the pre-lock path (the channel's shape).
+            inventory_lock: None,
             hold_expires_at: None,
             customer_id: cust_id,
             check_in: CI,
@@ -338,6 +767,9 @@ async fn already_mirrored_booking_takes_modify_path() {
                 room_id,
                 price_per_night: Some(1200.0),
             }],
+            // Omitted on purpose: the service DERIVES it from the assigned
+            // room (migration 094 agree-or-derive rule).
+            room_type_id: None,
             products: vec![],
             writeback_context: wb_context(cust_id, &room_no),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -350,7 +782,10 @@ async fn already_mirrored_booking_takes_modify_path() {
 
     let jobs = writeback_intents(&pool, agg).await;
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].0, "create_booking", "create-with-room enqueues CreateBooking");
+    assert_eq!(
+        jobs[0].0, "create_booking",
+        "create-with-room enqueues CreateBooking"
+    );
 
     // Simulate worker back-population of the legacy id → booking is now mirrored.
     sqlx::query("UPDATE ht_bookings SET legacy_book_id = 'R999002' WHERE book_id = $1")
@@ -376,8 +811,15 @@ async fn already_mirrored_booking_takes_modify_path() {
             room_id,
             price_per_night: Some(1200.0),
         }],
+        // `Keep` = the field was absent from the request. With rooms assigned
+        // the service still DERIVES from the room, so this is the ordinary
+        // desk shape.
+        room_type_id: RoomTypeEdit::Keep,
         changes: empty_changes(),
         promote_context: Some(wb_context(cust_id, &room_no)),
+        // B8g: the test drives the service directly, so it keeps the
+        // unlocked shape every other double uses.
+        inventory_lock: None,
         before_snapshot: None,
         after_snapshot: snapshot(),
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),

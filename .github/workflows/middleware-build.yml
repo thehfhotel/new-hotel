@@ -38,11 +38,11 @@ jobs:
       - name: Checkout
         # v6 pinned to commit SHA — matches docker-build.yml SHA used for
         # the equivalent `actions/checkout@v5.0.0` pin. Supply-chain hygiene.
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6 (matches docker-build.yml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6 (matches docker-build.yml)
 
       - name: Setup Node.js
         # v4 pinned to commit SHA (resolved from `gh api git/refs/tags/v4`).
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -63,7 +63,7 @@ jobs:
 
       - name: Cache Rust dependencies
         # v2 pinned to SHA per Batch D.
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: thai-id-middleware-tauri/src-tauri -> target
           cache-on-failure: true
@@ -133,7 +133,7 @@ jobs:
 
       - name: Create Release
         # v2 pinned to SHA per Batch D.
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           tag_name: middleware-${{ github.event.inputs.release_version }}
           name: Thai ID Middleware ${{ github.event.inputs.release_version }}

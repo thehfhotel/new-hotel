@@ -32,6 +32,8 @@ complete (with date + evidence link) rather than deleting them.
 | V8 | **Cash-entry outbound** — progressed 2026-08-10 (be6bbb4): recipe `execute()` + allocator + `cash_legacy_id` back-population landed, #202 echo guard CLOSED. Still unwired (no route emits the intent) and byte-shape still unverified vs `FrmAddPay.cs:638` — one coordinated capture, then wire + flip | petty-cash parity in iHOTEL reports |
 | V9 | **Deposit refund on legacy-origin folios** — `cr_legacy_ds_id` backfill, then verify the WARN-no-op class is gone | deposit refunds for iHOTEL-created stays |
 | V10 | **Walk-up receipt VAT attribution scope** (finance decision + verify either app's tax report against `HT_Receipt_*`) — elevated: 4.3k receipts/yr | trusting tax reports |
+| V17 | ~~**Mode-1 `HT_Book_Ds.Book_Room_Type` semantics** (migration 094 / #304 B8c) — the "a `Book_room_type=1` header's Ds lines carry a room-TYPE code" reading was decompile-only~~ — **DONE 2026-09-11, see Completed.** Outcome changed the code: one live row carries a room NUMBER, so `resolve_room_type_code` gained a `ht_rooms_new.room_no` fallback. | `book_room_type_id` attribution accuracy |
+| V18 | **Multi-room mode-1 claims are under-counted** — `HT_Book_Ds.Book_Room_Num` can exceed 1 (HF Hotel `R003911` carries `2.0`), but `repository::channel` counts one parked CLAIM per booking regardless, so a legacy booking wanting 2 rooms of a type consumes 1. Pre-existing B8a behaviour, not introduced by B8c, and the live population is tiny (see V17 — 4 mode-1 Ds rows at HF Hotel, 0 at HF Ville, and only 2 of the 4 are `Book_status=1`). Fixing it needs a quantity column plus a weighted count in `inventory_ctes`, not a one-line change. | per-type accuracy for multi-room legacy bookings (low value at current volume) |
 
 
 
@@ -44,6 +46,43 @@ complete (with date + evidence link) rather than deleting them.
 Done items move to the bottom with evidence:
 
 ## Completed
+
+- ~~V17 Mode-1 `HT_Book_Ds.Book_Room_Type` semantics~~ — **VERIFIED 2026-09-11, BOTH sites, read-only**
+  (self-service; `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` so it could not block live
+  reception; documented access pattern from `docs/coexistence/room-calendar-deficit-design.md`,
+  password read from `/home/deploy/secrets/db_password` inside the remote shell and never
+  transcribed):
+
+  Query: `SELECT h.Book_ID, h.Book_room_type, d.Book_Room_Type, d.Book_Room_Num, d.Book_status
+  FROM HT_Book_H h JOIN HT_Book_Ds d ON d.Book_No = h.Book_ID WHERE h.Book_room_type = 1`.
+
+  **HF Hotel** (`db`): 6 `Book_room_type = 1` headers out of **16,208** total; 4 joined
+  `HT_Book_Ds` rows:
+
+  | Book_ID | Book_Room_Type | Book_Room_Num | Book_status |
+  |---|---|---|---|
+  | R003911 | `เตียงเดี่ยว` | 2.0 | 3 (cancelled) |
+  | R004003 | `เตียงเดี่ยว` | 1.0 | 1 (active) |
+  | R004004 | `เตียงเดี่ยว` | 1.0 | 1 (active) |
+  | R014814 | `402` | 1.0 | 3 (cancelled) |
+
+  **HF Ville** (`HOTEL`): **0** mode-1 headers out of 2,460 — the shape does not occur there at all.
+
+  `เตียงเดี่ยว` is `HT_SET_RoomType.name` id 2 (`id_full` `02`), so it resolves through
+  `ht_room_types.type_name` exactly as designed. **`R014814` disproves the pure reading**: a
+  mode-1 line CAN hold a room NUMBER. The decompile-derived assumption was therefore RIGHT for
+  3 of 4 rows and WRONG for the fourth, which is why this was gated.
+
+  **Code changed as a result** (this PR): `sync::mappers::booking::resolve_room_type_code` now
+  falls back to `ht_rooms_new.room_no` when the value matches no type, borrowing that room's
+  `room_type_id`. Type lookup still runs FIRST, so a genuine type can never be read as a room;
+  a value that is neither still lands on `NULL` (warned once) and the claim falls back to the
+  property-wide cap. Covered by `tests/test_sync_phase53_integration.rs`
+  (`mapper_records_the_room_type_of_a_parked_legacy_booking`, case b2).
+
+  Residual, split out as **V18**: `Book_Room_Num = 2.0` on `R003911` means one legacy booking can
+  claim two rooms of a type while `repository::channel` counts it as a single parked claim. That
+  is pre-existing B8a behaviour and was left unchanged deliberately — see V18.
 
 - ~~V11 Layout-edit writeback echo round-trip~~ — PASSED 2026-08-11 (self-service, at night):
   room 301 moved (683,704)→(683,744) via the real `PUT /api/rooms/layout` route from an

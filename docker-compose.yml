@@ -633,6 +633,85 @@ services:
       # "accepted WITHOUT a bearer token" WARNs — see docs/ota-bridge.md.
       - OTA_BRIDGE_ENABLED=${OTA_BRIDGE_ENABLED:-true}
       - OTA_BRIDGE_ENFORCE=${OTA_BRIDGE_ENFORCE:-true}
+      # Loyalty-app integration (docs/loyalty-channel.md) — SHIPS DARK.
+      #
+      # ADR 0004 applies to LOYALTY_CHANNEL_ENABLED exactly as to OTA_BRIDGE_*
+      # above: THE DEFAULT BELOW IS THE LIVE PRODUCTION VALUE, the key is
+      # deliberately NOT in .github/workflows/docker-build.yml, and it is NOT a
+      # GitHub repo variable. Flip it by editing the default here —
+      # docker-compose.yml is in the workflow's `deploy` paths filter, so the
+      # edit triggers its own deploy and the flip is a one-line reviewable diff
+      # that `git log -S LOYALTY_CHANNEL_ENABLED` can date. Adding the key back
+      # to the workflow would make this default unreachable and leave this file
+      # asserting the channel is dark while it is writing to the legacy DB;
+      # `lint-deploy-flag-ownership` fails CI if anyone does.
+      #
+      # Off ⇒ EVERY /api/channel/* request answers 503 before any credential is
+      # looked at (middleware::channel_token). Flipping it on is NOT "just
+      # config": a channel hold writes into the shared legacy DB as a normal จอง
+      # the moment it is created (coexistence invariant #6), so it needs a
+      # reception-coordinated live verification.
+      #
+      # There is ONE flag for BOTH properties — routes::channel::
+      # channel_service_for gates only HF Ville mutations (on
+      # HFVILLE_WRITES_ENABLED) and HF Hotel has no second gate — so this flip
+      # opens the mutating channel at HF Hotel and HF Ville in the same deploy.
+      # A single-property canary can only be enforced by the caller (the loyalty
+      # app choosing which `property=` it sends). See docs/loyalty-channel.md →
+      # "Go-live checklist".
+      - LOYALTY_CHANNEL_ENABLED=${LOYALTY_CHANNEL_ENABLED:-false}
+      # B8e / L2 — how many sellable rooms each property keeps for the FRONT
+      # DESK. With the channel's surplus for the requested nights at or below
+      # this number, a hold is refused 409 `reason: last_room_held_for_desk`;
+      # reception is NOT gated and can still sell the room. NOT a legacy-write
+      # flag and NOT an allotment — it caps nothing while the property has
+      # slack (loyalty-app ADR-0003) — but it is compose-owned like its
+      # siblings above so a change is a reviewable diff, and deliberately
+      # absent from docker-build.yml for that reason.
+      #
+      # SHIPS DARK AT 0. The refusal is only useful once loyalty-app renders
+      # call-the-desk copy for `reason: last_room_held_for_desk`; until then a
+      # floored hold reaches the guest as an unexplained failure, which is
+      # worse than the race it prevents. That loyalty-app change is filed
+      # separately — flip this to 1 AFTER it is live, and verify with a hold
+      # against a property drained to its last room.
+      #
+      # (The Rust default is 1, not 0: an unset or garbled value must not
+      # silently remove an inventory guard. The dark default is asserted HERE,
+      # once, where it can be reviewed and dated by `git log -S`.)
+      - LOYALTY_CHANNEL_LAST_ROOM_FLOOR=${LOYALTY_CHANNEL_LAST_ROOM_FLOOR:-0}
+      # B8e / L3 — kill switch for the per-property booking-inventory advisory
+      # lock that serialises pick -> create on the channel hold path and the
+      # desk/OTA create path.
+      #
+      # DEFAULT ON, which is the opposite polarity to every flag above: those
+      # ship dark because they OPEN a legacy write, this one CLOSES a
+      # double-sell window. Setting it false re-opens the race where two holds
+      # (or a hold and a desk booking) both take the property's last room.
+      # It exists so an operator can un-serialise booking creates during an
+      # incident without waiting for a rollback deploy — not a tuning knob.
+      - BOOKING_INVENTORY_LOCK_ENABLED=${BOOKING_INVENTORY_LOCK_ENABLED:-true}
+      # Loyalty-app base URL for the OUTBOUND checkout→stay hook (accrual).
+      # Blank ⇒ hook off. Accrual needs BOTH this and the LOYALTY_SERVICE_TOKEN
+      # secret file; with either missing, LoyaltyClient::from_config yields None
+      # and no stay ever accrues points (the checkout itself is unaffected).
+      #
+      # Unlike the flag above this one DOES ride the workflow as
+      # `vars.LOYALTY_APP_URL || ''` — a per-environment URL is the category ADR
+      # 0004 leaves on the variable path (ROUND_WRITEBACK_ENABLED /
+      # HFID_LOCATION_URL family). The two literals must stay identical;
+      # `lint-deploy-flag-ownership` asserts it.
+      - LOYALTY_APP_URL=${LOYALTY_APP_URL:-}
+      # NOTE: LOYALTY_CHANNEL_TOKEN and LOYALTY_SERVICE_TOKEN are SECRETS and so
+      # deliberately have NO `environment:` entry. They ride the deploy payload's
+      # `.secrets` block → /home/deploy/secrets/<name> → /run/secrets/<name>
+      # (hotel-backend/src/secrets.rs::SECRET_FILE_MAP maps both files).
+      # Their compose `secrets:` declaration landed ONE DEPLOY AFTER the payload
+      # keys (#296), exactly as ota_bridge_token and hfid_resolve_secret did —
+      # see the `secrets:` list below and docs/loyalty-channel.md →
+      # "Provisioning (deploy plumbing)" step 2. Mounting the files does not
+      # open anything: the channel still needs LOYALTY_CHANNEL_ENABLED (false,
+      # just above) and the stay hook still needs LOYALTY_APP_URL (blank).
     secrets:
       - db_password
       - postgres_password
@@ -659,6 +738,14 @@ services:
       #
       # Backend only; no worker resolves badges.
       - hfid_resolve_secret
+      # Loyalty-app bearers (docs/loyalty-channel.md). Backend only — no worker
+      # serves /api/channel/* or fires the checkout stay hook. SAFE to declare
+      # for the same reason as the entries above: the deploy payload has carried
+      # both `.secrets` keys since #296, so run-deploy.sh has already written
+      # both host files (empty while the GH secrets are unset, which the
+      # hydrator treats as absent — every gate stays closed).
+      - loyalty_channel_token
+      - loyalty_service_token
     volumes:
       # Thai-ID card template background now ships IN the image (Dockerfile:
       # /app/assets/thai_id_template.png) and is the default THAI_ID_TEMPLATE_PATH,
@@ -1446,15 +1533,36 @@ networks:
 # reads `std::env::var("DB_PASSWORD")` keeps working unchanged.
 #
 # DEPLOY-TIME PREREQUISITES on evergreen (must exist BEFORE merge / pipeline
-# runs `docker compose up`). The deploy script (`/srv/run-deploy.sh` on
-# evergreen, NOT in this repo) is responsible for writing these from GH
-# secrets, chmod 0400, chown deploy:docker:
+# runs `docker compose up`). The deploy script (`scripts/deploy/run-deploy.sh`
+# in this repo, self-updating `/srv/run-deploy.sh` on evergreen) is responsible
+# for writing these from the payload's `.secrets` block — `install -m 0444 -o
+# deploy -g docker`, one uniform loop over EVERY key, so a newly added secret
+# lands with exactly the same mode as the ones below.
+#
+# 0444, not 0400: the backend container's non-root `appuser` has to read the
+# bind-mounted file (v2.66.2 operator note). Tightening it is a tracked
+# follow-up with its own reasoning block in run-deploy.sh — do not "fix" the
+# mode in passing.
+#
+# One file per key under the top-level `secrets:` block at the end of this
+# file — that block is the authority; keep this list in step with it:
 #
 #     /home/deploy/secrets/db_password
 #     /home/deploy/secrets/postgres_password
-#     /home/deploy/secrets/ville_db_password   # symlink to postgres_password
-#                                              # until ADR 0001 Phase 8 split
+#     /home/deploy/secrets/ville_db_password   # a REAL file per key (one value
+#                                              # per secret, no symlink); still
+#                                              # the postgres value until HF
+#                                              # Ville gets its own credential
+#                                              # (ADR 0002)
 #     /home/deploy/secrets/slack_webhook_url
+#     /home/deploy/secrets/ota_bridge_token
+#     /home/deploy/secrets/ota_bridge_token_previous   # normally EMPTY
+#     /home/deploy/secrets/hfid_resolve_secret
+#     /home/deploy/secrets/loyalty_channel_token       # EMPTY until minted
+#     /home/deploy/secrets/loyalty_service_token       # EMPTY until minted
+#
+# An EMPTY file is fine (the hydrator treats it as absent, the gate stays
+# closed); a MISSING file is not — see below.
 #
 # An entry under `secrets:` that points to a missing file fails fast with
 #     "no such file or directory" before any container starts — operators
@@ -1502,3 +1610,22 @@ secrets:
   # secrets" for the three-names-one-secret table.
   hfid_resolve_secret:
     file: ${SECRETS_DIR:-/home/deploy/secrets}/hfid_resolve_secret
+  # Loyalty-app integration bearers (docs/loyalty-channel.md → "Provisioning
+  # (deploy plumbing)", step 2). Declared ONE DEPLOY AFTER the docker-build.yml
+  # payload keys `.secrets.loyalty_channel_token` / `.secrets.loyalty_service_token`
+  # (landed in #296), so both host files exist — the same stagger, and the same
+  # reason, as the OTA pair and hfid_resolve_secret above.
+  #
+  # `loyalty_channel_token` is the INBOUND bearer the loyalty app presents on
+  # /api/channel/*; `loyalty_service_token` is the OUTBOUND bearer this PMS
+  # presents on the checkout stay hook (it must hold the identical string as the
+  # loyalty app's own service token).
+  #
+  # Mounting them changes NOTHING about the dark state: the channel surface is
+  # additionally gated on LOYALTY_CHANNEL_ENABLED (false, compose-owned per ADR
+  # 0004) and the stay hook needs LOYALTY_APP_URL as well. An unset GH secret
+  # yields an EMPTY file, which the hydrator treats as absent.
+  loyalty_channel_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_channel_token
+  loyalty_service_token:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/loyalty_service_token

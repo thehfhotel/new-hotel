@@ -13,6 +13,41 @@
 //! 3. Enqueues the matching [`WritebackIntent`] in the outbox.
 //! 4. Publishes a [`DomainEvent`] on the bus.
 //! 5. Commits — all four effects atomic.
+//!
+//! # Lock order — **bookings before rooms**
+//!
+//! Every method here holds several row locks at once, and in PostgreSQL a plain
+//! `UPDATE` takes the same exclusive row lock as `SELECT … FOR UPDATE`. So the
+//! ORDER in which these statements appear IS a lock order, and two transactions
+//! that take the same two rows in opposite orders deadlock (`40P01`) — which
+//! reaches the desk as a 500 with the loser's outbox intent rolled back.
+//!
+//! The canonical order for this repo is:
+//!
+//! > **`ht_bookings` → `ht_checkins` / `ht_checkin_rooms` → `ht_rooms_new`**
+//!
+//! | path | booking row | room row |
+//! |---|---|---|
+//! | [`CheckInService::check_in_to_booking`] | `lock_booking_for_check_in` (B7b guard), then `set_booking_checkedin` | `mark_room_occupied`, after |
+//! | [`CheckInService::check_out`], whole stay | `set_booking_completed` | `mark_room_available_dirty`, after |
+//! | [`CheckInService::check_out`], per-room | `set_booking_completed` (header-completion block) | `mark_room_available_dirty` loop, after |
+//! | `service::housekeeping::lock_room_clean`, `service::hk_reports`'s `lock_room` | — | room only, so they can never close a cycle |
+//! | `repository::channel`'s `lock_channel_booking`, `BookingService::cancel` | booking only | — |
+//!
+//! Checkout used to run room-then-booking, which was harmless while check-in
+//! took no booking lock. B7b's guard made check-in booking-first, and that
+//! turned the pair into a real cycle: a maid marking room R clean parks the
+//! desk's check-in at `mark_room_occupied` **while it holds booking B**, and a
+//! concurrent checkout of the previous stay on B in R holds R and wants B.
+//! Reordering CHECKOUT (not the guard) is what removes it — both writes are
+//! unconditional in the same transaction, so the swap changes no behaviour.
+//!
+//! **Anything new that locks both must take the booking first.** The one known
+//! exception is `bin/migrate_legacy.rs`, which inserts `ht_rooms_new` before
+//! `ht_bookings` inside a single transaction spanning the whole dataset. It is
+//! an offline one-shot import, never run alongside live reception traffic, so
+//! it is recorded here rather than reordered — but if it ever becomes something
+//! that runs against a live site, it has to flip.
 
 use std::sync::Arc;
 
@@ -25,7 +60,9 @@ use crate::domain::shared::{DateRange, Money};
 use crate::outbox::event::{CheckInSnapshot, DomainEvent, EventSource};
 use crate::outbox::intent::{CreateCheckInPayload, WritebackIntent};
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
-use crate::repository::checkin::{CheckInInsert, CheckInRepository, CheckOutWrite};
+use crate::repository::checkin::{
+    BookingCheckInState, CheckInInsert, CheckInRepository, CheckOutWrite,
+};
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
@@ -435,6 +472,20 @@ impl CheckInService {
         }
 
         let mut tx = self.pg.begin().await?;
+
+        // B7b — the BOOKING-level guard. `count_active_for_room` above only
+        // asks "is this room busy?", so a second POST for the same booking
+        // aimed at a DIFFERENT room sailed through and minted a second stay on
+        // one reservation (two folios, two legacy `HT_CheckIn_H` rows, one
+        // booking). Inside the transaction and behind the booking's own row
+        // lock, so two simultaneous requests serialise instead of both
+        // observing "no open stay".
+        let booking_state = self
+            .repo
+            .lock_booking_for_check_in(&mut tx, cmd.booking_id)
+            .await
+            .map_err(map_booking_lock_error)?;
+        reject_double_checkin(cmd.booking_id, &booking_state)?;
 
         let cin_id = self
             .repo
@@ -1272,11 +1323,14 @@ impl CheckInService {
                 )));
             }
 
-            for (_, room_id, _, _) in &selected {
-                self.repo
-                    .mark_room_available_dirty(&mut tx, *room_id)
-                    .await?;
-            }
+            // Lock order: BOOKING before ROOM — the header-completion block
+            // (which is what writes `ht_bookings`) runs BEFORE the room loop.
+            //
+            // Nothing here depends on the rooms having been flipped: the
+            // `remaining_active` count reads `ht_checkin_rooms.cr_room_status`,
+            // which the UPDATE above already set, and `mark_room_available_dirty`
+            // touches only `ht_rooms_new`. So moving the block up is a pure
+            // reordering. See the "Lock order" section of this module's doc.
 
             // Header completes ONLY when no room is still in-house.
             let remaining_active: i64 = sqlx::query_scalar(
@@ -1304,6 +1358,12 @@ impl CheckInService {
                 if let Some(booking_id) = status.cin_book_id {
                     self.repo.set_booking_completed(&mut tx, booking_id).await?;
                 }
+            }
+
+            for (_, room_id, _, _) in &selected {
+                self.repo
+                    .mark_room_available_dirty(&mut tx, *room_id)
+                    .await?;
             }
 
             // One CheckOut intent per room: folio totals stay whole-stay (so
@@ -1371,13 +1431,19 @@ impl CheckInService {
             )
             .await?;
 
-        self.repo
-            .mark_room_available_dirty(&mut tx, status.cin_room_id)
-            .await?;
-
+        // Lock order: BOOKING before ROOM. Both are plain UPDATEs, which take
+        // the same exclusive row lock `SELECT … FOR UPDATE` does, so their
+        // ORDER is a lock order. Swapping these two lines is the whole of the
+        // fix — no condition, no behaviour, no extra statement changes. See the
+        // "Lock order" section of this module's doc for why the direction has
+        // to match `check_in_to_booking`'s.
         if let Some(booking_id) = status.cin_book_id {
             self.repo.set_booking_completed(&mut tx, booking_id).await?;
         }
+
+        self.repo
+            .mark_room_available_dirty(&mut tx, status.cin_room_id)
+            .await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
         // Audit H1: thread real revenue + nights + balance into the intent
@@ -1551,6 +1617,113 @@ fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
     Ok(())
 }
 
+/// `lock_timeout` on the B7b booking-row guard is CONTENTION, not a fault.
+///
+/// PostgreSQL raises SQLSTATE `55P03` (`lock_not_available`) when the
+/// `SET LOCAL lock_timeout` in `lock_booking_for_check_in` expires — someone
+/// else (realistically a CT sync table-tick, which holds one PG transaction
+/// across N MSSQL round trips) is holding the booking row. Nothing was written
+/// and the identical request will normally succeed, so it maps to
+/// [`ServiceError::Busy`] → `503` + `Retry-After`, never to the `500` that
+/// `From<sqlx::Error>` would produce.
+///
+/// It reuses the desk router's existing `inventory_lock_timeout` reason code
+/// rather than inventing a second one. That is deliberate and follows
+/// `crate::error::BUSY_REASON`'s own argument: to a caller the two are one
+/// condition — transient write contention, nothing written, retry the identical
+/// request — and a distinction it cannot act on differently is not worth a
+/// second code.
+fn map_booking_lock_error(err: sqlx::Error) -> ServiceError {
+    if let sqlx::Error::Database(ref db) = err {
+        if db.code().as_deref() == Some("55P03") {
+            tracing::warn!(
+                detail = %db,
+                "booking-row guard timed out waiting on ht_bookings; answering 503"
+            );
+            return ServiceError::busy(
+                "this booking is being updated right now; please retry in a moment",
+            );
+        }
+    }
+    ServiceError::Repository(err)
+}
+
+/// Guard: one booking may not carry more OPEN check-ins than it has assigned
+/// rooms (B7b).
+///
+/// ## The hole this closes
+///
+/// [`CheckInService::check_in_to_booking`] guarded the TARGET ROOM only
+/// (`count_active_for_room`). A second `POST /api/new/checkins` carrying the
+/// same `booking_id` but a different `room_id` — a double-click that retried
+/// against a re-picked room, two receptionists on the same arrival, an OTA
+/// bridge replay — passed every check and created a SECOND stay on one
+/// reservation: two canonical folios, two byte-parity `HT_CheckIn_H` rows in
+/// iHOTEL, one booking. Nothing downstream unpicks that; reception discovers
+/// it at checkout.
+///
+/// ## The ceiling is the ROOM COUNT, not one
+///
+/// A genuinely multi-room booking legitimately carries one open stay PER
+/// ASSIGNED ROOM, so the refusal fires at `open >= max(assigned_rooms, 1)`:
+///
+/// | assigned rooms | open check-ins | verdict |
+/// |---|---|---|
+/// | 0 (parked) | 0 | allow — one stay is the ceiling |
+/// | 1 | 0 | allow — the ordinary arrival |
+/// | 1 | 1 | **refuse** — the B7b bug |
+/// | 3 | 2 | allow — the third room may still arrive |
+/// | 3 | 3 | **refuse** — fully checked in |
+///
+/// `max(_, 1)` covers the parked case: a booking with no `ht_booking_rooms`
+/// rows yet has a ceiling of one stay, not zero (zero would refuse every
+/// check-in of a roomless booking).
+///
+/// The multi-room rows are unreachable from THIS endpoint today —
+/// [`reject_multi_room_checkin`] already refuses `assigned_rooms > 1` a few
+/// lines earlier — and that is deliberate: this guard must not become the
+/// thing that has to be rewritten when multi-room check-in lands. It states
+/// the rule the domain actually has.
+///
+/// ## Why not `ServiceError::Conflict`
+///
+/// `map_create_checkin_error` rewrites every `Conflict` to the fixed sentence
+/// "Room is currently occupied" (400) — accurate for the room guard, a lie
+/// here, and it would drop the id. [`ServiceError::ConflictWithReason`]
+/// carries the stable `booking_already_checked_in` code plus the open stay's
+/// `cin_id` through to a 409, so the desk can be sent to the folio that
+/// already exists.
+fn reject_double_checkin(booking_id: i32, state: &BookingCheckInState) -> ServiceResult<()> {
+    let ceiling = state.assigned_room_count.max(1);
+    let open = state.open_check_in_ids.len() as i64;
+    if open < ceiling {
+        return Ok(());
+    }
+
+    // Oldest open stay — the one a receptionist should be looking at.
+    let existing = state.open_check_in_ids.first().copied();
+    let message = match (ceiling, existing) {
+        (1, Some(cin_id)) => format!(
+            "booking {booking_id} is already checked in (check-in {cin_id}) — \
+             open that folio instead of creating a second one"
+        ),
+        (_, Some(cin_id)) => format!(
+            "booking {booking_id} already has {open} open check-in(s) for its {ceiling} \
+             assigned rooms (first: check-in {cin_id}) — every room is occupied"
+        ),
+        // Unreachable (`open >= ceiling >= 1` means the list is non-empty),
+        // but a guard that panicked on its own arithmetic would be worse than
+        // one that refuses without an id.
+        (_, None) => format!("booking {booking_id} is already checked in"),
+    };
+
+    Err(ServiceError::ConflictWithReason {
+        reason: crate::error::BOOKING_ALREADY_CHECKED_IN_REASON,
+        message,
+        conflicting_id: existing,
+    })
+}
+
 /// Guard: an "extension" whose new departure date EQUALS the folio's current
 /// `cin_expected_checkout` changes nothing, so it must not reach the outbox.
 ///
@@ -1636,6 +1809,7 @@ mod tests {
     //! cleanly when PG is not reachable so `cargo test` without a DB
     //! still passes the rest of the suite.
     use super::*;
+    use crate::error::ApiError;
     use crate::outbox::event::EventSource;
     use crate::outbox::{EventBus, OutboxRepository};
     use crate::repository::checkin::PgCheckInRepository;
@@ -1654,6 +1828,79 @@ mod tests {
         // rows yet (data gap). Only >1 is the unsupported multi-room case.
         assert!(reject_multi_room_checkin(1).is_ok());
         assert!(reject_multi_room_checkin(0).is_ok());
+    }
+
+    // B7b — the booking-level double-check-in guard, as a pure decision.
+
+    fn booking_state(open: &[i32], assigned_rooms: i64) -> BookingCheckInState {
+        BookingCheckInState {
+            open_check_in_ids: open.to_vec(),
+            assigned_room_count: assigned_rooms,
+        }
+    }
+
+    #[test]
+    fn a_booking_with_no_open_stay_may_be_checked_in() {
+        // The ordinary arrival, and the parked (roomless) booking whose
+        // ceiling is one stay rather than zero.
+        assert!(reject_double_checkin(7, &booking_state(&[], 1)).is_ok());
+        assert!(reject_double_checkin(7, &booking_state(&[], 0)).is_ok());
+    }
+
+    #[test]
+    fn a_second_check_in_on_a_single_room_booking_is_refused_with_the_open_stay_id() {
+        // The B7b bug itself: the caller aimed at a DIFFERENT, free room, so
+        // `count_active_for_room` had nothing to say. Only the booking-level
+        // guard can refuse this.
+        let err = reject_double_checkin(7, &booking_state(&[4242], 1))
+            .expect_err("a booking already checked in must be refused");
+
+        match err {
+            ServiceError::ConflictWithReason {
+                reason,
+                conflicting_id,
+                ref message,
+            } => {
+                // The `reason` is a wire contract loyalty-app / the desk UI
+                // branch on — pinned to the literal, not to the constant, so
+                // renaming the constant fails here instead of silently
+                // changing the contract.
+                assert_eq!(reason, "booking_already_checked_in");
+                assert_eq!(
+                    conflicting_id,
+                    Some(4242),
+                    "the refusal must name the folio that already exists"
+                );
+                assert!(message.contains("4242"), "message was: {message}");
+            }
+            other => panic!("expected ConflictWithReason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_a_409_not_the_room_occupied_400() {
+        // Guards the whole point of the dedicated variant: `Conflict` is
+        // flattened to 400 by `From<ServiceError> for ApiError` AND rewritten
+        // to "Room is currently occupied" by `map_create_checkin_error`.
+        let err = reject_double_checkin(7, &booking_state(&[1], 1)).unwrap_err();
+        assert!(
+            matches!(ApiError::from(err), ApiError::ConflictWithReason { .. }),
+            "the booking-level refusal must not collapse into the room-occupied 400"
+        );
+    }
+
+    #[test]
+    fn a_multi_room_booking_allows_one_open_stay_per_assigned_room() {
+        // Unreachable through today's route (`reject_multi_room_checkin`
+        // refuses >1 room first) — asserted anyway so the rule is the domain's
+        // and not an artefact of the interim single-room restriction.
+        assert!(reject_double_checkin(7, &booking_state(&[1, 2], 3)).is_ok());
+        assert!(
+            reject_double_checkin(7, &booking_state(&[1, 2, 3], 3)).is_err(),
+            "a fully checked-in multi-room booking takes no further stays"
+        );
+        // More open stays than rooms (historic data) must still refuse.
+        assert!(reject_double_checkin(7, &booking_state(&[1, 2, 3, 4], 3)).is_err());
     }
 
     async fn try_pool() -> Option<PgPool> {
@@ -2404,7 +2651,10 @@ mod extend_tests {
         match err {
             ServiceError::Validation(msg) => {
                 assert!(msg.contains("nothing to change"), "got: {msg}");
-                assert!(msg.contains("2026-08-21"), "message must name the date: {msg}");
+                assert!(
+                    msg.contains("2026-08-21"),
+                    "message must name the date: {msg}"
+                );
             }
             other => panic!("expected Validation, got {other:?}"),
         }
@@ -2430,7 +2680,9 @@ mod extend_tests {
     #[tokio::test]
     async fn extend_rejects_no_op_same_date_and_enqueues_nothing() {
         let Some(pool) = try_pool().await else {
-            eprintln!("skipping extend_rejects_no_op_same_date_and_enqueues_nothing — PG not reachable");
+            eprintln!(
+                "skipping extend_rejects_no_op_same_date_and_enqueues_nothing — PG not reachable"
+            );
             return;
         };
         let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "noop").await else {
@@ -2481,7 +2733,9 @@ mod extend_tests {
     #[tokio::test]
     async fn extend_still_lands_real_changes_in_both_directions() {
         let Some(pool) = try_pool().await else {
-            eprintln!("skipping extend_still_lands_real_changes_in_both_directions — PG not reachable");
+            eprintln!(
+                "skipping extend_still_lands_real_changes_in_both_directions — PG not reachable"
+            );
             return;
         };
         let Some((cin_id, checkin_date, expected_checkout)) = seed_stay(&pool, "real").await else {
@@ -2498,7 +2752,9 @@ mod extend_tests {
 
         // Earlier: the shorten / re-date edit.
         let earlier = expected_checkout;
-        let shorten_result = svc.extend(sample_extend(cin_id, checkin_date, earlier)).await;
+        let shorten_result = svc
+            .extend(sample_extend(cin_id, checkin_date, earlier))
+            .await;
         let after_shorten = checkout_and_updated_at(&pool, cin_id).await.0;
         let jobs_after_shorten = writeback_job_count(&pool, cin_id).await;
 
@@ -2532,7 +2788,11 @@ mod extend_tests {
     /// Same shape `routes::new_checkins::build_extend_stay_command` produces:
     /// UTC-midnight boundaries, one-room folio, totals that the recipe
     /// re-aggregates anyway.
-    fn sample_extend(cin_id: i32, checkin_date: NaiveDate, new_checkout: NaiveDate) -> ExtendStayCommand {
+    fn sample_extend(
+        cin_id: i32,
+        checkin_date: NaiveDate,
+        new_checkout: NaiveDate,
+    ) -> ExtendStayCommand {
         ExtendStayCommand {
             check_in_id: cin_id,
             new_end: utc_midnight(new_checkout),
@@ -2669,5 +2929,485 @@ mod extend_tests {
                 .execute(pool)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod checkin_to_booking_tests {
+    //! Task B7a — the booking LINK a from-reservation check-in must create.
+    //!
+    //! `CreateCheckInRequest.booking_id` has been accepted by the route since
+    //! the spike, but until B7a no frontend call site sent it: every POST
+    //! /api/checkins was room-only, so a stay created in our app had
+    //! `cin_book_id` NULL. That link is what the B7 app-deposit signposts
+    //! resolve through (`GET /api/checkins/:id/deposits` joins
+    //! `ht_bookings` via `ci.cin_book_id`), and it is what flips the booking
+    //! out of the arrivals list — so a silent NULL there means reception reads
+    //! "unpaid" on a guest who already paid, and the reservation still looks
+    //! like it is arriving.
+    //!
+    //! Same layout as `change_room_tests` / `extend_tests`: integration-style
+    //! against the PG test database, skipped at runtime when PG is unreachable
+    //! so the suite still passes without a DB.
+
+    use super::*;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::{EventBus, OutboxRepository};
+    use crate::repository::checkin::PgCheckInRepository;
+    use chrono::{NaiveTime, TimeZone};
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    fn build_service(pool: PgPool) -> CheckInService {
+        let repo: Arc<dyn crate::repository::checkin::CheckInRepository> =
+            Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        CheckInService::new(repo, outbox, events, pool)
+    }
+
+    fn utc_midnight(day: NaiveDate) -> DateTime<Utc> {
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+        Utc.from_utc_datetime(&day.and_time(midnight))
+    }
+
+    /// Same shape `routes::new_checkins::build_check_in_writeback_context`
+    /// produces for a from-reservation check-in with NO desk deposit — which is
+    /// the normal case for an app booking, whose money is already in the bank
+    /// (`ht_bookings.book_deposit_amount`) rather than in the drawer.
+    fn sample_context(
+        room_no: &str,
+        stay_start: NaiveDate,
+        stay_end: NaiveDate,
+    ) -> CheckInWritebackContext {
+        CheckInWritebackContext {
+            legacy_cust_no: None,
+            linked_legacy_book_id: None,
+            room_no: room_no.to_string(),
+            room_type: "Standard".to_string(),
+            stay: DateRange::new(utc_midnight(stay_start), utc_midnight(stay_end)),
+            price_per_night: Money::from_baht(900),
+            nights: 2,
+            price_total: Money::from_baht(1800),
+            created_by: String::new(),
+            guest_name_for_registry: "B7a Tester".to_string(),
+            guest_country: "ไทย".to_string(),
+            customer_phone: None,
+            deposit: Money::ZERO,
+            photo_tmp_no: None,
+        }
+    }
+
+    struct Seed {
+        cust_id: i32,
+        room_id: i32,
+        book_id: i32,
+        room_no: String,
+    }
+
+    /// Seed `(customer, room, booking, ht_booking_rooms)` for one single-room
+    /// reservation arriving today. Returns `None` if any step fails.
+    async fn seed_booking(pool: &PgPool, marker: &str) -> Option<Seed> {
+        // Clear anything an aborted earlier run left behind — a poisoned seed
+        // makes the test SKIP, and a test that quietly stops testing is worse
+        // than one that fails.
+        if let Ok(Some(stale)) =
+            sqlx::query_scalar::<_, i32>("SELECT book_id FROM ht_bookings WHERE book_no = $1")
+                .bind(format!("BK-B7A-{marker}"))
+                .fetch_optional(pool)
+                .await
+        {
+            cleanup(pool, stale).await;
+        }
+
+        let cust_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_customers (cust_firstname, cust_lastname) \
+             VALUES ($1, 'TestB7a') RETURNING cust_id",
+        )
+        .bind(format!("Guest_{marker}"))
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        let room_no = format!("B7A{marker}");
+        let room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'available') RETURNING room_id",
+        )
+        .bind(&room_no)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        // `confirmed` + a recorded deposit = exactly what the UI rule
+        // (`lib/v2/checkin-from-booking`) calls ready to check in.
+        let book_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_bookings (\
+                book_no, book_cust_id, book_checkin, book_checkout, book_status, \
+                book_channel, book_deposit_amount\
+             ) VALUES ($1, $2, CURRENT_DATE, CURRENT_DATE + 2, 'confirmed', 'loyalty', 600) \
+             RETURNING book_id",
+        )
+        .bind(format!("BK-B7A-{marker}"))
+        .bind(cust_id)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        sqlx::query(
+            "INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night) \
+             VALUES ($1, $2, 900)",
+        )
+        .bind(book_id)
+        .bind(room_id)
+        .execute(pool)
+        .await
+        .ok()?;
+
+        Some(Seed {
+            cust_id,
+            room_id,
+            book_id,
+            room_no,
+        })
+    }
+
+    /// Best-effort teardown of everything [`seed_booking`] planted, plus any
+    /// check-in the test created against it. Ordered so FKs are satisfied.
+    async fn cleanup(pool: &PgPool, book_id: i32) {
+        let cin_ids: Vec<i32> =
+            sqlx::query_scalar("SELECT cin_id FROM ht_checkins WHERE cin_book_id = $1")
+                .bind(book_id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        for cin_id in &cin_ids {
+            let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+                .bind(aggregate_uuid(AggregateKind::CheckIn, *cin_id))
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+                .bind(cin_id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_book_id = $1")
+            .bind(book_id)
+            .execute(pool)
+            .await;
+
+        let ids: Option<(i32,)> =
+            sqlx::query_as("SELECT book_cust_id FROM ht_bookings WHERE book_id = $1")
+                .bind(book_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let room_ids: Vec<i32> =
+            sqlx::query_scalar("SELECT br_room_id FROM ht_booking_rooms WHERE br_book_id = $1")
+                .bind(book_id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        // ht_booking_rooms cascades from the booking.
+        let _ = sqlx::query("DELETE FROM ht_bookings WHERE book_id = $1")
+            .bind(book_id)
+            .execute(pool)
+            .await;
+        for room_id in room_ids {
+            let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+                .bind(room_id)
+                .execute(pool)
+                .await;
+        }
+        if let Some((cust_id,)) = ids {
+            let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
+                .bind(cust_id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    /// The B7a contract in one test: a check-in created WITH `booking_id`
+    /// (1) stores the link in `ht_checkins.cin_book_id`,
+    /// (2) resolves the customer from the booking rather than the caller,
+    /// (3) flips the booking to `checkedin` so it leaves the arrivals list, and
+    /// (4) enqueues the `create_check_in` writeback carrying the linked booking.
+    #[tokio::test]
+    async fn check_in_to_booking_links_the_stay() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping check_in_to_booking_links_the_stay — PG not reachable");
+            return;
+        };
+        let Some(seed) = seed_booking(&pool, "link").await else {
+            eprintln!("skipping check_in_to_booking_links_the_stay — seed failed");
+            return;
+        };
+
+        let today = Utc::now().date_naive();
+        let svc = build_service(pool.clone());
+        let outcome = svc
+            .check_in_to_booking(CheckInToBookingCommand {
+                cin_no: "CIN-B7A-link".to_string(),
+                booking_id: seed.book_id,
+                room_id: seed.room_id,
+                check_in_time: None,
+                expected_checkout: today + chrono::Duration::days(2),
+                adults: 2,
+                children: 1,
+                rate_per_night: Some(900.0),
+                notes: None,
+                writeback_context: sample_context(
+                    &seed.room_no,
+                    today,
+                    today + chrono::Duration::days(2),
+                ),
+                source: EventSource::System {
+                    reason: "b7a_link_test".into(),
+                },
+            })
+            .await;
+
+        let result = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                cleanup(&pool, seed.book_id).await;
+                panic!("from-reservation check-in must succeed: {e:?}");
+            }
+        };
+
+        // 1. The link itself — the whole point of B7a.
+        let linked: (Option<i32>, i32) =
+            sqlx::query_as("SELECT cin_book_id, cin_cust_id FROM ht_checkins WHERE cin_id = $1")
+                .bind(result.check_in_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the new check-in must be readable");
+        assert_eq!(
+            linked.0,
+            Some(seed.book_id),
+            "cin_book_id must carry the originating booking — a NULL here is the \
+             bug B7a closes: every B7 app-deposit signpost resolves through it"
+        );
+
+        // 2. The customer came from the booking, not from the request.
+        assert_eq!(
+            linked.1, seed.cust_id,
+            "the customer must be resolved from the booking"
+        );
+
+        // 3. The booking left the arrivals list.
+        let status: String =
+            sqlx::query_scalar("SELECT book_status FROM ht_bookings WHERE book_id = $1")
+                .bind(seed.book_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the seeded booking must be readable");
+        assert_eq!(status, "checkedin", "check-in must flip the booking status");
+
+        // 4. The writeback intent is the booking-linked one, carrying the
+        //    booking's aggregate id — this is what makes the legacy mirror use
+        //    the `checkin_to_booking` recipe rather than the walk-in one.
+        let job: (String, serde_json::Value) = sqlx::query_as(
+            "SELECT intent, payload FROM writeback_jobs \
+              WHERE aggregate_id = $1 AND intent = 'create_check_in' \
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(aggregate_uuid(AggregateKind::CheckIn, result.check_in_id))
+        .fetch_one(&pool)
+        .await
+        .expect("a create_check_in outbox row must be enqueued");
+        assert_eq!(job.0, "create_check_in");
+        // `WritebackIntent` is `#[serde(tag = "intent", content = "payload")]`,
+        // so the stored column is
+        // `{intent, payload: {check_in_id, payload: CreateCheckInPayload}}` —
+        // hence the doubled hop. `linked_booking_id` is what discriminates the
+        // §3d `checkin_to_booking` recipe from the §3a walk-in one, so a NULL
+        // here would mean the legacy mirror re-created the customer and wrote
+        // an empty `Book_No` into `HT_CheckIn_H`.
+        let linked_booking = job.1["payload"]["payload"]["linked_booking_id"].as_str();
+        assert_eq!(
+            linked_booking,
+            Some(aggregate_uuid(AggregateKind::Booking, seed.book_id).to_string()).as_deref(),
+            "the writeback payload must name the linked booking"
+        );
+
+        cleanup(&pool, seed.book_id).await;
+    }
+
+    /// A booking that does not exist must surface as NotFound, not as a
+    /// silently unlinked walk-in stay.
+    #[tokio::test]
+    async fn check_in_to_booking_rejects_a_missing_booking() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping check_in_to_booking_rejects_a_missing_booking — PG not reachable");
+            return;
+        };
+        let svc = build_service(pool);
+        let err = svc
+            .check_in_to_booking(CheckInToBookingCommand {
+                cin_no: "CIN-B7A-missing".to_string(),
+                booking_id: -1,
+                room_id: 1,
+                check_in_time: None,
+                expected_checkout: Utc::now().date_naive() + chrono::Duration::days(1),
+                adults: 1,
+                children: 0,
+                rate_per_night: None,
+                notes: None,
+                writeback_context: sample_context(
+                    "000",
+                    Utc::now().date_naive(),
+                    Utc::now().date_naive() + chrono::Duration::days(1),
+                ),
+                source: EventSource::System {
+                    reason: "b7a_missing".into(),
+                },
+            })
+            .await
+            .expect_err("a non-existent booking must reject");
+        assert!(matches!(err, ServiceError::NotFound(_)), "got {err:?}");
+    }
+
+    /// B7b — a SECOND check-in on the same booking, aimed at a DIFFERENT free
+    /// room, must be refused.
+    ///
+    /// This is the exact shape the room-level guard could not see: `room_id`
+    /// points at a room with no active stay, so `count_active_for_room`
+    /// returns 0 and every pre-B7b check passed. The result was two canonical
+    /// folios — and two byte-parity `HT_CheckIn_H` rows in iHOTEL — for one
+    /// reservation, which nothing downstream unpicks.
+    ///
+    /// The multi-room ceiling (`open < assigned_rooms`) is NOT exercised here:
+    /// `reject_multi_room_checkin` refuses any booking with >1 assigned room a
+    /// few lines earlier, so it is unreachable through this service today.
+    /// Its branches are pinned in `reject_double_checkin`'s pure tests, and the
+    /// last assertion below pins the fact that the multi-room gate is what
+    /// stands in front of it.
+    #[tokio::test]
+    async fn a_second_check_in_on_one_booking_is_refused_at_another_room() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping a_second_check_in_on_one_booking_is_refused_at_another_room — PG not reachable");
+            return;
+        };
+        let Some(seed) = seed_booking(&pool, "b7bdup").await else {
+            eprintln!(
+                "skipping a_second_check_in_on_one_booking_is_refused_at_another_room — seed failed"
+            );
+            return;
+        };
+
+        // A second, EMPTY room. Not on the booking — the point is that the
+        // room-level guard has nothing to say about it.
+        let other_room_no = "B7Bother";
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+            .bind(other_room_no)
+            .execute(&pool)
+            .await;
+        let other_room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'available') RETURNING room_id",
+        )
+        .bind(other_room_no)
+        .fetch_one(&pool)
+        .await
+        .expect("seed the second room");
+
+        let today = Utc::now().date_naive();
+        let svc = build_service(pool.clone());
+        let cmd = |cin_no: &str, room_id: i32, room_no: &str| CheckInToBookingCommand {
+            cin_no: cin_no.to_string(),
+            booking_id: seed.book_id,
+            room_id,
+            check_in_time: None,
+            expected_checkout: today + chrono::Duration::days(2),
+            adults: 1,
+            children: 0,
+            rate_per_night: Some(900.0),
+            notes: None,
+            writeback_context: sample_context(room_no, today, today + chrono::Duration::days(2)),
+            source: EventSource::System {
+                reason: "b7b_double_checkin".into(),
+            },
+        };
+
+        let first = svc
+            .check_in_to_booking(cmd("CIN-B7B-1", seed.room_id, &seed.room_no))
+            .await;
+        let first = match first {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                cleanup(&pool, seed.book_id).await;
+                let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+                    .bind(other_room_id)
+                    .execute(&pool)
+                    .await;
+                panic!("the first check-in must succeed: {err:?}");
+            }
+        };
+
+        let err = svc
+            .check_in_to_booking(cmd("CIN-B7B-2", other_room_id, other_room_no))
+            .await
+            .expect_err("a second stay on one booking must be refused");
+
+        let outcome = match err {
+            ServiceError::ConflictWithReason {
+                reason,
+                conflicting_id,
+                ..
+            } => {
+                assert_eq!(reason, "booking_already_checked_in");
+                assert_eq!(
+                    conflicting_id,
+                    Some(first.check_in_id),
+                    "the refusal must point at the stay that already exists"
+                );
+                Ok(())
+            }
+            other => Err(format!("expected the B7b refusal, got {other:?}")),
+        };
+
+        // Nothing was written by the loser: the guard runs inside the same
+        // transaction as the INSERT, so a half-applied second stay is the
+        // failure mode worth asserting against.
+        let stays: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ht_checkins WHERE cin_book_id = $1")
+                .bind(seed.book_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(-1);
+
+        // And the multi-room gate still stands in front of the ceiling rule:
+        // give the booking a second room and the refusal changes shape.
+        let _ =
+            sqlx::query("INSERT INTO ht_booking_rooms (br_book_id, br_room_id) VALUES ($1, $2)")
+                .bind(seed.book_id)
+                .bind(other_room_id)
+                .execute(&pool)
+                .await;
+        let multi = svc
+            .check_in_to_booking(cmd("CIN-B7B-3", other_room_id, other_room_no))
+            .await
+            .err();
+
+        cleanup(&pool, seed.book_id).await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+            .bind(other_room_id)
+            .execute(&pool)
+            .await;
+
+        outcome.unwrap_or_else(|msg| panic!("{msg}"));
+        assert_eq!(stays, 1, "the booking must carry exactly ONE open stay");
+        assert!(
+            matches!(multi, Some(ServiceError::Validation(_))),
+            "a 2-room booking is still refused by reject_multi_room_checkin, not by the \
+             booking-level ceiling; got {multi:?}"
+        );
     }
 }

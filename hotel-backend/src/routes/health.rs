@@ -15,9 +15,69 @@
 //!   "service": "backend",
 //!   "site": "hfhotel",
 //!   "ct_watermark": 1234,
-//!   "last_polled_at": "2026-04-29T12:34:56Z"
+//!   "last_polled_at": "2026-04-29T12:34:56Z",
+//!   "revision": "9f2c1ab3d4e5f60718293a4b5c6d7e8f90a1b2c3",
+//!   "crate_version": "2.22.0"
 //! }
 //! ```
+//!
+//! ## Proving WHICH build is serving
+//!
+//! `revision` is the git SHA baked into the image at build time (`ARG
+//! GIT_SHA` / `ENV GIT_SHA` in `hotel-backend/Dockerfile`, passed by the
+//! `build-backend` job in `.github/workflows/docker-build.yml`). Without
+//! it, "verified live" had to be argued from the promote job's ghcr
+//! digest, off-band from the running container.
+//!
+//! It is the FULL 40-character `github.sha`, NOT the 7-character
+//! `type=sha,prefix=` image tag `build-backend`'s metadata step applies.
+//! Compare it against `github.sha` byte-for-byte; comparing it against an
+//! image tag (or truncating it to 7 chars to do so) is the mistake that
+//! makes a verifier permanently red and then quietly disabled.
+//!
+//! Baked, not injected at run time, on purpose — and NOT because the
+//! deploy shim is unreachable from CI (it is: `scripts/deploy/run-deploy.sh`
+//! is version-controlled here and the live `/srv/run-deploy.sh` self-updates
+//! from the repo on every deploy — `CLAUDE.md` §"Deployment Policy" item 5).
+//! The real reason is stronger: a runtime env var proves only what the
+//! deploy shim DELIVERED, not which image the container actually LOADED,
+//! and a baked value keeps telling the truth through a rollback to an older
+//! tag. A local `cargo run` or a pre-bake image reports `"unknown"`;
+//! verifiers should treat that as "cannot tell" and warn, not fail.
+//!
+//! `crate_version` is `CARGO_PKG_VERSION` — the RUST CRATE version from
+//! `hotel-backend/Cargo.toml`, which is a DIFFERENT numbering scheme from
+//! the product release the team tracks. release-please is configured
+//! `release-type: node` with no `extra-files`, so it bumps `package.json` +
+//! `.release-please-manifest.json` (v2.75.x at the time of writing) and
+//! never touches `Cargo.toml` (2.22.0) — the gap only widens. The field is
+//! named `crate_version` precisely so nobody curls `/health` mid-incident,
+//! reads a v2.2x number on a repo everyone knows as v2.7x, and concludes a
+//! wildly stale image is serving. It is also identical across most commits
+//! and so CANNOT distinguish a real deploy from a no-op: it is reported
+//! alongside, never instead of, `revision`.
+//!
+//! ## How to actually probe it
+//!
+//! `/health` is BACKEND-NETWORK-INTERNAL. There is no public URL for it:
+//! the `backend` service publishes no `ports:` (only `web` does), and
+//! `next.config.js` rewrites proxy ONLY `/api/:path*` and `/hk/api/:path*`
+//! while this route is mounted at the bare root in `main.rs`. A
+//! `curl https://<public-host>/health` gets the Next app's 404, which reads
+//! like a failed deploy and is not one.
+//!
+//! From evergreen, probe inside the container instead:
+//!
+//! ```text
+//! docker exec new-hotel-production-backend-1 \
+//!   curl -fsS --max-time 3 localhost:3003/health | jq -r .revision
+//! ```
+//!
+//! The deploy does this for you: `scripts/deploy/run-deploy.sh`'s
+//! post-deploy verification asserts the reported `revision` equals the
+//! commit whose image this run built (see `expected_backend_revision` in
+//! the payload). Exposing a public alias under `/api/` would be a separate,
+//! deliberate decision — do not infer one from this endpoint's existence.
 //!
 //! ## Liveness vs readiness
 //!
@@ -40,10 +100,48 @@
 //! would silently break the load-balancer probe whenever the watcher
 //! hiccups.
 
+use std::sync::OnceLock;
+
 use axum::{extract::State, response::Json};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+
+/// Value reported in `revision` when the image carries no build SHA.
+///
+/// Images built before the `GIT_SHA` build-arg existed (and any local
+/// `cargo run`) report this. Deploy verifiers should treat it as "cannot
+/// tell which build this is" and warn rather than fail — see the module
+/// docs.
+const UNKNOWN_REVISION: &str = "unknown";
+
+/// Normalise a raw `GIT_SHA` value into the `revision` field.
+///
+/// An UNSET var and an EMPTY one behave identically, defensively.
+/// NOTHING sets `GIT_SHA` at run time today — `docker-compose.yml` has no
+/// `env_file` and no `GIT_SHA` entry in the `backend` service's
+/// `environment:` block, so the only source is the image's own `ENV`. The
+/// guard exists so that IF a future compose entry or `env_file` ever
+/// supplies an empty value, it degrades to `unknown` instead of clobbering
+/// the baked SHA with a blank that a verifier reads as a mismatch rather
+/// than as "cannot tell". Adding such an entry is not a supported way to
+/// set the revision — the bake is.
+///
+/// Kept pure (the env read happens in the caller) so unit tests exercise
+/// every branch without mutating process env, which races across the
+/// parallel test harness.
+fn resolve_revision(raw: Option<String>) -> String {
+    match raw {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => UNKNOWN_REVISION.to_string(),
+    }
+}
+
+/// Process-wide revision, resolved from `GIT_SHA` exactly once.
+fn revision() -> &'static str {
+    static REVISION: OnceLock<String> = OnceLock::new();
+    REVISION.get_or_init(|| resolve_revision(std::env::var("GIT_SHA").ok()))
+}
 
 /// State carried by the healthcheck handler.
 ///
@@ -114,6 +212,13 @@ pub async fn health(State(state): State<HealthState>) -> Json<Value> {
         "service": "backend",
         "ct_watermark": ct_watermark,
         "last_polled_at": last_polled_at,
+        // Build identity. `revision` (the full 40-char github.sha) is the
+        // only field that distinguishes one deploy from the next.
+        // `crate_version` is the Rust crate version, NOT the release-please
+        // product version — deliberately named so it can't be mistaken for
+        // it. See the module docs.
+        "revision": revision(),
+        "crate_version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -146,6 +251,100 @@ mod tests {
         };
         let Json(body) = health(State(state)).await;
         assert_eq!(body.get("site").and_then(|v| v.as_str()), Some("hfhotel"));
+    }
+
+    /// The handler payload MUST carry build identity: `revision` (the
+    /// baked git SHA) and `crate_version`. Without `revision`, "verified
+    /// live" can only be argued from the promote job's ghcr digest, which
+    /// says nothing about what the container actually loaded.
+    ///
+    /// Asserts presence + type only, not a specific SHA: the test binary
+    /// is built without the `GIT_SHA` bake, so the value here is
+    /// whatever `resolve_revision` yields for this process — which is
+    /// `unknown`. THIS TEST THEREFORE CANNOT PROVE THE BAKE HAPPENED, and
+    /// no unit test can: the assertion that the shipped image actually
+    /// carries `github.sha` lives in the deploy
+    /// (`scripts/deploy/run-deploy.sh`, `expected_backend_revision`),
+    /// which is what stops the feature silently rotting back to
+    /// `"unknown"` with every gate still green.
+    #[tokio::test]
+    async fn health_includes_revision_and_crate_version() {
+        let state = HealthState {
+            site_id: "hfhotel".to_string(),
+            pg_pool: None,
+        };
+        let Json(body) = health(State(state)).await;
+
+        let revision = body
+            .get("revision")
+            .and_then(|v| v.as_str())
+            .expect("revision must be present and a string");
+        assert!(!revision.is_empty(), "revision must never be empty");
+
+        assert_eq!(
+            body.get("crate_version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "crate_version must report the Rust crate version"
+        );
+        assert!(
+            body.get("version").is_none(),
+            "the field is `crate_version`: a bare `version` invites the \
+             reader to compare it against the release-please product \
+             version, which tracks a different number entirely"
+        );
+    }
+
+    /// Adding build identity MUST NOT drop any pre-existing field or
+    /// flip the status semantics — external monitors key on all of them.
+    #[tokio::test]
+    async fn health_keeps_existing_fields_alongside_revision() {
+        let state = HealthState {
+            site_id: "hfville".to_string(),
+            pg_pool: None,
+        };
+        let Json(body) = health(State(state)).await;
+        let obj = body.as_object().expect("payload must be a JSON object");
+
+        for key in [
+            "site",
+            "ok",
+            "service",
+            "ct_watermark",
+            "last_polled_at",
+            "revision",
+            "crate_version",
+        ] {
+            assert!(obj.contains_key(key), "missing field: {key}");
+        }
+        assert_eq!(obj.len(), 7, "unexpected extra fields: {obj:?}");
+        assert_eq!(body.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            body.get("service").and_then(|v| v.as_str()),
+            Some("backend")
+        );
+    }
+
+    /// An unset OR empty `GIT_SHA` collapses to `unknown`. Nothing sets
+    /// the var at run time today (no compose `env_file`, no `GIT_SHA` in
+    /// the `backend` service's `environment:`); the empty branch is
+    /// defensive, so that if one is ever added and supplies a blank, the
+    /// payload says "cannot tell" rather than reporting an empty revision
+    /// a verifier reads as a mismatch.
+    #[test]
+    fn resolve_revision_treats_unset_and_blank_alike() {
+        assert_eq!(resolve_revision(None), UNKNOWN_REVISION);
+        assert_eq!(resolve_revision(Some(String::new())), UNKNOWN_REVISION);
+        assert_eq!(resolve_revision(Some("   ".to_string())), UNKNOWN_REVISION);
+        assert_eq!(resolve_revision(Some("\n".to_string())), UNKNOWN_REVISION);
+    }
+
+    /// A real SHA passes through verbatim, trimmed — the deploy verifier
+    /// compares it byte-for-byte against `github.sha`.
+    #[test]
+    fn resolve_revision_passes_through_a_real_sha() {
+        let sha = "9f2c1ab3d4e5f60718293a4b5c6d7e8f90a1b2c3";
+        assert_eq!(resolve_revision(Some(sha.to_string())), sha);
+        assert_eq!(resolve_revision(Some(format!("  {sha}\n"))), sha);
     }
 
     /// Pre-bootstrap topology (no PG pool configured at all): the

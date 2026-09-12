@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { X, AlertCircle, Loader2, LogOut, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import RoomCheckPanel from '@/components/v2/signals/RoomCheckPanel'
+import AppDepositNotice from '@/components/v2/AppDepositNotice'
 
 /**
  * Check-out & settle modal (M1 task #37).
@@ -126,6 +127,14 @@ export default function CheckOutModal({
   // release. Seeded with the clicked room once the room list loads.
   const [rooms, setRooms] = useState<RoomLine[]>([])
   const [selectedCrIds, setSelectedCrIds] = useState<Set<number>>(new Set())
+  // Task B7a — the ORIGINATING booking's channel + deposit, for the B7
+  // app-deposit signpost. Checkout is the last moment the divergence can bite
+  // (iHOTEL has shown this booking's deposit as 0 all stay), and it is also the
+  // moment money changes hands, so it belongs here as much as on the folio.
+  const [bookingDeposit, setBookingDeposit] = useState<{
+    bookChannel: string | null
+    amount: number | null
+  }>({ bookChannel: null, amount: null })
 
   // Find the currently active check-in for this room.
   useEffect(() => {
@@ -183,6 +192,28 @@ export default function CheckOutModal({
         })
       })
       .catch(() => {})
+    return () => { cancelled = true }
+  }, [activeCheckin, branchFetch])
+
+  // Task B7a — the originating booking's channel + deposit, read from the SAME
+  // endpoint the /billing folio uses (`GET /api/checkins/:id/deposits` carries
+  // `bookChannel` + `bookingDepositAmount` alongside the per-room lines). No new
+  // backend field: the checkout-quote DTO deliberately stays money-only.
+  useEffect(() => {
+    if (!activeCheckin) return
+    let cancelled = false
+    branchFetch(`/api/checkins/${activeCheckin.id}/deposits`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d?.success) return
+        setBookingDeposit({
+          bookChannel: d.bookChannel ?? null,
+          amount: d.bookingDepositAmount ?? null,
+        })
+      })
+      .catch(() => {
+        /* silent — the notice simply stays hidden, checkout is unaffected */
+      })
     return () => { cancelled = true }
   }, [activeCheckin, branchFetch])
 
@@ -320,6 +351,16 @@ export default function CheckOutModal({
             </div>
           ) : activeCheckin ? (
             <>
+              {/* Task B7a — the stay came from a booking the guest paid in the
+                  app. iHOTEL showed that booking's deposit as 0 all stay long,
+                  and this screen is where the remaining balance gets taken, so
+                  the signpost sits ABOVE the folio and the tender select — not
+                  after the money is collected. Silent for walk-ins and OTA. */}
+              <AppDepositNotice
+                bookChannel={bookingDeposit.bookChannel}
+                depositAmount={bookingDeposit.amount}
+              />
+
               <div className="bg-sky-50 border border-sky-200 rounded p-3 space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-600">เลขที่เช็คอิน:</span>

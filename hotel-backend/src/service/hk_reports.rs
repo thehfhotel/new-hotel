@@ -76,7 +76,10 @@
 //! (see `service::error`). That mapping is shared with booking-cancel, payment
 //! void, the `writeback_jobs` idempotency race and ADR 0008's room signals, and
 //! `ApiError::Conflict` (409) is reserved in this repo for a ship-dark FLAG
-//! refusing a request. Answering 409 for reports alone would have meant either
+//! refusing a request — with the single B7b carve-out
+//! `ApiError::ConflictWithReason`, an opt-in variant carrying a machine
+//! `reason` + the conflicting row's id, which plain `Conflict` is not.
+//! Answering 409 for reports alone would have meant either
 //! a second mapping or changing six shipped surfaces, so reports follow the
 //! house convention: **400 with a message naming the status it is already in**
 //! — byte-for-byte the choice `service::hk_signals` documents at its own

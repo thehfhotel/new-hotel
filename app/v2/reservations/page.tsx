@@ -9,7 +9,16 @@ import { formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import type { Booking, BookingDetail } from '@/types/booking'
 import { bookingStatusView } from '@/lib/v2/status'
 import { V2Spinner, V2PageHeader, StatusPill, VilleNotice } from '@/components/v2/primitives'
+import BookingChannelChip from '@/components/v2/BookingChannelChip'
+import BookingCheckInAction from '@/components/v2/BookingCheckInAction'
 import BookingForm, { type BookingFormState } from '@/components/forms/BookingForm'
+import CheckInModal, { type CheckInBookingContext } from '@/components/CheckInModal'
+import {
+  openCheckInIdForBooking,
+  resolveBookingCheckIn,
+  type BookingCheckInState,
+  type CheckInLite,
+} from '@/lib/v2/checkin-from-booking'
 
 const STATUS_FILTERS = [
   { value: '', label: 'ทั้งหมด' },
@@ -42,6 +51,18 @@ export default function V2Reservations() {
   const [showForm, setShowForm] = useState(false)
   const [mode, setMode] = useState<'create' | 'edit'>('create')
   const [editing, setEditing] = useState<BookingFormState | null>(null)
+  // Task B7a — the open stays, so a booking that already has one offers
+  // "เช็คอินแล้ว" + a folio link instead of a second check-in. `ht_bookings`
+  // carries no check-in id, so the link is resolved from the other side:
+  // `GET /api/checkins` serialises `bookingId` on every row.
+  const [activeCheckins, setActiveCheckins] = useState<CheckInLite[]>([])
+  // The reservation whose check-in modal is open, plus the room it goes into.
+  const [checkInTarget, setCheckInTarget] = useState<{
+    room: { id: number; roomNo: string; roomTypeName?: string | null }
+    booking: CheckInBookingContext
+  } | null>(null)
+  // Booking id whose detail fetch is in flight (spins that one row's button).
+  const [startingCheckIn, setStartingCheckIn] = useState<number | null>(null)
   // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
   const reqRef = useRef(0)
 
@@ -82,6 +103,19 @@ export default function V2Reservations() {
     }
   }, [branchFetch])
 
+  // Task B7a — open stays, keyed by their originating booking. One cheap read;
+  // the property runs ~50 rooms, so `limit=200` covers every possible open stay.
+  const fetchActiveCheckins = useCallback(async () => {
+    try {
+      const res = await branchFetch('/api/checkins?status=active&limit=200')
+      if (!res.ok) return
+      const data = await res.json()
+      setActiveCheckins((data.data || []) as CheckInLite[])
+    } catch {
+      /* ignore — the booking's own `checkedin` status still guards the action */
+    }
+  }, [branchFetch])
+
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
@@ -90,13 +124,18 @@ export default function V2Reservations() {
     fetchOtaPending()
   }, [fetchOtaPending])
 
+  useEffect(() => {
+    fetchActiveCheckins()
+  }, [fetchActiveCheckins])
+
   // Live-refresh when a booking/check-in changes in iHOTEL or the other app —
   // refresh both the list and the OTA-pending badge so a newly-arrived OTA
   // booking shows up live without a manual reload.
   const refreshAll = useCallback(() => {
     fetchBookings()
     fetchOtaPending()
-  }, [fetchBookings, fetchOtaPending])
+    fetchActiveCheckins()
+  }, [fetchBookings, fetchOtaPending, fetchActiveCheckins])
   useLiveRefresh(
     branch,
     ['BookingCreated', 'BookingModified', 'BookingCancelled', 'CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled'],
@@ -142,6 +181,7 @@ export default function V2Reservations() {
         children: d.children || 0,
         status: d.status,
         source: d.source,
+        bookChannel: d.bookChannel,
         depositAmount: d.depositAmount,
         notes: d.notes,
         rooms: d.rooms.map((r) => ({ roomId: r.roomId, pricePerNight: r.pricePerNight })),
@@ -152,6 +192,76 @@ export default function V2Reservations() {
       /* ignore */
     }
   }
+
+  /**
+   * Task B7a — open the check-in flow pre-filled from this reservation.
+   *
+   * The list row only knows `roomCount`, so the assigned room comes from the
+   * booking detail (the same GET `openEdit` already uses). The eligibility rule
+   * is re-run on the freshly-read detail before the modal opens: between paint
+   * and click the desk may have checked this guest in from iHOTEL, and the
+   * booking would then already be `checkedin`.
+   */
+  const startCheckIn = async (bookingId: number) => {
+    setStartingCheckIn(bookingId)
+    try {
+      const res = await branchFetch(`/api/bookings/${bookingId}`)
+      if (!res.ok) return
+      const data = await res.json()
+      if (!data.success) return
+      const d: BookingDetail = data.booking
+      const state = resolveBookingCheckIn(
+        {
+          status: d.status,
+          checkIn: d.checkIn,
+          depositAmount: d.depositAmount,
+          rooms: d.rooms.map((r) => ({ roomId: r.roomId, roomNo: r.roomNo })),
+        },
+        openCheckInIdForBooking(activeCheckins, d.id),
+      )
+      if (state.kind !== 'ready' || !state.room) {
+        // Stale row — refresh so it repaints as "เช็คอินแล้ว" / no-room rather
+        // than leaving a button that did nothing visible.
+        refreshAll()
+        return
+      }
+      const room = d.rooms.find((r) => r.roomId === state.room!.roomId)
+      setCheckInTarget({
+        room: {
+          id: state.room.roomId,
+          roomNo: state.room.roomNo ?? '',
+          roomTypeName: room?.roomTypeName ?? null,
+        },
+        booking: {
+          id: d.id,
+          bookNo: d.bookNo,
+          customerName: d.customerName,
+          checkIn: d.checkIn,
+          checkOut: d.checkOut,
+          adults: d.adults,
+          children: d.children,
+          depositAmount: d.depositAmount,
+          bookChannel: d.bookChannel,
+        },
+      })
+    } catch {
+      /* ignore — the row stays as it was and the desk can retry */
+    } finally {
+      setStartingCheckIn(null)
+    }
+  }
+
+  /** The check-in state for one LIST row (detail unknown — `roomCount` only). */
+  const rowCheckInState = (b: Booking): BookingCheckInState =>
+    resolveBookingCheckIn(
+      {
+        status: b.status,
+        checkIn: b.checkIn,
+        depositAmount: b.depositAmount,
+        roomCount: b.roomCount,
+      },
+      openCheckInIdForBooking(activeCheckins, b.id),
+    )
 
   const handleSave = async (data: BookingFormState) => {
     const endpoint = data.id ? `/api/bookings/${data.id}` : '/api/bookings'
@@ -275,16 +385,29 @@ export default function V2Reservations() {
       ) : (
         <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
           {bookings.map((b) => (
-            <button
+            /* Task B7a — the row is now a container, not one big button: the
+               check-in action is a control of its own and a <button> may not
+               nest inside another. The whole left region still opens the
+               reservation exactly as before. */
+            <div
               key={b.id}
+              className="flex items-center transition-colors hover:bg-[var(--v2-surface-2)]"
+              style={{ borderColor: 'var(--v2-line)' }}
+            >
+            <button
               onClick={() => { if (canWrite) openEdit(b) }}
-              className="w-full flex items-center gap-4 px-4 lg:px-5 py-3.5 text-left transition-colors hover:bg-[var(--v2-surface-2)]"
+              className="flex-1 min-w-0 flex items-center gap-4 px-4 lg:px-5 py-3.5 text-left"
               style={{ borderColor: 'var(--v2-line)' }}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[15px] font-semibold truncate">{b.customerName || 'ไม่ระบุชื่อ'}</span>
                   <StatusPill view={bookingStatusView(b.status)} />
+                  {/* Where the booking came from — "แอป" for a guest-app
+                      booking, the OTA name for an OTA one, nothing for a
+                      walk-in. Without it a walk-in and an app booking read
+                      identically at the desk. */}
+                  <BookingChannelChip bookChannel={b.bookChannel} bookSource={b.source} />
                   {(() => {
                     const bal = (b.totalAmount ?? 0) - (b.depositAmount ?? 0)
                     return bal > 0 ? (
@@ -311,6 +434,18 @@ export default function V2Reservations() {
                 <span className="inline-flex items-center gap-1"><BedDouble size={13} /> {b.roomCount}</span>
               </div>
             </button>
+            {/* Task B7a — เช็คอิน / เช็คอินแล้ว for this reservation. Renders
+                nothing for a cancelled, completed, no-show or unpaid-hold
+                booking. */}
+            <div className="pr-3 lg:pr-4 shrink-0">
+              <BookingCheckInAction
+                state={rowCheckInState(b)}
+                busy={startingCheckIn === b.id}
+                disabled={!canWrite}
+                onCheckIn={() => startCheckIn(b.id)}
+              />
+            </div>
+            </div>
           ))}
         </div>
       )}
@@ -338,6 +473,45 @@ export default function V2Reservations() {
           onClose={() => setShowForm(false)}
           onSave={handleSave}
           onCancel={handleCancel}
+          // Task B7a — the same action on the reservation DETAIL. The detail
+          // knows its assigned rooms, so the rule runs on `rooms` here and on
+          // `roomCount` in the list; both answer identically.
+          checkInState={
+            editing?.id != null
+              ? resolveBookingCheckIn(
+                  {
+                    status: editing.status,
+                    checkIn: editing.checkIn,
+                    depositAmount: editing.depositAmount,
+                    rooms: editing.rooms.map((r) => ({ roomId: r.roomId, roomNo: null })),
+                  },
+                  openCheckInIdForBooking(activeCheckins, editing.id),
+                )
+              : undefined
+          }
+          checkInBusy={startingCheckIn === editing?.id}
+          onCheckIn={() => {
+            const id = editing?.id
+            if (id == null) return
+            // Close the reservation form first — the check-in modal is the
+            // next confirm screen, not a second layer on top of this one.
+            setShowForm(false)
+            startCheckIn(id)
+          }}
+        />
+      )}
+
+      {/* Task B7a — check in from the reservation. Sends `bookingId`, so the
+          stay lands with `cin_book_id` set and every B7 deposit signpost
+          downstream (folio, payment dialog, checkout) can resolve it. */}
+      {checkInTarget && (
+        <CheckInModal
+          room={checkInTarget.room}
+          booking={checkInTarget.booking}
+          onClose={() => setCheckInTarget(null)}
+          onSuccess={() => {
+            refreshAll()
+          }}
         />
       )}
     </div>
