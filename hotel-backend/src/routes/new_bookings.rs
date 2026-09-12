@@ -620,6 +620,14 @@ pub async fn update_booking(
             customer_resave: None,
         },
         promote_context,
+        // B8g — the same property lock the desk CREATE takes, but only when
+        // this edit actually moves inventory (assigns, swaps or clears rooms);
+        // the service skips it for a notes-only save. Without it the edit flow
+        // was the one desk path that could hand a loyalty hold's freshly picked
+        // room to a walk-in, since `pick_free_room` excludes nothing it cannot
+        // see committed. Same `branch_property` mapping as create, so both
+        // handlers land on one key per property.
+        inventory_lock: Some(branch_property(query.branch).to_string()),
         // TODO: load prior snapshot from repo for richer event payload.
         before_snapshot: None,
         after_snapshot: snapshot,

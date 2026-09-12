@@ -71,12 +71,17 @@ export interface CheckInLite {
 /**
  * The id of the OPEN check-in that already claims `bookingId`, or `null`.
  *
- * This is the double-check-in guard's read side. The backend has no
- * booking-level guard — `check_in_to_booking` only rejects when the TARGET ROOM
- * already has an active stay (`count_active_for_room`) — so a second POST
- * aimed at a different room would happily create a second stay against the same
- * booking. Nothing in our UI does that, but that is a property of this rule, so
- * it is pinned here and tested rather than left implicit.
+ * This is the double-check-in guard's PROACTIVE half: it answers before the
+ * POST, so the button reads "เช็คอินแล้ว" instead of offering an action that
+ * will fail.
+ *
+ * It is not the authority. Since B7b the backend refuses a second stay on one
+ * booking inside the check-in transaction (`check_in_to_booking` →
+ * `reject_double_checkin`), which is what closes the window this read cannot:
+ * the state here is computed BEFORE the receptionist fills the form, so another
+ * desk — or iHOTEL — can check the same booking in while she types. That
+ * refusal arrives as `409 { reason: "booking_already_checked_in",
+ * conflictingId }` and is decoded by {@link parseAlreadyCheckedIn}.
  *
  * `checkins` is expected to be an already-active-filtered list
  * (`?status=active`); the `status` re-check makes the function safe to call on
@@ -221,6 +226,51 @@ export function pickTodaysBookingIdForRoom(
   const id = Number(raw)
   return Number.isInteger(id) && id > 0 ? id : null
 }
+
+/**
+ * The backend's B7b refusal, decoded — `409` with
+ * `reason: "booking_already_checked_in"`.
+ *
+ * Emitted by `CheckInService::check_in_to_booking` when the booking already has
+ * as many OPEN check-ins as it has assigned rooms. It is the RACE half of the
+ * rule above: {@link openCheckInIdForBooking} answers before the form is
+ * filled, this answers at the moment of the write.
+ *
+ * Two things make a decoder worth having rather than a `res.ok` check:
+ *
+ * * the body's human text is **English and internal** ("booking 812 is already
+ *   checked in (check-in 4242) …"), so a surface that renders `data.error` raw
+ *   shows Thai-speaking reception a sentence with row ids in it;
+ * * `conflictingId` is the folio that already exists, which is the only useful
+ *   next action — without decoding it, the refusal is a dead end.
+ *
+ * `checkInId` is `null` when the backend could not name one (it never should;
+ * the guard only fires with at least one open stay), so callers must render the
+ * message without a link in that case rather than linking to `/billing/null`.
+ */
+export const BOOKING_ALREADY_CHECKED_IN_REASON = 'booking_already_checked_in'
+
+export interface AlreadyCheckedInRefusal {
+  checkInId: number | null
+}
+
+export function parseAlreadyCheckedIn(
+  status: number,
+  body: unknown,
+): AlreadyCheckedInRefusal | null {
+  if (status !== 409 || typeof body !== 'object' || body === null) return null
+  const data = body as { reason?: unknown; conflictingId?: unknown }
+  if (data.reason !== BOOKING_ALREADY_CHECKED_IN_REASON) return null
+  const id = data.conflictingId
+  return { checkInId: typeof id === 'number' && Number.isFinite(id) ? id : null }
+}
+
+/**
+ * What reception reads. Thai, no row ids, no English — the backend's own
+ * message is a developer artefact and must never reach the desk.
+ */
+export const ALREADY_CHECKED_IN_MESSAGE =
+  'การจองนี้เช็คอินไปแล้ว — เปิดใบแจ้งหนี้เดิมแทนการเช็คอินซ้ำ'
 
 /**
  * Where "เช็คอินแล้ว" goes: the folio for that stay.

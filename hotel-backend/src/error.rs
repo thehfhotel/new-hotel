@@ -32,6 +32,29 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// 409 carrying a **machine `reason`** and, when the refusal points at an
+    /// existing row, that row's id.
+    ///
+    /// Same status as [`ApiError::Conflict`], different contract. `Conflict`
+    /// asks callers to parse a `SCREAMING_SNAKE` prefix out of a
+    /// human-readable message; this variant puts the code in its own field,
+    /// which is the convention the newer surfaces already use — `/api/channel/*`
+    /// (`routes::channel::reason`) and this router's own
+    /// [`ApiError::Busy`] body. New refusals should prefer it.
+    ///
+    /// The id matters as much as the code: a refusal that says only "already
+    /// done" leaves the desk hunting for the row that did it. `conflicting_id`
+    /// is rendered as `conflictingId` — for
+    /// [`BOOKING_ALREADY_CHECKED_IN_REASON`] it is the open check-in's
+    /// `ht_checkins.cin_id`, so the UI can offer that folio instead of a dead
+    /// end.
+    #[error("Conflict ({reason}): {message}")]
+    ConflictWithReason {
+        reason: &'static str,
+        message: String,
+        conflicting_id: Option<i32>,
+    },
+
     /// 503 — the request is well-formed and permitted, but a DEPENDENCY this
     /// handler needs could not be reached, so no authoritative answer exists
     /// right now. Distinct from [`ApiError::Forbidden`] on purpose: 403 means
@@ -79,6 +102,20 @@ pub const BUSY_RETRY_AFTER_SECONDS: u32 = 1;
 /// loyalty-app a distinction it cannot act on differently.
 pub const BUSY_REASON: &str = "inventory_lock_timeout";
 
+/// Machine `reason` for the booking-level double-check-in refusal (B7b).
+///
+/// `POST /api/checkins` (the mounted path; `routes::new_checkins` is the
+/// module name) with a `booking_id` whose booking already has as
+/// many OPEN check-ins as it has assigned rooms. Emitted as
+/// [`ApiError::ConflictWithReason`] → **409**, with `conflictingId` set to the
+/// open check-in's `cin_id`.
+///
+/// Declared here beside [`BUSY_REASON`] for the same reason: the code is a
+/// wire contract, and a contract that lives inside the one handler that emits
+/// it drifts the moment a second surface needs it. **Renaming it is a contract
+/// change, not a refactor.**
+pub const BOOKING_ALREADY_CHECKED_IN_REASON: &str = "booking_already_checked_in";
+
 impl From<tiberius::error::Error> for ApiError {
     fn from(err: tiberius::error::Error) -> Self {
         ApiError::Database(err.to_string())
@@ -116,8 +153,31 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        // Same early-return reason as `Busy`: this variant renders extra body
+        // fields (`reason`, `conflictingId`) rather than the uniform
+        // `{success, error}` shape every arm below shares.
+        if let ApiError::ConflictWithReason {
+            reason,
+            message,
+            conflicting_id,
+        } = &self
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "reason": reason,
+                    "error": message,
+                    "conflictingId": conflicting_id,
+                })),
+            )
+                .into_response();
+        }
+
         let (status, message) = match &self {
-            ApiError::Busy(_) => unreachable!("handled above"),
+            ApiError::Busy(_) | ApiError::ConflictWithReason { .. } => {
+                unreachable!("handled above")
+            }
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),

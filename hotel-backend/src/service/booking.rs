@@ -222,6 +222,24 @@ pub struct ModifyBookingCommand {
     /// `None` for a roomless edit — there's nothing to mirror.
     pub promote_context: Option<BookingWritebackContext>,
 
+    /// Property whose booking-inventory lock this modify must take **when the
+    /// edit moves inventory** (B8g — `repository::inventory_lock`), or `None`
+    /// when the caller already holds it / does not want it taken.
+    ///
+    /// Unlike [`CreateBookingCommand::inventory_lock`] this is CONDITIONAL, and
+    /// the condition is [`room_set_changed`]: an edit that assigns, swaps or
+    /// clears rooms consumes or frees exactly what the channel's
+    /// `pick_free_room` is choosing between, so it must serialise against it;
+    /// an edit that leaves the room set alone (a note, a price, a guest count)
+    /// moves nothing and must NOT queue behind a live create — booking writes
+    /// share ONE property-wide lock, so locking every edit would make the desk
+    /// wait on a race it cannot lose.
+    ///
+    /// `routes::new_bookings::update_booking` sets it for both properties.
+    /// Every test double leaves it `None`, which keeps those paths unlocked and
+    /// byte-for-byte unchanged.
+    pub inventory_lock: Option<String>,
+
     /// Snapshot context (`before` / `after`) for [`DomainEvent::BookingModified`].
     pub before_snapshot: Option<BookingSnapshotInputs>,
     pub after_snapshot: BookingSnapshotInputs,
@@ -605,6 +623,50 @@ impl BookingService {
         validate_stay_range(cmd.check_in, cmd.check_out)?;
         validate_room_assignments(&cmd.rooms)?;
 
+        // B8e / L3, extended by B8g — serialise room consumption property-wide
+        // for the edits that actually MOVE inventory. `modify` replaces the
+        // booking's whole room set (delete + re-insert below), so an edit that
+        // assigns the first room to a parked booking, or swaps one room for
+        // another, consumes exactly what a concurrent channel hold is picking
+        // between its SELECT and its INSERT — the same window `create` closed.
+        //
+        // The prior room set is read on the POOL, before the transaction, for
+        // the same reason `create` takes its lock before opening one: the guard
+        // owns a connection of its own and must hold the lock across the whole
+        // write, not be nested inside it.
+        //
+        // Residual, accepted and NOT understated: this read and the in-tx
+        // `writeback_state` read below are two different snapshots of the same
+        // fact. Under a concurrent edit OF THE SAME BOOKING they can disagree,
+        // and the case that disagrees includes the headline one — if a rival
+        // edit clears the rooms between the two reads, this read sees "rooms
+        // unchanged" and skips the lock while `writeback_state` then sees 0
+        // prior rooms and PROMOTES, emitting the byte-parity `CreateBooking`
+        // unlocked. That is the exact write B8g exists to serialise.
+        //
+        // Why it is not fixed here: the sound fix is to take both reads AFTER
+        // `update_booking` has locked the booking row, which moves the
+        // promote-vs-modify decision onto a different snapshot — a change to
+        // the legacy write-back leg, not to a lock, and it deserves its own
+        // review rather than riding along in this one. The exposure needs two
+        // concurrent edits of ONE booking within a millisecond window, both
+        // from the desk (`update_booking` is the only production caller, and
+        // there is no OTA PUT); the channel never edits. The reviewer's
+        // suggested alternative — lock whenever `rooms` is non-empty — was NOT
+        // taken because it locks every notes-only save of a roomed booking,
+        // which is precisely the over-blocking B8g was asked to avoid.
+        let inventory_lock = match cmd.inventory_lock.as_deref() {
+            Some(property) => {
+                let prior_rooms = self.repo.booking_room_ids(&self.pg, cmd.book_id).await?;
+                if room_set_changed(&prior_rooms, &cmd.rooms) {
+                    Some(InventoryLock::acquire(&self.pg, property).await?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
         let mut tx = self.pg.begin().await?;
 
         // Capture the pre-modify write-back state BEFORE we touch the rooms:
@@ -765,6 +827,19 @@ impl BookingService {
             .map_err(|err| ServiceError::outbox(err.to_string()))?;
 
         tx.commit().await?;
+
+        // Same deterministic release as `create`: free it right after OUR room
+        // set is visible to the next writer's availability read. `None` here is
+        // the ordinary notes-only edit, which never took it.
+        if let Some(lock) = inventory_lock {
+            if let Err(err) = lock.release().await {
+                tracing::warn!(
+                    error = %err,
+                    book_id = cmd.book_id,
+                    "releasing the booking-inventory lock failed; it frees on connection return"
+                );
+            }
+        }
 
         Ok(BookingOutcome {
             book_id: cmd.book_id,
@@ -962,6 +1037,37 @@ fn modify_writeback_plan(
     }
 }
 
+/// Does this edit MOVE inventory? (B8g — the predicate
+/// [`ModifyBookingCommand::inventory_lock`] is gated on.)
+///
+/// `true` when the requested room set differs from the committed one — an
+/// assign, a swap, an added or dropped room — so the write consumes or frees
+/// room-nights a concurrent channel hold may be picking between. `false` for
+/// an edit that leaves the rooms exactly as they were: notes, price, guest
+/// counts, status.
+///
+/// Compared as a sorted MULTISET, not as two lists: `ht_booking_rooms` has no
+/// intrinsic order and both desk savers re-send the rooms they loaded, so an
+/// ordering difference must not read as an inventory move and make every save
+/// take the property lock.
+///
+/// **Deliberately scoped to the room SET, and no wider.** A date change on an
+/// unchanged room set also shifts which room-nights are consumed, and is NOT
+/// locked here — that is the B8g scope as agreed, and it stays on the unlocked
+/// list in `repository::inventory_lock`'s table alongside room-change and
+/// extend-stay, which move claims the same way. Widening to dates is its own
+/// decision, not a side effect of this one.
+fn room_set_changed(prior_room_ids: &[i32], requested: &[BookingRoomCommand]) -> bool {
+    if prior_room_ids.len() != requested.len() {
+        return true;
+    }
+    let mut prior: Vec<i32> = prior_room_ids.to_vec();
+    let mut next: Vec<i32> = requested.iter().map(|room| room.room_id).collect();
+    prior.sort_unstable();
+    next.sort_unstable();
+    prior != next
+}
+
 /// Reject empty room lists + non-positive prices. The legacy app permits
 /// "no-room bookings" (a placeholder), so we mirror that — empty `rooms` is
 /// allowed; only individually invalid rows are rejected.
@@ -1120,5 +1226,58 @@ mod modify_writeback_plan_tests {
             generate_idempotency_key(&mk("b"), agg),
             "same (CreateBooking, aggregate) must yield the same key regardless of payload"
         );
+    }
+}
+
+#[cfg(test)]
+mod room_set_changed_tests {
+    //! B8g — the predicate that decides whether a booking EDIT takes the
+    //! per-property inventory lock. Pure; no database.
+    use super::*;
+
+    fn rooms(ids: &[i32]) -> Vec<BookingRoomCommand> {
+        ids.iter()
+            .map(|&room_id| BookingRoomCommand {
+                room_id,
+                price_per_night: Some(1000.0),
+            })
+            .collect()
+    }
+
+    /// The notes-only edit: both desk savers re-send the rooms they loaded, so
+    /// the common save must NOT take the lock. This is the assertion that stops
+    /// every booking edit at the property queueing behind one advisory lock.
+    #[test]
+    fn an_unchanged_room_set_moves_no_inventory() {
+        assert!(!room_set_changed(&[], &rooms(&[])));
+        assert!(!room_set_changed(&[7], &rooms(&[7])));
+        assert!(!room_set_changed(&[7, 9], &rooms(&[7, 9])));
+    }
+
+    /// `ht_booking_rooms` has no intrinsic order; a re-ordered but identical
+    /// set is still the same claim on inventory.
+    #[test]
+    fn ordering_alone_is_not_a_change() {
+        assert!(!room_set_changed(&[9, 7], &rooms(&[7, 9])));
+    }
+
+    /// The three shapes that DO move inventory.
+    #[test]
+    fn assigning_swapping_or_clearing_rooms_moves_inventory() {
+        // Parked booking gains its first room (the promote path).
+        assert!(room_set_changed(&[], &rooms(&[7])));
+        // Room swapped for another.
+        assert!(room_set_changed(&[7], &rooms(&[8])));
+        // Room added…
+        assert!(room_set_changed(&[7], &rooms(&[7, 8])));
+        // …and released back to the waitlist.
+        assert!(room_set_changed(&[7], &rooms(&[])));
+    }
+
+    /// A duplicate id is a different multiset, not a different-length list —
+    /// pinned so a future `HashSet` "simplification" cannot silently drop it.
+    #[test]
+    fn a_repeated_room_is_a_different_claim() {
+        assert!(room_set_changed(&[7, 8], &rooms(&[7, 7])));
     }
 }

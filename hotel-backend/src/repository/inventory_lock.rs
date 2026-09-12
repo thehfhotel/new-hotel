@@ -16,7 +16,7 @@
 //!
 //! ## EXACTLY which paths take this lock
 //!
-//! Two, and only two. Do not read this module as "inventory is now
+//! Three, and only three. Do not read this module as "inventory is now
 //! serialised"; it is not, and the list below is the whole of it:
 //!
 //! 1. **`service::channel::create_hold`** — holds it across last-room-floor
@@ -25,6 +25,15 @@
 //!    `CreateBookingCommand::inventory_lock` is `Some(property)` — which
 //!    `routes::new_bookings::create_booking` (the desk form and the OTA
 //!    bridge) always sets, roomless creates included.
+//! 3. **`service::booking::modify`** (B8g), whenever
+//!    `ModifyBookingCommand::inventory_lock` is `Some(property)` — which
+//!    `routes::new_bookings::update_booking` always sets — **AND** the edit
+//!    changes the booking's room set (`service::booking::room_set_changed`).
+//!    That covers the parked promote (first room assigned), a room swap, an
+//!    added room and a room released back to the waitlist. An edit that leaves
+//!    the rooms alone (notes, price, guest counts, status) takes NOTHING: it
+//!    moves no inventory, and one property-wide lock on every desk save would
+//!    serialise edits against creates for no benefit.
 //!
 //! **Everything else that moves inventory still runs unlocked**, by design and
 //! for now:
@@ -34,7 +43,7 @@
 //! | walk-in check-in (`service::checkin::create`) | consumes a room directly; a desk-vs-desk race, unchanged from today |
 //! | room change (`service::checkin::change_room`) | moves an occupied stay between rooms |
 //! | stay extension (`service::checkin::extend_stay`) | lengthens an existing claim |
-//! | booking edit / parked promote (`service::booking::modify`, via `routes::new_bookings::update_booking`) | assigns the FIRST room to a parked booking |
+//! | booking edit that only RE-DATES an unchanged room set (`service::booking::modify`) | shifts which room-nights are consumed without touching the room set, so B8g's predicate does not fire; same class as the two rows above, and widening to dates is its own decision |
 //! | CT sync mappers (`bin/sync.rs`) | replay iHOTEL's own writes; iHOTEL is the writer there and cannot be asked to take our lock |
 //!
 //! What protects the channel against those is **not** this lock — it is the
@@ -229,14 +238,15 @@ impl InventoryLock {
     ///
     /// Returns a no-op bypass guard when `BOOKING_INVENTORY_LOCK_ENABLED` is
     /// off — the kill switch exists so an operator can un-serialise booking
-    /// creates without a rollback deploy if this lock ever becomes the thing
-    /// that is wrong. It re-opens the B8 §2.1/§2.3 double-sell window, so it
-    /// is an incident tool, not a tuning knob.
+    /// writes (channel holds, desk creates, room-moving edits) without a
+    /// rollback deploy if this lock ever becomes the thing that is wrong. It
+    /// re-opens the B8 §2.1/§2.3 double-sell window, so it is an incident tool,
+    /// not a tuning knob.
     pub async fn acquire(pool: &PgPool, property: &str) -> Result<Self, InventoryLockError> {
         if !crate::config::booking_inventory_lock_enabled() {
             tracing::warn!(
                 property,
-                "BOOKING_INVENTORY_LOCK_ENABLED=false — booking creates are NOT serialised; \
+                "BOOKING_INVENTORY_LOCK_ENABLED=false — booking writes are NOT serialised; \
                  concurrent writers can take the same last room"
             );
             return Ok(Self {

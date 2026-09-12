@@ -241,6 +241,16 @@ pub trait BookingRepository: Send + Sync {
         write: BookingWrite<'_>,
     ) -> Result<u64, sqlx::Error>;
 
+    /// The `br_room_id`s currently assigned to a booking, ascending (B8g).
+    ///
+    /// Deliberately NOT [`Self::list_rooms`]: that one joins rooms + types to
+    /// render a booking, and the modify path needs one thing only — whether
+    /// this edit MOVES inventory, i.e. whether the requested room set differs
+    /// from the committed one. Read on the pool before the transaction opens,
+    /// because the answer decides whether the per-property inventory lock is
+    /// taken at all (and the lock must be held BEFORE the write starts).
+    async fn booking_room_ids(&self, pool: &PgPool, book_id: i32) -> Result<Vec<i32>, sqlx::Error>;
+
     /// Delete all `ht_booking_rooms` rows for a booking (used before re-inserting).
     async fn delete_booking_rooms(
         &self,
@@ -866,6 +876,17 @@ impl BookingRepository for PgBookingRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    async fn booking_room_ids(&self, pool: &PgPool, book_id: i32) -> Result<Vec<i32>, sqlx::Error> {
+        // Runtime query (not the `query!` macro) so this decision-only read
+        // needs no `.sqlx` offline-cache entry.
+        sqlx::query_scalar::<_, i32>(
+            "SELECT br_room_id FROM ht_booking_rooms WHERE br_book_id = $1 ORDER BY br_room_id",
+        )
+        .bind(book_id)
+        .fetch_all(pool)
+        .await
     }
 
     async fn delete_booking_rooms(
