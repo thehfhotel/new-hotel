@@ -233,7 +233,58 @@ the main router's `ville_write_guard` (which keys on `?branch=`).
   release path. Belt-and-braces — the loyalty app's own release call is not
   load-bearing. Registered unconditionally: it filters
   `book_channel='loyalty' AND book_status='pending'` via the partial index
-  `ix_ht_bookings_hold_expiry`, a no-op while the channel is dark.
+  `ix_ht_bookings_hold_expiry`, a no-op while the channel is dark. It also
+  stamps `book_hold_auto_released_at` (see below), which is what makes the
+  expired-hold rate measurable.
+
+#### How a hold dies, and how to tell the two ways apart (B13)
+
+Both ways end in the SAME write (`repository::channel::release_hold`) and leave
+`book_status='cancelled'` + `book_cancelled_at`. What separates them is the
+TYPED marker `ht_bookings.book_hold_auto_released_at` (migration 096) — **not**
+the free-text reason. It is named for the EVENT (an auto-release) rather than the
+verdict (an expiry), so it cannot be typo-confused with `book_hold_expires_at` — the
+FUTURE deadline, one letter away and also `TIMESTAMPTZ` — and so it stays accurate if
+a later `HOLD_TTL` change alters what "expired" means:
+
+**TWO paths write a hold cancellation, and only one of them is a TTL expiry** — the
+sweeper's `loyalty hold expired (auto-release)`; the channel release endpoint's
+`loyalty payment window lapsed (channel release)` is a guest abandonment and must
+never be counted as an expiry.
+
+| Path | `book_cancel_reason` (desk-facing) | `book_hold_auto_released_at` |
+|---|---|---|
+| Expiry sweep (`service::channel::sweep_expired_holds`) — **a TTL expiry** | `loyalty hold expired (auto-release)` | **set** to the instant it fired |
+| Channel release endpoint (`routes::channel::release`) — **a guest abandonment** | `loyalty payment window lapsed (channel release)` | `NULL` |
+| Any other cancellation (desk, iHOTEL via CT) | whatever that path writes | `NULL` |
+
+**Do not identify an expiry by its reason string.** Both channel reasons say
+the payment window ran out, but only the sweep's is an expiry whose `HOLD_TTL`
+we control — the endpoint fires when the loyalty app decides to hand the room
+back. Matching prose would count guest abandonments as TTL expiries and inflate
+the very number B13 exists to read. The reason text stays free-form on purpose,
+for the receptionist reading the booking; the marker is the machine-readable
+fact, and `service::channel::ReleaseCause` is what decides it, so a release can
+only be counted as an expiry by naming `PaymentWindowExpired` out loud.
+
+The marker is written in the same `UPDATE` that cancels, so it cannot disagree
+with the cancellation, and it is stamped once — the `book_status='pending'`
+guard means a later sweep tick writes nothing and the instant stays put.
+
+**Where to read it:** `GET /api/reports/channel-rollup` exposes it as
+`holdsExpired` (the metric keeps the business name; the column and Rust field keep
+the mechanism name, pinned by an explicit `serde(rename)`), per bucket and in
+`totals`, per branch and window — see
+`docs/channel-rollup.md`, which also explains why it shares that report's
+arrival-date basis. `holdsExpired ÷ bookings` in the `app` bucket is the
+expired-hold rate B13 asks for.
+
+**PG-only.** iHOTEL has no notion of a hold or a TTL: the hold is an ordinary
+`จอง` there and its expiry already reaches legacy as the normal
+`CancelBooking` writeback. Migration 096 changes no recipe, no intent and no
+byte-parity literal, and needs no CT mapper change (nothing legacy-side can
+author this fact, and `sync::mappers::booking` writes explicit column lists, so
+a legacy-driven update cannot clobber a stamped value).
 
 ### Idempotency on the hold create (`Idempotency-Key`)
 

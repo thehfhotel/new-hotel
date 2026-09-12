@@ -51,13 +51,13 @@ not silently mean "yesterday" for the first seven hours of each Thai day.
   "to": "2026-09-10",
   "buckets": [
     { "key": "app",     "kind": "app",     "label": "App",
-      "bookings": 12, "cancelled": 1, "roomNights": 30, "grossRevenue": 45000.0 },
+      "bookings": 12, "cancelled": 1, "holdsExpired": 1, "roomNights": 30, "grossRevenue": 45000.0 },
     { "key": "agoda",   "kind": "ota",     "label": "Agoda",     "...": "..." },
     { "key": "ota",     "kind": "ota",     "label": "OTA",       "...": "..." },
     { "key": "direct",  "kind": "direct",  "label": "Direct",    "...": "..." },
     { "key": "unknown", "kind": "unknown", "label": "Unknown",   "...": "..." }
   ],
-  "totals": { "bookings": 260, "cancelled": 41, "roomNights": 612, "grossRevenue": 918000.0 },
+  "totals": { "bookings": 260, "cancelled": 41, "holdsExpired": 6, "roomNights": 612, "grossRevenue": 918000.0 },
   "directShare": 38.5,
   "directShareByBookings": 41.2,
   "directShareByRevenue": 36.9
@@ -78,6 +78,7 @@ bases are exposed alongside it rather than forcing the caller to pick. All three
 |---|---|
 | `bookings` | `COUNT(*)` over `ht_bookings` with `book_checkin` in the window — **every status, cancellations included**. |
 | `cancelled` | Of those, `book_status = 'cancelled'`. `cancelled / bookings` is the cancellation rate KPI **K7** wants. |
+| `holdsExpired` | Of those cancellations, the ones with `book_hold_auto_released_at IS NOT NULL` — loyalty holds the expiry sweep **auto-released** because the payment window lapsed (migration 096, **B13**). A strict SUBSET of `cancelled`. Structurally `0` outside the `app` bucket: only a loyalty hold has a payment window to lapse. Note the deliberate name split: the column and the Rust field are named for the mechanism (`..._auto_released`), the wire field for the business question (`holdsExpired`), pinned together by an explicit `serde(rename)`. |
 | `roomNights` | `SUM(book_nights × rooms)` over **non-cancelled** bookings. `book_nights` is the stored generated column (`book_checkout - book_checkin`); `rooms` is `COUNT(*)` over `ht_booking_rooms` for that booking, **floored at 1**. |
 | `grossRevenue` | `SUM(book_total_amount)` over **non-cancelled** bookings, in baht. |
 
@@ -91,6 +92,43 @@ Two choices worth defending:
 * **Cancelled bookings sell no nights and earn no baht,** so they are excluded from
   `roomNights` and `grossRevenue` while staying in `bookings`. Any other split makes one
   of the two KPIs unreadable.
+
+### Why `holdsExpired` is a typed column, named for the auto-release, and shares the arrival-date basis
+
+Two decisions, both deliberate (**B13**).
+
+**Typed, not textual.** Before migration 096 a swept hold was indistinguishable from
+any other cancellation except by matching the free-text `book_cancel_reason`. That
+match is not merely brittle — it is *wrong*. The sweep writes `loyalty hold expired
+(auto-release)`; the channel's own release endpoint writes `loyalty payment window
+lapsed (channel release)`. Both sentences say the payment window ran out, yet only the
+first is an expiry whose TTL we control — the second is the loyalty app handing a room
+back for reasons of its own — a guest abandonment, which must never be counted as a TTL
+expiry. Counting them together would inflate the exact rate B13 exists to read, and
+would make a `HOLD_TTL` change look effective (or useless) for reasons that have nothing
+to do with `HOLD_TTL`. So the sweep stamps `book_hold_auto_released_at` in the same
+`UPDATE` that cancels, and this report counts that column. A reason-string rename can no
+longer silently zero the number.
+
+**Named for the event, not the verdict.** The column records an *auto-release*, because
+that is the one act that sets it. The rejected `..._expired_at` spelling sat one letter
+from migration 086's `book_hold_expires_at` and was also `TIMESTAMPTZ`, so a typo would
+compile and return plausible timestamps — measuring the deadline instead of the event, in
+the column whose whole purpose is measurement. It also keeps its meaning if a later
+`HOLD_TTL` change alters what "expired" means. The metric stays `holdsExpired` because
+that is the question being asked.
+
+**Same window basis as everything else here.** Every figure in this report is
+attributed by `book_checkin` (arrival), so a hold that expired in January for a March
+stay is counted in March — not in January when it actually died. An expiry-time basis
+(`book_cancelled_at`) would read more naturally on its own, but it would break the
+property that makes the number useful: counted this way `holdsExpired` is a strict
+subset of `cancelled`, over exactly the same rows, so `holdsExpired ÷ bookings` inside
+the `app` bucket is a real rate whose numerator and denominator describe the same
+population. Split the bases and that ratio silently compares two different sets of
+bookings. If you need "holds that expired *during* a calendar period" — a different and
+also legitimate question — that is a new field with its own basis, not a redefinition
+of this one.
 
 ### Why `grossRevenue` is `book_total_amount` and not the reports' revenue column
 

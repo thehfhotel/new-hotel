@@ -820,7 +820,32 @@ impl ChannelService {
     /// a release can never cancel a hold that payment-verified just
     /// confirmed. The legacy mirror rides the normal `CancelBooking`
     /// writeback so iHOTEL sees the room free again.
+    ///
+    /// This is the REQUESTED release — somebody (the loyalty app, via
+    /// `routes::channel::release`) asked for it. It leaves
+    /// `book_hold_auto_released_at` NULL. Only [`Self::sweep_expired_holds`]
+    /// records an auto-release, through [`Self::release_with_cause`]; see
+    /// [`ReleaseCause`].
     pub async fn release(&self, book_id: i32, reason: &str) -> ServiceResult<ReleaseOutcome> {
+        self.release_with_cause(book_id, reason, ReleaseCause::Requested)
+            .await
+    }
+
+    /// [`Self::release`] plus the typed reason the hold is dying, which is
+    /// what decides whether `book_hold_auto_released_at` is stamped
+    /// (migration 096, B13).
+    ///
+    /// Kept as a separate entry point rather than a fourth parameter on
+    /// `release` so that the DEFAULT is the safe one: every existing caller
+    /// keeps its signature and keeps writing NULL, and a path can only be
+    /// counted as an expiry by naming [`ReleaseCause::PaymentWindowExpired`]
+    /// out loud.
+    pub async fn release_with_cause(
+        &self,
+        book_id: i32,
+        reason: &str,
+        cause: ReleaseCause,
+    ) -> ServiceResult<ReleaseOutcome> {
         let mut tx = self.pg.begin().await?;
 
         let row = channel_repo::lock_channel_booking(&mut tx, book_id)
@@ -846,7 +871,8 @@ impl ChannelService {
             }
         }
 
-        let rows = channel_repo::release_hold(&mut tx, book_id, reason).await?;
+        let rows =
+            channel_repo::release_hold(&mut tx, book_id, reason, cause.is_auto_release()).await?;
         if rows == 0 {
             return Err(ServiceError::conflict(format!(
                 "hold {book_id} changed state during release; retry"
@@ -898,7 +924,11 @@ impl ChannelService {
         let mut released = 0usize;
         for book_id in ids {
             match self
-                .release(book_id, "loyalty hold expired (auto-release)")
+                .release_with_cause(
+                    book_id,
+                    "loyalty hold expired (auto-release)",
+                    ReleaseCause::PaymentWindowExpired,
+                )
                 .await
             {
                 Ok(outcome) if !outcome.already_released => {
@@ -918,6 +948,45 @@ impl ChannelService {
             }
         }
         released
+    }
+}
+
+/// Why a hold is being cancelled — the discriminator behind
+/// `ht_bookings.book_hold_auto_released_at` (migration 096, B13).
+///
+/// It exists because both release paths end in the SAME
+/// `repository::channel::release_hold` write, and until B13 the only thing
+/// telling them apart was the free-text `book_cancel_reason`. That text cannot
+/// carry the distinction: the sweep writes *"loyalty hold expired
+/// (auto-release)"* and the channel's own endpoint writes *"loyalty payment
+/// window lapsed (channel release)"* — both sentences say the payment window
+/// ran out, yet only one of them is an expiry whose TTL we control. Counting
+/// them together would inflate the expired-hold rate B13 exists to read, and
+/// would make a `HOLD_TTL` change look effective for reasons that have nothing
+/// to do with `HOLD_TTL`.
+///
+/// So the cause travels as a type instead of being re-derived from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseCause {
+    /// Somebody asked for the release — today that is the loyalty app calling
+    /// `POST /api/channel/bookings/{id}/release`, for whatever reason of its
+    /// own (guest abandoned the checkout, its own client-side timer, a retry).
+    /// Leaves `book_hold_auto_released_at` NULL: this is a guest abandonment,
+    /// not a TTL expiry, and it must never be counted as one.
+    Requested,
+    /// The scheduler's expiry sweep observed `book_hold_expires_at` in the
+    /// past while the hold was still `pending`. THIS is the event B13 counts,
+    /// and the only one that stamps `book_hold_auto_released_at`.
+    PaymentWindowExpired,
+}
+
+impl ReleaseCause {
+    /// Whether this release is the sweep's auto-release — i.e. whether
+    /// `book_hold_auto_released_at` gets stamped. Named for the act rather
+    /// than the verdict, matching the column. Sole reader:
+    /// `ChannelService::release_with_cause`.
+    pub fn is_auto_release(self) -> bool {
+        matches!(self, Self::PaymentWindowExpired)
     }
 }
 
