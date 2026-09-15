@@ -263,3 +263,19 @@ a closed defect is still open.
     document it actually means, and run `./scripts/check-doc-anchors.sh` locally. **Do not
     baseline it** — `scripts/doc-anchors-baseline.tsv` records pre-existing out-of-scope
     debt, and a citation written today is neither.
+
+
+## 2026-09-15 citation repair follow-up
+
+The three runsheet citations described above point to
+`docs/coexistence/legacy-writeback-test-runbook.md`, not `docs/runbook-sync.md`.
+The earlier diagnosis named the wrong file. Re-reading the actual IT reference
+confirms these targets:
+
+- `docs/coexistence/legacy-writeback-test-runbook.md` §"Where the flags live"
+- `docs/coexistence/legacy-writeback-test-runbook.md` §"Step 1 — Guest image write-back"
+- `docs/coexistence/legacy-writeback-test-runbook.md` §"Rollback (instant, no state to clean up)"
+
+The untracked runsheet remains owned by its originating session. A separate
+citation-only patch was prepared and checked against these headings; its live-test
+instructions and the results of any reception drill were not changed or verified.

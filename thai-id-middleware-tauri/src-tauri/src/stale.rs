@@ -5,7 +5,7 @@
 //! Per the ADR: every writeback that lands in the shared legacy MSSQL can
 //! leave iHOTEL's own room grid stale, because `FormRoomMain`'s ~60.56s
 //! refresh timer only runs while iHOTEL holds foreground
-//! (`docs/legacy-app/ROOM_GRID_REFRESH.md` §1-2). A toast on every single
+//! (`docs/legacy-app/ROOM_GRID_REFRESH.md` §1 and §2). A toast on every single
 //! writeback would retrain reception to ignore toasts within a shift (ADR
 //! 0006 §5, echoing CLAUDE.md's alerting guardrail), so staleness is
 //! modeled as one open "episode" per stale spell: the first writeback while

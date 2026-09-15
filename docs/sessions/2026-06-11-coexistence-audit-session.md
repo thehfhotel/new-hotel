@@ -47,9 +47,9 @@ invariants, and FEATURE_MAP × REPORTS_INVENTORY coverage. Verdict:
 **conditional pass — coexistence worked partly by accident.** Highlights:
 
 - 4 × P0: the June-3 FK-defer/watermark class (7 silent-drop paths);
-  `payment.rs` blindly deleting `HT_CheckIn_Product` without the §6.3
+  `payment.rs` blindly deleting `HT_CheckIn_Product` without the `docs/legacy-app/COMPAT_CHEATSHEET.md` §6.3
   stock pairing; `extend_stay.rs` zeroing `Total_Price_Product` /
-  clobbering `Total_Price_Pay`; `room_change.rs` skipping the §3.17
+  clobbering `Total_Price_Pay`; `room_change.rs` skipping the `docs/legacy-app/COMPAT_CHEATSHEET.md` §3.17
   caller duties (stale iHOTEL occupancy).
 - 6 × P1 incl.: **echo suppression was inert** (`SET CONTEXT_INFO`
   never populates `SYS_CHANGE_CONTEXT`; loop-safety was accidental via
