@@ -36,7 +36,7 @@ use tiberius::Row;
 use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
-use crate::writeback::error::WritebackResult;
+use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::{format_legacy_datetime, sql_quote};
 
 /// Result of the prior-occupant lookup.
@@ -168,16 +168,58 @@ pub async fn execute(
     // recipe (no longer recomputed inside build_statements).
     let now = Utc::now();
     let statements = build_statements(room_id_int, room_no, by, prior.as_ref(), now);
-    super::execute_all(conn, &statements).await?;
+    super::execute_all(conn, &statements[..1]).await?;
+    // Read the INSERT's row count in the SAME batch, immediately after it.
+    // A separate query can reset @@ROWCOUNT; counting matching rows instead
+    // cannot distinguish this attempt's INSERT from a pre-existing audit row.
+    // The INSERT itself (including the five-minute guard) remains byte-identical.
+    let audit_sql = with_housewife_row_count(&statements[1]);
+    let rows = simple_query_with_timeout(conn, &audit_sql, MssqlOpKind::Write).await?;
+    let count = match rows.as_slice() {
+        [row] => row.try_get::<i32, _>("housewife_rows_inserted")?,
+        _ => None,
+    };
+    let housewife_inserted = decode_housewife_row_count(count)?;
 
     let mut ids = LegacyIds::new();
     ids.extra
         .insert("room_id".into(), serde_json::Value::from(room_id_int));
+    ids.extra.insert(
+        "housewife_inserted".into(),
+        serde_json::Value::from(housewife_inserted),
+    );
+    if !housewife_inserted {
+        // No name, badge, prior guest, or SQL in the log. This describes this
+        // execution attempt: a retry after a lost COMMIT reply can legitimately
+        // find the audit row written by the earlier attempt.
+        tracing::warn!(
+            event_name = "writeback.housewife_insert_suppressed",
+            room_no,
+            room_id = room_id_int,
+            "mark-clean audit INSERT suppressed by the five-minute guard in this attempt"
+        );
+    }
     if let Some(p) = prior {
         ids.extra
             .insert("prior_cin_no".into(), serde_json::Value::from(p.cin_no));
     }
     Ok(ids)
+}
+
+fn with_housewife_row_count(insert: &str) -> String {
+    format!("{insert}; SELECT @@ROWCOUNT AS housewife_rows_inserted")
+}
+
+fn decode_housewife_row_count(count: Option<i32>) -> WritebackResult<bool> {
+    match count {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        // Never turn an absent/unexpected observation into a false claim that
+        // the guard suppressed the INSERT. The outer transaction rolls back.
+        _ => Err(WritebackError::Recipe(
+            "mark-clean audit INSERT did not return a single 0/1 row count".into(),
+        )),
+    }
 }
 
 /// Build the prior-occupant lookup SQL — exposed for unit tests so we can
@@ -240,6 +282,38 @@ mod tests {
         assert!(statements[1].contains("'<REDACTED-real-guest-name>'"));
         assert!(statements[1].contains("'Admin'"));
         assert!(statements[1].contains("'306'"));
+    }
+
+    #[test]
+    fn audit_observation_preserves_insert_and_reads_count_in_same_batch() {
+        let statements = build_statements(6, "306", "SAMPLE", None, pinned_now());
+        let batch = with_housewife_row_count(&statements[1]);
+        let (insert, observation) = batch.split_once(';').expect("one batch separator");
+        assert_eq!(
+            insert, statements[1],
+            "all INSERT bytes must stay unchanged"
+        );
+        assert_eq!(observation, " SELECT @@ROWCOUNT AS housewife_rows_inserted");
+        assert_eq!(
+            statements.len(),
+            2,
+            "the public builder must still contain only the two original writes"
+        );
+    }
+
+    #[test]
+    fn audit_row_count_distinguishes_insertion_from_suppression() {
+        assert!(decode_housewife_row_count(Some(1)).unwrap());
+        assert!(!decode_housewife_row_count(Some(0)).unwrap());
+        for invalid in [None, Some(-1), Some(2)] {
+            assert!(
+                matches!(
+                    decode_housewife_row_count(invalid),
+                    Err(WritebackError::Recipe(_))
+                ),
+                "missing or unexpected evidence must not be reported as suppression"
+            );
+        }
     }
 
     /// Maid attribution (housekeeping-ops, 2026-08-11): `by` must land in
