@@ -842,7 +842,7 @@ The legacy MSSQL schema and the `.NET` app's behavior are not documented anywher
 | 2 | Decompiled C# from the legacy `.exe` | `docs/legacy-app/` (analysis docs in repo) + `evergreen:/home/nut/new-hotel/legacy/` (vendor binaries off-repo) | High — but reflects intent, not always behavior |
 | 3 | Inferred / cheatsheet analysis | scattered notes, early write-ups | Lowest — may be stale or wrong |
 
-**Case in point — `HT_CheckIn_Ds.id`.** The original spike cheatsheet recorded this column as `IDENTITY` (autoincrement). The decompiled C# (see `docs/legacy-app/EVERGREEN_ARTIFACTS.md` for the off-repo decompile location) clearly shows the legacy app allocating the next id manually with `MAX(id)+1`, and a re-capture against the live DB confirmed the column is a plain `int`. We were one bug away from writebacks blowing up under concurrency. The current writeback (`hotel-backend/src/writeback/allocate.rs`) treats both `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` as manual-allocation columns under `TABLOCKX, HOLDLOCK`. See §4a for the SQL recipe.
+**Case in point — `HT_CheckIn_Ds.id`.** The original spike cheatsheet recorded this column as `IDENTITY` (autoincrement). The decompiled C# (see `docs/legacy-app/EVERGREEN_ARTIFACTS.md` for the off-repo decompile location) clearly shows the legacy app allocating the next id manually with `MAX(id)+1`, and a re-capture against the live DB confirmed the column is a plain `int`. We were one bug away from writebacks blowing up under concurrency. The current writeback (`hotel-backend/src/writeback/allocate.rs`) treats both `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` as manual-allocation columns under `TABLOCKX, HOLDLOCK`. See `docs/legacy-spike/findings.md` §"Allocation strategy (verified)" "WITH (TABLOCKX, HOLDLOCK)" for the SQL recipe.
 
 Other ground-truth facts that fall out of this precedence rule:
 
@@ -1109,7 +1109,7 @@ hotel-backend/src/
 │
 ├── writeback/                 ★ NEW — adapter to legacy MSSQL
 │   ├── allocate.rs            – TABLOCKX MAX+1 helpers per counter
-│   ├── walkin.rs              – §3a recipe from spike findings
+│   ├── walkin.rs              – docs/legacy-spike/findings.md §3a recipe
 │   ├── booking.rs             – §3b
 │   ├── modify_booking.rs      – §3c
 │   ├── checkin_to_booking.rs  – §3d

@@ -46,7 +46,7 @@
 //!
 //! # Guards
 //!
-//! A refresh is **not free** (`ROOM_GRID_REFRESH.md` §4-5): `LoadRooms` can
+//! A refresh is **not free** (`ROOM_GRID_REFRESH.md` §4 and §5): `LoadRooms` can
 //! `UPDATE HT_Rooms`/`HT_Book_Date` via `AutoAddBookingRooms` and toggle
 //! physical room power, and `ButtonX3_Click` calls `ClearCheck()` which
 //! destroys reception's in-progress multi-room tap-selection. So a **guarded

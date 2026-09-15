@@ -53,7 +53,7 @@ A refresh is not free — `LoadRooms` can `UPDATE HT_Rooms`/`HT_Book_Date`
 and toggle room power, and `ButtonX3_Click` calls `ClearCheck()`, which
 destroys any in-progress multi-room selection
 ([`docs/legacy-app/ROOM_GRID_REFRESH.md`](../docs/legacy-app/ROOM_GRID_REFRESH.md)
-§4-5). So a guarded skip is always preferred over a risky click. The
+§4 and §5). So a guarded skip is always preferred over a risky click. The
 endpoint answers `200` either way; `sent` is the discriminator, and a skip
 carries a stable `reason` plus the Thai `message` reception just saw on a
 toast:
