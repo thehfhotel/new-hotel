@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(
             statements.len(),
             2,
-            "mark-dirty also uses the original builder"
+            "the public builder must still contain only the two original writes"
         );
     }
 
