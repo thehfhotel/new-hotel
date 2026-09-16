@@ -1,0 +1,3 @@
+Operational redeploy marker for 2026-09-16.
+
+Purpose: trigger the guarded master deployment pipeline after loyalty channel secrets and LOYALTY_APP_URL were provisioned. No runtime behavior is changed by this file.
